@@ -463,23 +463,3 @@ func (b *ContainerBuilder) BuildProxyInitContainer() corev1.Container {
 		},
 	}
 }
-
-// Backward-compatible package-level wrappers using compiled defaults.
-// These are called by PodMutator and will be removed in Phase 4
-// when PodMutator is rewired to use ContainerBuilder directly.
-
-func BuildSpiffeHelperContainer() corev1.Container {
-	return NewContainerBuilder(nil).BuildSpiffeHelperContainer()
-}
-
-func BuildClientRegistrationContainerWithSpireOption(name, namespace string, spireEnabled bool) corev1.Container {
-	return NewContainerBuilder(nil).BuildClientRegistrationContainerWithSpireOption(name, namespace, spireEnabled)
-}
-
-func BuildEnvoyProxyContainer() corev1.Container {
-	return NewContainerBuilder(nil).BuildEnvoyProxyContainer()
-}
-
-func BuildProxyInitContainer() corev1.Container {
-	return NewContainerBuilder(nil).BuildProxyInitContainer()
-}

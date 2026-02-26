@@ -72,7 +72,7 @@ providing end-to-end security:
 │  │   SPIRE (namespace:  │          │ KEYCLOAK (namespace: │                      │
 │  │       spire)         │          │     keycloak)        │                      │
 │  │                      │          │                      │                      │
-│  │  Provides SPIFFE     │          │  - demo realm        │                      │
+│  │  Provides SPIFFE     │          │  - kagenti realm     │                      │
 │  │  identities (SVIDs)  │          │  - token exchange    │                      │
 │  └──────────────────────┘          └──────────────────────┘                      │
 └──────────────────────────────────────────────────────────────────────────────────┘
@@ -272,7 +272,7 @@ This creates:
 
 | Resource | Name | Purpose |
 |----------|------|---------|
-| **Realm** | `demo` | Keycloak realm for the demo |
+| **Realm** | `kagenti` | Keycloak realm for the demo |
 | **Client** | `github-tool` | Target audience for token exchange |
 | **Scope** | `agent-team1-git-issue-agent-aud` | Realm DEFAULT — auto-adds Agent's SPIFFE ID to all tokens |
 | **Scope** | `github-tool-aud` | Realm OPTIONAL — for exchanged tokens targeting the tool |
@@ -304,7 +304,7 @@ Verify the ConfigMap has the correct values:
 
 ```bash
 kubectl get configmap environments -n team1 -o jsonpath='{.data.KEYCLOAK_REALM}'
-# Expected: demo
+# Expected: kagenti
 ```
 
 > **Note:** If you're using a different namespace or service account, edit
@@ -512,7 +512,7 @@ A properly signed token from a **different Keycloak realm** has a valid signatur
 the issuer does not match the configured `ISSUER` in `authbridge-config`:
 
 ```bash
-# Get a valid token from the master realm (different issuer than "demo")
+# Get a valid token from the master realm (different issuer than "kagenti")
 WRONG_ISSUER_TOKEN=$(kubectl exec test-client -n team1 -- curl -s \
   "http://keycloak-service.keycloak.svc:8080/realms/master/protocol/openid-connect/token" \
   -d "grant_type=password" \
@@ -523,7 +523,7 @@ WRONG_ISSUER_TOKEN=$(kubectl exec test-client -n team1 -- curl -s \
 kubectl exec test-client -n team1 -- curl -s \
   -H "Authorization: Bearer $WRONG_ISSUER_TOKEN" \
   http://git-issue-agent:8080/
-# Expected: {"error":"unauthorized","message":"token validation failed: invalid issuer: expected http://keycloak.localtest.me:8080/realms/demo, got ..."}
+# Expected: {"error":"unauthorized","message":"token validation failed: invalid issuer: expected http://keycloak.localtest.me:8080/realms/kagenti, got ..."}
 ```
 
 > **Why this matters:** Even though the token is cryptographically valid (signed by
@@ -540,7 +540,7 @@ echo "Agent Client ID: $CLIENT_ID"
 
 # Get a service account token (simulating what the UI would obtain)
 TOKEN=$(kubectl exec test-client -n team1 -- curl -s -X POST \
-  "http://keycloak-service.keycloak.svc:8080/realms/demo/protocol/openid-connect/token" \
+  "http://keycloak-service.keycloak.svc:8080/realms/kagenti/protocol/openid-connect/token" \
   -d "grant_type=client_credentials" \
   -d "client_id=$CLIENT_ID" \
   -d "client_secret=$CLIENT_SECRET" | jq -r '.access_token')
@@ -581,8 +581,8 @@ Expected (one line per request in 8b–8e):
 ```
 [Inbound] Missing Authorization header
 [Inbound] JWT validation failed: failed to parse/validate token: ...
-[Inbound] JWT validation failed: invalid issuer: expected http://keycloak.localtest.me:8080/realms/demo, got ...
-[Inbound] Token validated - issuer: http://keycloak.localtest.me:8080/realms/demo, audience: [...]
+[Inbound] JWT validation failed: invalid issuer: expected http://keycloak.localtest.me:8080/realms/kagenti, got ...
+[Inbound] Token validated - issuer: http://keycloak.localtest.me:8080/realms/kagenti, audience: [...]
 [Inbound] JWT validation succeeded, forwarding request
 ```
 
@@ -627,11 +627,11 @@ echo "Admin token length: ${#ADMIN_TOKEN}"
 # Expected: Admin token length: 782
 # If 0 or 4 (null), Keycloak is not reachable or credentials are wrong — stop here.
 
-# Look up the agent's client in the demo realm.
+# Look up the agent's client in the kagenti realm.
 # The client ID is the SPIFFE ID (URL-encoded in the query parameter).
 SPIFFE_ID="spiffe://localtest.me/ns/team1/sa/git-issue-agent"
 CLIENTS=$(curl -s -H "Authorization: Bearer $ADMIN_TOKEN" \
-  "http://keycloak-service.keycloak.svc:8080/admin/realms/demo/clients" \
+  "http://keycloak-service.keycloak.svc:8080/admin/realms/kagenti/clients" \
   --data-urlencode "clientId=$SPIFFE_ID" --get)
 INTERNAL_ID=$(echo "$CLIENTS" | jq -r ".[0].id")
 CLIENT_ID=$(echo "$CLIENTS" | jq -r ".[0].clientId")
@@ -648,7 +648,7 @@ echo "Secret length: ${#CLIENT_SECRET}"
 
 # Get an OAuth token for the agent
 TOKEN=$(curl -s -X POST \
-  "http://keycloak-service.keycloak.svc:8080/realms/demo/protocol/openid-connect/token" \
+  "http://keycloak-service.keycloak.svc:8080/realms/kagenti/protocol/openid-connect/token" \
   -d "grant_type=client_credentials" \
   --data-urlencode "client_id=$CLIENT_ID" \
   --data-urlencode "client_secret=$CLIENT_SECRET" | jq -r ".access_token")
@@ -669,7 +669,7 @@ Token length:  1165
 > **Troubleshooting:** If `INTERNAL_ID` shows `null`, the Keycloak query didn't find
 > the client. Verify `$ADMIN_TOKEN` is not empty (Keycloak reachable?) and that
 > `setup_keycloak.py` was run. You can also list all clients with:
-> `curl -s -H "Authorization: Bearer $ADMIN_TOKEN" "http://keycloak-service.keycloak.svc:8080/admin/realms/demo/clients" | jq '.[].clientId'`
+> `curl -s -H "Authorization: Bearer $ADMIN_TOKEN" "http://keycloak-service.keycloak.svc:8080/admin/realms/kagenti/clients" | jq '.[].clientId'`
 
 ### 9c. Send a prompt to the agent
 
@@ -755,7 +755,7 @@ kubectl logs deployment/git-issue-agent -n team1 -c envoy-proxy 2>&1 | grep -i "
 Expected output:
 
 ```
-[Inbound] Token validated - issuer: http://keycloak.localtest.me:8080/realms/demo, audience: [spiffe://localtest.me/ns/team1/sa/git-issue-agent ...]
+[Inbound] Token validated - issuer: http://keycloak.localtest.me:8080/realms/kagenti, audience: [spiffe://localtest.me/ns/team1/sa/git-issue-agent ...]
 [Inbound] JWT validation succeeded, forwarding request
 ```
 
@@ -764,7 +764,7 @@ If you ran the rejection tests (8b, 8c, 8d), you should also see:
 ```
 [Inbound] Missing Authorization header
 [Inbound] JWT validation failed: failed to parse/validate token: ...
-[Inbound] JWT validation failed: invalid issuer: expected http://keycloak.localtest.me:8080/realms/demo, got ...
+[Inbound] JWT validation failed: invalid issuer: expected http://keycloak.localtest.me:8080/realms/kagenti, got ...
 ```
 
 **Outbound token exchange logs** (RFC 8693 token exchange for the GitHub tool):
@@ -776,7 +776,7 @@ kubectl logs deployment/git-issue-agent -n team1 -c envoy-proxy 2>&1 | grep "^20
 Expected:
 
 ```
-[Token Exchange] Token URL: http://keycloak-service.keycloak.svc:8080/realms/demo/protocol/openid-connect/token
+[Token Exchange] Token URL: http://keycloak-service.keycloak.svc:8080/realms/kagenti/protocol/openid-connect/token
 [Token Exchange] Client ID: spiffe://localtest.me/ns/team1/sa/git-issue-agent
 [Token Exchange] Audience: github-tool
 [Token Exchange] Scopes: openid github-tool-aud github-full-access
@@ -812,7 +812,7 @@ kubectl delete pod test-client -n team1 --ignore-not-found
 **Symptom:** `{"error":"invalid_client","error_description":"Invalid client or Invalid client credentials"}`
 
 **Cause:** The client was registered in the wrong Keycloak realm (typically `master` instead
-of `demo`). This happens when the `environments` ConfigMap is updated **after** the agent
+of `kagenti`). This happens when the `environments` ConfigMap is updated **after** the agent
 pod has already started — the pod reads ConfigMap values at startup time.
 
 **Fix:**
@@ -822,7 +822,7 @@ pod has already started — the pod reads ConfigMap values at startup time.
 kubectl exec deployment/git-issue-agent -n team1 -c kagenti-client-registration -- \
   sh -c 'echo "KEYCLOAK_REALM=$KEYCLOAK_REALM"'
 
-# 2. If it shows "master" instead of "demo", delete the stale client
+# 2. If it shows "master" instead of "kagenti", delete the stale client
 kubectl exec test-client -n team1 -- sh -c '
 ADMIN_TOKEN=$(curl -s http://keycloak-service.keycloak.svc:8080/realms/master/protocol/openid-connect/token \
   -d "grant_type=password" -d "client_id=admin-cli" -d "username=admin" -d "password=admin" | jq -r ".access_token")
@@ -838,7 +838,7 @@ echo "Deleted stale client from master realm"'
 
 # 3. Verify ConfigMap is correct, then restart
 kubectl get configmap environments -n team1 -o jsonpath='{.data.KEYCLOAK_REALM}'
-# Should show: demo
+# Should show: kagenti
 kubectl rollout restart deployment/git-issue-agent -n team1
 ```
 
@@ -880,7 +880,7 @@ kubectl logs deployment/git-issue-agent -n team1 -c agent
 **Symptom:** Tool rejects the exchanged token
 
 **Fix:** Verify the tool's environment variables match the Keycloak configuration:
-- `ISSUER` should be `http://keycloak.localtest.me:8080/realms/demo`
+- `ISSUER` should be `http://keycloak.localtest.me:8080/realms/kagenti`
 - `AUDIENCE` should be `github-tool`
 
 ### Upstream Request Timeout

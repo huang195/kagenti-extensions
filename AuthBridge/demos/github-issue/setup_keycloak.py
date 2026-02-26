@@ -53,7 +53,7 @@ from keycloak import KeycloakAdmin, KeycloakPostError
 
 # Default configuration
 KEYCLOAK_URL = os.environ.get("KEYCLOAK_URL", "http://keycloak.localtest.me:8080")
-KEYCLOAK_REALM = os.environ.get("KEYCLOAK_REALM", "demo")
+KEYCLOAK_REALM = os.environ.get("KEYCLOAK_REALM", "kagenti")
 KEYCLOAK_ADMIN_USERNAME = os.environ.get("KEYCLOAK_ADMIN_USERNAME", "admin")
 KEYCLOAK_ADMIN_PASSWORD = os.environ.get("KEYCLOAK_ADMIN_PASSWORD", "admin")
 
@@ -243,7 +243,7 @@ def main():
     print(f"\n--- Setting up realm: {KEYCLOAK_REALM} ---")
     get_or_create_realm(master_admin, KEYCLOAK_REALM)
 
-    # Switch to demo realm
+    # Switch to target realm
     keycloak_admin = KeycloakAdmin(
         server_url=KEYCLOAK_URL,
         username=KEYCLOAK_ADMIN_USERNAME,

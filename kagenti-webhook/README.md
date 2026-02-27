@@ -43,8 +43,7 @@ All workloads use the **common pod mutation code** for consistent behavior.
 
 > **⚠️ DEPRECATION NOTICE**: The following webhooks are deprecated and will be removed in a future release. Please migrate to the AuthBridge webhook with standard Kubernetes workloads.
 
-1. **MCPServer** (group: `toolhive.stacklok.dev/v1alpha1`) - ToolHive MCP servers *(deprecated)*
-2. **Agent** (group: `agent.kagenti.dev/v1alpha1`) - Kagenti agents from [kagenti-operator](https://github.com/kagenti/kagenti-operator) *(deprecated)*
+1. **Agent** (group: `agent.kagenti.dev/v1alpha1`) - Kagenti agents from [kagenti-operator](https://github.com/kagenti/kagenti-operator) *(deprecated)*
 
 ## Injection Control
 

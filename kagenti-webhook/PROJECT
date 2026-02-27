@@ -8,16 +8,6 @@ layout:
 projectName: kagenti-webhook
 repo: github.com/kagenti/kagenti-extensions/kagenti-webhook
 resources:
-- domain: stacklok.dev
-  external: true
-  group: toolhive.stacklok.dev
-  kind: MCPServer
-  path: github.com/stacklok/toolhive/cmd/thv-operator/api/v1alpha1
-  version: v1alpha1
-  webhooks:
-    defaulting: true
-    validation: true
-    webhookVersion: v1
 - domain: kagenti.dev
   external: true
   group: agent

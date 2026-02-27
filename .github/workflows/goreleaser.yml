@@ -54,7 +54,7 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Package and push toolhive webhook chart
+      - name: Package and push kagenti webhook chart
         run: |
           chartVersion=$(echo ${{ github.ref_name }} | cut -c 2-)
           chartPackageName="kagenti-webhook-chart-${chartVersion}.tgz"

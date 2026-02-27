@@ -65,26 +65,6 @@ webhooks:
     resources:
     - agents
   sideEffects: None
-- admissionReviewVersions:
-  - v1
-  clientConfig:
-    service:
-      name: webhook-service
-      namespace: system
-      path: /mutate-toolhive-stacklok-dev-v1alpha1-mcpserver
-  failurePolicy: Fail
-  name: mmcpserver-v1alpha1.kb.io
-  rules:
-  - apiGroups:
-    - toolhive.stacklok.dev
-    apiVersions:
-    - v1alpha1
-    operations:
-    - CREATE
-    - UPDATE
-    resources:
-    - mcpservers
-  sideEffects: None
 ---
 apiVersion: admissionregistration.k8s.io/v1
 kind: ValidatingWebhookConfiguration
@@ -110,24 +90,4 @@ webhooks:
     - UPDATE
     resources:
     - agents
-  sideEffects: None
-- admissionReviewVersions:
-  - v1
-  clientConfig:
-    service:
-      name: webhook-service
-      namespace: system
-      path: /validate-toolhive-stacklok-dev-v1alpha1-mcpserver
-  failurePolicy: Fail
-  name: vmcpserver-v1alpha1.kb.io
-  rules:
-  - apiGroups:
-    - toolhive.stacklok.dev
-    apiVersions:
-    - v1alpha1
-    operations:
-    - CREATE
-    - UPDATE
-    resources:
-    - mcpservers
   sideEffects: None

@@ -19,7 +19,7 @@ This PR adds complete GitHub Actions CI/CD workflows following the kagenti-opera
 2. **GoReleaser Workflow** ([`.github/workflows/goreleaser.yml`](.github/workflows/goreleaser.yml))
    - Triggers on version tags (e.g., `v1.0.0`)
    - Builds multi-architecture binaries (Linux/Darwin, amd64/arm64)
-   - Creates and pushes Docker images to `ghcr.io/kagenti/toolhive-webhook`
+   - Creates and pushes Docker images to `ghcr.io/kagenti/kagenti-webhook`
    - Packages and publishes Helm charts to GHCR
    - Creates GitHub releases with changelog
 
@@ -57,17 +57,17 @@ This PR adds complete GitHub Actions CI/CD workflows following the kagenti-opera
 
 ### Helm Chart Updates
 
-- **Values** ([`charts/toolhive-webhook/values.yaml`](charts/toolhive-webhook/values.yaml))
-  - Updated image repository to `ghcr.io/kagenti/toolhive-webhook`
+- **Values** ([`charts/kagenti-webhook/values.yaml`](charts/kagenti-webhook/values.yaml))
+  - Updated image repository to `ghcr.io/kagenti/kagenti-webhook`
   - Added version placeholder `__PLACEHOLDER__` for automated releases
 
 - **New Templates**:
-  - [`mutatingwebhook.yaml`](charts/toolhive-webhook/templates/mutatingwebhook.yaml) - Webhook configuration
-  - [`validatingwebhook.yaml`](charts/toolhive-webhook/templates/validatingwebhook.yaml) - Validation webhook
-  - [`clusterrole.yaml`](charts/toolhive-webhook/templates/clusterrole.yaml) - RBAC permissions
-  - [`clusterrolebinding.yaml`](charts/toolhive-webhook/templates/clusterrolebinding.yaml) - Role binding
-  - [`certificate-issuer.yaml`](charts/toolhive-webhook/templates/certificate-issuer.yaml) - Self-signed issuer
-  - [`certificate.yaml`](charts/toolhive-webhook/templates/certificate.yaml) - TLS certificate
+  - [`mutatingwebhook.yaml`](charts/kagenti-webhook/templates/mutatingwebhook.yaml) - Webhook configuration
+  - [`validatingwebhook.yaml`](charts/kagenti-webhook/templates/validatingwebhook.yaml) - Validation webhook
+  - [`clusterrole.yaml`](charts/kagenti-webhook/templates/clusterrole.yaml) - RBAC permissions
+  - [`clusterrolebinding.yaml`](charts/kagenti-webhook/templates/clusterrolebinding.yaml) - Role binding
+  - [`certificate-issuer.yaml`](charts/kagenti-webhook/templates/certificate-issuer.yaml) - Self-signed issuer
+  - [`certificate.yaml`](charts/kagenti-webhook/templates/certificate.yaml) - TLS certificate
 
 ### Documentation
 
@@ -88,7 +88,7 @@ git push origin v1.0.0
 
 This automatically:
 - Builds binaries for all platforms
-- Creates Docker images for `ghcr.io/kagenti/toolhive-webhook:v1.0.0`
+- Creates Docker images for `ghcr.io/kagenti/kagenti-webhook:v1.0.0`
 - Packages and publishes Helm chart to GHCR
 - Creates GitHub release with artifacts and changelog
 
@@ -98,8 +98,8 @@ This automatically:
 - [ ] PR verifier validates semantic commit titles
 - [ ] Spellcheck passes on documentation
 - [ ] GoReleaser dry-run succeeds: `goreleaser release --snapshot --clean`
-- [ ] Helm chart templates correctly: `helm template toolhive-webhook ./charts/toolhive-webhook`
-- [ ] Helm chart lints cleanly: `helm lint charts/toolhive-webhook`
+- [ ] Helm chart templates correctly: `helm template kagenti-webhook ./charts/kagenti-webhook`
+- [ ] Helm chart lints cleanly: `helm lint charts/kagenti-webhook`
 - [ ] Webhook configurations are created
 - [ ] Certificates are generated
 - [ ] RBAC resources are applied

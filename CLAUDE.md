@@ -43,12 +43,12 @@ A Kubernetes **mutating admission webhook** that intercepts workload creation (D
 **Detailed guide:** [`kagenti-webhook/CLAUDE.md`](kagenti-webhook/CLAUDE.md)
 
 **Key facts:**
-- Three registered webhooks: **AuthBridge** (recommended), MCPServer (deprecated), Agent (deprecated)
+- Primary webhook: **AuthBridge** (recommended), with deprecated Agent webhook still present
 - AuthBridge webhook path: `/mutate-workloads-authbridge`
 - Injection controlled via pod labels (`kagenti.io/type`, `kagenti.io/inject`, `kagenti.io/spire`) and namespace labels (`kagenti-enabled: "true"`)
 - Shared `PodMutator` instance across all webhooks (in `internal/webhook/injector/`)
 - **AuthBridge path** injects: `proxy-init` (init), `envoy-proxy`, `spiffe-helper` (gated by `kagenti.io/spire` label), `kagenti-client-registration` (gated by `--enable-client-registration` flag)
-- **Legacy path** (deprecated MCPServer/Agent) injects: `spiffe-helper`, `kagenti-client-registration`, `envoy-proxy` (no `proxy-init` — legacy does not call `InjectInitContainers`)
+- **Legacy path** (deprecated Agent) injects: `spiffe-helper`, `kagenti-client-registration`, `envoy-proxy` (no `proxy-init` — legacy does not call `InjectInitContainers`)
 - Build: `cd kagenti-webhook && make build` / `make test` / `make docker-build`
 - Local dev: `cd kagenti-webhook && make local-dev CLUSTER=<kind-cluster>`
 
@@ -150,7 +150,7 @@ Key values:
 - `image.repository` / `image.tag` — Webhook manager image (tag is `__PLACEHOLDER__` in source, replaced at release time)
 - `webhook.enableClientRegistration` — Controls `--enable-client-registration` flag
 - `certManager.enabled` — Uses cert-manager for webhook TLS certificates
-- Templates include: Deployment, Service, ServiceAccount, RBAC, CertManager Certificate/Issuer, MutatingWebhookConfigurations (authbridge, mcpserver, agent)
+- Templates include: Deployment, Service, ServiceAccount, RBAC, CertManager Certificate/Issuer, MutatingWebhookConfigurations (authbridge, agent)
 
 Install:
 ```bash

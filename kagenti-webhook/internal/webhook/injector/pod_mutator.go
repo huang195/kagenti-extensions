@@ -92,7 +92,7 @@ func NewPodMutator(
 	}
 }
 
-// DEPRECATED, used by Agent and MCPServer CRs. Remove ShouldMutate after both CRs are deleted and use InjectAuthBridge instead.
+// DEPRECATED, used by Agent CR. Remove ShouldMutate after Agent CR is deleted and use InjectAuthBridge instead.
 
 // main entry point for pod mutations
 // It checks if injection should occur and performs all necessary mutations
@@ -257,7 +257,7 @@ func (m *PodMutator) InjectAuthBridge(ctx context.Context, podSpec *corev1.PodSp
 	return true, nil
 }
 
-// DEPRECATED, used by Agent and MCPServer CRs. Remove ShouldMutate after both CRs are deleted and use NeedsMutation instead.
+// DEPRECATED, used by Agent CR. Remove ShouldMutate after Agent CR is deleted and use NeedsMutation instead.
 
 // ShouldMutate determines if pod mutation should occur based on annotations and namespace labels
 // Priority order:
@@ -296,7 +296,7 @@ func (m *PodMutator) ShouldMutate(ctx context.Context, namespace string, crAnnot
 	return false, nil
 }
 
-// NeedsMutation is DEPRECATED (used by Agent and MCPServer CRs only).
+// NeedsMutation is DEPRECATED (used by Agent CR only).
 // It uses different opt-in semantics than InjectAuthBridge: when
 // kagenti.io/inject is absent it falls back to namespace-level settings.
 // InjectAuthBridge requires an explicit kagenti.io/inject=enabled label.

@@ -1,11 +1,10 @@
 apiVersion: v2
 name: kagenti-webhook-chart
-description: A Kubernetes admission webhook for MCPServer resources
+description: A Kubernetes admission webhook for AuthBridge sidecar injection
 type: application
 version: 0.1.0
 appVersion: "1.16.0"
 keywords:
   - webhook
-  - mcp
-  - toolhive
   - kagenti
+  - authbridge

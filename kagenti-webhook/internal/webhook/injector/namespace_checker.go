@@ -26,7 +26,7 @@ import (
 
 var nsLog = logf.Log.WithName("namespace-checker")
 
-// DEPRECATED, used by Agent and MCPServer CRs. Remove CheckNamespaceInjectionEnabled after both CRs are deleted and use IsNamespaceInjectionEnabled instead.
+// DEPRECATED, used by Agent CR. Remove CheckNamespaceInjectionEnabled after Agent CR is deleted and use IsNamespaceInjectionEnabled instead.
 
 // checks if a namespace has injection enabled via labels or annotations
 func CheckNamespaceInjectionEnabled(ctx context.Context, k8sClient client.Client, namespaceName, labelKey, annotationKey string) (bool, error) {

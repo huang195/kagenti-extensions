@@ -28,9 +28,8 @@ import (
 
 	"github.com/kagenti/kagenti-extensions/kagenti-webhook/internal/webhook/config"
 	"github.com/kagenti/kagenti-extensions/kagenti-webhook/internal/webhook/injector"
-	webhooktoolhivestacklokdevv1alpha1 "github.com/kagenti/kagenti-extensions/kagenti-webhook/internal/webhook/v1alpha1"
+	webhookv1alpha1 "github.com/kagenti/kagenti-extensions/kagenti-webhook/internal/webhook/v1alpha1"
 	agentsv1alpha1 "github.com/kagenti/operator/api/v1alpha1"
-	toolhivestacklokdevv1alpha1 "github.com/stacklok/toolhive/cmd/thv-operator/api/v1alpha1"
 	"k8s.io/apimachinery/pkg/runtime"
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
@@ -53,7 +52,6 @@ var (
 func init() {
 	utilruntime.Must(clientgoscheme.AddToScheme(scheme))
 
-	utilruntime.Must(toolhivestacklokdevv1alpha1.AddToScheme(scheme))
 	utilruntime.Must(agentsv1alpha1.AddToScheme(scheme))
 	// +kubebuilder:scaffold:scheme
 }
@@ -284,20 +282,14 @@ func main() {
 
 	// nolint:goconst
 	if os.Getenv("ENABLE_WEBHOOKS") != "false" {
-		// Setup MCPServer webhook
-		if err = webhooktoolhivestacklokdevv1alpha1.SetupMCPServerWebhookWithManager(mgr, podMutator); err != nil {
-			setupLog.Error(err, "unable to create webhook", "webhook", "MCPServer")
-			os.Exit(1)
-		}
-
 		// Setup Agent webhook
-		if err = webhooktoolhivestacklokdevv1alpha1.SetupAgentWebhookWithManager(mgr, podMutator); err != nil {
+		if err = webhookv1alpha1.SetupAgentWebhookWithManager(mgr, podMutator); err != nil {
 			setupLog.Error(err, "unable to create webhook", "webhook", "Agent")
 			os.Exit(1)
 		}
 
 		// Setup AuthBridge webhook
-		if err = webhooktoolhivestacklokdevv1alpha1.SetupAuthBridgeWebhookWithManager(mgr, podMutator); err != nil {
+		if err = webhookv1alpha1.SetupAuthBridgeWebhookWithManager(mgr, podMutator); err != nil {
 			setupLog.Error(err, "unable to create webhook", "webhook", "AuthBridge")
 			os.Exit(1)
 		}

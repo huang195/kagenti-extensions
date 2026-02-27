@@ -4,7 +4,7 @@ This document provides Mermaid diagrams illustrating the webhook architecture.
 
 ## ⚠️ Architecture Update
 
-**The Agent CR and MCPServer CR webhooks are deprecated**. The AuthBridge webhook is the recommended approach for new deployments.
+**The Agent CR webhook is deprecated**. The AuthBridge webhook is the recommended approach for new deployments.
 
 ## Component Architecture
 
@@ -23,7 +23,6 @@ graph TB
         end
 
         subgraph "Legacy Webhooks (Deprecated)"
-            MCP[MCPServer Webhook<br/>⚠️ DEPRECATED]
             AGENT[Agent Webhook<br/>⚠️ DEPRECATED]
         end
 
@@ -43,7 +42,6 @@ graph TB
         end
 
         subgraph "Custom Resources (Legacy)"
-            MCPCR[MCPServer CR<br/>toolhive.stacklok.dev<br/>⚠️ DEPRECATED]
             AGENTCR[Agent CR<br/>agent.kagenti.dev<br/>⚠️ DEPRECATED]
         end
 
@@ -51,16 +49,13 @@ graph TB
     end
 
     API -->|mutate workloads| AUTH
-    API -->|mutate MCPServer| MCP
     API -->|mutate Agent| AGENT
 
     MAIN -->|creates & shares| MUTATOR
     MAIN -->|registers| AUTH
-    MAIN -->|registers| MCP
     MAIN -->|registers| AGENT
 
     AUTH -->|InjectAuthBridge| MUTATOR
-    MCP -->|MutatePodSpec| MUTATOR
     AGENT -->|MutatePodSpec| MUTATOR
 
     MUTATOR -->|builds containers| CONT
@@ -72,12 +67,10 @@ graph TB
     AUTH -.->|modifies| STS
     AUTH -.->|modifies| DS
     AUTH -.->|modifies| JOB
-    MCP -.->|modifies| MCPCR
     AGENT -.->|modifies| AGENTCR
 
     style MUTATOR fill:#90EE90
     style AUTH fill:#32CD32,stroke:#006400,stroke-width:3px
-    style MCP fill:#D3D3D3,stroke:#808080,stroke-dasharray: 5 5
     style AGENT fill:#D3D3D3,stroke:#808080,stroke-dasharray: 5 5
     style CONT fill:#FFB6C1
     style VOL fill:#FFB6C1
@@ -86,7 +79,6 @@ graph TB
     style STS fill:#87CEEB
     style DS fill:#87CEEB
     style JOB fill:#87CEEB
-    style MCPCR fill:#D3D3D3,stroke:#808080,stroke-dasharray: 5 5
     style AGENTCR fill:#D3D3D3,stroke:#808080,stroke-dasharray: 5 5
 ```
 
@@ -154,7 +146,7 @@ graph LR
 
 ### Legacy Webhooks - SPIRE Only (Deprecated)
 
-Agent CR and MCPServer CR webhooks always inject SPIRE sidecars:
+Agent CR webhook always injects SPIRE sidecars:
 
 ```mermaid
 graph LR
@@ -199,7 +191,7 @@ graph TD
     end
 
     subgraph "Legacy Path (Deprecated)"
-        CUSTOM[Custom Resource<br/>Agent/MCPServer CR]
+        CUSTOM[Custom Resource<br/>Agent CR]
         CHECK_NS_LEG{Namespace has<br/>kagenti-enabled=true?}
         CHECK_ANNO{CR has<br/>kagenti.io/inject=enabled?}
         INJECT_SPIRE[Inject: spiffe-helper<br/>client-registration]

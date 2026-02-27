@@ -11,15 +11,14 @@ The project lives inside the larger `kagenti-extensions` monorepo. The Helm char
 
 ## Architecture Summary
 
-There are **three** registered webhooks, but only one is actively recommended:
+There are **two** registered webhooks, but only one is actively recommended:
 
 | Webhook | Status | Path | Handles |
 |---------|--------|------|---------|
 | **AuthBridge** | **Active / Recommended** | `/mutate-workloads-authbridge` | Deployments, StatefulSets, DaemonSets, Jobs, CronJobs |
-| MCPServer | Deprecated | `/mutate-toolhive-stacklok-dev-v1alpha1-mcpserver` | `MCPServer` CR (`toolhive.stacklok.dev/v1alpha1`) |
 | Agent | Deprecated | `/mutate-agent-kagenti-dev-v1alpha1-agent` | `Agent` CR (`agent.kagenti.dev/v1alpha1`) |
 
-All three webhooks share a single `PodMutator` instance created in `cmd/main.go`.
+Both webhooks share a single `PodMutator` instance created in `cmd/main.go`.
 
 ### Injection Decision Flow
 
@@ -29,7 +28,7 @@ All three webhooks share a single `PodMutator` instance created in `cmd/main.go`
 3. `kagenti.io/inject: disabled` (or any non-`enabled` value) forces injection OFF.
 4. If no pod label, fall back to namespace label `kagenti-enabled: "true"`.
 
-**Legacy** (deprecated path):
+**Legacy Agent** (deprecated path):
 1. CR annotation `kagenti.dev/inject: "false"` opts out.
 2. CR annotation `kagenti.dev/inject: "true"` opts in.
 3. Fall back to namespace label/annotation.
@@ -44,7 +43,7 @@ All three webhooks share a single `PodMutator` instance created in `cmd/main.go`
 - `spiffe-helper` (sidecar) -- gated by `kagenti.io/spire: enabled` pod label. Obtains JWT-SVIDs from SPIRE agent.
 - `kagenti-client-registration` (sidecar) -- gated by `--enable-client-registration` flag (default `true`). Registers with Keycloak; uses SPIFFE identity when SPIRE is enabled, otherwise uses static `CLIENT_NAME`.
 
-**Legacy webhooks (deprecated) always inject:** `spiffe-helper` + `kagenti-client-registration` + `envoy-proxy` (no `proxy-init` — legacy path does not call `InjectInitContainers`).
+**Legacy Agent webhook (deprecated) always injects:** `spiffe-helper` + `kagenti-client-registration` + `envoy-proxy` (no `proxy-init` — legacy path does not call `InjectInitContainers`).
 
 ## Directory Structure
 
@@ -65,10 +64,8 @@ kagenti-webhook/
 │   │   └── namespace_checker.go             #   CheckNamespaceInjectionEnabled / IsNamespaceInjectionEnabled
 │   └── v1alpha1/                            # Webhook handlers
 │       ├── authbridge_webhook.go            #   AuthBridge (recommended): raw admission.Handler
-│       ├── mcpserver_webhook.go             #   MCPServer (deprecated): CustomDefaulter + CustomValidator
 │       ├── agent_webhook.go                 #   Agent (deprecated): CustomDefaulter + CustomValidator
-│       ├── webhook_suite_test.go            #   ENVTEST-based test setup (Ginkgo)
-│       └── mcpserver_webhook_test.go        #   Unit test stubs for MCPServer webhook
+│       └── webhook_suite_test.go            #   ENVTEST-based test setup (Ginkgo)
 ├── config/                                  # Kustomize manifests (CRDs, RBAC, webhook configs, etc.)
 ├── test/
 │   ├── e2e/                                 # End-to-end tests (Kind cluster, Ginkgo)
@@ -88,7 +85,6 @@ kagenti-webhook/
 | `sigs.k8s.io/controller-runtime` | v0.22.1 | Manager, webhook server, envtest |
 | `k8s.io/api` | v0.34.1 | Kubernetes API types |
 | `github.com/kagenti/operator` | v0.2.0-alpha.12 | Agent CR types (via replace directive) |
-| `github.com/stacklok/toolhive` | v0.3.7 | MCPServer CR types |
 | `github.com/onsi/ginkgo/v2` | v2.26.0 | BDD test framework |
 | `github.com/onsi/gomega` | v1.38.2 | Test matchers |
 | `github.com/fsnotify/fsnotify` | v1.9.0 | Config file watching |
@@ -209,13 +205,13 @@ Injected sidecars expect these ConfigMaps to exist in the target namespace:
 - Changes to label/annotation keys require updating the constants at the top of `pod_mutator.go`.
 
 ### Removing Deprecated Code
-When removing legacy (Agent/MCPServer) webhook support:
-1. Remove `mcpserver_webhook.go`, `agent_webhook.go`, and their tests.
+When removing the legacy Agent webhook:
+1. Remove `agent_webhook.go` and its tests.
 2. Remove `ShouldMutate()`, `MutatePodSpec()`, `InjectSidecars()`, `InjectVolumes()` from `pod_mutator.go`.
 3. Remove `CheckNamespaceInjectionEnabled()` from `namespace_checker.go`.
 4. Remove legacy scheme registration and webhook setup calls from `cmd/main.go`.
-5. Remove `github.com/kagenti/operator` and `github.com/stacklok/toolhive` from `go.mod`.
-6. Remove legacy Helm templates (`agent-*.yaml`, `mcpserver-*.yaml`).
+5. Remove `github.com/kagenti/operator` from `go.mod`.
+6. Remove legacy Helm templates (`agent-*.yaml`).
 7. Run `make manifests` and `make generate`.
 
 ### Updating Container Images

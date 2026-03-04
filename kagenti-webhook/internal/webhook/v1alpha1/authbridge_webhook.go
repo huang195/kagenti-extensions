@@ -54,6 +54,8 @@ func SetupAuthBridgeWebhookWithManager(mgr ctrl.Manager, mutator *injector.PodMu
 }
 
 // Handle processes admission requests for workload resources
+//
+//nolint:gocritic // hugeParam: admission.Handler interface requires value receiver for admission.Request
 func (w *AuthBridgeWebhook) Handle(ctx context.Context, req admission.Request) admission.Response {
 	authbridgelog.Info("AuthBridge webhook called",
 		"kind", req.Kind.Kind,

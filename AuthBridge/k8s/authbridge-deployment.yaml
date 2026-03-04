@@ -67,6 +67,9 @@ stringData:
 # CONFIGMAPS
 # =============================================================================
 # Shared ConfigMap for environment variables
+# Demo/development only: do NOT use hardcoded admin credentials in production.
+# For production deployments, supply these via a Kubernetes Secret and reference
+# them with secretKeyRef instead of literal values.
 apiVersion: v1
 kind: ConfigMap
 metadata:

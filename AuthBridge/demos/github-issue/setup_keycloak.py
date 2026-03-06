@@ -67,6 +67,7 @@ if KEYCLOAK_ADMIN_USERNAME == "admin" and KEYCLOAK_ADMIN_PASSWORD == "admin":
 DEFAULT_NAMESPACE = "team1"
 DEFAULT_SERVICE_ACCOUNT = "git-issue-agent"
 SPIFFE_TRUST_DOMAIN = "localtest.me"
+UI_CLIENT_ID = os.environ.get("UI_CLIENT_ID", "kagenti")
 
 DEMO_USERS = [
     {
@@ -351,6 +352,38 @@ def main():
         print("    via scope=github-full-access in the token request.")
     except Exception as e:
         print(f"Note: Could not add 'github-full-access' as optional: {e}")
+
+    # ---------------------------------------------------------------
+    # Add agent audience scope to the Kagenti UI client
+    # ---------------------------------------------------------------
+    # Keycloak only auto-assigns realm default scopes to NEW clients.
+    # The UI client was created during install (before this scope existed),
+    # so we must add it explicitly. Without this, the UI's tokens won't
+    # include the agent's SPIFFE ID in the audience, and AuthBridge will
+    # reject UI chat requests with "invalid audience".
+    #
+    # TODO: Remove this workaround once the client-registration sidecar
+    # handles this automatically (kagenti/kagenti-extensions#169).
+    print(f"\n--- Adding agent audience scope to UI client '{UI_CLIENT_ID}' ---")
+    ui_client_internal_id = keycloak_admin.get_client_id(UI_CLIENT_ID)
+    if ui_client_internal_id:
+        try:
+            keycloak_admin.add_client_default_client_scope(
+                ui_client_internal_id, agent_spiffe_scope_id, {}
+            )
+            print(
+                f"Added '{scope_name}' as default scope on client '{UI_CLIENT_ID}'."
+            )
+            print("  → UI tokens will now include the agent's SPIFFE ID in audience.")
+            print("  → Users must log out and back in for the new scope to take effect.")
+        except Exception as e:
+            print(f"Note: Could not add scope to '{UI_CLIENT_ID}' client: {e}")
+    else:
+        print(
+            f"Warning: UI client '{UI_CLIENT_ID}' not found in realm "
+            f"'{KEYCLOAK_REALM}'. UI chat with this agent will require "
+            f"manually adding the '{scope_name}' scope to the UI client."
+        )
 
     # ---------------------------------------------------------------
     # Create demo users

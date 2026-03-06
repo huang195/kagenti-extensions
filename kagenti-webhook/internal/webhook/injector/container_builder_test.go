@@ -107,3 +107,30 @@ func TestBuildEnvoyProxyContainer_Name(t *testing.T) {
 		t.Errorf("container name = %q, want %q", container.Name, EnvoyProxyContainerName)
 	}
 }
+
+func TestBuildClientRegistrationContainer_HasPlatformClientIDsEnv(t *testing.T) {
+	builder := NewContainerBuilder(config.CompiledDefaults())
+	container := builder.BuildClientRegistrationContainerWithSpireOption("test-agent", "team1", true)
+
+	found := false
+	for _, env := range container.Env {
+		if env.Name == "PLATFORM_CLIENT_IDS" {
+			found = true
+			if env.ValueFrom == nil || env.ValueFrom.ConfigMapKeyRef == nil {
+				t.Error("PLATFORM_CLIENT_IDS should reference a ConfigMap key")
+				break
+			}
+			if env.ValueFrom.ConfigMapKeyRef.Key != "PLATFORM_CLIENT_IDS" {
+				t.Errorf("PLATFORM_CLIENT_IDS key = %q, want PLATFORM_CLIENT_IDS",
+					env.ValueFrom.ConfigMapKeyRef.Key)
+			}
+			if env.ValueFrom.ConfigMapKeyRef.Optional == nil || !*env.ValueFrom.ConfigMapKeyRef.Optional {
+				t.Error("PLATFORM_CLIENT_IDS should be optional")
+			}
+			break
+		}
+	}
+	if !found {
+		t.Error("client-registration container missing PLATFORM_CLIENT_IDS env var")
+	}
+}

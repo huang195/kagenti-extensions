@@ -2,10 +2,16 @@
 client_registration.py
 
 Registers a Keycloak client and stores its secret in a file.
+Also creates an audience scope for the agent and adds it to
+platform clients (e.g., the UI client) so they can reach
+AuthBridge-protected agents without manual Keycloak configuration.
+
 Idempotent:
 - Creates the client if it does not exist.
 - If the client already exists, reuses it.
 - Always retrieves and stores the client secret.
+- Creates audience scope if it does not exist.
+- Adds audience scope to platform clients if not already assigned.
 """
 
 import os
@@ -100,6 +106,96 @@ def get_client_id() -> str:
         raise Exception('SVID JWT does not contain a "sub" claim.')
     return decoded["sub"]
 
+
+def get_or_create_audience_scope(
+    keycloak_admin: KeycloakAdmin, scope_name: str, audience: str
+) -> str | None:
+    """
+    Create a client scope with an audience mapper if it doesn't exist.
+    Returns the scope ID, or None on failure.
+    """
+    scopes = keycloak_admin.get_client_scopes()
+    for scope in scopes:
+        if scope["name"] == scope_name:
+            print(f'Audience scope "{scope_name}" already exists with ID: {scope["id"]}')
+            return scope["id"]
+
+    try:
+        scope_id = keycloak_admin.create_client_scope(
+            {
+                "name": scope_name,
+                "protocol": "openid-connect",
+                "attributes": {
+                    "include.in.token.scope": "true",
+                    "display.on.consent.screen": "true",
+                },
+            }
+        )
+        print(f'Created audience scope "{scope_name}": {scope_id}')
+    except KeycloakPostError as e:
+        print(f'Could not create audience scope "{scope_name}": {e}')
+        return None
+
+    # Add audience mapper to the scope
+    mapper_payload = {
+        "name": scope_name,
+        "protocol": "openid-connect",
+        "protocolMapper": "oidc-audience-mapper",
+        "consentRequired": False,
+        "config": {
+            "included.custom.audience": audience,
+            "id.token.claim": "false",
+            "access.token.claim": "true",
+            "userinfo.token.claim": "false",
+        },
+    }
+    try:
+        keycloak_admin.add_mapper_to_client_scope(scope_id, mapper_payload)
+        print(f'Added audience mapper for "{audience}" to scope "{scope_name}"')
+    except Exception as e:
+        print(f'Note: Could not add audience mapper (might already exist): {e}')
+
+    return scope_id
+
+
+def add_scope_to_platform_clients(
+    keycloak_admin: KeycloakAdmin,
+    scope_id: str,
+    scope_name: str,
+    platform_client_ids: list[str],
+) -> None:
+    """
+    Add an audience scope as a default client scope on each platform client.
+    This ensures existing clients (like the UI) include the agent's audience
+    in their tokens without requiring manual Keycloak configuration.
+    """
+    for platform_client_id in platform_client_ids:
+        internal_id = keycloak_admin.get_client_id(platform_client_id)
+        if not internal_id:
+            print(
+                f'Platform client "{platform_client_id}" not found in realm. '
+                f'Skipping scope assignment.'
+            )
+            continue
+        try:
+            keycloak_admin.add_client_default_client_scope(
+                internal_id, scope_id, {}
+            )
+            print(
+                f'Added scope "{scope_name}" to platform client "{platform_client_id}".'
+            )
+        except Exception as e:
+            # 409 Conflict means it's already assigned — that's fine
+            if "409" in str(e) or "already" in str(e).lower():
+                print(
+                    f'Scope "{scope_name}" already assigned to "{platform_client_id}".'
+                )
+            else:
+                print(
+                    f'Could not add scope "{scope_name}" to "{platform_client_id}": {e}'
+                )
+
+
 client_name = get_env_var("CLIENT_NAME")
 
 # If SPIFFE is enabled, use the client ID from the SVID JWT.
@@ -175,5 +271,42 @@ write_client_secret(
     client_name,
     secret_file_path=secret_file_path,
 )
+
+# --- Audience scope management ---
+# Create an audience scope for this agent and add it to platform clients
+# so their tokens include this agent's audience (required by AuthBridge).
+AUDIENCE_SCOPE_ENABLED = (
+    get_env_var("KEYCLOAK_AUDIENCE_SCOPE_ENABLED", "true").lower() == "true"
+)
+
+if AUDIENCE_SCOPE_ENABLED:
+    # Derive scope name from client_name (namespace/sa → agent-namespace-sa-aud)
+    scope_name = "agent-" + client_name.replace("/", "-") + "-aud"
+
+    print(f'\n--- Audience scope management for "{scope_name}" ---')
+
+    scope_id = get_or_create_audience_scope(keycloak_admin, scope_name, client_id)
+
+    if scope_id:
+        # Add as realm default so new clients automatically get this scope
+        try:
+            keycloak_admin.add_default_default_client_scope(scope_id)
+            print(f'Added "{scope_name}" as realm default scope.')
+        except Exception as e:
+            print(f'Note: Could not add "{scope_name}" as realm default (might already exist): {e}')
+
+        # Add to platform clients (e.g., the UI client)
+        platform_clients_raw = get_env_var("PLATFORM_CLIENT_IDS", "kagenti")
+        platform_client_ids = [
+            c.strip() for c in platform_clients_raw.split(",") if c.strip()
+        ]
+        if platform_client_ids:
+            print(f"Adding scope to platform clients: {platform_client_ids}")
+            add_scope_to_platform_clients(
+                keycloak_admin, scope_id, scope_name, platform_client_ids
+            )
+    else:
+        print(f'Warning: Could not create audience scope "{scope_name}". '
+              f'Platform clients will not automatically include this agent\'s audience.')
 
 print("Client registration complete.")

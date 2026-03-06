@@ -162,6 +162,18 @@ func (b *ContainerBuilder) BuildClientRegistrationContainerWithSpireOption(name,
 			Name:  "SECRET_FILE_PATH",
 			Value: "/shared/client-secret.txt",
 		},
+		{
+			Name: "PLATFORM_CLIENT_IDS",
+			ValueFrom: &corev1.EnvVarSource{
+				ConfigMapKeyRef: &corev1.ConfigMapKeySelector{
+					LocalObjectReference: corev1.LocalObjectReference{
+						Name: "environments",
+					},
+					Key:      "PLATFORM_CLIENT_IDS",
+					Optional: ptr.To(true),
+				},
+			},
+		},
 	}
 
 	// Volume mounts depend on SPIRE enablement

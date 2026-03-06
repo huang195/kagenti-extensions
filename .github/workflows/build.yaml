@@ -91,7 +91,7 @@ jobs:
 
       # 7. Build and push image
       - name: Build and push ${{ matrix.image_config.name }}
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@v7
         with:
           context: ${{ matrix.image_config.context }}
           file: ${{ matrix.image_config.context }}/${{ matrix.image_config.dockerfile }}

@@ -173,24 +173,20 @@ This creates:
 
 ---
 
-## Step 2: Apply ConfigMaps
+## Step 2: Apply Demo ConfigMaps
 
-> **Critical: Apply ConfigMaps BEFORE importing the agent in the UI.** The agent pod
-> reads ConfigMap values at startup. If the agent starts before the ConfigMaps are
-> correct, the client will be registered in the wrong Keycloak realm.
+The Kagenti installer creates default ConfigMaps (`environments`,
+`spiffe-helper-config`, `envoy-config`, `authbridge-config`) with the correct
+`kagenti` realm settings and 300s Envoy timeouts. This step overrides only
+`authbridge-config` with demo-specific values — the token exchange target
+audience (`github-tool`), scopes, and the agent's SPIFFE ID for inbound
+audience validation.
 
 ```bash
 cd AuthBridge
 
-# Apply the GitHub Issue demo ConfigMaps
+# Override authbridge-config for this demo (sets TARGET_AUDIENCE=github-tool)
 kubectl apply -f demos/github-issue/k8s/configmaps.yaml
-```
-
-Verify:
-
-```bash
-kubectl get configmap environments -n team1 -o jsonpath='{.data.KEYCLOAK_REALM}'
-# Expected: kagenti
 ```
 
 ---
@@ -686,19 +682,17 @@ kubectl rollout status deployment/git-issue-agent -n team1 --timeout=180s
 
 **Symptom:** `{"error":"invalid_client","error_description":"Invalid client or Invalid client credentials"}`
 
-**Cause:** The client was registered in the wrong Keycloak realm (typically `master`
-instead of `kagenti`). This happens when the `environments` ConfigMap is updated **after**
-the agent pod has already started. This is especially common with UI deployments where
-the Kagenti Helm chart may have pre-existing ConfigMaps.
+**Cause:** The agent pod's `environments` ConfigMap was missing or incorrect at startup,
+so the client-registration sidecar registered the client with wrong settings.
 
 **Fix:**
 
 ```bash
-# 1. Verify ConfigMap is correct
+# 1. Verify the installer's environments ConfigMap has the correct realm
 kubectl get configmap environments -n team1 -o jsonpath='{.data.KEYCLOAK_REALM}'
 # Should show: kagenti
 
-# 2. If wrong, re-apply ConfigMaps and restart
+# 2. Re-apply the demo ConfigMap and restart
 kubectl apply -f demos/github-issue/k8s/configmaps.yaml
 kubectl rollout restart deployment/git-issue-agent -n team1
 ```
@@ -729,17 +723,18 @@ Both the UI and manual deployments create `git-issue-agent:8080` (targetPort 800
 
 **Cause:** The LLM inference takes longer than the Envoy route timeout.
 
-**Fix:** The `envoy-config` ConfigMap sets the route timeout to 300 seconds (5 min).
-If you still hit timeouts, check that the ConfigMap was applied correctly:
+**Fix:** The installer's `envoy-config` ConfigMap sets route and ext_proc
+timeouts to 300 seconds (5 min). If you still hit timeouts, verify the
+ConfigMap has the correct values:
 
 ```bash
 kubectl get configmap envoy-config -n team1 -o jsonpath='{.data.envoy\.yaml}' | grep "timeout:"
 ```
 
-If you see `30s` values instead of `300s`, re-apply the ConfigMaps and restart:
+If you see `30s` values instead of `300s`, reinstall Kagenti (the installer
+creates the correct defaults) and restart the agent:
 
 ```bash
-kubectl apply -f demos/github-issue/k8s/configmaps.yaml
 kubectl rollout restart deployment/git-issue-agent -n team1
 ```
 
@@ -834,7 +829,7 @@ kubectl delete mutatingwebhookconfiguration kagenti-webhook-authbridge-mutating-
 | `demos/github-issue/demo-ui.md` | This guide |
 | `demos/github-issue/demo-manual.md` | Fully manual deployment guide |
 | `demos/github-issue/setup_keycloak.py` | Keycloak configuration script |
-| `demos/github-issue/k8s/configmaps.yaml` | ConfigMaps for AuthBridge sidecars |
+| `demos/github-issue/k8s/configmaps.yaml` | Demo-specific authbridge-config override |
 | `demos/github-issue/k8s/git-issue-agent-deployment.yaml` | Agent deployment YAML (manual only) |
 | `demos/github-issue/k8s/github-tool-deployment.yaml` | GitHub tool deployment YAML (manual only) |
 

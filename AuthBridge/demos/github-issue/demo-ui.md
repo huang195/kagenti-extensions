@@ -173,14 +173,26 @@ This creates:
 
 ---
 
-## Step 2: Apply Demo ConfigMaps
+## Step 2: Create Keycloak Admin Secret and Apply Demo ConfigMaps
 
 The Kagenti installer creates default ConfigMaps (`environments`,
 `spiffe-helper-config`, `envoy-config`, `authbridge-config`) with the correct
-`kagenti` realm settings and 300s Envoy timeouts. This step overrides only
-`authbridge-config` with demo-specific values — the token exchange target
-audience (`github-tool`), scopes, and the agent's SPIFFE ID for inbound
-audience validation.
+`kagenti` realm settings and 300s Envoy timeouts.
+
+The client-registration sidecar needs Keycloak admin credentials to register
+agents as OAuth clients. These are stored in a Kubernetes Secret (not a
+ConfigMap) to follow security best practices:
+
+```bash
+kubectl create secret generic keycloak-admin-secret -n team1 \
+  --from-literal=KEYCLOAK_ADMIN_USERNAME=admin \
+  --from-literal=KEYCLOAK_ADMIN_PASSWORD=admin \
+  --dry-run=client -o yaml | kubectl apply -f -
+```
+
+Then apply the demo-specific `authbridge-config` override — the token exchange
+target audience (`github-tool`), scopes, and the agent's SPIFFE ID for inbound
+audience validation:
 
 ```bash
 cd AuthBridge
@@ -682,17 +694,20 @@ kubectl rollout status deployment/git-issue-agent -n team1 --timeout=180s
 
 **Symptom:** `{"error":"invalid_client","error_description":"Invalid client or Invalid client credentials"}`
 
-**Cause:** The agent pod's `environments` ConfigMap was missing or incorrect at startup,
-so the client-registration sidecar registered the client with wrong settings.
+**Cause:** The `keycloak-admin-secret` Secret or `environments` ConfigMap was missing
+or incorrect at startup, so the client-registration sidecar couldn't register the client.
 
 **Fix:**
 
 ```bash
-# 1. Verify the installer's environments ConfigMap has the correct realm
+# 1. Verify the keycloak-admin-secret exists
+kubectl get secret keycloak-admin-secret -n team1
+
+# 2. Verify the installer's environments ConfigMap has the correct realm
 kubectl get configmap environments -n team1 -o jsonpath='{.data.KEYCLOAK_REALM}'
 # Should show: kagenti
 
-# 2. Re-apply the demo ConfigMap and restart
+# 3. Re-apply the demo ConfigMap and restart
 kubectl apply -f demos/github-issue/k8s/configmaps.yaml
 kubectl rollout restart deployment/git-issue-agent -n team1
 ```

@@ -30,23 +30,44 @@ repos:
         language: script
         stages: [commit-msg]
 
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.9.10
+    hooks:
+      - id: ruff
+        args: ['--fix']
+        files: ^AuthBridge/
+      - id: ruff-format
+        files: ^AuthBridge/
+
   - repo: local
     hooks:
-      - id: go-fmt
-        name: go-fmt
+      - id: go-fmt-webhook
+        name: go-fmt (webhook)
         entry: bash -c 'cd kagenti-webhook && go fmt ./...'
         language: system
         files: ^kagenti-webhook/.*\.go$
         pass_filenames: false
-      - id: go-vet
-        name: go-vet
+      - id: go-vet-webhook
+        name: go-vet (webhook)
         entry: bash -c 'cd kagenti-webhook && go vet ./...'
         language: system
         files: ^kagenti-webhook/.*\.go$
         pass_filenames: false
-      - id: go-mod-tidy
-        name: go-mod-tidy
+      - id: go-mod-tidy-webhook
+        name: go-mod-tidy (webhook)
         entry: bash -c 'cd kagenti-webhook && go mod tidy'
         language: system
         files: ^kagenti-webhook/(go\.mod|go\.sum)$
+        pass_filenames: false
+      - id: go-fmt-authproxy
+        name: go-fmt (AuthProxy)
+        entry: bash -c 'cd AuthBridge/AuthProxy && go fmt ./...'
+        language: system
+        files: ^AuthBridge/AuthProxy/.*\.go$
+        pass_filenames: false
+      - id: go-vet-authproxy
+        name: go-vet (AuthProxy)
+        entry: bash -c 'cd AuthBridge/AuthProxy && go vet ./...'
+        language: system
+        files: ^AuthBridge/AuthProxy/.*\.go$
         pass_filenames: false

@@ -5,9 +5,7 @@ using `kubectl` commands exclusively. All resources — agent, tool, ConfigMaps,
 secrets — are deployed via Kubernetes manifests.
 
 For a UI-driven deployment using the Kagenti dashboard, see [demo-ui.md](demo-ui.md).
-
-This demo extends the [upstream GitHub Issue Agent demo](https://github.com/kagenti/kagenti/blob/main/docs/demos/demo-github-issue.md)
-by replacing manual token handling with AuthBridge's automatic token exchange.
+For a simpler getting-started demo, see the [Weather Agent demo](../weather-agent/demo-ui.md).
 
 ## What This Demo Shows
 
@@ -180,7 +178,17 @@ You should also have:
   - `<PUBLIC_ACCESS_PAT>` — access to public repositories only
   - `<PRIVILEGED_ACCESS_PAT>` — access to all repositories
 
-See the [upstream demo](https://github.com/kagenti/kagenti/blob/main/docs/demos/demo-github-issue.md#required-github-pat-tokens) for instructions on creating GitHub PAT tokens.
+### Creating GitHub Personal Access Tokens
+
+Follow [GitHub's instructions](https://docs.github.com/en/authentication/keeping-your-account-and-data-secure/managing-your-personal-access-tokens#creating-a-fine-grained-personal-access-token)
+to create fine-grained PAT tokens:
+
+- **`<PUBLIC_ACCESS_PAT>`** — select **Public Repositories (read-only)** access
+- **`<PRIVILEGED_ACCESS_PAT>`** — select **All Repositories** access
+
+This lets you demonstrate finer-grained authorization: a user with full access
+can see issues on all repositories, while a user with partial access can only
+see issues on public repositories.
 
 ### Build and Load Container Images
 

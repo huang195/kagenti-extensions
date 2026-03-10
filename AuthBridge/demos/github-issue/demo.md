@@ -1,11 +1,12 @@
 # GitHub Issue Agent Demo with AuthBridge
 
 This demo shows the **GitHub Issue Agent** running with **AuthBridge** for transparent,
-zero-trust token management. AuthBridge adds automatic identity registration, inbound JWT
-validation, and outbound token exchange — all without changing the agent code.
+zero-trust token management. AuthBridge provides automatic identity registration,
+inbound JWT validation, and outbound token exchange — all without changing the
+agent code.
 
-This demo extends the [upstream GitHub Issue Agent demo](https://github.com/kagenti/kagenti/blob/main/docs/demos/demo-github-issue.md)
-by replacing manual token handling with AuthBridge's automatic token exchange.
+For a simpler getting-started demo without token exchange, see the
+[Weather Agent demo](../weather-agent/demo-ui.md).
 
 ## Choose Your Deployment Method
 
@@ -74,6 +75,8 @@ Common names used by both:
 
 ## Related
 
+- [All Demos](../README.md) — index of all AuthBridge demos
+- [Weather Agent Demo](../weather-agent/demo-ui.md) — simpler getting-started demo (no token exchange)
 - [Multi-Target Demo](../multi-target/demo.md) — route-based token exchange to multiple tools
 - [Access Policies Proposal](../../PROPOSAL-access-policies.md) — role-based delegation control
 - [AuthBridge Overview](../../README.md) — architecture and design

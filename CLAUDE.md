@@ -20,7 +20,7 @@ kagenti-extensions/
 │   │   ├── go-processor/     #     gRPC ext-proc server (inbound JWT validation, outbound token exchange)
 │   │   └── quickstart/       #     Standalone demo (no SPIFFE)
 │   ├── client-registration/  #   Keycloak auto-registration (Python)
-│   ├── demos/                #   Demo scenarios (webhook, single-target, multi-target, github-issue)
+│   ├── demos/                #   Demo scenarios (weather-agent, github-issue, webhook, single-target, multi-target)
 │   └── keycloak_sync.py      #   Declarative Keycloak sync tool
 ├── charts/
 │   └── kagenti-webhook/      # Helm chart for the webhook
@@ -221,7 +221,11 @@ cd AuthBridge/AuthProxy && make build-images
 
 1. Set up a Kind cluster with SPIRE + Keycloak (use [Kagenti Ansible installer](https://github.com/kagenti/kagenti/blob/main/docs/install.md))
 2. Deploy the webhook: `cd kagenti-webhook && make local-dev CLUSTER=<name>`
-3. Follow `AuthBridge/demos/webhook/README.md` for the webhook-based AuthBridge demo (recommended), or `AuthBridge/demos/single-target/demo.md` for manual deployment
+3. See the [AuthBridge demos index](AuthBridge/demos/README.md) for a recommended learning path:
+   - **Getting started**: `AuthBridge/demos/weather-agent/demo-ui.md` (inbound validation, UI deployment)
+   - **Full flow**: `AuthBridge/demos/github-issue/demo-ui.md` (token exchange + scope-based access)
+   - **Webhook internals**: `AuthBridge/demos/webhook/README.md`
+   - **Manual deployment**: `AuthBridge/demos/single-target/demo.md`
 
 ### Quick Webhook Iteration
 

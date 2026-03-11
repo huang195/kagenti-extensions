@@ -222,7 +222,16 @@ Always use the `-s` flag when committing:
 git commit -s -m "fix: Update container builder"
 ```
 
-PRs without DCO sign-off will fail CI checks. See the [root CLAUDE.md](../CLAUDE.md) for full commit policy details.
+PRs without DCO sign-off will fail CI checks.
+
+## Commit Attribution Policy
+
+Do NOT use `Co-Authored-By` trailers for AI attribution. Use `Assisted-By` instead:
+
+    Assisted-By: Claude (Anthropic AI) <noreply@anthropic.com>
+
+Never add `Co-authored-by`, `Made-with`, or similar trailers that GitHub parses as co-authorship.
+See the [root CLAUDE.md](../CLAUDE.md) for full commit policy details.
 
 ## License
 

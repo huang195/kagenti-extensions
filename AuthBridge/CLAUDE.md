@@ -303,3 +303,14 @@ kubectl apply -f k8s/auth-target-deployment-webhook.yaml     # Target service
 8. **Envoy Lua filter required for inbound**: The `x-authbridge-direction: inbound` header MUST be injected via a Lua filter before ext_proc in the inbound listener. Route-level `request_headers_to_add` does NOT work because the router filter runs after ext_proc.
 
 9. **iptables backend auto-detection**: `init-iptables.sh` auto-detects `iptables-legacy` vs `iptables-nft`. Override with `IPTABLES_CMD` env var if needed. Always verify with proxy-init logs after deployment.
+
+## DCO Sign-Off (Mandatory)
+
+All commits **must** include a `Signed-off-by` trailer (Developer Certificate of Origin).
+Always use the `-s` flag when committing:
+
+```sh
+git commit -s -m "fix: Fix token exchange"
+```
+
+PRs without DCO sign-off will fail CI checks. See the [root CLAUDE.md](../CLAUDE.md) for full commit policy details.

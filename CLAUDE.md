@@ -294,6 +294,22 @@ AUTHBRIDGE_DEMO=true ./scripts/webhook-rollout.sh
 
 6. **Envoy config not embedded:** The envoy-proxy sidecar mounts `envoy-config` ConfigMap at `/etc/envoy`. This ConfigMap must exist in the target namespace before workloads are created.
 
+## DCO Sign-Off (Mandatory)
+
+All commits **must** include a `Signed-off-by` trailer (Developer Certificate of Origin).
+Always use the `-s` flag when committing:
+
+```sh
+git commit -s -m "feat: Add new feature"
+```
+
+This adds a line like `Signed-off-by: Your Name <your@email.com>` to the commit message.
+PRs without DCO sign-off will fail CI checks. To retroactively sign-off existing commits:
+
+```sh
+git rebase --signoff main
+```
+
 ## Commit Attribution Policy
 
 When creating git commits, do NOT use `Co-Authored-By` trailers for AI attribution.

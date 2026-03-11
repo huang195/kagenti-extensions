@@ -1,5 +1,5 @@
 # Use minimal Python base image
-FROM python:3.12-slim
+FROM python:3.14-slim
 
 # Create non-root user with UID/GID 1000
 # IMPORTANT: These values MUST match ClientRegistrationUID/GID in

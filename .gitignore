@@ -50,3 +50,29 @@ Thumbs.db
 
 # venv
 venv
+.venv
+
+# Secrets and credentials
+.env
+.env.*
+!.env.example
+!.env.template
+.env.local
+*.key
+*.pem
+*.p12
+*.jks
+credentials.json
+credentials.env
+secrets.json
+secrets.env
+kubeconfig
+*.kubeconfig
+
+# Python
+__pycache__/
+*.pyc
+.ruff_cache/
+*.egg-info/
+.pytest_cache/
+.mypy_cache/

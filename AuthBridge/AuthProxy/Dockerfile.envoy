@@ -1,4 +1,4 @@
-FROM golang:1.23-alpine AS builder
+FROM golang:1.26-alpine AS builder
 
 WORKDIR /app
 
@@ -10,7 +10,7 @@ COPY go-processor/ ./go-processor/
 RUN CGO_ENABLED=0 GOOS=linux go build -o /go-processor ./go-processor
 
 # Use official Envoy image as base
-FROM envoyproxy/envoy:v1.28-latest
+FROM envoyproxy/envoy:v1.37-latest
 
 # Install ca-certificates for TLS connections
 USER root

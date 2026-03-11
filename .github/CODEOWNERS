@@ -1,0 +1,19 @@
+# Default owners for everything
+* @kagenti/maintainers
+
+# Admission webhook (Go / Kubebuilder)
+kagenti-webhook/ @kagenti/maintainers
+
+# AuthBridge components
+AuthBridge/ @kagenti/maintainers
+
+# Helm charts
+charts/ @kagenti/maintainers
+
+# CI/CD and GitHub configuration
+.github/ @kagenti/platform
+.goreleaser.yaml @kagenti/platform
+
+# Documentation
+*.md @kagenti/maintainers
+docs/ @kagenti/maintainers

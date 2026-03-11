@@ -322,6 +322,32 @@ PRs without DCO sign-off will fail CI checks. To retroactively sign-off existing
 git rebase --signoff main
 ```
 
+## Orchestration
+
+This repo includes orchestrate skills for enhancing related repositories.
+Run `/orchestrate <repo-url>` to start.
+
+| Skill | Description |
+|-------|-------------|
+| `orchestrate` | Entry point — scan, plan, execute phases |
+| `orchestrate:scan` | Assess repo structure, CI, security gaps |
+| `orchestrate:plan` | Create phased enhancement plan |
+| `orchestrate:precommit` | Add pre-commit hooks and linting |
+| `orchestrate:tests` | Add test infrastructure |
+| `orchestrate:ci` | Add CI/CD workflows |
+| `orchestrate:security` | Add security governance files |
+| `orchestrate:replicate` | Bootstrap skills into target repo |
+| `orchestrate:review` | Review all orchestration PRs before merge |
+
+Skills management:
+
+| Skill | Description |
+|-------|-------------|
+| `skills` | Skills router — create, validate, scan |
+| `skills:write` | Create or edit skills with proper structure |
+| `skills:validate` | Validate skill format and naming |
+| `skills:scan` | Audit repo for skill gaps |
+
 ## Commit Attribution Policy
 
 When creating git commits, do NOT use `Co-Authored-By` trailers for AI attribution.

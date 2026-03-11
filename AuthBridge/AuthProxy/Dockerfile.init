@@ -1,4 +1,4 @@
-FROM docker.io/library/alpine:3.18
+FROM docker.io/library/alpine:3.23
 
 # Installs both iptables-legacy and iptables-nft; init-iptables.sh auto-detects
 # the correct backend at runtime (prefers legacy for Kind/kubeadm compatibility)

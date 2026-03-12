@@ -347,7 +347,7 @@ func (b *ContainerBuilder) BuildEnvoyProxyContainerWithSpireOption(spireEnabled 
 							Name: "authbridge-config",
 						},
 						Key:      "ISSUER",
-						Optional: ptr.To(false),
+						Optional: ptr.To(true),
 					},
 				},
 			},

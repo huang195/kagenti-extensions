@@ -120,7 +120,7 @@ jobs:
       # -----------------------------------------------------------------------
 
       - name: Install Python e2e test dependencies
-        run: pip install pytest==8.* kubernetes==32.* requests==2.*
+        run: pip install pytest==8.* pytest-timeout==2.* kubernetes==32.* requests==2.*
 
       - name: Run Python e2e tests
         env:

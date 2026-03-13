@@ -1,0 +1,162 @@
+# E2E Kind Tests
+#
+# Runs the webhook end-to-end test suite on a local Kind cluster.
+# Tests the Python injection tests (pytest) against a real Kind cluster.
+#
+# Workflow:
+#   1. Create Kind cluster
+#   2. Install cert-manager (required for webhook TLS)
+#   3. Build webhook Docker image and load into Kind
+#   4. Deploy webhook via kustomize (make deploy)
+#   5. Run Python e2e tests (health + injection behavior)
+#   6. Cleanup
+#
+name: E2E Kind Tests
+
+on:
+  pull_request:
+    branches:
+      - main
+      - "release-*"
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+env:
+  WEBHOOK_IMAGE: example.com/kagenti-webhook:v0.0.1
+  KIND_CLUSTER: kind
+  CERT_MANAGER_VERSION: v1.16.3
+
+jobs:
+  e2e-kind:
+    name: Kind E2E Tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6
+
+      - uses: actions/setup-go@4b73464bb391d4059bd26b0524d20df3927bd417  # v6
+        with:
+          go-version-file: kagenti-webhook/go.mod
+          cache-dependency-path: kagenti-webhook/go.sum
+
+      - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405  # v6
+        with:
+          python-version: '3.12'
+
+      # -----------------------------------------------------------------------
+      # Cluster setup
+      # -----------------------------------------------------------------------
+
+      - name: Install Kind
+        run: |
+          curl -Lo ./kind https://kind.sigs.k8s.io/dl/v0.27.0/kind-linux-amd64
+          chmod +x ./kind
+          sudo mv ./kind /usr/local/bin/kind
+          kind version
+
+      - name: Create Kind cluster
+        run: kind create cluster --name ${{ env.KIND_CLUSTER }} --wait 60s
+
+      - name: Install cert-manager
+        run: |
+          kubectl apply -f https://github.com/cert-manager/cert-manager/releases/download/${{ env.CERT_MANAGER_VERSION }}/cert-manager.yaml
+          kubectl wait deployment/cert-manager-webhook \
+            --namespace cert-manager \
+            --for=condition=Available \
+            --timeout=5m
+
+      # -----------------------------------------------------------------------
+      # Build and load webhook image
+      # -----------------------------------------------------------------------
+
+      - name: Build webhook Docker image
+        working-directory: kagenti-webhook
+        run: make docker-build IMG=${{ env.WEBHOOK_IMAGE }}
+
+      - name: Load webhook image into Kind
+        run: kind load docker-image ${{ env.WEBHOOK_IMAGE }} --name ${{ env.KIND_CLUSTER }}
+
+      # -----------------------------------------------------------------------
+      # Deploy webhook
+      # -----------------------------------------------------------------------
+
+      - name: Deploy webhook
+        working-directory: kagenti-webhook
+        run: make deploy IMG=${{ env.WEBHOOK_IMAGE }}
+
+      - name: Wait for webhook deployment to be ready
+        run: |
+          kubectl wait deployment \
+            --namespace kagenti-webhook-system \
+            --selector control-plane=controller-manager \
+            --for=condition=Available \
+            --timeout=3m
+
+      - name: Wait for webhook CA bundle injection
+        run: |
+          # cert-manager needs a moment to inject the CA bundle into the
+          # MutatingWebhookConfiguration after the Certificate is ready.
+          WEBHOOK_CFG=$(kubectl get mutatingwebhookconfiguration \
+            -o jsonpath='{.items[*].metadata.name}' | tr ' ' '\n' | grep kagenti-webhook | head -1)
+          if [ -z "$WEBHOOK_CFG" ]; then
+            echo "ERROR: no MutatingWebhookConfiguration matching 'kagenti-webhook' found"
+            kubectl get mutatingwebhookconfiguration
+            exit 1
+          fi
+          echo "Waiting for CA bundle injection in: $WEBHOOK_CFG"
+          for i in $(seq 1 30); do
+            CA=$(kubectl get mutatingwebhookconfiguration "$WEBHOOK_CFG" \
+              -o jsonpath='{.webhooks[0].clientConfig.caBundle}' 2>/dev/null || true)
+            if [ -n "$CA" ] && [ ${#CA} -gt 10 ]; then
+              echo "CA bundle injected (attempt $i)"
+              break
+            fi
+            echo "Attempt $i: CA bundle not yet injected, waiting..."
+            sleep 3
+          done
+          if [ -z "$CA" ] || [ ${#CA} -le 10 ]; then
+            echo "ERROR: CA bundle was not injected after 30 attempts (90s)"
+            exit 1
+          fi
+
+      # -----------------------------------------------------------------------
+      # Python e2e tests
+      # -----------------------------------------------------------------------
+
+      - name: Install Python e2e test dependencies
+        run: pip install pytest==8.* pytest-timeout==2.* kubernetes==32.* requests==2.*
+
+      - name: Run Python e2e tests
+        env:
+          WEBHOOK_NAMESPACE: kagenti-webhook-system
+          TEST_NAMESPACE: kagenti-webhook-test
+        run: |
+          mkdir -p test-results
+          pytest tests/e2e/ -v --timeout=120 --tb=short --junitxml=test-results/e2e.xml
+
+      # -----------------------------------------------------------------------
+      # Cleanup (always runs to avoid orphaned resources)
+      # -----------------------------------------------------------------------
+
+      - name: Undeploy webhook
+        if: always()
+        working-directory: kagenti-webhook
+        run: make undeploy || true
+
+      - name: Delete Kind cluster
+        if: always()
+        run: kind delete cluster --name ${{ env.KIND_CLUSTER }} || true
+
+      - name: Upload test results
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4
+        with:
+          name: e2e-kind-results
+          path: |
+            test-results/
+          if-no-files-found: ignore

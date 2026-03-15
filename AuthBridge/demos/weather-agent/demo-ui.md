@@ -103,57 +103,18 @@ No GitHub tokens or additional secrets are required for this demo.
 
 ---
 
-## Step 1: Configure Keycloak
+## Installer-Provided Resources
 
-Keycloak needs a realm and a client scope for the agent's SPIFFE identity.
-This is a simpler setup than the GitHub Issue demo — no token exchange clients
-or access control scopes are needed.
+The Kagenti installer creates everything this demo needs in the target namespace:
 
-### Port-forward Keycloak (if needed)
+- **`kagenti` realm** in Keycloak
+- **`keycloak-admin-secret`** Secret (Keycloak admin credentials)
+- **`authbridge-config`**, **`spiffe-helper-config`**, **`envoy-config`** ConfigMaps
 
-The setup script connects to Keycloak at `http://keycloak.localtest.me:8080`.
-If Keycloak is not already reachable at that address (e.g., via an ingress),
-start a port-forward in a separate terminal:
+No additional Keycloak configuration, Secrets, or ConfigMaps are required for
+this demo. The weather agent uses outbound passthrough (no token exchange), and
+inbound JWT validation works with signature and issuer checks alone.
 
-```bash
-kubectl port-forward service/keycloak-service -n keycloak 8080:8080
-```
-
-### Run the setup script
-
-```bash
-cd AuthBridge
-
-# Create virtual environment (if not already done)
-python -m venv venv
-source venv/bin/activate
-pip install --upgrade pip
-pip install -r requirements.txt
-
-# Run the Keycloak setup for this demo
-python demos/webhook/setup_keycloak.py --namespace team1 --service-account weather-service
-```
-
-This creates:
-
-| Resource | Name | Purpose |
-|----------|------|---------|
-| **Realm** | `kagenti` | Keycloak realm for the demo |
-| **Scope** | `agent-team1-weather-service-aud` | Realm DEFAULT — auto-adds Agent's SPIFFE ID to all tokens |
-| **User** | `alice` (password: `alice123`) | Demo user for testing |
-
-> **Note:** If the `kagenti` realm already exists from a prior demo or from the
-> Kagenti installer, the script will reuse it and only create missing resources.
-
----
-
-## Step 2: Import the Weather Tool via Kagenti UI
-
-> **Note:** The Kagenti installer creates `keycloak-admin-secret`, along with
-> default ConfigMaps (`authbridge-config`, `spiffe-helper-config`, `envoy-config`),
-> in the target namespace with the correct `kagenti` realm settings. No additional
-> Secrets or ConfigMaps are needed for this demo.
->
 > If your Keycloak admin credentials differ from the default (`admin`/`admin`),
 > update the secret:
 > ```bash
@@ -162,6 +123,23 @@ This creates:
 >   --from-literal=KEYCLOAK_ADMIN_PASSWORD=<your-admin-password> \
 >   --dry-run=client -o yaml | kubectl apply -f -
 > ```
+
+> **Optional — enable inbound audience validation:** To add the agent's SPIFFE ID
+> to the token `aud` claim (so AuthProxy can validate audience in addition to
+> signature and issuer), run the setup script:
+> ```bash
+> cd AuthBridge
+> python -m venv venv && source venv/bin/activate
+> pip install -r requirements.txt
+> python demos/webhook/setup_keycloak.py --namespace team1 --service-account weather-service
+> ```
+> Then set `EXPECTED_AUDIENCE` in the `authbridge-config` ConfigMap to the
+> agent's SPIFFE ID. This is recommended for production but not required for
+> this getting-started demo.
+
+---
+
+## Step 1: Import the Weather Tool via Kagenti UI
 
 1. Navigate to [Import Tool](http://kagenti-ui.localtest.me:8080/tools/import)
    in the Kagenti UI.
@@ -194,7 +172,7 @@ kubectl get pods -n team1 | grep weather-tool
 
 ---
 
-## Step 3: Import the Weather Agent via Kagenti UI
+## Step 2: Import the Weather Agent via Kagenti UI
 
 1. Navigate to [Import Agent](http://kagenti-ui.localtest.me:8080/agents/import)
    in the Kagenti UI.
@@ -246,7 +224,7 @@ Wait for the Shipwright build to complete and the deployment to become ready.
 
 ---
 
-## Step 4: Verify the Deployment
+## Step 3: Verify the Deployment
 
 ### Check pod status
 
@@ -324,7 +302,7 @@ The service maps **port 8080** to the agent's internal port 8000.
 
 ---
 
-## Step 5: Verify Ollama is Running
+## Step 4: Verify Ollama is Running
 
 The agent uses an LLM for inference. If using Ollama, verify it is running:
 
@@ -346,7 +324,7 @@ model is pulled (`ollama pull ibm/granite4:latest`).
 
 ---
 
-## Step 6: Chat via Kagenti UI
+## Step 5: Chat via Kagenti UI
 
 1. Navigate to the **Agent Catalog** in the Kagenti UI.
 2. Select the `team1` namespace.
@@ -358,12 +336,12 @@ model is pulled (`ollama pull ibm/granite4:latest`).
 
 > **Troubleshooting:** If UI chat returns a `401`, verify that both the UI and
 > AuthBridge are configured against the same `kagenti` realm. You can also use
-> [Step 7: Test via CLI](#step-7-test-via-cli) to test the AuthBridge flow
+> [Step 6: Test via CLI](#step-6-test-via-cli) to test the AuthBridge flow
 > independently.
 
 ---
 
-## Step 7: Test via CLI
+## Step 6: Test via CLI
 
 Test the AuthBridge flow from the command line to verify inbound validation.
 
@@ -375,7 +353,7 @@ kubectl run test-client --image=nicolaka/netshoot -n team1 --restart=Never -- sl
 kubectl wait --for=condition=ready pod/test-client -n team1 --timeout=30s
 ```
 
-### 7a. Agent Card - Public Endpoint (No Token Required)
+### 6a. Agent Card - Public Endpoint (No Token Required)
 
 The `/.well-known/agent.json` endpoint is publicly accessible — AuthBridge's
 go-processor bypasses JWT validation for `/.well-known/*`, `/healthz`, `/readyz`,
@@ -387,7 +365,7 @@ kubectl exec test-client -n team1 -- curl -s \
 # Expected: "weather_service"
 ```
 
-### 7b. Inbound Rejection - No Token
+### 6b. Inbound Rejection - No Token
 
 Non-public endpoints require a valid JWT:
 
@@ -397,7 +375,7 @@ kubectl exec test-client -n team1 -- curl -s \
 # Expected: {"error":"unauthorized","message":"missing Authorization header"}
 ```
 
-### 7c. Inbound Rejection - Invalid Token
+### 6c. Inbound Rejection - Invalid Token
 
 A malformed or tampered token fails the JWKS signature check:
 
@@ -408,7 +386,7 @@ kubectl exec test-client -n team1 -- curl -s \
 # Expected: {"error":"unauthorized","message":"token validation failed: failed to parse/validate token: ..."}
 ```
 
-### 7d. End-to-End Test with Valid Token
+### 6d. End-to-End Test with Valid Token
 
 Open a shell inside the test-client pod to avoid JWT shell expansion issues:
 
@@ -473,7 +451,7 @@ Exit the pod when done:
 exit
 ```
 
-### 7e. Verify AuthProxy Logs (Inbound)
+### 6e. Verify AuthProxy Logs (Inbound)
 
 Check the ext_proc logs to confirm inbound validation is working:
 

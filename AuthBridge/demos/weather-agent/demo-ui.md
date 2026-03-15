@@ -147,25 +147,21 @@ This creates:
 
 ---
 
-## Step 2: Create Keycloak Admin Secret
+## Step 2: Import the Weather Tool via Kagenti UI
 
-The client-registration sidecar needs Keycloak admin credentials to register
-the agent as an OAuth client. These are stored in a Kubernetes Secret:
-
-```bash
-kubectl create secret generic keycloak-admin-secret -n team1 \
-  --from-literal=KEYCLOAK_ADMIN_USERNAME=admin \
-  --from-literal=KEYCLOAK_ADMIN_PASSWORD=admin \
-  --dry-run=client -o yaml | kubectl apply -f -
-```
-
-The Kagenti installer creates default ConfigMaps (`authbridge-config`,
-`spiffe-helper-config`, `envoy-config`) with the correct `kagenti` realm
-settings. No additional ConfigMaps are needed for this demo.
-
----
-
-## Step 3: Import the Weather Tool via Kagenti UI
+> **Note:** The Kagenti installer creates `keycloak-admin-secret`, along with
+> default ConfigMaps (`authbridge-config`, `spiffe-helper-config`, `envoy-config`),
+> in the target namespace with the correct `kagenti` realm settings. No additional
+> Secrets or ConfigMaps are needed for this demo.
+>
+> If your Keycloak admin credentials differ from the default (`admin`/`admin`),
+> update the secret:
+> ```bash
+> kubectl create secret generic keycloak-admin-secret -n team1 \
+>   --from-literal=KEYCLOAK_ADMIN_USERNAME=<your-admin-user> \
+>   --from-literal=KEYCLOAK_ADMIN_PASSWORD=<your-admin-password> \
+>   --dry-run=client -o yaml | kubectl apply -f -
+> ```
 
 1. Navigate to [Import Tool](http://kagenti-ui.localtest.me:8080/tools/import)
    in the Kagenti UI.
@@ -198,7 +194,7 @@ kubectl get pods -n team1 | grep weather-tool
 
 ---
 
-## Step 4: Import the Weather Agent via Kagenti UI
+## Step 3: Import the Weather Agent via Kagenti UI
 
 1. Navigate to [Import Agent](http://kagenti-ui.localtest.me:8080/agents/import)
    in the Kagenti UI.
@@ -250,7 +246,7 @@ Wait for the Shipwright build to complete and the deployment to become ready.
 
 ---
 
-## Step 5: Verify the Deployment
+## Step 4: Verify the Deployment
 
 ### Check pod status
 
@@ -328,7 +324,7 @@ The service maps **port 8080** to the agent's internal port 8000.
 
 ---
 
-## Step 6: Verify Ollama is Running
+## Step 5: Verify Ollama is Running
 
 The agent uses an LLM for inference. If using Ollama, verify it is running:
 
@@ -350,7 +346,7 @@ model is pulled (`ollama pull ibm/granite4:latest`).
 
 ---
 
-## Step 7: Chat via Kagenti UI
+## Step 6: Chat via Kagenti UI
 
 1. Navigate to the **Agent Catalog** in the Kagenti UI.
 2. Select the `team1` namespace.
@@ -362,12 +358,12 @@ model is pulled (`ollama pull ibm/granite4:latest`).
 
 > **Troubleshooting:** If UI chat returns a `401`, verify that both the UI and
 > AuthBridge are configured against the same `kagenti` realm. You can also use
-> [Step 8: Test via CLI](#step-8-test-via-cli) to test the AuthBridge flow
+> [Step 7: Test via CLI](#step-7-test-via-cli) to test the AuthBridge flow
 > independently.
 
 ---
 
-## Step 8: Test via CLI
+## Step 7: Test via CLI
 
 Test the AuthBridge flow from the command line to verify inbound validation.
 
@@ -379,7 +375,7 @@ kubectl run test-client --image=nicolaka/netshoot -n team1 --restart=Never -- sl
 kubectl wait --for=condition=ready pod/test-client -n team1 --timeout=30s
 ```
 
-### 8a. Agent Card - Public Endpoint (No Token Required)
+### 7a. Agent Card - Public Endpoint (No Token Required)
 
 The `/.well-known/agent.json` endpoint is publicly accessible — AuthBridge's
 go-processor bypasses JWT validation for `/.well-known/*`, `/healthz`, `/readyz`,
@@ -391,7 +387,7 @@ kubectl exec test-client -n team1 -- curl -s \
 # Expected: "weather_service"
 ```
 
-### 8b. Inbound Rejection - No Token
+### 7b. Inbound Rejection - No Token
 
 Non-public endpoints require a valid JWT:
 
@@ -401,7 +397,7 @@ kubectl exec test-client -n team1 -- curl -s \
 # Expected: {"error":"unauthorized","message":"missing Authorization header"}
 ```
 
-### 8c. Inbound Rejection - Invalid Token
+### 7c. Inbound Rejection - Invalid Token
 
 A malformed or tampered token fails the JWKS signature check:
 
@@ -412,7 +408,7 @@ kubectl exec test-client -n team1 -- curl -s \
 # Expected: {"error":"unauthorized","message":"token validation failed: failed to parse/validate token: ..."}
 ```
 
-### 8d. End-to-End Test with Valid Token
+### 7d. End-to-End Test with Valid Token
 
 Open a shell inside the test-client pod to avoid JWT shell expansion issues:
 
@@ -477,7 +473,7 @@ Exit the pod when done:
 exit
 ```
 
-### 8e. Verify AuthProxy Logs (Inbound)
+### 7e. Verify AuthProxy Logs (Inbound)
 
 Check the ext_proc logs to confirm inbound validation is working:
 

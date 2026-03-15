@@ -290,25 +290,23 @@ This creates:
 
 ---
 
-## Step 3: Create Keycloak Admin Secret and Apply Demo ConfigMaps
+## Step 3: Apply Demo ConfigMaps
 
 The Kagenti installer creates default ConfigMaps (`authbridge-config`,
-`spiffe-helper-config`, `envoy-config`) with the correct `kagenti` realm
-settings and 300s Envoy timeouts.
+`spiffe-helper-config`, `envoy-config`) and the `keycloak-admin-secret` Secret
+in the target namespace with the correct `kagenti` realm settings and 300s Envoy
+timeouts. No manual secret creation is needed for this demo.
 
-The client-registration sidecar needs Keycloak admin credentials to register
-agents as OAuth clients. These are stored in a Kubernetes Secret (not a
-ConfigMap) to follow security best practices. Create the secret **before**
-deploying the agent:
+> If your Keycloak admin credentials differ from the default (`admin`/`admin`),
+> update the secret:
+> ```bash
+> kubectl create secret generic keycloak-admin-secret -n team1 \
+>   --from-literal=KEYCLOAK_ADMIN_USERNAME=<your-admin-user> \
+>   --from-literal=KEYCLOAK_ADMIN_PASSWORD=<your-admin-password> \
+>   --dry-run=client -o yaml | kubectl apply -f -
+> ```
 
-```bash
-kubectl create secret generic keycloak-admin-secret -n team1 \
-  --from-literal=KEYCLOAK_ADMIN_USERNAME=admin \
-  --from-literal=KEYCLOAK_ADMIN_PASSWORD=admin \
-  --dry-run=client -o yaml | kubectl apply -f -
-```
-
-Then apply the demo-specific ConfigMaps — the `authproxy-routes` ConfigMap
+Apply the demo-specific ConfigMaps — the `authproxy-routes` ConfigMap
 configures per-route token exchange (target audience and scopes for the
 `github-tool` host), and `authbridge-config` sets the agent's SPIFFE ID for
 inbound audience validation. Apply this **before** deploying the agent.

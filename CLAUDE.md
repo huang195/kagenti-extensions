@@ -29,7 +29,7 @@ kagenti-extensions/
 ├── charts/
 │   └── kagenti-webhook/      # Helm chart for the webhook
 ├── .github/
-│   ├── workflows/            # CI/CD (ci.yaml, build.yaml, goreleaser.yml, pr-verifier.yaml, spellcheck)
+│   ├── workflows/            # CI/CD (ci.yaml, build.yaml, goreleaser.yml, e2e-kind.yaml, spellcheck, security-scans)
 │   └── ISSUE_TEMPLATE/       # Bug report, feature request, epic templates
 ├── .goreleaser.yaml          # GoReleaser config (webhook binary + ko image + Helm chart)
 ├── .pre-commit-config.yaml   # Pre-commit hooks (trailing whitespace, go fmt/vet, helmlint)
@@ -43,7 +43,7 @@ kagenti-extensions/
 A Kubernetes **mutating admission webhook** that intercepts workload creation (Deployments, StatefulSets, DaemonSets, Jobs, CronJobs) and automatically injects AuthBridge sidecar containers.
 
 **Location:** `kagenti-webhook/`
-**Language:** Go 1.24, controller-runtime v0.22, Kubebuilder v4
+**Language:** Go 1.26, controller-runtime v0.23, Kubebuilder v4
 **Detailed guide:** [`kagenti-webhook/CLAUDE.md`](kagenti-webhook/CLAUDE.md)
 
 **Key facts:**
@@ -59,7 +59,7 @@ A Kubernetes **mutating admission webhook** that intercepts workload creation (D
 An **Envoy proxy with a gRPC external processor** that provides transparent traffic interception for both inbound JWT validation and outbound OAuth 2.0 token exchange (RFC 8693).
 
 **Location:** `AuthBridge/AuthProxy/`
-**Language:** Go 1.23
+**Language:** Go 1.24
 **Detailed guide:** [`AuthBridge/CLAUDE.md`](AuthBridge/CLAUDE.md)
 
 **Core components:**
@@ -114,10 +114,12 @@ A Python script that **automatically registers Kubernetes workloads as Keycloak 
 
 | Workflow | Trigger | Purpose |
 |----------|---------|---------|
-| `ci.yaml` | PR to main/release-* | Go fmt, vet, build across all Go modules |
+| `ci.yaml` | PR to main/release-* | Go fmt, vet, build across all Go modules; Python tests |
 | `build.yaml` | Tag push (`v*`) or manual | Multi-arch Docker builds for: client-registration, auth-proxy, proxy-init, envoy-with-processor, demo-app |
 | `goreleaser.yml` | Tag push (`v*`) | GoReleaser binary + ko image for webhook, Helm chart package + push |
-| `pr-verifier.yaml` | PR to main/release-* | Semantic PR title validation (conventional commits) |
+| `e2e-kind.yaml` | PR to main/release-* | End-to-end tests on a Kind cluster (webhook injection) |
+| `security-scans.yaml` | PR to main | Dependency review, shellcheck, YAML lint, Hadolint, Bandit, Trivy, CodeQL |
+| `scorecard.yaml` | Weekly / push to main | OpenSSF Scorecard security health metrics |
 | `spellcheck_action.yml` | PR | Spellcheck on markdown files |
 
 ### PR Title Convention
@@ -169,14 +171,16 @@ Install: `pre-commit install`
 Hooks:
 - `trailing-whitespace`, `end-of-file-fixer`, `check-added-large-files` (max 1024KB), `check-yaml`, `check-json`, `check-merge-conflict`, `mixed-line-ending`
 - `helmlint` — Runs on `charts/` directory
-- `go-fmt`, `go-vet`, `go-mod-tidy` — Runs on `kagenti-webhook/` Go files
+- `ai-assisted-by-trailer` — Rewrites `Co-Authored-By` to `Assisted-By` (commit-msg stage)
+- `ruff`, `ruff-format` — Python linting/formatting on `AuthBridge/` files
+- `go-fmt`, `go-vet`, `go-mod-tidy` — Runs on both `kagenti-webhook/` and `AuthBridge/AuthProxy/` Go files
 
 ## Languages and Tech Stack
 
 | Area | Technology |
 |------|------------|
-| Webhook | Go 1.24, controller-runtime v0.22, Kubebuilder v4 |
-| AuthProxy ext-proc | Go 1.23, envoy-control-plane, lestrrat-go/jwx |
+| Webhook | Go 1.26, controller-runtime v0.23, Kubebuilder v4 |
+| AuthProxy ext-proc | Go 1.24, envoy-control-plane, lestrrat-go/jwx |
 | Client Registration | Python 3.12, python-keycloak, PyJWT |
 | Proxy | Envoy 1.28 |
 | Traffic interception | iptables (via init container) |
@@ -285,19 +289,19 @@ AUTHBRIDGE_DEMO=true ./scripts/webhook-rollout.sh
 
 4. **Port Coordination:** Envoy listens on 15123 (outbound) and 15124 (inbound). The ext-proc listens on 9090. The `proxy-init` iptables rules redirect to these ports. The webhook's `container_builder.go` exposes these ports on the container spec.
 
-5. **Image References:** Default image tags are hardcoded in `kagenti-webhook/internal/webhook/injector/container_builder.go` and paralleled in `kagenti-webhook/internal/webhook/config/defaults.go`. The CI in `build.yaml` builds the images. All three must stay in sync.
+5. **Image References:** Default image tags are defined in `kagenti-webhook/internal/webhook/config/defaults.go` (via `CompiledDefaults()`). The `ContainerBuilder` reads from `PlatformConfig` at runtime. The CI in `build.yaml` builds the images. Both must stay in sync.
 
 ## Gotchas and Known Issues
 
-1. **Config system not wired in:** `kagenti-webhook/internal/webhook/config/` (PlatformConfig, FeatureGates, loaders) exists but is NOT used by the injector. Container builder uses hardcoded constants. This is a known gap.
+1. **Config system is wired in:** `kagenti-webhook/internal/webhook/config/` (PlatformConfig, FeatureGates, loaders) is used by `PodMutator` and `ContainerBuilder`. Feature gates support hot-reload via `FeatureGateLoader`. Platform config (images, ports, resources) is loaded at startup from the `kagenti-webhook-defaults` ConfigMap, with `CompiledDefaults()` as the fallback.
 
-2. **Two Go modules:** The repo has two independent Go modules (`kagenti-webhook/go.mod` and `AuthBridge/AuthProxy/go.mod`) with different Go versions (1.24 vs 1.23). They do not share code.
+2. **Two Go modules:** The repo has two independent Go modules (`kagenti-webhook/go.mod` and `AuthBridge/AuthProxy/go.mod`) with different Go versions (1.26 vs 1.24). They do not share code.
 
 3. **Helm chart tag placeholder:** `charts/kagenti-webhook/values.yaml` uses `tag: "__PLACEHOLDER__"`. The goreleaser workflow replaces this at release time. For local dev, override with `--set image.tag=<tag>`.
 
 4. **Avoid committing venvs:** Virtual environment directories (e.g. `AuthBridge/AuthProxy/quickstart/venv/`) should be gitignored (the repo's `.gitignore` has a `venv` pattern). Do not create and commit new virtual environments under version control.
 
-5. **CI Go version alignment:** Ensure the Go version in `ci.yaml` matches the highest Go version required across all modules (currently Go 1.24, matching `kagenti-webhook/go.mod`).
+5. **CI Go version alignment:** Ensure the Go version in `ci.yaml` matches the highest Go version required across all modules (currently Go 1.26, matching `kagenti-webhook/go.mod`).
 
 6. **Envoy config not embedded:** The envoy-proxy sidecar mounts `envoy-config` ConfigMap at `/etc/envoy`. This ConfigMap must exist in the target namespace before workloads are created.
 

@@ -259,7 +259,7 @@ kubectl apply -f k8s/auth-target-deployment-webhook.yaml     # Target service
 ## Code Conventions
 
 ### Go (AuthProxy, go-processor, demo-app)
-- Go 1.23 (module: `github.com/kagenti/kagenti-extensions/AuthBridge/AuthProxy`)
+- Go 1.24 (module: `github.com/kagenti/kagenti-extensions/AuthBridge/AuthProxy`)
 - Logging with `log.Printf` (stdlib), prefixed by `[Config]`, `[Token Exchange]`, `[Inbound]`, `[JWT Debug]`
 - Thread-safe config via `sync.RWMutex` in the `Config` struct
 - gRPC ext-proc using `envoyproxy/go-control-plane` types

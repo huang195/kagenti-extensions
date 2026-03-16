@@ -80,7 +80,7 @@ kagenti-webhook/
 │   └── test-precedence.sh                   # Automated end-to-end test runner for the precedence system
 ├── Makefile                                 # Build, test, deploy targets
 ├── Dockerfile                               # Multi-stage Go build -> distroless
-├── go.mod / go.sum                          # Go 1.24, controller-runtime v0.22
+├── go.mod / go.sum                          # Go 1.26, controller-runtime v0.23
 └── PROJECT                                  # Kubebuilder project metadata
 ```
 
@@ -88,13 +88,13 @@ kagenti-webhook/
 
 | Package | Version | Purpose |
 |---------|---------|---------|
-| `sigs.k8s.io/controller-runtime` | v0.22.1 | Manager, webhook server, envtest |
-| `k8s.io/api` | v0.34.1 | Kubernetes API types |
-| `github.com/onsi/ginkgo/v2` | v2.26.0 | BDD test framework |
-| `github.com/onsi/gomega` | v1.38.2 | Test matchers |
+| `sigs.k8s.io/controller-runtime` | v0.23.3 | Manager, webhook server, envtest |
+| `k8s.io/api` | v0.35.2 | Kubernetes API types |
+| `github.com/onsi/ginkgo/v2` | v2.28.1 | BDD test framework |
+| `github.com/onsi/gomega` | v1.39.1 | Test matchers |
 | `github.com/fsnotify/fsnotify` | v1.9.0 | Config file watching |
 
-**Go version:** 1.24.4 (toolchain 1.24.8), with `godebug default=go1.23`.
+**Go version:** 1.26.1, with `godebug default=go1.23`.
 
 ## Build and Test Commands
 

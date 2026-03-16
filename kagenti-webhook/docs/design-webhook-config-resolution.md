@@ -1,6 +1,6 @@
 # Design: Admission-Time Configuration Resolution for AuthBridge Sidecar Injection
 
-**Status**: Implementation in progress
+**Status**: Implemented (PR #217) — under review
 
 **Authors**: Kagenti Team
 
@@ -226,13 +226,10 @@ Pod CREATE admission request
 │     │   label, tool gate)                                │
 │     ├── Precedence evaluation (per-sidecar decisions)    │
 │     │                                                    │
-│     ├── NEW: Config Resolution                           │
-│     │   ├── NamespaceConfigCache.GetOrLoad()             │
-│     │   │   (if perWorkloadConfigResolution=false,        │
-│     │   │    returns cached; else reads fresh)            │
+│     ├── NEW: Config Resolution (perWorkloadConfigResolution) │
+│     │   ├── ReadNamespaceConfig()                        │
 │     │   │   ├── GET configmap/environments               │
 │     │   │   ├── GET configmap/authbridge-config          │
-│     │   │   ├── GET secret/keycloak-admin-secret         │
 │     │   │   ├── GET configmap/spiffe-helper-config       │
 │     │   │   ├── GET configmap/envoy-config (optional)    │
 │     │   │   └── GET configmap/authproxy-routes (optional)│
@@ -300,9 +297,9 @@ type NamespaceConfig struct {
     TargetAudience   string
     TargetScopes     string
 
-    // From "keycloak-admin-secret" Secret
-    KeycloakAdminUser string
-    KeycloakAdminPass string
+    // Note: keycloak-admin-secret is NOT read into this struct.
+    // Credentials stay as SecretKeyRef in the container spec, keeping
+    // them out of the webhook's memory and Pod environment literals.
 
     // From "spiffe-helper-config" ConfigMap
     SpiffeHelperConf string   // raw helper.conf content
@@ -346,8 +343,8 @@ type ResolvedConfig struct {
     // Identity — merged from namespace CMs + AgentRuntime overrides
     KeycloakURL       string
     KeycloakRealm     string
-    KeycloakAdminUser string
-    KeycloakAdminPass string
+    // Admin credentials referenced via SecretKeyRef — not stored here
+    AdminCredentialsSecretName string // defaults to "keycloak-admin-secret"
     SpireEnabled      string
     SpiffeTrustDomain string
     PlatformClientIDs string
@@ -381,8 +378,6 @@ type ResolvedConfig struct {
 | `internal/webhook/injector/agentruntime_types.go` | Create | Stub constants for AgentRuntime CRD (GVR, Kind) |
 | `internal/webhook/injector/namespace_config.go` | Create | `ReadNamespaceConfig()` — reads well-known CMs/Secrets from target namespace |
 | `internal/webhook/injector/namespace_config_test.go` | Create | Unit tests: CM present, CM missing, partial CMs, Secret missing |
-| `internal/webhook/injector/namespace_config_cache.go` | Create | `NamespaceConfigCache` — per-namespace in-memory cache with `GetOrLoad()` |
-| `internal/webhook/injector/namespace_config_cache_test.go` | Create | Unit tests: cache hit, different namespaces, empty namespace |
 | `internal/webhook/injector/agentruntime_config.go` | Create | `ReadAgentRuntimeOverrides()` — unstructured read of AgentRuntime CR |
 | `internal/webhook/injector/agentruntime_config_test.go` | Create | Unit tests: CR found, CR not found, CRD not installed, partial overrides |
 | `internal/webhook/injector/resolved_config.go` | Create | `ResolveConfig()` — merge logic with precedence rules |
@@ -392,7 +387,7 @@ type ResolvedConfig struct {
 | `internal/webhook/injector/envoy.yaml.tmpl` | Create | Embedded Go template for envoy.yaml |
 | `internal/webhook/injector/container_builder.go` | Modify | Add `NewResolvedContainerBuilder()`, dual-mode env vars (literal or ValueFrom) |
 | `internal/webhook/injector/volume_builder.go` | Modify | Add `BuildResolvedVolumes()` for future per-workload envoy configs |
-| `internal/webhook/injector/pod_mutator.go` | Modify | Add config resolution pipeline with `NamespaceConfigCache` and feature gate check |
+| `internal/webhook/injector/pod_mutator.go` | Modify | Add config resolution pipeline with feature gate check (false=legacy ValueFrom, true=resolved reads) |
 | `internal/webhook/config/feature_gates.go` | Modify | Add `PerWorkloadConfigResolution` field |
 | `internal/webhook/config/feature_gate_loader.go` | Modify | Log new gate in banner |
 | `charts/kagenti-webhook/values.yaml` | Modify | Add `perWorkloadConfigResolution: false` to `featureGates` |
@@ -427,25 +422,18 @@ To minimize API server calls, the webhook caches namespace ConfigMaps/Secrets **
 | `false` (default) | **Cached mode** — ConfigMaps/Secrets are read once per namespace and reused for all workloads in that namespace. Cache lives in memory, cleared on webhook pod restart. | Production — namespace ConfigMaps rarely change. |
 | `true` | **Per-workload mode** — ConfigMaps/Secrets are read from the API server on every admission request. | Development/debugging — see config changes immediately without restart. |
 
-The cache is implemented as a thread-safe `sync.RWMutex`-guarded `map[string]*NamespaceConfig` in the `NamespaceConfigCache` struct. The first workload in a namespace triggers the API reads; subsequent workloads in the same namespace use the cached result.
-
-**Cache invalidation**: Restart the webhook pod. This is acceptable because:
-- Namespace ConfigMaps are part of the deployment contract and rarely change
-- Webhook pods are lightweight and restart quickly
-- The `perWorkloadConfigResolution` gate provides an escape hatch for dynamic environments
-
-### Additional performance notes
-
+When the `perWorkloadConfigResolution` feature gate is enabled, namespace ConfigMaps are read on every admission request. This is acceptable because:
 - The webhook already makes API calls (ServiceAccount creation) so the client infrastructure exists
-- ConfigMap/Secret reads are small (< 1KB each)
+- ConfigMap reads are small (< 1KB each)
 - AgentRuntime list is namespace-scoped and filtered
-- In cached mode, the steady-state cost is **zero API calls** for namespace config (only the AgentRuntime lookup per workload)
+
+**Note**: A `NamespaceConfigCache` was originally designed but removed during implementation review. Per-namespace caching may be added in a future iteration if API call volume becomes a concern at scale.
 
 ---
 
 ## Security Considerations
 
-1. **Secret access at admission time**: The webhook reads `keycloak-admin-secret` and injects credentials as literal env var values in the Pod spec. This is equivalent to today's `ValueFrom` pattern — the secret is visible in the Pod spec either way. No change in security posture.
+1. **Credentials stay as SecretKeyRef**: The webhook does NOT read `keycloak-admin-secret` into memory. Instead, the resolved container builder uses `SecretKeyRef` references (same as the legacy path), keeping credentials out of the webhook's memory and out of Pod spec literal env vars. Non-sensitive values (URLs, realm names, etc.) are injected as literals.
 
 2. **AgentRuntime RBAC**: The webhook gains read access to `agentruntimes.agent.kagenti.dev`. This is a low-risk addition — it's read-only and scoped to the Kagenti API group.
 
@@ -456,8 +444,7 @@ The cache is implemented as a thread-safe `sync.RWMutex`-guarded `map[string]*Na
 ## Testing Strategy
 
 1. **Unit tests** (per new file):
-   - `namespace_config_test.go`: ConfigMap present/absent/partial, Secret present/absent
-   - `namespace_config_cache_test.go`: Cache hit (same pointer), different namespaces, empty namespace
+   - `namespace_config_test.go`: ConfigMap present/absent/partial
    - `agentruntime_config_test.go`: targetRef match, no match, partial overrides, CRD not installed
    - `resolved_config_test.go`: All-layers merge, missing layers, realm override, trace overrides, token exchange not overridable
    - `envoy_template_test.go`: Default ports, custom ports, verbatim passthrough

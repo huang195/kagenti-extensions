@@ -47,6 +47,9 @@ const defaultExtProcPort int32 = 9090
 // ConfigMap creation is implemented. Currently this function is only used in
 // unit tests.
 func RenderEnvoyConfig(cfg *ResolvedConfig) (string, error) {
+	if cfg == nil || cfg.Platform == nil {
+		return "", fmt.Errorf("resolved config or platform config is nil")
+	}
 	if cfg.EnvoyYAML != "" {
 		return cfg.EnvoyYAML, nil
 	}

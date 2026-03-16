@@ -10,10 +10,11 @@ type FeatureGates struct {
 	// InjectTools controls whether tool workloads (kagenti.io/type=tool) receive
 	// sidecar injection. Defaults to false — tools are not injected by default.
 	InjectTools bool `json:"injectTools" yaml:"injectTools"`
-	// PerWorkloadConfigResolution controls whether namespace ConfigMaps/Secrets
-	// are read on every admission request (true) or cached per namespace and
-	// reused across workloads (false). Defaults to false for performance — the
-	// cache is cleared on webhook pod restart.
+	// PerWorkloadConfigResolution controls the env-var injection mode:
+	//   false (default) → legacy path: env vars use ValueFrom ConfigMapKeyRef/
+	//                     SecretKeyRef references; kubelet resolves at container start.
+	//   true            → resolved path: webhook reads namespace ConfigMaps at
+	//                     admission time and injects literal env var values.
 	PerWorkloadConfigResolution bool `json:"perWorkloadConfigResolution" yaml:"perWorkloadConfigResolution"`
 }
 
@@ -21,11 +22,12 @@ type FeatureGates struct {
 // agents and disabled for tools.
 func DefaultFeatureGates() *FeatureGates {
 	return &FeatureGates{
-		GlobalEnabled:      true,
-		EnvoyProxy:         true,
-		SpiffeHelper:       true,
-		ClientRegistration: true,
-		InjectTools:        false,
+		GlobalEnabled:               true,
+		EnvoyProxy:                  true,
+		SpiffeHelper:                true,
+		ClientRegistration:          true,
+		InjectTools:                 false,
+		PerWorkloadConfigResolution: false,
 	}
 }
 

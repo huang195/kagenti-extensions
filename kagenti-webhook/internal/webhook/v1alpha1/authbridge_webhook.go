@@ -91,7 +91,7 @@ func (w *AuthBridgeWebhook) Handle(ctx context.Context, req admission.Request) a
 		return admission.Allowed("already injected")
 	}
 
-	if mutated, err := w.Mutator.InjectAuthBridge(ctx, &pod.Spec, req.Namespace, resourceName, pod.Labels); err != nil {
+	if mutated, err := w.Mutator.InjectAuthBridge(ctx, &pod.Spec, req.Namespace, resourceName, pod.Labels, pod.Annotations); err != nil {
 		authbridgelog.Error(err, "Failed to mutate pod spec",
 			"namespace", req.Namespace,
 			"name", resourceName)

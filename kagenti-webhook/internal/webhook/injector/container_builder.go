@@ -18,6 +18,8 @@ package injector
 
 import (
 	"fmt"
+	"strconv"
+	"strings"
 
 	"github.com/kagenti/kagenti-extensions/kagenti-webhook/internal/webhook/config"
 	corev1 "k8s.io/api/core/v1"
@@ -450,8 +452,20 @@ func (b *ContainerBuilder) BuildEnvoyProxyContainerWithSpireOption(spireEnabled 
 // Alternative approaches (not currently implemented):
 //   - CNI plugin: Configure iptables at pod network setup time (requires cluster-level changes)
 //   - Istio CNI: Similar approach used by Istio to avoid privileged init containers
-func (b *ContainerBuilder) BuildProxyInitContainer() corev1.Container {
-	builderLog.Info("building ProxyInit Container")
+//
+// mandatoryOutboundExclude is always prepended so that Keycloak traffic
+// (port 8080) is never intercepted by Envoy.
+const mandatoryOutboundExclude = "8080"
+
+// BuildProxyInitContainer creates the proxy-init container. The
+// outboundPortsExclude parameter is a comma-separated list of additional
+// ports to exclude from outbound interception (from the
+// kagenti.io/outbound-ports-exclude annotation). The mandatory port 8080
+// is always included.
+func (b *ContainerBuilder) BuildProxyInitContainer(outboundPortsExclude string) corev1.Container {
+	excludeValue := buildOutboundExcludeValue(outboundPortsExclude)
+
+	builderLog.Info("building ProxyInit Container", "resolvedOutboundPortsExclude", excludeValue)
 
 	return corev1.Container{
 		Name:            ProxyInitContainerName,
@@ -473,7 +487,7 @@ func (b *ContainerBuilder) BuildProxyInitContainer() corev1.Container {
 			},
 			{
 				Name:  "OUTBOUND_PORTS_EXCLUDE",
-				Value: "8080", // Exclude Keycloak port from redirect
+				Value: excludeValue,
 			},
 		},
 		SecurityContext: &corev1.SecurityContext{
@@ -482,4 +496,35 @@ func (b *ContainerBuilder) BuildProxyInitContainer() corev1.Container {
 			Privileged:   ptr.To(true),
 		},
 	}
+}
+
+// buildOutboundExcludeValue merges the mandatory 8080 with validated
+// user-supplied ports. Invalid tokens (non-numeric, out of range) are
+// silently dropped and logged. Duplicates of 8080 are removed.
+func buildOutboundExcludeValue(extra string) string {
+	if extra == "" {
+		return mandatoryOutboundExclude
+	}
+
+	seen := map[string]bool{mandatoryOutboundExclude: true}
+	ports := []string{mandatoryOutboundExclude}
+
+	for _, tok := range strings.Split(extra, ",") {
+		tok = strings.TrimSpace(tok)
+		if tok == "" {
+			continue
+		}
+		p, err := strconv.Atoi(tok)
+		if err != nil || p < 1 || p > 65535 {
+			builderLog.V(0).Info("WARNING: ignoring invalid port in outbound-ports-exclude annotation", "value", tok)
+			continue
+		}
+		normalized := strconv.Itoa(p)
+		if seen[normalized] {
+			continue
+		}
+		seen[normalized] = true
+		ports = append(ports, normalized)
+	}
+	return strings.Join(ports, ",")
 }

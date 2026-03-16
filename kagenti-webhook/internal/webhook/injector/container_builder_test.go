@@ -237,6 +237,85 @@ func TestBuildEnvoyProxyContainer_HasKeycloakURLAndRealm(t *testing.T) {
 	}
 }
 
+func TestBuildOutboundExcludeValue_Empty(t *testing.T) {
+	got := buildOutboundExcludeValue("")
+	if got != "8080" {
+		t.Errorf("buildOutboundExcludeValue(\"\") = %q, want %q", got, "8080")
+	}
+}
+
+func TestBuildOutboundExcludeValue_SinglePort(t *testing.T) {
+	got := buildOutboundExcludeValue("11434")
+	if got != "8080,11434" {
+		t.Errorf("buildOutboundExcludeValue(\"11434\") = %q, want %q", got, "8080,11434")
+	}
+}
+
+func TestBuildOutboundExcludeValue_MultiplePorts(t *testing.T) {
+	got := buildOutboundExcludeValue("11434,4317")
+	if got != "8080,11434,4317" {
+		t.Errorf("buildOutboundExcludeValue(\"11434,4317\") = %q, want %q", got, "8080,11434,4317")
+	}
+}
+
+func TestBuildOutboundExcludeValue_Deduplicates8080(t *testing.T) {
+	got := buildOutboundExcludeValue("8080,11434")
+	if got != "8080,11434" {
+		t.Errorf("buildOutboundExcludeValue(\"8080,11434\") = %q, want %q", got, "8080,11434")
+	}
+}
+
+func TestBuildOutboundExcludeValue_TrimsWhitespace(t *testing.T) {
+	got := buildOutboundExcludeValue(" 11434 , 4317 ")
+	if got != "8080,11434,4317" {
+		t.Errorf("buildOutboundExcludeValue(\" 11434 , 4317 \") = %q, want %q", got, "8080,11434,4317")
+	}
+}
+
+func TestBuildOutboundExcludeValue_DropsInvalidTokens(t *testing.T) {
+	got := buildOutboundExcludeValue("11434,abc,0,65536,-1,,99999")
+	if got != "8080,11434" {
+		t.Errorf("buildOutboundExcludeValue with invalid tokens = %q, want %q", got, "8080,11434")
+	}
+}
+
+func TestBuildOutboundExcludeValue_BoundaryPorts(t *testing.T) {
+	got := buildOutboundExcludeValue("1,65535")
+	if got != "8080,1,65535" {
+		t.Errorf("buildOutboundExcludeValue(\"1,65535\") = %q, want %q", got, "8080,1,65535")
+	}
+}
+
+func TestBuildProxyInitContainer_DefaultExclude(t *testing.T) {
+	builder := NewContainerBuilder(config.CompiledDefaults())
+	container := builder.BuildProxyInitContainer("")
+
+	for _, env := range container.Env {
+		if env.Name == "OUTBOUND_PORTS_EXCLUDE" {
+			if env.Value != "8080" {
+				t.Errorf("OUTBOUND_PORTS_EXCLUDE = %q, want %q", env.Value, "8080")
+			}
+			return
+		}
+	}
+	t.Error("proxy-init container missing OUTBOUND_PORTS_EXCLUDE env var")
+}
+
+func TestBuildProxyInitContainer_WithAnnotationPorts(t *testing.T) {
+	builder := NewContainerBuilder(config.CompiledDefaults())
+	container := builder.BuildProxyInitContainer("11434,4317")
+
+	for _, env := range container.Env {
+		if env.Name == "OUTBOUND_PORTS_EXCLUDE" {
+			if env.Value != "8080,11434,4317" {
+				t.Errorf("OUTBOUND_PORTS_EXCLUDE = %q, want %q", env.Value, "8080,11434,4317")
+			}
+			return
+		}
+	}
+	t.Error("proxy-init container missing OUTBOUND_PORTS_EXCLUDE env var")
+}
+
 func TestBuildEnvoyProxyContainer_HasExpectedAudienceFromConfigMap(t *testing.T) {
 	builder := NewContainerBuilder(config.CompiledDefaults())
 	container := builder.BuildEnvoyProxyContainerWithSpireOption(true)

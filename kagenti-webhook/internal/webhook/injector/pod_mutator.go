@@ -58,6 +58,11 @@ const (
 	IstioSidecarInjectAnnotation = "sidecar.istio.io/inject"
 	AmbientRedirectionAnnotation = "ambient.istio.io/redirection"
 
+	// Port exclusion annotations — per-workload iptables overrides.
+	// Values are comma-separated port numbers appended to the mandatory
+	// outbound exclusion (8080). Example: "11434,4317"
+	OutboundPortsExcludeAnnotation = "kagenti.io/outbound-ports-exclude"
+
 	// KagentiTypeLabel is the label key that identifies the workload type
 	KagentiTypeLabel = "kagenti.io/type"
 	// KagentiTypeAgent is the label value that identifies agent workloads
@@ -89,7 +94,7 @@ func NewPodMutator(
 }
 
 // InjectAuthBridge evaluates the multi-layer precedence chain and conditionally injects sidecars.
-func (m *PodMutator) InjectAuthBridge(ctx context.Context, podSpec *corev1.PodSpec, namespace, crName string, labels map[string]string) (bool, error) {
+func (m *PodMutator) InjectAuthBridge(ctx context.Context, podSpec *corev1.PodSpec, namespace, crName string, labels, annotations map[string]string) (bool, error) {
 	mutatorLog.Info("InjectAuthBridge called", "namespace", namespace, "crName", crName, "labels", labels)
 
 	// Pre-filter: kagenti.io/type must be agent or tool.
@@ -188,7 +193,8 @@ func (m *PodMutator) InjectAuthBridge(ctx context.Context, podSpec *corev1.PodSp
 	}
 
 	if decision.ProxyInit.Inject && !containerExists(podSpec.InitContainers, ProxyInitContainerName) {
-		podSpec.InitContainers = append(podSpec.InitContainers, builder.BuildProxyInitContainer())
+		outboundExclude := annotations[OutboundPortsExcludeAnnotation]
+		podSpec.InitContainers = append(podSpec.InitContainers, builder.BuildProxyInitContainer(outboundExclude))
 	}
 
 	if decision.SpiffeHelper.Inject && !containerExists(podSpec.Containers, SpiffeHelperContainerName) {

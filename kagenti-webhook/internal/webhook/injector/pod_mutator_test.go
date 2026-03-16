@@ -123,7 +123,7 @@ func TestInjectAuthBridge_SetsServiceAccountName(t *testing.T) {
 		KagentiTypeLabel: KagentiTypeAgent,
 	}
 
-	injected, err := m.InjectAuthBridge(ctx, podSpec, "test-ns", "my-agent", labels)
+	injected, err := m.InjectAuthBridge(ctx, podSpec, "test-ns", "my-agent", labels, nil)
 	if err != nil {
 		t.Fatalf("InjectAuthBridge() returned error: %v", err)
 	}
@@ -151,7 +151,7 @@ func TestInjectAuthBridge_RespectsExistingServiceAccountName(t *testing.T) {
 		KagentiTypeLabel: KagentiTypeAgent,
 	}
 
-	injected, err := m.InjectAuthBridge(ctx, podSpec, "test-ns", "my-agent", labels)
+	injected, err := m.InjectAuthBridge(ctx, podSpec, "test-ns", "my-agent", labels, nil)
 	if err != nil {
 		t.Fatalf("InjectAuthBridge() returned error: %v", err)
 	}
@@ -175,7 +175,7 @@ func TestInjectAuthBridge_NoSACreationWhenSpiffeHelperDisabled(t *testing.T) {
 		LabelSpiffeHelperInject: "false", // explicitly opt out of spiffe-helper
 	}
 
-	injected, err := m.InjectAuthBridge(ctx, podSpec, "test-ns", "my-agent", labels)
+	injected, err := m.InjectAuthBridge(ctx, podSpec, "test-ns", "my-agent", labels, nil)
 	if err != nil {
 		t.Fatalf("InjectAuthBridge() returned error: %v", err)
 	}
@@ -204,7 +204,7 @@ func TestInjectAuthBridge_Tool_SkipsInjectionByDefault(t *testing.T) {
 		KagentiTypeLabel: KagentiTypeTool,
 	}
 
-	injected, err := m.InjectAuthBridge(ctx, podSpec, "test-ns", "my-tool", labels)
+	injected, err := m.InjectAuthBridge(ctx, podSpec, "test-ns", "my-tool", labels, nil)
 	if err != nil {
 		t.Fatalf("InjectAuthBridge() returned error: %v", err)
 	}
@@ -228,7 +228,7 @@ func TestInjectAuthBridge_GlobalOptOut_Agent(t *testing.T) {
 		AuthBridgeInjectLabel: AuthBridgeDisabledValue,
 	}
 
-	injected, err := m.InjectAuthBridge(ctx, podSpec, "test-ns", "my-agent", labels)
+	injected, err := m.InjectAuthBridge(ctx, podSpec, "test-ns", "my-agent", labels, nil)
 	if err != nil {
 		t.Fatalf("InjectAuthBridge() returned error: %v", err)
 	}
@@ -253,7 +253,7 @@ func TestInjectAuthBridge_Tool_SkippedByGateRegardlessOfOptOut(t *testing.T) {
 		AuthBridgeInjectLabel: AuthBridgeDisabledValue,
 	}
 
-	injected, err := m.InjectAuthBridge(ctx, podSpec, "test-ns", "my-tool", labels)
+	injected, err := m.InjectAuthBridge(ctx, podSpec, "test-ns", "my-tool", labels, nil)
 	if err != nil {
 		t.Fatalf("InjectAuthBridge() returned error: %v", err)
 	}
@@ -277,7 +277,7 @@ func TestInjectAuthBridge_DefaultSAOverridden(t *testing.T) {
 		KagentiTypeLabel: KagentiTypeAgent,
 	}
 
-	injected, err := m.InjectAuthBridge(ctx, podSpec, "test-ns", "my-agent", labels)
+	injected, err := m.InjectAuthBridge(ctx, podSpec, "test-ns", "my-agent", labels, nil)
 	if err != nil {
 		t.Fatalf("InjectAuthBridge() returned error: %v", err)
 	}
@@ -287,4 +287,75 @@ func TestInjectAuthBridge_DefaultSAOverridden(t *testing.T) {
 	if podSpec.ServiceAccountName != "my-agent" {
 		t.Errorf("expected ServiceAccountName=%q (overriding 'default'), got %q", "my-agent", podSpec.ServiceAccountName)
 	}
+}
+
+func TestInjectAuthBridge_OutboundPortsExcludeAnnotation(t *testing.T) {
+	m := newTestMutator()
+	ctx := context.Background()
+
+	podSpec := &corev1.PodSpec{}
+	labels := map[string]string{
+		KagentiTypeLabel: KagentiTypeAgent,
+	}
+	annotations := map[string]string{
+		OutboundPortsExcludeAnnotation: "11434",
+	}
+
+	injected, err := m.InjectAuthBridge(ctx, podSpec, "test-ns", "my-agent", labels, annotations)
+	if err != nil {
+		t.Fatalf("InjectAuthBridge() returned error: %v", err)
+	}
+	if !injected {
+		t.Fatal("expected InjectAuthBridge to return true")
+	}
+
+	for _, ic := range podSpec.InitContainers {
+		if ic.Name != ProxyInitContainerName {
+			continue
+		}
+		for _, env := range ic.Env {
+			if env.Name == "OUTBOUND_PORTS_EXCLUDE" {
+				if env.Value != "8080,11434" {
+					t.Errorf("OUTBOUND_PORTS_EXCLUDE = %q, want %q", env.Value, "8080,11434")
+				}
+				return
+			}
+		}
+		t.Fatal("proxy-init container missing OUTBOUND_PORTS_EXCLUDE env var")
+	}
+	t.Fatal("proxy-init container not found in initContainers")
+}
+
+func TestInjectAuthBridge_NilAnnotations(t *testing.T) {
+	m := newTestMutator()
+	ctx := context.Background()
+
+	podSpec := &corev1.PodSpec{}
+	labels := map[string]string{
+		KagentiTypeLabel: KagentiTypeAgent,
+	}
+
+	injected, err := m.InjectAuthBridge(ctx, podSpec, "test-ns", "my-agent", labels, nil)
+	if err != nil {
+		t.Fatalf("InjectAuthBridge() returned error: %v", err)
+	}
+	if !injected {
+		t.Fatal("expected InjectAuthBridge to return true")
+	}
+
+	for _, ic := range podSpec.InitContainers {
+		if ic.Name != ProxyInitContainerName {
+			continue
+		}
+		for _, env := range ic.Env {
+			if env.Name == "OUTBOUND_PORTS_EXCLUDE" {
+				if env.Value != "8080" {
+					t.Errorf("OUTBOUND_PORTS_EXCLUDE = %q, want %q (nil annotations should default to 8080 only)", env.Value, "8080")
+				}
+				return
+			}
+		}
+		t.Fatal("proxy-init container missing OUTBOUND_PORTS_EXCLUDE env var")
+	}
+	t.Fatal("proxy-init container not found in initContainers")
 }

@@ -339,18 +339,18 @@ Ollama traffic on port 11434 is intercepted by Envoy, which corrupts the LLM's
 streaming response and causes function calling failures.
 
 **Workaround:** After deploying the agent, exclude Ollama's port from Envoy
-interception by adding an init container that runs after `proxy-init`:
+interception by appending an init container that runs after `proxy-init`:
 
 ```bash
 kubectl patch deployment weather-service -n team1 --type=json -p='[
-  {"op":"add","path":"/spec/template/spec/initContainers","value":[
+  {"op":"add","path":"/spec/template/spec/initContainers/-","value":
     {
       "name":"fix-iptables",
       "image":"alpine:3.19",
       "command":["sh","-c","apk add --no-cache iptables && iptables -t nat -I OUTPUT -p tcp --dport 11434 -j RETURN"],
       "securityContext":{"capabilities":{"add":["NET_ADMIN"]},"runAsUser":0}
     }
-  ]}
+  }
 ]'
 kubectl rollout status deployment/weather-service -n team1 --timeout=120s
 ```
@@ -362,7 +362,8 @@ annotation or ConfigMap.
 
 ### Option B: OpenAI
 
-Verify the OpenAI secret was created (Step 2, item 11):
+Verify the OpenAI secret exists (see the prerequisite note in
+[Step 2](#step-2-import-the-weather-agent-via-kagenti-ui)):
 
 ```bash
 kubectl get secret openai-secret -n team1

@@ -2,10 +2,21 @@
 
 This guide walks you through testing JWT-SVID authentication using local images (no push to ghcr.io).
 
+## ⚠️ Important: Use the Build Script
+
+**CRITICAL**: You MUST run the `./local-build-and-test.sh` script to build all required images. Do NOT build images individually with `docker build` or `podman build` commands, as this will miss critical images like `spiffe-idp-setup:local` (located in the kagenti repo).
+
+The script:
+- Builds images from **both** kagenti and kagenti-extensions repositories
+- Automatically detects Docker vs Podman
+- Loads all images into your Kind cluster
+- Ensures consistent image tags and pull policies
+
 ## Prerequisites
 
 - Docker or Podman running
 - Kind CLI installed
+- Both `kagenti` and `kagenti-extensions` repositories cloned
 
 ## Step 0: Create Kind Cluster
 
@@ -33,10 +44,14 @@ kubectl cluster-info --context kind-kagenti-dev
 
 ## Step 1: Build and Load Local Images
 
+**⚠️ REQUIRED: Run the automated build script**
+
+The `local-build-and-test.sh` script is the **only supported way** to build local images for testing. It builds images from both repositories and ensures everything is loaded correctly.
+
 ```bash
 cd kagenti-extensions
 
-# Make the script executable
+# Make the script executable (first time only)
 chmod +x local-build-and-test.sh
 
 # Build all images and load into Kind cluster
@@ -48,12 +63,25 @@ export KIND_EXPERIMENTAL_PROVIDER=podman  # Only needed for Podman
 # CLUSTER_NAME=my-cluster ./local-build-and-test.sh
 ```
 
-This builds and loads:
-- `spiffe-idp-setup:local`
-- `client-registration:local` (with UID 1337)
-- `kagenti-webhook:local` (with updated container_builder.go)
-- `envoy-with-processor:local`
-- `proxy-init:local`
+### What the script builds and loads:
+
+**From kagenti repo** (critical - often missed!):
+- `ghcr.io/kagenti/kagenti/spiffe-idp-setup:local` - Configures SPIFFE Identity Provider in Keycloak
+
+**From kagenti-extensions repo**:
+- `ghcr.io/kagenti/kagenti-extensions/client-registration:local` - Registers agents as Keycloak clients
+- `ghcr.io/kagenti/kagenti-extensions/kagenti-webhook:local` - Admission webhook for sidecar injection
+- `ghcr.io/kagenti/kagenti-extensions/envoy-with-processor:local` - Envoy proxy with token exchange
+- `ghcr.io/kagenti/kagenti-extensions/proxy-init:local` - iptables initialization
+
+### Common Mistakes to Avoid:
+
+❌ **DON'T** run individual `docker build` or `podman build` commands
+❌ **DON'T** skip building images from the kagenti repo
+❌ **DON'T** forget to set `KIND_EXPERIMENTAL_PROVIDER=podman` if using Podman
+
+✅ **DO** run `./local-build-and-test.sh` every time you need to rebuild
+✅ **DO** verify all images are loaded: `kind get images --name kagenti-dev | grep :local`
 
 **Note for Podman users:** The script automatically detects Podman and uses tar archives to load images into Kind, since `kind load docker-image` doesn't work with Podman's image store.
 
@@ -156,38 +184,139 @@ Expected output:
 - ✅ Keycloak admin secret exists
 - ✅ SPIFFE IdP setup job completed successfully
 
-## Step 5: Run AuthBridge Demo
+## Step 5: Test SPIFFE/Keycloak Authentication
 
-### Option A: Manual Demo (Recommended First)
+This test verifies that workloads can authenticate to Keycloak using JWT-SVIDs from SPIRE.
 
-Follow [AuthBridge/demos/github-issue/demo-manual.md](AuthBridge/demos/github-issue/demo-manual.md):
+### Create Test Deployment
 
 ```bash
-cd /Users/alan/Documents/Work/kagenti-extensions/AuthBridge/demos/github-issue
+# 1. Create namespace and deploy SPIFFE helper pod
+kubectl create namespace agent1
 
-# 1. Create namespace
-kubectl create namespace team1
-kubectl label namespace team1 kagenti-enabled=true
+kubectl apply -f - <<'EOF'
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: spiffe-helper-config
+  namespace: agent1
+data:
+  helper.conf: |
+    agent_address = "/spiffe-workload-api/spire-agent.sock"
+    cmd = ""
+    cmd_args = ""
+    svid_file_name = "/opt/svid.pem"
+    svid_key_file_name = "/opt/svid_key.pem"
+    svid_bundle_file_name = "/opt/svid_bundle.pem"
+    jwt_svids = [{jwt_audience="http://keycloak.localtest.me:8080/realms/kagenti", jwt_svid_file_name="/opt/jwt_svid.token"}]
+    jwt_svid_file_mode = 0644
+    include_federated_domains = true
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: spiffe-demo
+  namespace: agent1
+  labels:
+    app: spiffe-demo
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: spiffe-demo
+  template:
+    metadata:
+      labels:
+        app: spiffe-demo
+    spec:
+      containers:
+      - name: spiffe-helper
+        image: ghcr.io/spiffe/spiffe-helper:nightly
+        args: ["-config", "/conf/helper.conf"]
+        volumeMounts:
+        - name: spiffe-workload-api
+          mountPath: /spiffe-workload-api
+          readOnly: true
+        - name: certs
+          mountPath: /opt
+        - name: config
+          mountPath: /conf
+      - name: tools
+        image: ghcr.io/nicolaka/netshoot:latest
+        command: ["sleep", "infinity"]
+        volumeMounts:
+        - name: certs
+          mountPath: /opt
+          readOnly: true
+      volumes:
+      - name: spiffe-workload-api
+        csi:
+          driver: "csi.spiffe.io"
+          readOnly: true
+      - name: certs
+        emptyDir: {}
+      - name: config
+        configMap:
+          name: spiffe-helper-config
+EOF
 
-# 2. Deploy ConfigMaps (use the updated ones with kagenti-webhook-config)
-kubectl apply -f k8s/configmaps.yaml
-
-# 3. Deploy demo workload
-kubectl apply -f k8s/deployment.yaml
-
-# 4. Check client-registration sidecar logs
-kubectl logs -n team1 deployment/weather-service -c kagenti-client-registration -f
-
-# Expected (Phase 1 - client-secret):
-# "Configuring client for client-secret authentication"
-
-# Expected (Phase 2 - federated-jwt):
-# "Configuring client for JWT-SVID authentication (federated-jwt)"
+# Wait for pod to be ready
+kubectl wait -n agent1 --for=condition=ready pod -l app=spiffe-demo --timeout=120s
 ```
 
-### Option B: Webhook-Based Demo
+### Create Keycloak Client
 
-Follow [AuthBridge/demos/webhook/README.md](AuthBridge/demos/webhook/README.md) for automatic sidecar injection testing.
+```bash
+# 2. Configure kcadm.sh credentials
+kubectl exec -n keycloak keycloak-0 -- /opt/keycloak/bin/kcadm.sh config credentials \
+  --server http://localhost:8080 --realm master --user admin --password admin
+
+# 3. Create client with SPIFFE authentication
+kubectl exec -n keycloak keycloak-0 -- /opt/keycloak/bin/kcadm.sh create clients -r kagenti \
+  -s 'clientId=spiffe://localtest.me/ns/agent1/sa/default' \
+  -s 'clientAuthenticatorType=client-spiffe' \
+  -s 'serviceAccountsEnabled=true' \
+  -s 'directAccessGrantsEnabled=false' \
+  -s 'standardFlowEnabled=false' \
+  -s 'enabled=true'
+```
+
+### Test Token Exchange
+
+```bash
+# 4. Get JWT-SVID from the pod
+export JWT=$(kubectl exec -n agent1 deploy/spiffe-demo -c tools -- sh -c 'cat /opt/jwt_svid.token')
+
+# 5. Exchange JWT-SVID for access token
+curl -s -X POST \
+    -d "grant_type=client_credentials" \
+    -d "client_id=spiffe://localtest.me/ns/agent1/sa/default" \
+    -d "client_assertion_type=urn:ietf:params:oauth:client-assertion-type:jwt-spiffe" \
+    -d "client_assertion=$JWT" \
+    "http://keycloak.localtest.me:8080/realms/kagenti/protocol/openid-connect/token"
+```
+
+**Expected output:** JSON response with `access_token`, `expires_in`, `token_type`, etc.
+
+**What this test verifies:**
+- SPIRE agent issues JWT-SVIDs with correct audience
+- Keycloak SPIFFE IdP is configured correctly
+- Workloads can authenticate using their SPIFFE identity
+- Token exchange flow works end-to-end
+
+### Cleanup
+
+```bash
+kubectl delete namespace agent1
+```
+
+### Optional: Run Full AuthBridge Demo
+
+For testing the complete AuthBridge flow with automatic sidecar injection:
+
+**Manual Demo:** Follow [AuthBridge/demos/github-issue/demo-manual.md](AuthBridge/demos/github-issue/demo-manual.md)
+
+**Webhook Demo:** Follow [AuthBridge/demos/webhook/README.md](AuthBridge/demos/webhook/README.md)
 
 ---
 
@@ -341,6 +470,135 @@ kubectl run test-curl --rm -i --image=curlimages/curl --restart=Never -- \
 3. **Race condition avoidance**: The job must run AFTER the ConfigMap is patched, not as a Helm post-install hook
 
 **Recommendation:** Use the Ansible installer (Step 3 in main guide) instead of standalone Helm - it handles all of this automatically!
+
+## Troubleshooting
+
+### Issue: ErrImageNeverPull for spiffe-idp-setup
+
+**Symptom:**
+```
+kagenti-spiffe-idp-setup-job-xxxxx   0/1   ErrImageNeverPull   0   5m
+```
+
+**Root Cause:** The `spiffe-idp-setup:local` image wasn't built or loaded into Kind.
+
+**Solution:**
+1. Verify you ran `./local-build-and-test.sh` (not individual docker build commands)
+2. Check if the image is loaded:
+   ```bash
+   kind get images --name kagenti-dev | grep spiffe-idp-setup
+   ```
+3. If missing, rebuild:
+   ```bash
+   cd /Users/alan/Documents/Work/kagenti/kagenti/auth/spiffe-idp-setup
+
+   # For Docker:
+   docker build -t ghcr.io/kagenti/kagenti/spiffe-idp-setup:local .
+   kind load docker-image ghcr.io/kagenti/kagenti/spiffe-idp-setup:local --name kagenti-dev
+
+   # For Podman:
+   podman build -t ghcr.io/kagenti/kagenti/spiffe-idp-setup:local .
+   podman save ghcr.io/kagenti/kagenti/spiffe-idp-setup:local -o /tmp/spiffe-idp.tar
+   kind load image-archive /tmp/spiffe-idp.tar --name kagenti-dev
+   rm /tmp/spiffe-idp.tar
+   ```
+4. Delete the failing pod:
+   ```bash
+   kubectl delete pod -n kagenti-system -l job-name=kagenti-spiffe-idp-setup-job
+   ```
+
+### Issue: SPIFFE IdP Job Init Container CrashLoopBackOff
+
+**Symptom:**
+```
+kagenti-spiffe-idp-setup-job-xxxxx   0/1   Init:CrashLoopBackOff   3   2m
+```
+
+**Root Cause:** Missing RBAC permissions to list pods in keycloak or SPIRE namespaces.
+
+**Check:**
+```bash
+kubectl logs -n kagenti-system -l job-name=kagenti-spiffe-idp-setup-job -c wait-for-spire
+```
+
+**Expected error:**
+```
+Error from server (Forbidden): pods is forbidden: User "system:serviceaccount:kagenti-system:kagenti-spiffe-idp-setup"
+cannot list resource "pods" in API group "" in the namespace "keycloak"
+```
+
+**Solution:** This should be automatically created by the Ansible installer. If missing, manually create RBAC:
+```bash
+# For keycloak namespace
+kubectl create role kagenti-spiffe-idp-pod-reader \
+  -n keycloak \
+  --verb=get,list,watch \
+  --resource=pods
+
+kubectl create rolebinding kagenti-spiffe-idp-pod-reader \
+  -n keycloak \
+  --role=kagenti-spiffe-idp-pod-reader \
+  --serviceaccount=kagenti-system:kagenti-spiffe-idp-setup
+```
+
+### Issue: Token Exchange Fails with "invalid_client"
+
+**Symptom:**
+```json
+{"error":"invalid_client","error_description":"Invalid client or Invalid client credentials"}
+```
+
+**Root Causes & Solutions:**
+
+1. **Wrong client_assertion_type**
+   - ❌ DON'T use: `urn:ietf:params:oauth:client-assertion-type:jwt-bearer`
+   - ✅ DO use: `urn:ietf:params:oauth:client-assertion-type:jwt-spiffe`
+
+2. **Client not configured for federated-jwt**
+   - Check client authenticator type:
+     ```bash
+     kubectl exec -n keycloak keycloak-0 -- sh -c \
+       '/opt/keycloak/bin/kcadm.sh config credentials --server http://localhost:8080 --realm master --user admin --password admin && \
+        /opt/keycloak/bin/kcadm.sh get clients -r kagenti -q clientId="spiffe://localtest.me/ns/agent1/sa/default"' | \
+       jq '.[] | {clientAuthenticatorType, attributes}'
+     ```
+   - Should show:
+     ```json
+     {
+       "clientAuthenticatorType": "federated-jwt",
+       "attributes": {
+         "jwt.credential.issuer": "spire-spiffe",
+         "jwt.credential.sub": "spiffe://localtest.me/ns/agent1/sa/default"
+       }
+     }
+     ```
+
+3. **SPIFFE Identity Provider missing**
+   - Check IdP exists:
+     ```bash
+     kubectl exec -n keycloak keycloak-0 -- sh -c \
+       '/opt/keycloak/bin/kcadm.sh config credentials --server http://localhost:8080 --realm master --user admin --password admin && \
+        /opt/keycloak/bin/kcadm.sh get identity-provider/instances -r kagenti'
+     ```
+   - Should show IdP with alias "spire-spiffe"
+
+### Issue: Images Not Found After Rebuild
+
+**Symptom:** After making code changes and rebuilding, the old images are still used.
+
+**Solution:**
+1. Delete pods to force recreation:
+   ```bash
+   kubectl delete pod -n <namespace> <pod-name>
+   ```
+2. For webhook changes, restart the webhook deployment:
+   ```bash
+   kubectl rollout restart deployment -n kagenti-webhook-system kagenti-webhook
+   ```
+3. Verify new images are loaded:
+   ```bash
+   kind get images --name kagenti-dev | grep :local
+   ```
 
 ## Verify Federated-JWT Configuration
 

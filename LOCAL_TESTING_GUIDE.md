@@ -736,7 +736,7 @@ Since you installed with `dev_values_federated-jwt.yaml`, the system should alre
 
 ```bash
 # 1. Verify authBridge.clientAuthType is set to federated-jwt
-kubectl get configmap kagenti-webhook-config -n <namespace> -o jsonpath='{.data.CLIENT_AUTH_TYPE}'
+kubectl get configmap authbridge-config -n <namespace> -o jsonpath='{.data.CLIENT_AUTH_TYPE}'
 # Expected: federated-jwt
 
 # 2. Deploy an agent and check client-registration logs

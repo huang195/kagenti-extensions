@@ -104,7 +104,7 @@ func TestStaticResolver_GlobMultiLevel(t *testing.T) {
 		matches bool
 	}{
 		{"foo.example.com", true},
-		{"foo.bar.example.com", true},  // ** crosses '.' separator
+		{"foo.bar.example.com", true}, // ** crosses '.' separator
 		{"a.b.c.example.com", true},
 		{"example.com", false},
 	}

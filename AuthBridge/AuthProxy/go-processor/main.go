@@ -98,6 +98,11 @@ const defaultRoutesConfigPath = "/etc/authproxy/routes.yaml"
 
 var globalResolver resolver.TargetResolver
 
+// defaultOutboundPolicy controls behavior when no route matches.
+// "passthrough" (default): Pass traffic unchanged unless explicit route matches.
+// "exchange": Attempt token exchange using global config if available.
+var defaultOutboundPolicy = "passthrough"
+
 // defaultBypassInboundPaths are paths that skip inbound JWT validation by default.
 // These cover common public endpoints: Agent Card discovery, health/readiness probes.
 var defaultBypassInboundPaths = []string{"/.well-known/*", "/healthz", "/readyz", "/livez"}
@@ -609,6 +614,16 @@ func (p *processor) handleOutbound(ctx context.Context, headers *core.HeaderMap)
 		}
 	}
 
+	// Handle default outbound policy when no route matches
+	if targetConfig == nil && defaultOutboundPolicy == "passthrough" {
+		log.Printf("[Resolver] No route for host %q and default policy is passthrough, skipping token exchange", requestHost)
+		return &v3.ProcessingResponse{
+			Response: &v3.ProcessingResponse_RequestHeaders{
+				RequestHeaders: &v3.HeadersResponse{},
+			},
+		}
+	}
+
 	// Get global configuration (from files or env vars)
 	clientID, clientSecret, tokenURL, targetAudience, targetScopes, spireEnabled, jwtSvidPath := getConfig()
 
@@ -832,6 +847,12 @@ func main() {
 		}
 	}
 	log.Printf("[Inbound] Bypass paths: %v", bypassInboundPaths)
+
+	// Initialize default outbound policy
+	if policy := os.Getenv("DEFAULT_OUTBOUND_POLICY"); policy != "" {
+		defaultOutboundPolicy = policy
+	}
+	log.Printf("[Outbound] Default policy when no route matches: %s", defaultOutboundPolicy)
 
 	// Initialize the target resolver
 	configPath := os.Getenv("ROUTES_CONFIG_PATH")

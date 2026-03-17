@@ -520,47 +520,16 @@ func (b *ContainerBuilder) BuildProxyInitContainer(outboundPortsExclude, inbound
 	}
 }
 
-// buildOutboundExcludeValue merges the mandatory 8080 with validated
-// user-supplied ports. Invalid tokens (non-numeric, out of range) are
-// silently dropped and logged. Duplicates of 8080 are removed.
-func buildOutboundExcludeValue(extra string) string {
-	if extra == "" {
-		return mandatoryOutboundExclude
-	}
-
-	seen := map[string]bool{mandatoryOutboundExclude: true}
-	ports := []string{mandatoryOutboundExclude}
-
-	for _, tok := range strings.Split(extra, ",") {
-		tok = strings.TrimSpace(tok)
-		if tok == "" {
-			continue
-		}
-		p, err := strconv.Atoi(tok)
-		if err != nil || p < 1 || p > 65535 {
-			builderLog.V(0).Info("WARNING: ignoring invalid port in outbound-ports-exclude annotation", "value", tok)
-			continue
-		}
-		normalized := strconv.Itoa(p)
-		if seen[normalized] {
-			continue
-		}
-		seen[normalized] = true
-		ports = append(ports, normalized)
-	}
-	return strings.Join(ports, ",")
-}
-
-// buildPortExcludeValue validates and deduplicates a comma-separated port
-// list. Returns "" when the input is empty. Used for inbound port exclusion
-// where there is no mandatory port.
-func buildPortExcludeValue(raw, annotationName string) string {
-	if raw == "" {
-		return ""
-	}
-
+// validateAndDeduplicatePorts parses a comma-separated port string, validates
+// each token (numeric, 1-65535), deduplicates, and returns the clean list.
+// initialPorts are prepended and excluded from duplicates.
+func validateAndDeduplicatePorts(raw, annotationName string, initialPorts []string) []string {
 	seen := map[string]bool{}
-	var ports []string
+	ports := make([]string, 0, len(initialPorts)+4)
+	for _, p := range initialPorts {
+		seen[p] = true
+		ports = append(ports, p)
+	}
 
 	for _, tok := range strings.Split(raw, ",") {
 		tok = strings.TrimSpace(tok)
@@ -579,5 +548,25 @@ func buildPortExcludeValue(raw, annotationName string) string {
 		seen[normalized] = true
 		ports = append(ports, normalized)
 	}
-	return strings.Join(ports, ",")
+	return ports
+}
+
+// buildOutboundExcludeValue merges the mandatory 8080 with validated
+// user-supplied ports. Invalid tokens (non-numeric, out of range) are
+// silently dropped and logged. Duplicates of 8080 are removed.
+func buildOutboundExcludeValue(extra string) string {
+	if extra == "" {
+		return mandatoryOutboundExclude
+	}
+	return strings.Join(validateAndDeduplicatePorts(extra, "outbound-ports-exclude", []string{mandatoryOutboundExclude}), ",")
+}
+
+// buildPortExcludeValue validates and deduplicates a comma-separated port
+// list. Returns "" when the input is empty. Used for inbound port exclusion
+// where there is no mandatory port.
+func buildPortExcludeValue(raw, annotationName string) string {
+	if raw == "" {
+		return ""
+	}
+	return strings.Join(validateAndDeduplicatePorts(raw, annotationName, nil), ",")
 }

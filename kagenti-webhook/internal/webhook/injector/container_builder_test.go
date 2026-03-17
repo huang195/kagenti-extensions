@@ -290,8 +290,10 @@ func TestBuildProxyInitContainer_DefaultExclude(t *testing.T) {
 	builder := NewContainerBuilder(config.CompiledDefaults())
 	container := builder.BuildProxyInitContainer("", "")
 
+	var foundOutbound bool
 	for _, env := range container.Env {
 		if env.Name == "OUTBOUND_PORTS_EXCLUDE" {
+			foundOutbound = true
 			if env.Value != "8080" {
 				t.Errorf("OUTBOUND_PORTS_EXCLUDE = %q, want %q", env.Value, "8080")
 			}
@@ -300,14 +302,19 @@ func TestBuildProxyInitContainer_DefaultExclude(t *testing.T) {
 			t.Error("INBOUND_PORTS_EXCLUDE should not be set when inbound exclude is empty")
 		}
 	}
+	if !foundOutbound {
+		t.Error("proxy-init container missing OUTBOUND_PORTS_EXCLUDE env var")
+	}
 }
 
 func TestBuildProxyInitContainer_WithAnnotationPorts(t *testing.T) {
 	builder := NewContainerBuilder(config.CompiledDefaults())
 	container := builder.BuildProxyInitContainer("11434,4317", "")
 
+	var foundOutbound bool
 	for _, env := range container.Env {
 		if env.Name == "OUTBOUND_PORTS_EXCLUDE" {
+			foundOutbound = true
 			if env.Value != "8080,11434,4317" {
 				t.Errorf("OUTBOUND_PORTS_EXCLUDE = %q, want %q", env.Value, "8080,11434,4317")
 			}
@@ -315,6 +322,9 @@ func TestBuildProxyInitContainer_WithAnnotationPorts(t *testing.T) {
 		if env.Name == "INBOUND_PORTS_EXCLUDE" {
 			t.Error("INBOUND_PORTS_EXCLUDE should not be set when inbound exclude is empty")
 		}
+	}
+	if !foundOutbound {
+		t.Error("proxy-init container missing OUTBOUND_PORTS_EXCLUDE env var")
 	}
 }
 

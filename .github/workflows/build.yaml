@@ -5,6 +5,9 @@ on:
   push:
     tags:
       - 'v*'
+    # Trigger on PR merges to main
+    branches:
+      - main
   # Allow manual trigger
   workflow_dispatch:
 
@@ -86,8 +89,8 @@ jobs:
           tags: |
             # Always use the computed tag
             type=raw,value=${{ steps.tag.outputs.tag }}
-            # Add 'latest' tag only for version tags
-            type=raw,value=latest,enable=${{ github.ref_type == 'tag' && startsWith(github.ref_name, 'v') }}
+            # Add 'latest' tag for version tags, workflow_dispatch, and pushes to main
+            type=raw,value=latest,enable=${{ (github.ref_type == 'tag' && startsWith(github.ref_name, 'v')) || github.event_name == 'workflow_dispatch' || github.ref == 'refs/heads/main' }}
 
       # 7. Build and push image
       - name: Build and push ${{ matrix.image_config.name }}

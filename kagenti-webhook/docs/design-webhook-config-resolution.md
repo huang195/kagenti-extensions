@@ -19,7 +19,7 @@ The kagenti-webhook injects AuthBridge sidecars into Pods at CREATE time. The in
 | Source | What it provides | How it's consumed today |
 |--------|-----------------|------------------------|
 | **Platform defaults** (`kagenti-webhook-defaults` ConfigMap) | Container images, proxy ports, resource limits | Loaded at startup, hot-reloaded via file watcher. Used by `ContainerBuilder` to set image, ports, resources. |
-| **Namespace ConfigMaps** (5 well-known names) | Keycloak URL/realm, token exchange params, envoy routing, SPIFFE helper config, admin credentials | Emitted as `ValueFrom` references in container env vars. Resolved by kubelet at Pod startup — **the webhook never reads these values**. |
+| **Namespace ConfigMaps** (4 ConfigMaps + 1 Secret) | Keycloak URL/realm, token exchange params, envoy routing, SPIFFE helper config, admin credentials | Emitted as `ValueFrom` references in container env vars. Resolved by kubelet at Pod startup — **the webhook never reads these values**. |
 | **AgentRuntime CR** (planned) | Per-workload identity and token exchange overrides | **Does not exist yet.** Will be defined in kagenti-operator. |
 
 ### Why this is a problem
@@ -97,8 +97,7 @@ The webhook reads these resources from the **target namespace** (the namespace w
 
 | Resource | Kind | Keys read by webhook |
 |----------|------|---------------------|
-| `environments` | ConfigMap | `KEYCLOAK_URL`, `KEYCLOAK_REALM`, `SPIRE_ENABLED`, `PLATFORM_CLIENT_IDS` |
-| `authbridge-config` | ConfigMap | `TOKEN_URL`, `ISSUER`, `EXPECTED_AUDIENCE`, `TARGET_AUDIENCE`, `TARGET_SCOPES`, `DEFAULT_OUTBOUND_POLICY` |
+| `authbridge-config` | ConfigMap | `KEYCLOAK_URL`, `KEYCLOAK_REALM`, `SPIRE_ENABLED`, `PLATFORM_CLIENT_IDS`, `TOKEN_URL`, `ISSUER`, `EXPECTED_AUDIENCE`, `TARGET_AUDIENCE`, `TARGET_SCOPES`, `DEFAULT_OUTBOUND_POLICY` |
 | `keycloak-admin-secret` | Secret | `KEYCLOAK_ADMIN_USERNAME`, `KEYCLOAK_ADMIN_PASSWORD` |
 | `spiffe-helper-config` | ConfigMap | `helper.conf` (full file content) |
 | `envoy-config` | ConfigMap | `envoy.yaml` (full file content, optional — if absent, webhook templates it) |
@@ -228,7 +227,6 @@ Pod CREATE admission request
 │     │                                                    │
 │     ├── NEW: Config Resolution (perWorkloadConfigResolution) │
 │     │   ├── ReadNamespaceConfig()                        │
-│     │   │   ├── GET configmap/environments               │
 │     │   │   ├── GET configmap/authbridge-config          │
 │     │   │   ├── GET configmap/spiffe-helper-config       │
 │     │   │   ├── GET configmap/envoy-config (optional)    │
@@ -241,9 +239,6 @@ Pod CREATE admission request
 │     │   └── ResolveConfig(platform, namespace, runtime)  │
 │     │       → ResolvedConfig (all fields merged)         │
 │     │                                                    │
-│     ├── NEW: RenderEnvoyConfig(resolved)                 │
-│     │   → rendered envoy.yaml string                     │
-│     │                                                    │
 │     ├── ContainerBuilder(resolved)                       │
 │     │   ├── BuildEnvoyProxy (literal env vars)           │
 │     │   ├── BuildProxyInit (unchanged)                   │
@@ -255,9 +250,10 @@ Pod CREATE admission request
 │         ├── spiffe-helper-config (ConfigMap ref)         │
 │         └── shared-data, spire-agent-socket, svid-output │
 │                                                          │
-│     Note: Envoy template rendering (RenderEnvoyConfig)   │
-│     is available but not yet wired into the injection    │
-│     pipeline — volumes reference ConfigMaps by name.     │
+│     Note: RenderEnvoyConfig() exists for programmatic     │
+│     ConfigMap creation but is not yet called in the      │
+│     admission pipeline — volumes reference namespace     │
+│     ConfigMaps by name. See envoy_template.go TODO.      │
 │                                                          │
 │  3. Marshal mutated Pod, return JSON patch               │
 └─────────────────────────────────────────────────────────┘
@@ -288,18 +284,17 @@ Holds values extracted from namespace ConfigMaps/Secrets at admission time.
 
 ```go
 type NamespaceConfig struct {
-    // From "environments" ConfigMap
-    KeycloakURL       string
-    KeycloakRealm     string
-    SpireEnabled      string
-    PlatformClientIDs string
-
     // From "authbridge-config" ConfigMap
-    TokenURL         string
-    Issuer           string
-    ExpectedAudience string
-    TargetAudience   string
-    TargetScopes     string
+    KeycloakURL           string
+    KeycloakRealm         string
+    SpireEnabled          string
+    PlatformClientIDs     string
+    TokenURL              string
+    Issuer                string
+    ExpectedAudience      string
+    TargetAudience        string
+    TargetScopes          string
+    DefaultOutboundPolicy string
 
     // Note: keycloak-admin-secret is NOT read into this struct.
     // Credentials stay as SecretKeyRef in the container spec, keeping
@@ -415,18 +410,18 @@ type ResolvedConfig struct {
 
 ## Performance Considerations
 
-The config resolution adds **up to 6 API server reads** per Pod admission (5 ConfigMaps/Secrets + 1 AgentRuntime list). Webhook admission must complete within 10 seconds.
+The config resolution adds **up to 5 API server reads** per Pod admission (4 ConfigMaps + 1 AgentRuntime list). Webhook admission must complete within 10 seconds.
 
-### Namespace Config Caching
+### Feature Gate Behavior
 
-To minimize API server calls, the webhook caches namespace ConfigMaps/Secrets **per namespace** in memory. This is controlled by the `perWorkloadConfigResolution` feature gate:
+The `perWorkloadConfigResolution` feature gate controls which injection path the webhook uses:
 
 | Gate value | Behavior | Use case |
 |------------|----------|----------|
-| `false` (default) | **Cached mode** — ConfigMaps/Secrets are read once per namespace and reused for all workloads in that namespace. Cache lives in memory, cleared on webhook pod restart. | Production — namespace ConfigMaps rarely change. |
-| `true` | **Per-workload mode** — ConfigMaps/Secrets are read from the API server on every admission request. | Development/debugging — see config changes immediately without restart. |
+| `false` (default) | **Legacy path** — env vars use `ValueFrom` ConfigMapKeyRef/SecretKeyRef references. Kubernetes kubelet resolves values at container start. | Production — no additional API calls at admission time. |
+| `true` | **Resolved path** — webhook reads namespace ConfigMaps at admission time and injects literal env var values. Enables AgentRuntime CR overrides. | When per-workload config resolution or AgentRuntime overrides are needed. |
 
-When the `perWorkloadConfigResolution` feature gate is enabled, namespace ConfigMaps are read on every admission request. This is acceptable because:
+When the resolved path is enabled, ConfigMaps are read on every admission request. This is acceptable because:
 - The webhook already makes API calls (ServiceAccount creation) so the client infrastructure exists
 - ConfigMap reads are small (< 1KB each)
 - AgentRuntime list is namespace-scoped and filtered

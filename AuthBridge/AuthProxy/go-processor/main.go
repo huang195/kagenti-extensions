@@ -46,7 +46,7 @@ type actorTokenCache struct {
 }
 
 var globalActorCache = &actorTokenCache{}
-var actorTokenEnabled = true
+var actorTokenEnabled = false
 
 // getActorToken returns a cached actor token or obtains a fresh one via
 // client_credentials grant. The token represents this service's own identity
@@ -723,12 +723,12 @@ func (p *processor) Process(stream v3.ExternalProcessor_ProcessServer) error {
 func main() {
 	log.Println("=== Go External Processor Starting ===")
 
-	// Initialize actor token feature flag
-	if v := os.Getenv("ACTOR_TOKEN_ENABLED"); v == "false" {
-		actorTokenEnabled = false
-		log.Println("[Actor Token] Actor token injection disabled via ACTOR_TOKEN_ENABLED=false")
+	// Initialize actor token feature flag (off by default, requires explicit opt-in)
+	if v := os.Getenv("ACTOR_TOKEN_ENABLED"); v == "true" {
+		actorTokenEnabled = true
+		log.Println("[Actor Token] Actor token injection enabled via ACTOR_TOKEN_ENABLED=true")
 	} else {
-		log.Println("[Actor Token] Actor token injection enabled (set ACTOR_TOKEN_ENABLED=false to disable)")
+		log.Println("[Actor Token] Actor token injection disabled (set ACTOR_TOKEN_ENABLED=true to enable)")
 	}
 
 	// Wait for credential files from client-registration (up to 60 seconds)

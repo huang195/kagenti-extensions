@@ -185,8 +185,57 @@ func (m *PodMutator) InjectAuthBridge(ctx context.Context, podSpec *corev1.PodSp
 		podSpec.Volumes = []corev1.Volume{}
 	}
 
-	// Build containers using fresh config (picks up hot-reloaded images/resources)
-	builder := NewContainerBuilder(currentConfig)
+	// ========================================
+	// Build containers + volumes
+	// ========================================
+	//
+	// Two modes controlled by the perWorkloadConfigResolution feature gate:
+	//   false (default) → legacy path: ValueFrom refs for env vars, kubelet
+	//                     resolves ConfigMap/Secret values at container start.
+	//   true            → resolved path: webhook reads namespace ConfigMaps/
+	//                     Secrets at admission time and injects literal values.
+
+	var builder *ContainerBuilder
+	var requiredVolumes []corev1.Volume
+
+	if currentGates.PerWorkloadConfigResolution {
+		// Resolved path: read namespace config and build literal env vars
+		var nsConfig *NamespaceConfig
+		var err error
+		mutatorLog.V(1).Info("reading namespace config per-workload", "namespace", namespace)
+		nsConfig, err = ReadNamespaceConfig(ctx, m.Client, namespace)
+		if err != nil {
+			mutatorLog.Error(err, "failed to read namespace config, using empty defaults",
+				"namespace", namespace)
+			nsConfig = &NamespaceConfig{}
+		}
+
+		// Read AgentRuntime overrides (nil if CR not found or CRD not installed)
+		var arOverrides *AgentRuntimeOverrides
+		arOverrides, err = ReadAgentRuntimeOverrides(ctx, m.Client, namespace, crName)
+		if err != nil {
+			mutatorLog.Error(err, "failed to read AgentRuntime overrides, continuing without",
+				"namespace", namespace, "crName", crName)
+		}
+
+		resolved := ResolveConfig(currentConfig, nsConfig, arOverrides)
+		builder = NewResolvedContainerBuilder(resolved)
+		requiredVolumes = BuildResolvedVolumes(spireEnabled, "")
+
+		mutatorLog.Info("Using resolved config path",
+			"namespace", namespace, "crName", crName,
+			"hasAgentRuntimeOverrides", arOverrides != nil)
+	} else {
+		// Legacy path: ValueFrom refs, kubelet resolves at runtime
+		builder = NewContainerBuilder(currentConfig)
+		if spireEnabled {
+			requiredVolumes = BuildRequiredVolumes()
+		} else {
+			requiredVolumes = BuildRequiredVolumesNoSpire()
+		}
+		mutatorLog.Info("Using legacy ValueFrom config path",
+			"namespace", namespace, "crName", crName)
+	}
 
 	// Conditionally inject sidecars based on precedence decisions
 	if decision.EnvoyProxy.Inject && !containerExists(podSpec.Containers, EnvoyProxyContainerName) {
@@ -207,14 +256,7 @@ func (m *PodMutator) InjectAuthBridge(ctx context.Context, podSpec *corev1.PodSp
 		podSpec.Containers = append(podSpec.Containers, builder.BuildClientRegistrationContainerWithSpireOption(crName, namespace, spireEnabled))
 	}
 
-	// Inject volumes — use SPIRE volumes when spireEnabled because both
-	// spiffe-helper AND client-registration mount svid-output in that mode.
-	var requiredVolumes []corev1.Volume
-	if spireEnabled {
-		requiredVolumes = BuildRequiredVolumes()
-	} else {
-		requiredVolumes = BuildRequiredVolumesNoSpire()
-	}
+	// Inject volumes
 	for i := range requiredVolumes {
 		if !volumeExists(podSpec.Volumes, requiredVolumes[i].Name) {
 			podSpec.Volumes = append(podSpec.Volumes, requiredVolumes[i])

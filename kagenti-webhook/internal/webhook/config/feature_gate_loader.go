@@ -181,6 +181,7 @@ func logFeatureGates(fg *FeatureGates, source string) {
 		"spiffeHelper", fg.SpiffeHelper,
 		"clientRegistration", fg.ClientRegistration,
 		"injectTools", fg.InjectTools,
+		"perWorkloadConfigResolution", fg.PerWorkloadConfigResolution,
 	)
 	log.Info("=============================================")
 }

@@ -40,15 +40,36 @@ const (
 	ClientRegistrationGID = 1000
 )
 
+// ContainerBuilder creates container specs from resolved config.
+// It supports two modes:
+//   - Legacy mode: constructed with NewContainerBuilder(platformConfig) — uses
+//     ValueFrom refs for env vars (backward compatible)
+//   - Resolved mode: constructed with NewResolvedContainerBuilder(resolvedConfig)
+//     — uses literal env var values read at admission time
 type ContainerBuilder struct {
-	cfg *config.PlatformConfig
+	cfg      *config.PlatformConfig
+	resolved *ResolvedConfig
 }
 
+// NewContainerBuilder creates a ContainerBuilder that uses ValueFrom refs
+// for environment variables (legacy behavior).
 func NewContainerBuilder(cfg *config.PlatformConfig) *ContainerBuilder {
 	if cfg == nil {
 		cfg = config.CompiledDefaults()
 	}
 	return &ContainerBuilder{cfg: cfg}
+}
+
+// NewResolvedContainerBuilder creates a ContainerBuilder that uses literal
+// env var values from the resolved config (admission-time resolution).
+func NewResolvedContainerBuilder(resolved *ResolvedConfig) *ContainerBuilder {
+	if resolved == nil {
+		resolved = ResolveConfig(nil, nil, nil)
+	}
+	return &ContainerBuilder{
+		cfg:      resolved.Platform,
+		resolved: resolved,
+	}
 }
 
 func (b *ContainerBuilder) BuildSpiffeHelperContainer() corev1.Container {
@@ -102,78 +123,13 @@ func (b *ContainerBuilder) BuildClientRegistrationContainerWithSpireOption(name,
 
 	clientName := namespace + "/" + name
 
-	// Base environment variables
-	env := []corev1.EnvVar{
-		{
-			Name:  "SPIRE_ENABLED",
-			Value: fmt.Sprintf("%t", spireEnabled),
-		},
-		{
-			Name: "KEYCLOAK_URL",
-			ValueFrom: &corev1.EnvVarSource{
-				ConfigMapKeyRef: &corev1.ConfigMapKeySelector{
-					LocalObjectReference: corev1.LocalObjectReference{
-						Name: "authbridge-config",
-					},
-					Key:      "KEYCLOAK_URL",
-					Optional: ptr.To(true),
-				},
-			},
-		},
-		{
-			Name: "KEYCLOAK_REALM",
-			ValueFrom: &corev1.EnvVarSource{
-				ConfigMapKeyRef: &corev1.ConfigMapKeySelector{
-					LocalObjectReference: corev1.LocalObjectReference{
-						Name: "authbridge-config",
-					},
-					Key:      "KEYCLOAK_REALM",
-					Optional: ptr.To(true),
-				},
-			},
-		},
-		{
-			Name: "KEYCLOAK_ADMIN_USERNAME",
-			ValueFrom: &corev1.EnvVarSource{
-				SecretKeyRef: &corev1.SecretKeySelector{
-					LocalObjectReference: corev1.LocalObjectReference{
-						Name: "keycloak-admin-secret",
-					},
-					Key: "KEYCLOAK_ADMIN_USERNAME",
-				},
-			},
-		},
-		{
-			Name: "KEYCLOAK_ADMIN_PASSWORD",
-			ValueFrom: &corev1.EnvVarSource{
-				SecretKeyRef: &corev1.SecretKeySelector{
-					LocalObjectReference: corev1.LocalObjectReference{
-						Name: "keycloak-admin-secret",
-					},
-					Key: "KEYCLOAK_ADMIN_PASSWORD",
-				},
-			},
-		},
-		{
-			Name:  "CLIENT_NAME",
-			Value: clientName,
-		},
-		{
-			Name: "PLATFORM_CLIENT_IDS",
-			ValueFrom: &corev1.EnvVarSource{
-				ConfigMapKeyRef: &corev1.ConfigMapKeySelector{
-					LocalObjectReference: corev1.LocalObjectReference{
-						Name: "authbridge-config",
-					},
-					Key:      "PLATFORM_CLIENT_IDS",
-					Optional: ptr.To(true),
-				},
-			},
-		},
-		{
-			Name:  "SECRET_FILE_PATH",
-			Value: "/shared/client-secret.txt",
-		},
+	var env []corev1.EnvVar
+	if b.resolved != nil {
+		// Resolved mode: literal values
+		env = b.buildClientRegistrationEnvResolved(clientName, spireEnabled)
+	} else {
+		// Legacy mode: ValueFrom refs
+		env = b.buildClientRegistrationEnvLegacy(clientName, spireEnabled)
 	}
 
 	// Volume mounts depend on SPIRE enablement
@@ -199,8 +155,6 @@ func (b *ContainerBuilder) BuildClientRegistrationContainerWithSpireOption(name,
 	}
 
 	// Build the command based on SPIRE enablement
-	// When SPIRE is enabled, extract client ID from JWT
-	// When SPIRE is disabled, use CLIENT_NAME as the client ID
 	var command string
 	if spireEnabled {
 		command = `
@@ -264,8 +218,109 @@ tail -f /dev/null
 	}
 }
 
+// buildClientRegistrationEnvResolved returns env vars from resolved config.
+// Non-sensitive values (URLs, realm, client name) are injected as literals.
+// Sensitive values (KEYCLOAK_ADMIN_USERNAME/PASSWORD) use SecretKeyRef to keep
+// credentials out of the Pod spec — only a reference to the Secret is stored.
+func (b *ContainerBuilder) buildClientRegistrationEnvResolved(clientName string, spireEnabled bool) []corev1.EnvVar {
+	secretName := b.resolved.AdminCredentialsSecretName
+	if secretName == "" {
+		secretName = KeycloakAdminSecretName
+	}
+	return []corev1.EnvVar{
+		{Name: "SPIRE_ENABLED", Value: fmt.Sprintf("%t", spireEnabled)},
+		{Name: "KEYCLOAK_URL", Value: b.resolved.KeycloakURL},
+		{Name: "KEYCLOAK_REALM", Value: b.resolved.KeycloakRealm},
+		{
+			Name: "KEYCLOAK_ADMIN_USERNAME",
+			ValueFrom: &corev1.EnvVarSource{
+				SecretKeyRef: &corev1.SecretKeySelector{
+					LocalObjectReference: corev1.LocalObjectReference{Name: secretName},
+					Key:                  "KEYCLOAK_ADMIN_USERNAME",
+				},
+			},
+		},
+		{
+			Name: "KEYCLOAK_ADMIN_PASSWORD",
+			ValueFrom: &corev1.EnvVarSource{
+				SecretKeyRef: &corev1.SecretKeySelector{
+					LocalObjectReference: corev1.LocalObjectReference{Name: secretName},
+					Key:                  "KEYCLOAK_ADMIN_PASSWORD",
+				},
+			},
+		},
+		{Name: "CLIENT_NAME", Value: clientName},
+		{Name: "SECRET_FILE_PATH", Value: "/shared/client-secret.txt"},
+		{Name: "PLATFORM_CLIENT_IDS", Value: b.resolved.PlatformClientIDs},
+	}
+}
+
+// buildClientRegistrationEnvLegacy returns ValueFrom-based env vars (backward compat).
+func (b *ContainerBuilder) buildClientRegistrationEnvLegacy(clientName string, spireEnabled bool) []corev1.EnvVar {
+	return []corev1.EnvVar{
+		{
+			Name:  "SPIRE_ENABLED",
+			Value: fmt.Sprintf("%t", spireEnabled),
+		},
+		{
+			Name: "KEYCLOAK_URL",
+			ValueFrom: &corev1.EnvVarSource{
+				ConfigMapKeyRef: &corev1.ConfigMapKeySelector{
+					LocalObjectReference: corev1.LocalObjectReference{Name: AuthBridgeConfigMapName},
+					Key:                  "KEYCLOAK_URL",
+					Optional:             ptr.To(true),
+				},
+			},
+		},
+		{
+			Name: "KEYCLOAK_REALM",
+			ValueFrom: &corev1.EnvVarSource{
+				ConfigMapKeyRef: &corev1.ConfigMapKeySelector{
+					LocalObjectReference: corev1.LocalObjectReference{Name: AuthBridgeConfigMapName},
+					Key:                  "KEYCLOAK_REALM",
+				},
+			},
+		},
+		{
+			Name: "KEYCLOAK_ADMIN_USERNAME",
+			ValueFrom: &corev1.EnvVarSource{
+				SecretKeyRef: &corev1.SecretKeySelector{
+					LocalObjectReference: corev1.LocalObjectReference{Name: "keycloak-admin-secret"},
+					Key:                  "KEYCLOAK_ADMIN_USERNAME",
+				},
+			},
+		},
+		{
+			Name: "KEYCLOAK_ADMIN_PASSWORD",
+			ValueFrom: &corev1.EnvVarSource{
+				SecretKeyRef: &corev1.SecretKeySelector{
+					LocalObjectReference: corev1.LocalObjectReference{Name: "keycloak-admin-secret"},
+					Key:                  "KEYCLOAK_ADMIN_PASSWORD",
+				},
+			},
+		},
+		{
+			Name:  "CLIENT_NAME",
+			Value: clientName,
+		},
+		{
+			Name:  "SECRET_FILE_PATH",
+			Value: "/shared/client-secret.txt",
+		},
+		{
+			Name: "PLATFORM_CLIENT_IDS",
+			ValueFrom: &corev1.EnvVarSource{
+				ConfigMapKeyRef: &corev1.ConfigMapKeySelector{
+					LocalObjectReference: corev1.LocalObjectReference{Name: AuthBridgeConfigMapName},
+					Key:                  "PLATFORM_CLIENT_IDS",
+					Optional:             ptr.To(true),
+				},
+			},
+		},
+	}
+}
+
 // BuildEnvoyProxyContainer creates the envoy-proxy sidecar container with SPIRE enabled (default).
-// This container intercepts inbound traffic (JWT validation) and outbound traffic (token exchange) via ext-proc.
 func (b *ContainerBuilder) BuildEnvoyProxyContainer() corev1.Container {
 	return b.BuildEnvoyProxyContainerWithSpireOption(true)
 }
@@ -302,96 +357,13 @@ func (b *ContainerBuilder) BuildEnvoyProxyContainerWithSpireOption(spireEnabled 
 		})
 	}
 
-	env := []corev1.EnvVar{
-		{
-			Name: "KEYCLOAK_URL",
-			ValueFrom: &corev1.EnvVarSource{
-				ConfigMapKeyRef: &corev1.ConfigMapKeySelector{
-					LocalObjectReference: corev1.LocalObjectReference{
-						Name: "authbridge-config",
-					},
-					Key:      "KEYCLOAK_URL",
-					Optional: ptr.To(true),
-				},
-			},
-		},
-		{
-			Name: "KEYCLOAK_REALM",
-			ValueFrom: &corev1.EnvVarSource{
-				ConfigMapKeyRef: &corev1.ConfigMapKeySelector{
-					LocalObjectReference: corev1.LocalObjectReference{
-						Name: "authbridge-config",
-					},
-					Key:      "KEYCLOAK_REALM",
-					Optional: ptr.To(true),
-				},
-			},
-		},
-		{
-			Name: "TOKEN_URL",
-			ValueFrom: &corev1.EnvVarSource{
-				ConfigMapKeyRef: &corev1.ConfigMapKeySelector{
-					LocalObjectReference: corev1.LocalObjectReference{
-						Name: "authbridge-config",
-					},
-					Key:      "TOKEN_URL",
-					Optional: ptr.To(true),
-				},
-			},
-		},
-		{
-			Name: "ISSUER",
-			ValueFrom: &corev1.EnvVarSource{
-				ConfigMapKeyRef: &corev1.ConfigMapKeySelector{
-					LocalObjectReference: corev1.LocalObjectReference{
-						Name: "authbridge-config",
-					},
-					Key:      "ISSUER",
-					Optional: ptr.To(true),
-				},
-			},
-		},
+	var env []corev1.EnvVar
+	if b.resolved != nil {
+		env = b.buildEnvoyProxyEnvResolved()
+	} else {
+		env = b.buildEnvoyProxyEnvLegacy()
 	}
 
-	env = append(env, corev1.EnvVar{
-		Name: "EXPECTED_AUDIENCE",
-		ValueFrom: &corev1.EnvVarSource{
-			ConfigMapKeyRef: &corev1.ConfigMapKeySelector{
-				LocalObjectReference: corev1.LocalObjectReference{
-					Name: "authbridge-config",
-				},
-				Key:      "EXPECTED_AUDIENCE",
-				Optional: ptr.To(true),
-			},
-		},
-	})
-
-	env = append(env,
-		corev1.EnvVar{
-			Name:  "CLIENT_ID_FILE",
-			Value: "/shared/client-id.txt",
-		},
-		corev1.EnvVar{
-			Name:  "CLIENT_SECRET_FILE",
-			Value: "/shared/client-secret.txt",
-		},
-		corev1.EnvVar{
-			Name:  "ROUTES_CONFIG_PATH",
-			Value: "/etc/authproxy/routes.yaml",
-		},
-		corev1.EnvVar{
-			Name: "DEFAULT_OUTBOUND_POLICY",
-			ValueFrom: &corev1.EnvVarSource{
-				ConfigMapKeyRef: &corev1.ConfigMapKeySelector{
-					LocalObjectReference: corev1.LocalObjectReference{
-						Name: "authbridge-config",
-					},
-					Key:      "DEFAULT_OUTBOUND_POLICY",
-					Optional: ptr.To(true),
-				},
-			},
-		},
-	)
 
 	return corev1.Container{
 		Name:            EnvoyProxyContainerName,
@@ -426,6 +398,121 @@ func (b *ContainerBuilder) BuildEnvoyProxyContainerWithSpireOption(spireEnabled 
 			RunAsGroup: ptr.To(b.cfg.Proxy.UID),
 		},
 		VolumeMounts: volumeMounts,
+	}
+}
+
+// buildEnvoyProxyEnvResolved returns literal env vars from resolved config.
+func (b *ContainerBuilder) buildEnvoyProxyEnvResolved() []corev1.EnvVar {
+	return []corev1.EnvVar{
+		{Name: "KEYCLOAK_URL", Value: b.resolved.KeycloakURL},
+		{Name: "KEYCLOAK_REALM", Value: b.resolved.KeycloakRealm},
+		{Name: "TOKEN_URL", Value: b.resolved.TokenURL},
+		{Name: "ISSUER", Value: b.resolved.Issuer},
+		{Name: "EXPECTED_AUDIENCE", Value: b.resolved.ExpectedAudience},
+		{Name: "TARGET_AUDIENCE", Value: b.resolved.TargetAudience},
+		{Name: "TARGET_SCOPES", Value: b.resolved.TargetScopes},
+		{Name: "CLIENT_ID_FILE", Value: "/shared/client-id.txt"},
+		{Name: "CLIENT_SECRET_FILE", Value: "/shared/client-secret.txt"},
+		{Name: "ROUTES_CONFIG_PATH", Value: "/etc/authproxy/routes.yaml"},
+		{Name: "DEFAULT_OUTBOUND_POLICY", Value: b.resolved.DefaultOutboundPolicy},
+	}
+}
+
+// buildEnvoyProxyEnvLegacy returns ValueFrom-based env vars (backward compat).
+func (b *ContainerBuilder) buildEnvoyProxyEnvLegacy() []corev1.EnvVar {
+	return []corev1.EnvVar{
+		{
+			Name: "KEYCLOAK_URL",
+			ValueFrom: &corev1.EnvVarSource{
+				ConfigMapKeyRef: &corev1.ConfigMapKeySelector{
+					LocalObjectReference: corev1.LocalObjectReference{Name: AuthBridgeConfigMapName},
+					Key:                  "KEYCLOAK_URL",
+					Optional:             ptr.To(true),
+				},
+			},
+		},
+		{
+			Name: "KEYCLOAK_REALM",
+			ValueFrom: &corev1.EnvVarSource{
+				ConfigMapKeyRef: &corev1.ConfigMapKeySelector{
+					LocalObjectReference: corev1.LocalObjectReference{Name: AuthBridgeConfigMapName},
+					Key:                  "KEYCLOAK_REALM",
+					Optional:             ptr.To(true),
+				},
+			},
+		},
+		{
+			Name: "TOKEN_URL",
+			ValueFrom: &corev1.EnvVarSource{
+				ConfigMapKeyRef: &corev1.ConfigMapKeySelector{
+					LocalObjectReference: corev1.LocalObjectReference{Name: "authbridge-config"},
+					Key:                  "TOKEN_URL",
+					Optional:             ptr.To(true),
+				},
+			},
+		},
+		{
+			Name: "ISSUER",
+			ValueFrom: &corev1.EnvVarSource{
+				ConfigMapKeyRef: &corev1.ConfigMapKeySelector{
+					LocalObjectReference: corev1.LocalObjectReference{Name: "authbridge-config"},
+					Key:                  "ISSUER",
+					Optional:             ptr.To(false),
+				},
+			},
+		},
+		{
+			Name: "EXPECTED_AUDIENCE",
+			ValueFrom: &corev1.EnvVarSource{
+				ConfigMapKeyRef: &corev1.ConfigMapKeySelector{
+					LocalObjectReference: corev1.LocalObjectReference{Name: "authbridge-config"},
+					Key:                  "EXPECTED_AUDIENCE",
+					Optional:             ptr.To(true),
+				},
+			},
+		},
+		{
+			Name: "TARGET_AUDIENCE",
+			ValueFrom: &corev1.EnvVarSource{
+				ConfigMapKeyRef: &corev1.ConfigMapKeySelector{
+					LocalObjectReference: corev1.LocalObjectReference{Name: "authbridge-config"},
+					Key:                  "TARGET_AUDIENCE",
+					Optional:             ptr.To(true),
+				},
+			},
+		},
+		{
+			Name: "TARGET_SCOPES",
+			ValueFrom: &corev1.EnvVarSource{
+				ConfigMapKeyRef: &corev1.ConfigMapKeySelector{
+					LocalObjectReference: corev1.LocalObjectReference{Name: "authbridge-config"},
+					Key:                  "TARGET_SCOPES",
+					Optional:             ptr.To(true),
+				},
+			},
+		},
+		{
+			Name:  "CLIENT_ID_FILE",
+			Value: "/shared/client-id.txt",
+		},
+		{
+			Name:  "CLIENT_SECRET_FILE",
+			Value: "/shared/client-secret.txt",
+		},
+		{
+			Name:  "ROUTES_CONFIG_PATH",
+			Value: "/etc/authproxy/routes.yaml",
+		},
+		{
+			Name: "DEFAULT_OUTBOUND_POLICY",
+			ValueFrom: &corev1.EnvVarSource{
+				ConfigMapKeyRef: &corev1.ConfigMapKeySelector{
+					LocalObjectReference: corev1.LocalObjectReference{Name: "authbridge-config"},
+					Key:                  "DEFAULT_OUTBOUND_POLICY",
+					Optional:             ptr.To(true),
+				},
+			},
+		},
 	}
 }
 

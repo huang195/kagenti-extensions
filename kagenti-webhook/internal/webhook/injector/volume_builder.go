@@ -116,3 +116,79 @@ func BuildRequiredVolumesNoSpire() []corev1.Volume {
 		},
 	}
 }
+
+// BuildResolvedVolumes creates volumes using resolved config values.
+// When a resolved envoy config name is provided, the envoy-config volume
+// references that ConfigMap instead of the default "envoy-config" one.
+// This enables per-workload envoy configs created at admission time.
+func BuildResolvedVolumes(spireEnabled bool, envoyConfigMapName string) []corev1.Volume {
+	if envoyConfigMapName == "" {
+		envoyConfigMapName = EnvoyConfigMapName
+	}
+
+	volumes := []corev1.Volume{
+		{
+			Name: "shared-data",
+			VolumeSource: corev1.VolumeSource{
+				EmptyDir: &corev1.EmptyDirVolumeSource{},
+			},
+		},
+	}
+
+	if spireEnabled {
+		isReadOnly := true
+		volumes = append(volumes,
+			corev1.Volume{
+				Name: "spire-agent-socket",
+				VolumeSource: corev1.VolumeSource{
+					CSI: &corev1.CSIVolumeSource{
+						Driver:   "csi.spiffe.io",
+						ReadOnly: &isReadOnly,
+					},
+				},
+			},
+			corev1.Volume{
+				Name: "spiffe-helper-config",
+				VolumeSource: corev1.VolumeSource{
+					ConfigMap: &corev1.ConfigMapVolumeSource{
+						LocalObjectReference: corev1.LocalObjectReference{
+							Name: SpiffeHelperConfigMapName,
+						},
+					},
+				},
+			},
+			corev1.Volume{
+				Name: "svid-output",
+				VolumeSource: corev1.VolumeSource{
+					EmptyDir: &corev1.EmptyDirVolumeSource{},
+				},
+			},
+		)
+	}
+
+	volumes = append(volumes,
+		corev1.Volume{
+			Name: "envoy-config",
+			VolumeSource: corev1.VolumeSource{
+				ConfigMap: &corev1.ConfigMapVolumeSource{
+					LocalObjectReference: corev1.LocalObjectReference{
+						Name: envoyConfigMapName,
+					},
+				},
+			},
+		},
+		corev1.Volume{
+			Name: "authproxy-routes",
+			VolumeSource: corev1.VolumeSource{
+				ConfigMap: &corev1.ConfigMapVolumeSource{
+					LocalObjectReference: corev1.LocalObjectReference{
+						Name: AuthproxyRoutesConfigMapName,
+					},
+					Optional: ptr.To(true),
+				},
+			},
+		},
+	)
+
+	return volumes
+}

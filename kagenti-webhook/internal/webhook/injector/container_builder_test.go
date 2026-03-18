@@ -165,6 +165,39 @@ func TestBuildClientRegistrationContainer_AdminCredentialsFromSecret(t *testing.
 	}
 }
 
+func TestBuildClientRegistrationContainer_ResolvedPath_AdminCredentialsFromSecret(t *testing.T) {
+	resolved := &ResolvedConfig{
+		Platform:    config.CompiledDefaults(),
+		KeycloakURL: "https://keycloak.example.com",
+	}
+	builder := NewResolvedContainerBuilder(resolved)
+	container := builder.BuildClientRegistrationContainerWithSpireOption("my-app", "my-ns", true)
+
+	sensitiveKeys := []string{"KEYCLOAK_ADMIN_USERNAME", "KEYCLOAK_ADMIN_PASSWORD"}
+	for _, key := range sensitiveKeys {
+		found := false
+		for _, env := range container.Env {
+			if env.Name != key {
+				continue
+			}
+			found = true
+			if env.Value != "" {
+				t.Errorf("env %q must NOT have a literal Value in resolved path (security: keeps credentials out of Pod spec)", key)
+			}
+			if env.ValueFrom == nil || env.ValueFrom.SecretKeyRef == nil {
+				t.Errorf("env %q must use SecretKeyRef, got literal or ConfigMapKeyRef", key)
+				continue
+			}
+			if env.ValueFrom.SecretKeyRef.Name != "keycloak-admin-secret" {
+				t.Errorf("env %q SecretKeyRef.Name = %q, want %q", key, env.ValueFrom.SecretKeyRef.Name, "keycloak-admin-secret")
+			}
+		}
+		if !found {
+			t.Errorf("client-registration container missing env var %q", key)
+		}
+	}
+}
+
 func TestBuildClientRegistrationContainer_NonSensitiveKeysFromConfigMap(t *testing.T) {
 	builder := NewContainerBuilder(config.CompiledDefaults())
 	container := builder.BuildClientRegistrationContainerWithSpireOption("my-app", "my-ns", true)

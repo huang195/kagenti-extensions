@@ -104,6 +104,11 @@ featureGates:
   # injectTools controls whether tool workloads (kagenti.io/type=tool) receive
   # sidecar injection. Defaults to false — tools are not injected by default.
   injectTools: false
+  # perWorkloadConfigResolution controls whether namespace ConfigMaps/Secrets are
+  # read on every admission request (true) or cached per namespace (false).
+  # Default false — cached mode is faster and sufficient when namespace ConfigMaps
+  # rarely change. Cache is cleared on webhook pod restart.
+  perWorkloadConfigResolution: false
 
 # custom values for kagenti-webhook injection configuration
 # This is your "source of truth" for platform defaults.

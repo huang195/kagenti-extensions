@@ -37,6 +37,49 @@ type Config struct {
 
 var globalConfig = &Config{}
 
+// actorTokenCache caches the service's own access token for use as actor_token
+// in RFC 8693 token exchange. This avoids a client_credentials grant per request.
+type actorTokenCache struct {
+	mu        sync.RWMutex
+	token     string
+	expiresAt time.Time
+}
+
+var globalActorCache = &actorTokenCache{}
+var actorTokenEnabled = false
+
+// getActorToken returns a cached actor token or obtains a fresh one via
+// client_credentials grant. The token represents this service's own identity
+// and is passed as actor_token during token exchange to produce nested act claims.
+func (c *actorTokenCache) getActorToken(clientID, clientSecret, tokenURL string) (string, error) {
+	c.mu.RLock()
+	if c.token != "" && time.Now().Add(30*time.Second).Before(c.expiresAt) {
+		token := c.token
+		c.mu.RUnlock()
+		return token, nil
+	}
+	c.mu.RUnlock()
+
+	// Need a fresh token — use client_credentials with no specific audience/scope
+	// since this token is only used as actor_token (identity proof), not for access.
+	token, expiresIn, err := clientCredentialsGrant(clientID, clientSecret, tokenURL, "", "openid")
+	if err != nil {
+		return "", fmt.Errorf("failed to obtain actor token: %w", err)
+	}
+
+	if expiresIn < 60 {
+		expiresIn = 60
+	}
+
+	c.mu.Lock()
+	c.token = token
+	c.expiresAt = time.Now().Add(time.Duration(expiresIn) * time.Second)
+	c.mu.Unlock()
+
+	log.Printf("[Actor Token] Cached actor token (expires in %ds)", expiresIn)
+	return token, nil
+}
+
 type processor struct {
 	v3.UnimplementedExternalProcessorServer
 }
@@ -306,12 +349,15 @@ func getHostFromHeaders(headers []*core.HeaderValue) string {
 // Requires the exchanging client to be in the subject token's audience.
 // When using dynamic credentials from /shared/, this works because the token's
 // audience matches the auto-registered client's SPIFFE ID.
-func exchangeToken(clientID, clientSecret, tokenURL, subjectToken, audience, scopes string) (string, error) {
+func exchangeToken(clientID, clientSecret, tokenURL, subjectToken, audience, scopes, actorToken string) (string, error) {
 	log.Printf("[Token Exchange] Starting token exchange")
 	log.Printf("[Token Exchange] Token URL: %s", tokenURL)
 	log.Printf("[Token Exchange] Client ID: %s", clientID)
 	log.Printf("[Token Exchange] Audience: %s", audience)
 	log.Printf("[Token Exchange] Scopes: %s", scopes)
+	if actorToken != "" {
+		log.Printf("[Token Exchange] Actor token: present (act claim chaining enabled)")
+	}
 
 	data := url.Values{}
 	data.Set("client_id", clientID)
@@ -322,6 +368,11 @@ func exchangeToken(clientID, clientSecret, tokenURL, subjectToken, audience, sco
 	data.Set("subject_token_type", "urn:ietf:params:oauth:token-type:access_token")
 	data.Set("audience", audience)
 	data.Set("scope", scopes)
+
+	if actorToken != "" {
+		data.Set("actor_token", actorToken)
+		data.Set("actor_token_type", "urn:ietf:params:oauth:token-type:access_token")
+	}
 
 	resp, err := http.PostForm(tokenURL, data)
 	if err != nil {
@@ -355,7 +406,7 @@ func exchangeToken(clientID, clientSecret, tokenURL, subjectToken, audience, sco
 // Used as a fallback when no Authorization header is present on outbound requests.
 // The agent's identity (client-id/client-secret from client-registration) is used
 // to obtain a token scoped to the target audience.
-func clientCredentialsGrant(clientID, clientSecret, tokenURL, audience, scopes string) (string, error) {
+func clientCredentialsGrant(clientID, clientSecret, tokenURL, audience, scopes string) (string, int, error) {
 	log.Printf("[Client Credentials] Starting client credentials grant")
 	log.Printf("[Client Credentials] Token URL: %s", tokenURL)
 	log.Printf("[Client Credentials] Client ID: %s", clientID)
@@ -366,35 +417,37 @@ func clientCredentialsGrant(clientID, clientSecret, tokenURL, audience, scopes s
 	data.Set("client_id", clientID)
 	data.Set("client_secret", clientSecret)
 	data.Set("grant_type", "client_credentials")
-	data.Set("audience", audience)
+	if audience != "" {
+		data.Set("audience", audience)
+	}
 	data.Set("scope", scopes)
 
 	resp, err := http.PostForm(tokenURL, data)
 	if err != nil {
 		log.Printf("[Client Credentials] Failed to make request: %v", err)
-		return "", err
+		return "", 0, err
 	}
 	defer resp.Body.Close()
 
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
 		log.Printf("[Client Credentials] Failed to read response: %v", err)
-		return "", err
+		return "", 0, err
 	}
 
 	if resp.StatusCode != http.StatusOK {
 		log.Printf("[Client Credentials] Failed with status %d: %s", resp.StatusCode, string(body))
-		return "", status.Errorf(codes.Internal, "client credentials grant failed: %s", string(body))
+		return "", 0, status.Errorf(codes.Internal, "client credentials grant failed: %s", string(body))
 	}
 
 	var tokenResp tokenExchangeResponse
 	if err := json.Unmarshal(body, &tokenResp); err != nil {
 		log.Printf("[Client Credentials] Failed to parse response: %v", err)
-		return "", err
+		return "", 0, err
 	}
 
 	log.Printf("[Client Credentials] Successfully obtained token")
-	return tokenResp.AccessToken, nil
+	return tokenResp.AccessToken, tokenResp.ExpiresIn, nil
 }
 
 func getHeaderValue(headers []*core.HeaderValue, key string) string {
@@ -532,13 +585,22 @@ func (p *processor) handleOutbound(ctx context.Context, headers *core.HeaderMap)
 		log.Printf("[Token Exchange] Target Audience: %s", targetAudience)
 		log.Printf("[Token Exchange] Target Scopes: %s", targetScopes)
 
+		// Obtain actor token for act claim chaining (RFC 8693 Section 4.1)
+		var actorToken string
+		if actorTokenEnabled {
+			actorToken, err = globalActorCache.getActorToken(clientID, clientSecret, tokenURL)
+			if err != nil {
+				log.Printf("[Actor Token] WARNING: failed to obtain actor token: %v, proceeding without", err)
+			}
+		}
+
 		authHeader := getHeaderValue(headers.Headers, "authorization")
 		if authHeader != "" {
 			subjectToken := strings.TrimPrefix(authHeader, "Bearer ")
 			subjectToken = strings.TrimPrefix(subjectToken, "bearer ")
 
 			if subjectToken != authHeader {
-				newToken, err := exchangeToken(clientID, clientSecret, tokenURL, subjectToken, targetAudience, targetScopes)
+				newToken, err := exchangeToken(clientID, clientSecret, tokenURL, subjectToken, targetAudience, targetScopes, actorToken)
 				if err == nil {
 					log.Printf("[Token Exchange] Successfully exchanged token, replacing Authorization header")
 					return &v3.ProcessingResponse{
@@ -571,7 +633,7 @@ func (p *processor) handleOutbound(ctx context.Context, headers *core.HeaderMap)
 			// This handles agent frameworks that don't propagate the inbound token.
 			// The token uses the agent's identity rather than the end user's.
 			log.Printf("[Client Credentials] No Authorization header on outbound, falling back to client_credentials grant")
-			newToken, err := clientCredentialsGrant(clientID, clientSecret, tokenURL, targetAudience, targetScopes)
+			newToken, _, err := clientCredentialsGrant(clientID, clientSecret, tokenURL, targetAudience, targetScopes)
 			if err == nil {
 				log.Printf("[Client Credentials] Injecting token into outbound request")
 				return &v3.ProcessingResponse{
@@ -660,6 +722,14 @@ func (p *processor) Process(stream v3.ExternalProcessor_ProcessServer) error {
 
 func main() {
 	log.Println("=== Go External Processor Starting ===")
+
+	// Initialize actor token feature flag (off by default, requires explicit opt-in)
+	if v := os.Getenv("ACTOR_TOKEN_ENABLED"); v == "true" {
+		actorTokenEnabled = true
+		log.Println("[Actor Token] Actor token injection enabled via ACTOR_TOKEN_ENABLED=true")
+	} else {
+		log.Println("[Actor Token] Actor token injection disabled (set ACTOR_TOKEN_ENABLED=true to enable)")
+	}
 
 	// Wait for credential files from client-registration (up to 60 seconds)
 	// This handles the startup race condition with client-registration container

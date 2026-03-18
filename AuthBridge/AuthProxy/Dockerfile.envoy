@@ -10,7 +10,7 @@ COPY go-processor/ ./go-processor/
 RUN CGO_ENABLED=0 GOOS=linux go build -o /go-processor ./go-processor
 
 # Use official Envoy image as base
-FROM envoyproxy/envoy:v1.37.1
+FROM docker.io/envoyproxy/envoy:v1.37.1
 
 # Install ca-certificates for TLS connections
 USER root

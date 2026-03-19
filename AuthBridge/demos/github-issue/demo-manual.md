@@ -465,6 +465,15 @@ ollama serve
 > **Tip:** If using a different model, update `TASK_MODEL_ID` in
 > `git-issue-agent-deployment.yaml` before deploying.
 
+> **Note:** The `git-issue-agent-deployment.yaml` file defaults to `LLM_API_BASE=http://host.docker.internal:11434` and `OLLAMA_API_BASE=http://host.docker.internal:11434`,
+> which reaches Ollama running on your host machine via the Kind/Docker Desktop gateway.
+> If you deploy Ollama inside the cluster instead, modify the `git-issue-agent-deployment.yaml` file directly or patch the agent:
+> ```bash
+> kubectl set env deployment/git-issue-agent -n team1 -c agent \
+>   LLM_API_BASE="http://ollama.ollama.svc:11434" \
+>   OLLAMA_API_BASE="http://ollama.ollama.svc:11434"
+> ```
+
 ---
 
 ## Step 8: Test the AuthBridge Flow

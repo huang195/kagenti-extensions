@@ -19,12 +19,12 @@ metadata:
   namespace: team1
 data:
   KEYCLOAK_URL: "http://keycloak-service.keycloak.svc:8080"
-  KEYCLOAK_REALM: "demo"
+  KEYCLOAK_REALM: "kagenti"
   # TOKEN_URL: Optional. Auto-derived from KEYCLOAK_URL + KEYCLOAK_REALM if not set.
-  # TOKEN_URL: "http://keycloak-service.keycloak.svc:8080/realms/demo/protocol/openid-connect/token"
+  # TOKEN_URL: "http://keycloak-service.keycloak.svc:8080/realms/kagenti/protocol/openid-connect/token"
   # ISSUER: Set explicitly when the internal KEYCLOAK_URL differs from the frontend URL
   # that appears in token "iss" claims (split-horizon DNS).
-  ISSUER: "http://keycloak.localtest.me:8080/realms/demo"
+  ISSUER: "http://keycloak.localtest.me:8080/realms/kagenti"
 
 ---
 # spiffe-helper-config ConfigMap - Used by spiffe-helper container (SPIRE mode only)

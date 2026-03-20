@@ -32,15 +32,15 @@ metadata:
   namespace: team1
 data:
   KEYCLOAK_URL: "http://keycloak-service.keycloak.svc:8080"
-  KEYCLOAK_REALM: "demo"
+  KEYCLOAK_REALM: "kagenti"
   # TOKEN_URL: Optional. Auto-derived from KEYCLOAK_URL + KEYCLOAK_REALM if not set.
   # Only set explicitly when the token endpoint differs from the standard Keycloak path.
-  # TOKEN_URL: "http://keycloak-service.keycloak.svc:8080/realms/demo/protocol/openid-connect/token"
+  # TOKEN_URL: "http://keycloak-service.keycloak.svc:8080/realms/kagenti/protocol/openid-connect/token"
   # ISSUER: Optional when KEYCLOAK_URL points to the frontend. Auto-derived from
   # KEYCLOAK_URL + KEYCLOAK_REALM if not set. Set explicitly when the internal
   # KEYCLOAK_URL differs from the frontend URL that appears in token "iss" claims
   # (split-horizon DNS).
-  ISSUER: "http://keycloak.localtest.me:8080/realms/demo"
+  ISSUER: "http://keycloak.localtest.me:8080/realms/kagenti"
   # EXPECTED_AUDIENCE: Optional. Set to the workload's SPIFFE ID to enable
   # inbound audience validation (e.g., spiffe://<trust-domain>/ns/<namespace>/sa/<service-account>).
   # Recommended for production to prevent token replay attacks across workloads.

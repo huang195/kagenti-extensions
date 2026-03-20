@@ -4,7 +4,9 @@ This guide demonstrates how to use the **kagenti-webhook** to automatically inje
 
 ## Overview
 
-The kagenti-webhook watches for deployments with the `kagenti.io/inject: enabled` label and automatically injects:
+The kagenti-webhook watches for deployments with the `kagenti.io/inject: enabled` label and automatically injects AuthBridge sidecars. There are two injection modes controlled by the `combinedSidecar` feature gate:
+
+### Separate mode (default: `combinedSidecar: false`)
 
 | Container | Purpose |
 |-----------|---------|
@@ -12,6 +14,15 @@ The kagenti-webhook watches for deployments with the `kagenti.io/inject: enabled
 | `spiffe-helper` | Fetches SPIFFE credentials from SPIRE (only with `kagenti.io/spire: enabled`) |
 | `kagenti-client-registration` | Registers the workload with Keycloak (using SPIFFE ID or static client ID) |
 | `envoy-proxy` | Intercepts inbound HTTP requests (JWT validation) and outbound requests (HTTP: token exchange; HTTPS: TLS passthrough) |
+
+### Combined mode (`combinedSidecar: true`)
+
+| Container | Purpose |
+|-----------|---------|
+| `proxy-init` | Init container that sets up iptables (same as separate mode) |
+| `authbridge` | Single sidecar combining Envoy, go-processor, spiffe-helper, and client-registration |
+
+Combined mode reduces per-pod overhead from 3 long-running sidecars to 1, simplifies debugging, and speeds up pod startup. See [Enabling Combined Sidecar Mode](#enabling-combined-sidecar-mode) below.
 
 ## Architecture
 
@@ -110,6 +121,64 @@ The ConfigMaps include:
 
 **Note**: All labels must be on the **Pod template** (`spec.template.metadata.labels`), not the Deployment metadata.
 
+## Enabling Combined Sidecar Mode
+
+To use the combined `authbridge` container instead of separate sidecars, enable the `combinedSidecar` feature gate:
+
+### Via Helm values
+
+```yaml
+# values.yaml
+featureGates:
+  combinedSidecar: true
+```
+
+```bash
+helm upgrade kagenti-webhook oci://ghcr.io/kagenti/kagenti-extensions/kagenti-webhook-chart \
+  --set featureGates.combinedSidecar=true \
+  --namespace kagenti-webhook-system
+```
+
+### Via ConfigMap (for existing deployments)
+
+```bash
+# Edit the feature gates ConfigMap directly
+kubectl edit configmap kagenti-webhook-feature-gates -n kagenti-webhook-system
+```
+
+Add `combinedSidecar: true` to the `feature-gates.yaml` data key:
+
+```yaml
+data:
+  feature-gates.yaml: |
+    globalEnabled: true
+    envoyProxy: true
+    spiffeHelper: true
+    clientRegistration: true
+    combinedSidecar: true
+```
+
+The webhook watches this ConfigMap for changes and reloads automatically. New pods created after the change will use combined mode. Existing pods are not affected — delete and recreate them to switch.
+
+### What changes
+
+| Aspect | Separate mode | Combined mode |
+|--------|---------------|---------------|
+| Sidecar containers | 3 (`envoy-proxy`, `spiffe-helper`, `kagenti-client-registration`) | 1 (`authbridge`) |
+| Init containers | 1 (`proxy-init`) | 1 (`proxy-init`) |
+| Container to read credentials | `-c envoy-proxy` | `-c authbridge` |
+| Container for Envoy logs | `-c envoy-proxy` | `-c authbridge` |
+| Per-sidecar opt-out labels | Each sidecar can be independently disabled | `spiffeHelper` and `clientRegistration` are passed as flags to the entrypoint; `envoy-proxy` disabled = no combined container |
+| Image | `envoy-with-processor` + `spiffe-helper` + `client-registration` | `authbridge` (single image) |
+
+### Per-sidecar control in combined mode
+
+When `combinedSidecar: true`, the per-sidecar feature gates and workload labels still work:
+
+- **`spiffeHelper: false`** or `kagenti.io/spiffe-helper-inject: "false"`: The combined container starts with `SPIRE_ENABLED=false` — spiffe-helper is not launched, and a static client ID is used instead.
+- **`clientRegistration: false`** or `kagenti.io/client-registration-inject: "false"`: The combined container starts with `CLIENT_REGISTRATION_ENABLED=false` — client registration is skipped.
+- **`envoyProxy: false`** or `kagenti.io/envoy-proxy-inject: "false"`: No combined container is injected at all (the proxy is the core component).
+
 Then continue with:
 - [Step 1: Setup Keycloak](#step-1-setup-keycloak) - Configure Keycloak clients and scopes
 - [Step 2: Deploy Auth Target and Agent](#step-2-deploy-auth-target-and-agent) - Deploy the demo workloads
@@ -177,8 +246,9 @@ Verify the injected containers:
 
 ```bash
 kubectl get pod -n team1 -l app=agent -o jsonpath='{.items[0].spec.containers[*].name}'
-# Expected (with SPIFFE):    agent spiffe-helper kagenti-client-registration envoy-proxy
-# Expected (without SPIFFE): agent kagenti-client-registration envoy-proxy
+# Expected (separate mode, with SPIFFE):    agent spiffe-helper kagenti-client-registration envoy-proxy
+# Expected (separate mode, without SPIFFE): agent kagenti-client-registration envoy-proxy
+# Expected (combined mode):                 agent authbridge
 ```
 
 ## Step 3: Test the Flow
@@ -195,21 +265,22 @@ These tests verify both **inbound** JWT validation and **outbound** token exchan
 kubectl run test-client --image=nicolaka/netshoot -n team1 --restart=Never -- sleep 3600
 kubectl wait --for=condition=ready pod/test-client -n team1 --timeout=30s
 
-# Get the agent's client credentials (from envoy-proxy container which has the shared volume)
+# Get the agent's client credentials from the sidecar container with the shared volume.
+# Use -c authbridge in combined mode, or -c envoy-proxy in separate mode.
 CLIENT_ID=$(kubectl exec deployment/agent -n team1 -c envoy-proxy -- cat /shared/client-id.txt)
 CLIENT_SECRET=$(kubectl exec deployment/agent -n team1 -c envoy-proxy -- cat /shared/client-secret.txt)
 echo "Client ID: $CLIENT_ID"
 
 # Get a service account token (using test-client which has curl)
 TOKEN=$(kubectl exec test-client -n team1 -- curl -s -X POST \
-  "http://keycloak-service.keycloak.svc:8080/realms/demo/protocol/openid-connect/token" \
+  "http://keycloak-service.keycloak.svc:8080/realms/kagenti/protocol/openid-connect/token" \
   -d "grant_type=client_credentials" \
   -d "client_id=$CLIENT_ID" \
   -d "client_secret=$CLIENT_SECRET" | jq -r '.access_token')
 
 # Get a user token for alice (for subject preservation test)
 USER_TOKEN=$(kubectl exec test-client -n team1 -- curl -s -X POST \
-  "http://keycloak-service.keycloak.svc:8080/realms/demo/protocol/openid-connect/token" \
+  "http://keycloak-service.keycloak.svc:8080/realms/kagenti/protocol/openid-connect/token" \
   -d "grant_type=password" \
   -d "client_id=$CLIENT_ID" \
   -d "client_secret=$CLIENT_SECRET" \
@@ -267,11 +338,11 @@ CLIENT_ID=$(kubectl exec deployment/agent -n team1 -c envoy-proxy -- cat /shared
 CLIENT_SECRET=$(kubectl exec deployment/agent -n team1 -c envoy-proxy -- cat /shared/client-secret.txt)
 
 TOKEN=$(kubectl exec test-client -n team1 -- curl -s -X POST \
-  "http://keycloak-service.keycloak.svc:8080/realms/demo/protocol/openid-connect/token" \
+  "http://keycloak-service.keycloak.svc:8080/realms/kagenti/protocol/openid-connect/token" \
   -d "grant_type=client_credentials" -d "client_id=$CLIENT_ID" -d "client_secret=$CLIENT_SECRET" | jq -r '.access_token')
 
 USER_TOKEN=$(kubectl exec test-client -n team1 -- curl -s -X POST \
-  "http://keycloak-service.keycloak.svc:8080/realms/demo/protocol/openid-connect/token" \
+  "http://keycloak-service.keycloak.svc:8080/realms/kagenti/protocol/openid-connect/token" \
   -d "grant_type=password" -d "client_id=$CLIENT_ID" -d "client_secret=$CLIENT_SECRET" \
   -d "username=alice" -d "password=alice123" | jq -r '.access_token')
 
@@ -305,15 +376,20 @@ kubectl describe pod -l app=agent -n team1
 
 ### Check Container Logs
 
+**Separate mode** (default):
 ```bash
-# Client registration logs
 kubectl logs deployment/agent -n team1 -c kagenti-client-registration
-
-# Envoy proxy logs (includes token exchange)
 kubectl logs deployment/agent -n team1 -c envoy-proxy | grep -E "(Token Exchange|error)"
-
-# SPIFFE helper logs
 kubectl logs deployment/agent -n team1 -c spiffe-helper
+```
+
+**Combined mode** (`combinedSidecar: true`):
+```bash
+# All sidecar logs are in one container
+kubectl logs deployment/agent -n team1 -c authbridge
+# Filter by component
+kubectl logs deployment/agent -n team1 -c authbridge | grep "\[AuthBridge\]"
+kubectl logs deployment/agent -n team1 -c authbridge | grep "Token Exchange"
 ```
 
 ### Common Issues
@@ -378,21 +454,21 @@ ADMIN_TOKEN=$(curl -s http://keycloak.localtest.me:8080/realms/master/protocol/o
 # Delete the dynamically registered agent client
 CLIENT_ID="spiffe://localtest.me/ns/team1/sa/agent"
 INTERNAL_ID=$(curl -s -H "Authorization: Bearer $ADMIN_TOKEN" \
-  "http://keycloak.localtest.me:8080/admin/realms/demo/clients?clientId=$CLIENT_ID" | jq -r ".[0].id")
+  "http://keycloak.localtest.me:8080/admin/realms/kagenti/clients?clientId=$CLIENT_ID" | jq -r ".[0].id")
 curl -s -X DELETE -H "Authorization: Bearer $ADMIN_TOKEN" \
-  "http://keycloak.localtest.me:8080/admin/realms/demo/clients/$INTERNAL_ID"
+  "http://keycloak.localtest.me:8080/admin/realms/kagenti/clients/$INTERNAL_ID"
 
 # Delete auth-target client
 AUTH_TARGET_ID=$(curl -s -H "Authorization: Bearer $ADMIN_TOKEN" \
-  "http://keycloak.localtest.me:8080/admin/realms/demo/clients?clientId=auth-target" | jq -r ".[0].id")
+  "http://keycloak.localtest.me:8080/admin/realms/kagenti/clients?clientId=auth-target" | jq -r ".[0].id")
 curl -s -X DELETE -H "Authorization: Bearer $ADMIN_TOKEN" \
-  "http://keycloak.localtest.me:8080/admin/realms/demo/clients/$AUTH_TARGET_ID"
+  "http://keycloak.localtest.me:8080/admin/realms/kagenti/clients/$AUTH_TARGET_ID"
 
 # Delete demo user alice
 ALICE_ID=$(curl -s -H "Authorization: Bearer $ADMIN_TOKEN" \
-  "http://keycloak.localtest.me:8080/admin/realms/demo/users?username=alice" | jq -r ".[0].id")
+  "http://keycloak.localtest.me:8080/admin/realms/kagenti/users?username=alice" | jq -r ".[0].id")
 curl -s -X DELETE -H "Authorization: Bearer $ADMIN_TOKEN" \
-  "http://keycloak.localtest.me:8080/admin/realms/demo/users/$ALICE_ID"
+  "http://keycloak.localtest.me:8080/admin/realms/kagenti/users/$ALICE_ID"
 
 echo "Keycloak resources cleaned up"
 ```

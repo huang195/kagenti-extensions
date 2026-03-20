@@ -44,7 +44,7 @@ from keycloak import KeycloakAdmin, KeycloakPostError
 import sys
 
 KEYCLOAK_URL = "http://keycloak.localtest.me:8080"
-KEYCLOAK_REALM = "demo"
+KEYCLOAK_REALM = "kagenti"
 KEYCLOAK_ADMIN_USERNAME = "admin"
 KEYCLOAK_ADMIN_PASSWORD = "admin"
 
@@ -302,7 +302,7 @@ def main():
    # Get a token (simulating what a Caller would do)
    # The token will have aud: {AGENT_SPIFFE_ID}
    TOKEN=$(curl -sX POST \\
-     http://keycloak-service.keycloak.svc:8080/realms/demo/protocol/openid-connect/token \\
+     http://keycloak-service.keycloak.svc:8080/realms/kagenti/protocol/openid-connect/token \\
      -d 'grant_type=client_credentials' \\
      -d "client_id=$CLIENT_ID" \\
      -d "client_secret=$CLIENT_SECRET" | jq -r '.access_token')
@@ -321,7 +321,7 @@ def main():
    # This demonstrates how the user's identity (sub claim) is preserved during exchange
    
    USER_TOKEN=$(curl -sX POST \\
-     http://keycloak-service.keycloak.svc:8080/realms/demo/protocol/openid-connect/token \\
+     http://keycloak-service.keycloak.svc:8080/realms/kagenti/protocol/openid-connect/token \\
      -d 'grant_type=password' \\
      -d "client_id=$CLIENT_ID" \\
      -d "client_secret=$CLIENT_SECRET" \\

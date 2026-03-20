@@ -23,9 +23,9 @@ spec:
         - containerPort: 8443
         env:
         - name: ISSUER
-          value: "http://keycloak.localtest.me:8080/realms/demo"
+          value: "http://keycloak.localtest.me:8080/realms/kagenti"
         - name: JWKS_URL
-          value: "http://keycloak-service.keycloak.svc.cluster.local:8080/realms/demo/protocol/openid-connect/certs"
+          value: "http://keycloak-service.keycloak.svc.cluster.local:8080/realms/kagenti/protocol/openid-connect/certs"
         - name: AUDIENCE
           value: "demoapp"
         resources:

@@ -38,11 +38,11 @@ func TestReadNamespaceConfig_AllPresent(t *testing.T) {
 		ObjectMeta: metav1.ObjectMeta{Name: AuthBridgeConfigMapName, Namespace: "ns1"},
 		Data: map[string]string{
 			"KEYCLOAK_URL":            "http://keycloak:8080",
-			"KEYCLOAK_REALM":          "demo",
+			"KEYCLOAK_REALM":          "kagenti",
 			"SPIRE_ENABLED":           "true",
 			"PLATFORM_CLIENT_IDS":     "id1,id2",
-			"TOKEN_URL":               "http://keycloak:8080/realms/demo/protocol/openid-connect/token",
-			"ISSUER":                  "http://keycloak:8080/realms/demo",
+			"TOKEN_URL":               "http://keycloak:8080/realms/kagenti/protocol/openid-connect/token",
+			"ISSUER":                  "http://keycloak:8080/realms/kagenti",
 			"EXPECTED_AUDIENCE":       "my-audience",
 			"TARGET_AUDIENCE":         "auth-target",
 			"TARGET_SCOPES":           "openid auth-target-aud",
@@ -71,13 +71,13 @@ func TestReadNamespaceConfig_AllPresent(t *testing.T) {
 	if cfg.KeycloakURL != "http://keycloak:8080" {
 		t.Errorf("KeycloakURL = %q, want %q", cfg.KeycloakURL, "http://keycloak:8080")
 	}
-	if cfg.KeycloakRealm != "demo" {
-		t.Errorf("KeycloakRealm = %q, want %q", cfg.KeycloakRealm, "demo")
+	if cfg.KeycloakRealm != "kagenti" {
+		t.Errorf("KeycloakRealm = %q, want %q", cfg.KeycloakRealm, "kagenti")
 	}
-	if cfg.TokenURL != "http://keycloak:8080/realms/demo/protocol/openid-connect/token" {
+	if cfg.TokenURL != "http://keycloak:8080/realms/kagenti/protocol/openid-connect/token" {
 		t.Errorf("TokenURL = %q", cfg.TokenURL)
 	}
-	if cfg.Issuer != "http://keycloak:8080/realms/demo" {
+	if cfg.Issuer != "http://keycloak:8080/realms/kagenti" {
 		t.Errorf("Issuer = %q", cfg.Issuer)
 	}
 	if cfg.SpiffeHelperConf == "" {
@@ -115,7 +115,7 @@ func TestReadNamespaceConfig_PartialConfig(t *testing.T) {
 		ObjectMeta: metav1.ObjectMeta{Name: AuthBridgeConfigMapName, Namespace: "ns1"},
 		Data: map[string]string{
 			"KEYCLOAK_URL":   "http://keycloak:8080",
-			"KEYCLOAK_REALM": "demo",
+			"KEYCLOAK_REALM": "kagenti",
 		},
 	}
 

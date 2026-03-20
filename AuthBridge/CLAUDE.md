@@ -167,7 +167,7 @@ There are **four** setup scripts for different demo scenarios:
 
 **Common Keycloak defaults across all scripts:**
 - URL: `http://keycloak.localtest.me:8080`
-- Realm: `demo`
+- Realm: `kagenti`
 - Admin: `admin` / `admin`
 
 **Note:** All scripts share the same helper function patterns (`get_or_create_realm`, `get_or_create_client`, `get_or_create_client_scope`, etc.) and are idempotent.

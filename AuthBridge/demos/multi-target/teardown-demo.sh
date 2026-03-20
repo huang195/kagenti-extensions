@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 #
 # Teardown script for the multi-target demo.
-# Deletes k8s resources and optionally the Keycloak demo realm.
+# Deletes k8s resources and optionally the Keycloak realm.
 #
 
 set -eu
@@ -12,7 +12,7 @@ K8S_DIR="${SCRIPT_DIR}/k8s"
 KEYCLOAK_URL="${KEYCLOAK_URL:-http://keycloak.localtest.me:8080}"
 KEYCLOAK_ADMIN_USER="${KEYCLOAK_ADMIN_USER:-admin}"
 KEYCLOAK_ADMIN_PASSWORD="${KEYCLOAK_ADMIN_PASSWORD:-admin}"
-REALM="${REALM:-demo}"
+REALM="${REALM:-kagenti}"
 
 echo "=== Multi-Target Demo Teardown ==="
 echo ""
@@ -25,7 +25,18 @@ kubectl delete -f "${K8S_DIR}/authbridge-deployment-no-spiffe.yaml" --ignore-not
 echo "Kubernetes resources deleted."
 echo ""
 
-# Delete Keycloak realm
+# Delete Keycloak realm (with safety check for platform realm)
+if [ "${REALM}" = "kagenti" ] && [ "${FORCE_REALM_DELETE:-}" != "true" ]; then
+    echo "WARNING: The 'kagenti' realm is the platform's default realm."
+    echo "Deleting it will break authentication for all platform services."
+    echo ""
+    echo "To delete demo-specific Keycloak objects only, use keycloak_sync.py --delete."
+    echo "To force realm deletion, set FORCE_REALM_DELETE=true."
+    echo ""
+    echo "Skipping realm deletion. Kubernetes resources were deleted above."
+    exit 0
+fi
+
 echo "Deleting Keycloak realm '${REALM}' from ${KEYCLOAK_URL}..."
 echo ""
 

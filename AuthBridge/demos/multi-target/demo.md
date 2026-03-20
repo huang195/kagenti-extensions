@@ -96,7 +96,7 @@ python keycloak_sync.py --config demos/multi-target/routes.yaml \
 ```
 
 This reconciles routes.yaml with Keycloak, creating:
-- The `demo` realm (if it doesn't exist)
+- The `kagenti` realm (if it doesn't exist)
 - The agent client (if `--agent-client` is specified and it doesn't exist)
 - `target-alpha`, `target-beta`, `target-gamma` clients (targets)
 - Audience scopes (`target-alpha-aud`, etc.) with audience mappers

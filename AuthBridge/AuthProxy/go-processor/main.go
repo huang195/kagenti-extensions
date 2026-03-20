@@ -243,11 +243,19 @@ func waitForCredentials(maxWait time.Duration) bool {
 	return false
 }
 
-// getConfig returns the current configuration
-func getConfig() (clientID, clientSecret, tokenURL, targetAudience, targetScopes string, spireEnabled bool, jwtSvidPath string) {
+// getConfig returns a copy of the current configuration
+func getConfig() Config {
 	globalConfig.mu.RLock()
 	defer globalConfig.mu.RUnlock()
-	return globalConfig.ClientID, globalConfig.ClientSecret, globalConfig.TokenURL, globalConfig.TargetAudience, globalConfig.TargetScopes, globalConfig.SpireEnabled, globalConfig.JWTSvidPath
+	return Config{
+		ClientID:       globalConfig.ClientID,
+		ClientSecret:   globalConfig.ClientSecret,
+		TokenURL:       globalConfig.TokenURL,
+		TargetAudience: globalConfig.TargetAudience,
+		TargetScopes:   globalConfig.TargetScopes,
+		SpireEnabled:   globalConfig.SpireEnabled,
+		JWTSvidPath:    globalConfig.JWTSvidPath,
+	}
 }
 
 var (
@@ -625,9 +633,12 @@ func (p *processor) handleOutbound(ctx context.Context, headers *core.HeaderMap)
 	}
 
 	// Get global configuration (from files or env vars)
-	clientID, clientSecret, tokenURL, targetAudience, targetScopes, spireEnabled, jwtSvidPath := getConfig()
+	config := getConfig()
 
 	// Apply target-specific overrides if available
+	targetAudience := config.TargetAudience
+	targetScopes := config.TargetScopes
+	tokenURL := config.TokenURL
 	if targetConfig != nil {
 		log.Printf("[Resolver] Applying target config for host %q", requestHost)
 		if targetConfig.Audience != "" {
@@ -645,17 +656,17 @@ func (p *processor) handleOutbound(ctx context.Context, headers *core.HeaderMap)
 	}
 
 	// Check if we have required config (clientSecret not needed when SPIRE is enabled)
-	hasCredentials := (spireEnabled && jwtSvidPath != "") || clientSecret != ""
-	if clientID != "" && hasCredentials && tokenURL != "" && targetAudience != "" && targetScopes != "" {
+	hasCredentials := (config.SpireEnabled && config.JWTSvidPath != "") || config.ClientSecret != ""
+	if config.ClientID != "" && hasCredentials && tokenURL != "" && targetAudience != "" && targetScopes != "" {
 		log.Println("[Token Exchange] Configuration loaded, attempting token exchange")
-		log.Printf("[Token Exchange] Client ID: %s", clientID)
+		log.Printf("[Token Exchange] Client ID: %s", config.ClientID)
 		log.Printf("[Token Exchange] Target Audience: %s", targetAudience)
 		log.Printf("[Token Exchange] Target Scopes: %s", targetScopes)
 
 		// Obtain actor token for act claim chaining (RFC 8693 Section 4.1)
 		var actorToken string
 		if actorTokenEnabled {
-			actorToken, err = globalActorCache.getActorToken(clientID, clientSecret, tokenURL)
+			actorToken, err = globalActorCache.getActorToken(config.ClientID, config.ClientSecret, tokenURL)
 			if err != nil {
 				log.Printf("[Actor Token] WARNING: failed to obtain actor token: %v, proceeding without", err)
 			}
@@ -667,7 +678,7 @@ func (p *processor) handleOutbound(ctx context.Context, headers *core.HeaderMap)
 			subjectToken = strings.TrimPrefix(subjectToken, "bearer ")
 
 			if subjectToken != authHeader {
-				newToken, err := exchangeToken(clientID, clientSecret, tokenURL, subjectToken, targetAudience, targetScopes, spireEnabled, jwtSvidPath, actorToken)
+				newToken, err := exchangeToken(config.ClientID, config.ClientSecret, tokenURL, subjectToken, targetAudience, targetScopes, config.SpireEnabled, config.JWTSvidPath, actorToken)
 				if err == nil {
 					log.Printf("[Token Exchange] Successfully exchanged token, replacing Authorization header")
 					return &v3.ProcessingResponse{
@@ -700,7 +711,7 @@ func (p *processor) handleOutbound(ctx context.Context, headers *core.HeaderMap)
 			// This handles agent frameworks that don't propagate the inbound token.
 			// The token uses the agent's identity rather than the end user's.
 			log.Printf("[Client Credentials] No Authorization header on outbound, falling back to client_credentials grant")
-			newToken, _, err := clientCredentialsGrant(clientID, clientSecret, tokenURL, targetAudience, targetScopes)
+			newToken, _, err := clientCredentialsGrant(config.ClientID, config.ClientSecret, tokenURL, targetAudience, targetScopes)
 			if err == nil {
 				log.Printf("[Client Credentials] Injecting token into outbound request")
 				return &v3.ProcessingResponse{
@@ -728,7 +739,7 @@ func (p *processor) handleOutbound(ctx context.Context, headers *core.HeaderMap)
 	} else {
 		log.Println("[Token Exchange] Missing configuration, skipping token exchange")
 		log.Printf("[Token Exchange] CLIENT_ID present: %v, CLIENT_SECRET present: %v, TOKEN_URL present: %v",
-			clientID != "", clientSecret != "", tokenURL != "")
+			config.ClientID != "", config.ClientSecret != "", tokenURL != "")
 		log.Printf("[Token Exchange] TARGET_AUDIENCE present: %v, TARGET_SCOPES present: %v",
 			targetAudience != "", targetScopes != "")
 	}
@@ -810,11 +821,11 @@ func main() {
 	loadConfig()
 
 	// Initialize inbound JWT validation
-	_, _, tokenURL, _, _, _, _ := getConfig() // clientID, clientSecret, tokenURL, targetAudience, targetScopes, spireEnabled, jwtSvid
+	config := getConfig()
 	inboundIssuer = os.Getenv("ISSUER")
 	expectedAudience = os.Getenv("EXPECTED_AUDIENCE")
-	if tokenURL != "" && inboundIssuer != "" {
-		inboundJWKSURL = deriveJWKSURL(tokenURL)
+	if config.TokenURL != "" && inboundIssuer != "" {
+		inboundJWKSURL = deriveJWKSURL(config.TokenURL)
 		initJWKSCache(inboundJWKSURL)
 		log.Printf("[Inbound] Issuer: %s", inboundIssuer)
 		if expectedAudience != "" {
@@ -823,7 +834,7 @@ func main() {
 			log.Printf("[Inbound] Audience validation disabled (EXPECTED_AUDIENCE not set)")
 		}
 	} else {
-		if tokenURL == "" {
+		if config.TokenURL == "" {
 			log.Println("[Inbound] TOKEN_URL not configured, inbound JWT validation disabled")
 		}
 		if inboundIssuer == "" {
@@ -850,7 +861,12 @@ func main() {
 
 	// Initialize default outbound policy
 	if policy := os.Getenv("DEFAULT_OUTBOUND_POLICY"); policy != "" {
-		defaultOutboundPolicy = policy
+		if policy != "exchange" && policy != "passthrough" {
+			log.Printf("[Outbound] Warning: Unknown DEFAULT_OUTBOUND_POLICY %q, defaulting to 'passthrough'. Valid values: 'exchange', 'passthrough'", policy)
+			defaultOutboundPolicy = "passthrough"
+		} else {
+			defaultOutboundPolicy = policy
+		}
 	}
 	log.Printf("[Outbound] Default policy when no route matches: %s", defaultOutboundPolicy)
 

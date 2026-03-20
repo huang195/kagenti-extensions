@@ -220,7 +220,7 @@ sequenceDiagram
 | Step | Component | Action | Verification |
 |------|-----------|--------|--------------|
 | 1 | SPIRE → spiffe-helper | Issue SVID | Pod receives cryptographic identity (SPIFFE ID) |
-| 2 | setup_keycloak.py | Configure realm | Creates `demo` realm, `auth-target` client, scopes, and demo user `alice` |
+| 2 | setup_keycloak.py | Configure realm | Creates `kagenti` realm, `auth-target` client, scopes, and demo user `alice` |
 | 3 | client-registration → Keycloak | Register client | Keycloak client created with `client_id = SPIFFE ID` |
 | 4 | agent → Keycloak | Get token | Token issued with `aud: SPIFFE ID`, `scope: agent-spiffe-aud` |
 | 5 | agent → envoy-proxy | HTTP request | Envoy intercepts inbound traffic, Ext Proc validates JWT (signature + issuer) |
@@ -285,7 +285,7 @@ python setup_keycloak.py
 
 The `setup_keycloak` script creates:
 
-- `demo` realm
+- `kagenti` realm
 - `auth-target` client (token exchange target audience)
 - `agent-spiffe-aud` scope (realm default - adds Agent's SPIFFE ID to all tokens)
 - `auth-target-aud` scope (for exchanged tokens)

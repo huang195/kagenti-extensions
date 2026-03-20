@@ -25,7 +25,18 @@ kubectl delete -f "${K8S_DIR}/authbridge-deployment-no-spiffe.yaml" --ignore-not
 echo "Kubernetes resources deleted."
 echo ""
 
-# Delete Keycloak realm
+# Delete Keycloak realm (with safety check for platform realm)
+if [ "${REALM}" = "kagenti" ] && [ "${FORCE_REALM_DELETE:-}" != "true" ]; then
+    echo "WARNING: The 'kagenti' realm is the platform's default realm."
+    echo "Deleting it will break authentication for all platform services."
+    echo ""
+    echo "To delete demo-specific Keycloak objects only, use keycloak_sync.py --delete."
+    echo "To force realm deletion, set FORCE_REALM_DELETE=true."
+    echo ""
+    echo "Skipping realm deletion. Kubernetes resources were deleted above."
+    exit 0
+fi
+
 echo "Deleting Keycloak realm '${REALM}' from ${KEYCLOAK_URL}..."
 echo ""
 

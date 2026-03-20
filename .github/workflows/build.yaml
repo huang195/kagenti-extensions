@@ -40,6 +40,11 @@ jobs:
             context: ./AuthBridge/AuthProxy
             dockerfile: Dockerfile.envoy
 
+          # Combined AuthBridge sidecar (envoy + go-processor + spiffe-helper + client-registration)
+          - name: authbridge
+            context: ./AuthBridge
+            dockerfile: AuthProxy/Dockerfile.authbridge
+
           # Demo application for testing
           - name: demo-app
             context: ./AuthBridge/AuthProxy/quickstart/demo-app

@@ -237,23 +237,44 @@ func (m *PodMutator) InjectAuthBridge(ctx context.Context, podSpec *corev1.PodSp
 			"namespace", namespace, "crName", crName)
 	}
 
-	// Conditionally inject sidecars based on precedence decisions
-	if decision.EnvoyProxy.Inject && !containerExists(podSpec.Containers, EnvoyProxyContainerName) {
-		podSpec.Containers = append(podSpec.Containers, builder.BuildEnvoyProxyContainerWithSpireOption(spireEnabled))
-	}
+	// Conditionally inject sidecars based on precedence decisions.
+	// Two modes controlled by the combinedSidecar feature gate:
+	//   true  → combined mode: single "authbridge" container replaces envoy-proxy +
+	//           spiffe-helper + client-registration. proxy-init is still separate.
+	//   false → legacy mode: separate sidecar containers (unchanged behavior).
+	if currentGates.CombinedSidecar {
+		// Combined mode: inject single authbridge container (only when envoy-proxy is enabled)
+		if decision.EnvoyProxy.Inject && !containerExists(podSpec.Containers, AuthBridgeContainerName) {
+			podSpec.Containers = append(podSpec.Containers,
+				builder.BuildAuthBridgeContainer(crName, namespace,
+					decision.SpiffeHelper.Inject,
+					decision.ClientRegistration.Inject))
+		}
+		// proxy-init is still injected separately
+		if decision.ProxyInit.Inject && !containerExists(podSpec.InitContainers, ProxyInitContainerName) {
+			outboundExclude := annotations[OutboundPortsExcludeAnnotation]
+			inboundExclude := annotations[InboundPortsExcludeAnnotation]
+			podSpec.InitContainers = append(podSpec.InitContainers, builder.BuildProxyInitContainer(outboundExclude, inboundExclude))
+		}
+	} else {
+		// Legacy mode: separate sidecar containers
+		if decision.EnvoyProxy.Inject && !containerExists(podSpec.Containers, EnvoyProxyContainerName) {
+			podSpec.Containers = append(podSpec.Containers, builder.BuildEnvoyProxyContainerWithSpireOption(spireEnabled))
+		}
 
-	if decision.ProxyInit.Inject && !containerExists(podSpec.InitContainers, ProxyInitContainerName) {
-		outboundExclude := annotations[OutboundPortsExcludeAnnotation]
-		inboundExclude := annotations[InboundPortsExcludeAnnotation]
-		podSpec.InitContainers = append(podSpec.InitContainers, builder.BuildProxyInitContainer(outboundExclude, inboundExclude))
-	}
+		if decision.ProxyInit.Inject && !containerExists(podSpec.InitContainers, ProxyInitContainerName) {
+			outboundExclude := annotations[OutboundPortsExcludeAnnotation]
+			inboundExclude := annotations[InboundPortsExcludeAnnotation]
+			podSpec.InitContainers = append(podSpec.InitContainers, builder.BuildProxyInitContainer(outboundExclude, inboundExclude))
+		}
 
-	if decision.SpiffeHelper.Inject && !containerExists(podSpec.Containers, SpiffeHelperContainerName) {
-		podSpec.Containers = append(podSpec.Containers, builder.BuildSpiffeHelperContainer())
-	}
+		if decision.SpiffeHelper.Inject && !containerExists(podSpec.Containers, SpiffeHelperContainerName) {
+			podSpec.Containers = append(podSpec.Containers, builder.BuildSpiffeHelperContainer())
+		}
 
-	if decision.ClientRegistration.Inject && !containerExists(podSpec.Containers, ClientRegistrationContainerName) {
-		podSpec.Containers = append(podSpec.Containers, builder.BuildClientRegistrationContainerWithSpireOption(crName, namespace, spireEnabled))
+		if decision.ClientRegistration.Inject && !containerExists(podSpec.Containers, ClientRegistrationContainerName) {
+			podSpec.Containers = append(podSpec.Containers, builder.BuildClientRegistrationContainerWithSpireOption(crName, namespace, spireEnabled))
+		}
 	}
 
 	// Inject volumes

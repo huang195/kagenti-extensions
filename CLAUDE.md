@@ -50,7 +50,7 @@ A Kubernetes **mutating admission webhook** that intercepts workload creation (D
 - Webhook: **AuthBridge** at `/mutate-workloads-authbridge`
 - Injection controlled via pod labels (`kagenti.io/type`, `kagenti.io/inject`) and per-sidecar opt-out labels (`kagenti.io/envoy-proxy-inject`, `kagenti.io/spiffe-helper-inject`, `kagenti.io/client-registration-inject`)
 - Shared `PodMutator` instance (in `internal/webhook/injector/`)
-- Injects: `proxy-init` (init), `envoy-proxy`, `spiffe-helper`, `kagenti-client-registration` — all opt-out via workload labels or feature gates
+- Injects: `proxy-init` (init), `envoy-proxy`, `spiffe-helper`, `kagenti-client-registration` — all opt-out via workload labels or feature gates. When `featureGates.combinedSidecar=true`, sidecars are merged into a single `authbridge` container.
 - Build: `cd kagenti-webhook && make build` / `make test` / `make docker-build`
 - Local dev: `cd kagenti-webhook && make local-dev CLUSTER=<kind-cluster>`
 
@@ -110,12 +110,29 @@ A Python script that **automatically registers Kubernetes workloads as Keycloak 
          └────────────────────────────────────┘
 ```
 
+When `featureGates.combinedSidecar=true`, the three long-running sidecars are merged into a single `authbridge` container (proxy-init remains separate):
+
+```
+         ┌────────────────────────────────────┐
+         │            WORKLOAD POD            │
+         │                                    │
+         │  proxy-init (init) ─► iptables     │
+         │                                    │
+         │  authbridge (combined sidecar)     │
+         │    spiffe-helper ──► SPIRE Agent   │
+         │    client-registration ──► Keycloak│
+         │    envoy-proxy + go-processor      │
+         │       │                            │
+         │  Your Application                  │
+         └────────────────────────────────────┘
+```
+
 ## CI/CD Workflows
 
 | Workflow | Trigger | Purpose |
 |----------|---------|---------|
 | `ci.yaml` | PR to main/release-* | Go fmt, vet, build across all Go modules; Python tests |
-| `build.yaml` | Tag push (`v*`) or manual | Multi-arch Docker builds for: client-registration, auth-proxy, proxy-init, envoy-with-processor, demo-app |
+| `build.yaml` | Tag push (`v*`) or manual | Multi-arch Docker builds for: client-registration, auth-proxy, proxy-init, envoy-with-processor, authbridge, demo-app |
 | `goreleaser.yml` | Tag push (`v*`) | GoReleaser binary + ko image for webhook, Helm chart package + push |
 | `e2e-kind.yaml` | PR to main/release-* | End-to-end tests on a Kind cluster (webhook injection) |
 | `security-scans.yaml` | PR to main | Dependency review, shellcheck, YAML lint, Hadolint, Bandit, Trivy, CodeQL |
@@ -142,6 +159,7 @@ All images are pushed to `ghcr.io/kagenti/kagenti-extensions/`:
 | `envoy-with-processor` | `AuthBridge/AuthProxy/Dockerfile.envoy` | Envoy 1.28 + go-processor ext-proc |
 | `proxy-init` | `AuthBridge/AuthProxy/Dockerfile.init` | Alpine + iptables init container |
 | `client-registration` | `AuthBridge/client-registration/Dockerfile` | Python Keycloak client registrar |
+| `authbridge` | `AuthBridge/AuthProxy/Dockerfile.authbridge` | Combined sidecar (Envoy + go-processor + spiffe-helper + client-registration) |
 | `auth-proxy` | `AuthBridge/AuthProxy/Dockerfile` | Example pass-through proxy (for demos) |
 | `demo-app` | `AuthBridge/AuthProxy/quickstart/demo-app/Dockerfile` | Demo target service |
 
@@ -278,9 +296,9 @@ AUTHBRIDGE_DEMO=true ./scripts/webhook-rollout.sh
 
 ## Important Cross-Component Relationships
 
-1. **UID/GID Sync:** The `client-registration` Dockerfile creates a user with UID/GID 1000. The webhook's `container_builder.go` sets `runAsUser: 1000` / `runAsGroup: 1000`. These MUST match.
+1. **UID/GID Sync:** The `client-registration` Dockerfile creates a user with UID/GID 1000. The webhook's `container_builder.go` sets `runAsUser: 1000` / `runAsGroup: 1000`. These MUST match. In combined mode (`authbridge` container), everything runs as UID 1337 instead.
 
-2. **Envoy Proxy UID:** Envoy runs as UID 1337. The `proxy-init` iptables rules exclude this UID from redirection to prevent loops. Both `container_builder.go` and `init-iptables.sh` use this value.
+2. **Envoy Proxy UID:** Envoy runs as UID 1337. The `proxy-init` iptables rules exclude this UID from redirection to prevent loops. Both `container_builder.go` and `init-iptables.sh` use this value. The combined `authbridge` container also runs as UID 1337.
 
 3. **Shared Volume Contract:** The sidecars communicate through shared volumes:
    - `/opt/jwt_svid.token` — spiffe-helper writes, client-registration reads

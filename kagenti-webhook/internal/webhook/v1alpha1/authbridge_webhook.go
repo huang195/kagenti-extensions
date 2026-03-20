@@ -145,7 +145,8 @@ func (w *AuthBridgeWebhook) isAlreadyInjected(podSpec *corev1.PodSpec) bool {
 	for i := range podSpec.Containers {
 		if podSpec.Containers[i].Name == injector.EnvoyProxyContainerName ||
 			podSpec.Containers[i].Name == injector.SpiffeHelperContainerName ||
-			podSpec.Containers[i].Name == injector.ClientRegistrationContainerName {
+			podSpec.Containers[i].Name == injector.ClientRegistrationContainerName ||
+			podSpec.Containers[i].Name == injector.AuthBridgeContainerName {
 			return true
 		}
 	}

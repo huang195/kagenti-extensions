@@ -435,6 +435,246 @@ func TestBuildPortExcludeValue(t *testing.T) {
 	}
 }
 
+// ========================================
+// AuthBridge combined container tests
+// ========================================
+
+func TestBuildAuthBridgeContainer_Name(t *testing.T) {
+	builder := NewContainerBuilder(config.CompiledDefaults())
+	container := builder.BuildAuthBridgeContainer("my-agent", "test-ns", true, true)
+
+	if container.Name != AuthBridgeContainerName {
+		t.Errorf("container name = %q, want %q", container.Name, AuthBridgeContainerName)
+	}
+}
+
+func TestBuildAuthBridgeContainer_UID1337(t *testing.T) {
+	builder := NewContainerBuilder(config.CompiledDefaults())
+	container := builder.BuildAuthBridgeContainer("my-agent", "test-ns", true, true)
+
+	if container.SecurityContext == nil {
+		t.Fatal("SecurityContext is nil")
+	}
+	if container.SecurityContext.RunAsUser == nil || *container.SecurityContext.RunAsUser != 1337 {
+		t.Errorf("RunAsUser = %v, want 1337", container.SecurityContext.RunAsUser)
+	}
+	if container.SecurityContext.RunAsGroup == nil || *container.SecurityContext.RunAsGroup != 1337 {
+		t.Errorf("RunAsGroup = %v, want 1337", container.SecurityContext.RunAsGroup)
+	}
+}
+
+func TestBuildAuthBridgeContainer_Ports(t *testing.T) {
+	builder := NewContainerBuilder(config.CompiledDefaults())
+	container := builder.BuildAuthBridgeContainer("my-agent", "test-ns", true, true)
+
+	wantPorts := map[string]int32{
+		"envoy-outbound": 15123,
+		"envoy-inbound":  15124,
+		"envoy-admin":    9901,
+		"ext-proc":       9090,
+	}
+
+	portsByName := make(map[string]int32)
+	for _, p := range container.Ports {
+		portsByName[p.Name] = p.ContainerPort
+	}
+
+	for name, wantPort := range wantPorts {
+		got, ok := portsByName[name]
+		if !ok {
+			t.Errorf("missing port %q", name)
+			continue
+		}
+		if got != wantPort {
+			t.Errorf("port %q = %d, want %d", name, got, wantPort)
+		}
+	}
+}
+
+func TestBuildAuthBridgeContainer_SpireEnabled_AllMounts(t *testing.T) {
+	builder := NewContainerBuilder(config.CompiledDefaults())
+	container := builder.BuildAuthBridgeContainer("my-agent", "test-ns", true, true)
+
+	wantMounts := map[string]string{
+		"envoy-config":        "/etc/envoy",
+		"authproxy-routes":    "/etc/authproxy",
+		"shared-data":         "/shared",
+		"svid-output":         "/opt",
+		"spiffe-helper-config": "/etc/spiffe-helper",
+		"spire-agent-socket":  "/spiffe-workload-api",
+	}
+
+	mountsByName := make(map[string]string)
+	for _, vm := range container.VolumeMounts {
+		mountsByName[vm.Name] = vm.MountPath
+	}
+
+	for name, wantPath := range wantMounts {
+		gotPath, ok := mountsByName[name]
+		if !ok {
+			t.Errorf("missing volume mount %q", name)
+			continue
+		}
+		if gotPath != wantPath {
+			t.Errorf("volume mount %q path = %q, want %q", name, gotPath, wantPath)
+		}
+	}
+
+	// shared-data and svid-output must be read-write
+	for _, vm := range container.VolumeMounts {
+		if vm.Name == "shared-data" || vm.Name == "svid-output" {
+			if vm.ReadOnly {
+				t.Errorf("volume mount %q should be read-write, got ReadOnly=true", vm.Name)
+			}
+		}
+	}
+}
+
+func TestBuildAuthBridgeContainer_SpireDisabled_NoSpireMounts(t *testing.T) {
+	builder := NewContainerBuilder(config.CompiledDefaults())
+	container := builder.BuildAuthBridgeContainer("my-agent", "test-ns", false, true)
+
+	spireMounts := []string{"svid-output", "spiffe-helper-config", "spire-agent-socket"}
+	for _, vm := range container.VolumeMounts {
+		for _, spireMount := range spireMounts {
+			if vm.Name == spireMount {
+				t.Errorf("unexpected SPIRE volume mount %q when SPIRE is disabled", vm.Name)
+			}
+		}
+	}
+
+	// Still has non-SPIRE mounts
+	found := false
+	for _, vm := range container.VolumeMounts {
+		if vm.Name == "envoy-config" {
+			found = true
+		}
+	}
+	if !found {
+		t.Error("missing envoy-config volume mount")
+	}
+}
+
+func TestBuildAuthBridgeContainer_ControlFlags(t *testing.T) {
+	builder := NewContainerBuilder(config.CompiledDefaults())
+	container := builder.BuildAuthBridgeContainer("my-agent", "test-ns", true, false)
+
+	envByName := make(map[string]string)
+	for _, env := range container.Env {
+		if env.Value != "" {
+			envByName[env.Name] = env.Value
+		}
+	}
+
+	if envByName["SPIRE_ENABLED"] != "true" {
+		t.Errorf("SPIRE_ENABLED = %q, want %q", envByName["SPIRE_ENABLED"], "true")
+	}
+	if envByName["CLIENT_REGISTRATION_ENABLED"] != "false" {
+		t.Errorf("CLIENT_REGISTRATION_ENABLED = %q, want %q", envByName["CLIENT_REGISTRATION_ENABLED"], "false")
+	}
+}
+
+func TestBuildAuthBridgeContainer_AllEnvVars(t *testing.T) {
+	builder := NewContainerBuilder(config.CompiledDefaults())
+	container := builder.BuildAuthBridgeContainer("my-agent", "test-ns", true, true)
+
+	// Verify union of envoy-proxy + client-registration env vars exist
+	requiredEnvNames := []string{
+		"SPIRE_ENABLED", "CLIENT_REGISTRATION_ENABLED",
+		"KEYCLOAK_URL", "KEYCLOAK_REALM", "TOKEN_URL", "ISSUER",
+		"EXPECTED_AUDIENCE", "TARGET_AUDIENCE", "TARGET_SCOPES",
+		"CLIENT_ID_FILE", "CLIENT_SECRET_FILE", "ROUTES_CONFIG_PATH",
+		"DEFAULT_OUTBOUND_POLICY",
+		"KEYCLOAK_ADMIN_USERNAME", "KEYCLOAK_ADMIN_PASSWORD",
+		"CLIENT_NAME", "SECRET_FILE_PATH", "PLATFORM_CLIENT_IDS",
+	}
+
+	envNames := make(map[string]bool)
+	for _, env := range container.Env {
+		envNames[env.Name] = true
+	}
+
+	for _, name := range requiredEnvNames {
+		if !envNames[name] {
+			t.Errorf("missing env var %q", name)
+		}
+	}
+}
+
+func TestBuildAuthBridgeContainer_AdminCredentialsFromSecret(t *testing.T) {
+	builder := NewContainerBuilder(config.CompiledDefaults())
+	container := builder.BuildAuthBridgeContainer("my-agent", "test-ns", true, true)
+
+	for _, key := range []string{"KEYCLOAK_ADMIN_USERNAME", "KEYCLOAK_ADMIN_PASSWORD"} {
+		found := false
+		for _, env := range container.Env {
+			if env.Name != key {
+				continue
+			}
+			found = true
+			if env.ValueFrom == nil || env.ValueFrom.SecretKeyRef == nil {
+				t.Errorf("env %q must use SecretKeyRef", key)
+			}
+		}
+		if !found {
+			t.Errorf("missing env var %q", key)
+		}
+	}
+}
+
+func TestBuildAuthBridgeContainer_ResolvedMode(t *testing.T) {
+	resolved := &ResolvedConfig{
+		Platform:              config.CompiledDefaults(),
+		KeycloakURL:           "https://keycloak.example.com",
+		KeycloakRealm:         "test-realm",
+		TokenURL:              "https://keycloak.example.com/realms/test-realm/protocol/openid-connect/token",
+		DefaultOutboundPolicy: "passthrough",
+	}
+	builder := NewResolvedContainerBuilder(resolved)
+	container := builder.BuildAuthBridgeContainer("my-agent", "test-ns", true, true)
+
+	envByName := make(map[string]string)
+	for _, env := range container.Env {
+		if env.Value != "" {
+			envByName[env.Name] = env.Value
+		}
+	}
+
+	if envByName["KEYCLOAK_URL"] != "https://keycloak.example.com" {
+		t.Errorf("KEYCLOAK_URL = %q, want %q", envByName["KEYCLOAK_URL"], "https://keycloak.example.com")
+	}
+	if envByName["KEYCLOAK_REALM"] != "test-realm" {
+		t.Errorf("KEYCLOAK_REALM = %q, want %q", envByName["KEYCLOAK_REALM"], "test-realm")
+	}
+
+	// Sensitive values should still use SecretKeyRef
+	for _, env := range container.Env {
+		if env.Name == "KEYCLOAK_ADMIN_USERNAME" || env.Name == "KEYCLOAK_ADMIN_PASSWORD" {
+			if env.Value != "" {
+				t.Errorf("env %q must NOT have a literal Value in resolved path", env.Name)
+			}
+			if env.ValueFrom == nil || env.ValueFrom.SecretKeyRef == nil {
+				t.Errorf("env %q must use SecretKeyRef", env.Name)
+			}
+		}
+	}
+}
+
+func TestBuildAuthBridgeContainer_ClientName(t *testing.T) {
+	builder := NewContainerBuilder(config.CompiledDefaults())
+	container := builder.BuildAuthBridgeContainer("my-agent", "test-ns", true, true)
+
+	for _, env := range container.Env {
+		if env.Name == "CLIENT_NAME" {
+			if env.Value != "test-ns/my-agent" {
+				t.Errorf("CLIENT_NAME = %q, want %q", env.Value, "test-ns/my-agent")
+			}
+			return
+		}
+	}
+	t.Error("missing CLIENT_NAME env var")
+}
+
 func TestBuildEnvoyProxyContainer_HasExpectedAudienceFromConfigMap(t *testing.T) {
 	builder := NewContainerBuilder(config.CompiledDefaults())
 	container := builder.BuildEnvoyProxyContainerWithSpireOption(true)

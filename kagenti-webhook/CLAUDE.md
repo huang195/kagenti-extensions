@@ -41,6 +41,8 @@ Each sidecar independently passes through a two-layer chain:
 
 ### Injected Containers
 
+#### Separate mode (default: `featureGates.combinedSidecar: false`)
+
 **Injected when envoy-proxy decision passes:**
 
 - `proxy-init` (init container) -- iptables redirect setup. Follows `envoy-proxy` decision exactly.
@@ -50,6 +52,11 @@ Each sidecar independently passes through a two-layer chain:
 
 - `spiffe-helper` (sidecar) -- obtains JWT-SVIDs from SPIRE agent. Opt out with `kagenti.io/spiffe-helper-inject: "false"` or `featureGates.spiffeHelper: false`.
 - `kagenti-client-registration` (sidecar) -- registers with Keycloak via SPIFFE identity. Opt out with `kagenti.io/client-registration-inject: "false"` or `featureGates.clientRegistration: false`.
+
+#### Combined mode (`featureGates.combinedSidecar: true`)
+
+- `proxy-init` (init container) -- same as separate mode.
+- `authbridge` (sidecar) -- single container combining Envoy + go-processor + spiffe-helper + client-registration. Runs as UID 1337. Per-sidecar feature gates and workload labels are passed as `SPIRE_ENABLED` and `CLIENT_REGISTRATION_ENABLED` env vars to the entrypoint. If envoy-proxy is disabled, no combined container is injected.
 
 ## Directory Structure
 
@@ -182,6 +189,7 @@ Secrets:
 - `envoy-proxy` runs as UID 1337.
 - `client-registration` runs as UID/GID 1000.
 - `spiffe-helper` uses no explicit security context.
+- `authbridge` (combined mode) runs as UID 1337 (Envoy UID, excluded from iptables redirect).
 - Istio exclusion annotations (`sidecar.istio.io/inject`, `ambient.istio.io/redirection`) are defined as constants but not yet actively applied.
 
 ### Test Infrastructure
@@ -224,7 +232,7 @@ The webhook targets **Pods at CREATE time** (not Deployments/StatefulSets/etc.).
 
 3. **AuthBridge uses raw admission.Handler**: Unlike webhooks that use `CustomDefaulter`/`CustomValidator`, the AuthBridge webhook registers directly via `mgr.GetWebhookServer().Register()`. It decodes `corev1.Pod` directly and includes a Kind guard for defense-in-depth against stale webhook configs.
 
-4. **Idempotency check**: `isAlreadyInjected()` checks for all four injected components (`envoy-proxy`, `spiffe-helper`, `kagenti-client-registration` in sidecar containers, `proxy-init` in init containers). If any one is found, re-admission is short-circuited.
+4. **Idempotency check**: `isAlreadyInjected()` checks for all injected components (`envoy-proxy`, `spiffe-helper`, `kagenti-client-registration`, `authbridge` in sidecar containers, `proxy-init` in init containers). If any one is found, re-admission is short-circuited.
 
 5. **ENVTEST binary path**: Tests assume envtest binaries are in `bin/k8s/`. Run `make setup-envtest` to download them before running tests from an IDE.
 

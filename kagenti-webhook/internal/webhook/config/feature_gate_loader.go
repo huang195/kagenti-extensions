@@ -182,6 +182,7 @@ func logFeatureGates(fg *FeatureGates, source string) {
 		"clientRegistration", fg.ClientRegistration,
 		"injectTools", fg.InjectTools,
 		"perWorkloadConfigResolution", fg.PerWorkloadConfigResolution,
+		"combinedSidecar", fg.CombinedSidecar,
 	)
 	log.Info("=============================================")
 }

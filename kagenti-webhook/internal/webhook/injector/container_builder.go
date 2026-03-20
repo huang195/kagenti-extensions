@@ -31,8 +31,9 @@ var builderLog = logf.Log.WithName("container-builder")
 
 const (
 	// Container names for AuthBridge sidecars
-	EnvoyProxyContainerName = "envoy-proxy"
-	ProxyInitContainerName  = "proxy-init"
+	EnvoyProxyContainerName  = "envoy-proxy"
+	ProxyInitContainerName   = "proxy-init"
+	AuthBridgeContainerName  = "authbridge"
 
 	// Client registration container configuration
 	// Keep in sync with AuthBridge/client-registration/Dockerfile
@@ -509,6 +510,270 @@ func (b *ContainerBuilder) buildEnvoyProxyEnvLegacy() []corev1.EnvVar {
 				ConfigMapKeyRef: &corev1.ConfigMapKeySelector{
 					LocalObjectReference: corev1.LocalObjectReference{Name: "authbridge-config"},
 					Key:                  "DEFAULT_OUTBOUND_POLICY",
+					Optional:             ptr.To(true),
+				},
+			},
+		},
+	}
+}
+
+// BuildAuthBridgeContainer creates the combined authbridge sidecar container
+// that includes envoy-proxy, go-processor, spiffe-helper, and client-registration
+// in a single container. This is used when the CombinedSidecar feature gate is enabled.
+func (b *ContainerBuilder) BuildAuthBridgeContainer(name, namespace string, spireEnabled, clientRegistrationEnabled bool) corev1.Container {
+	builderLog.Info("building AuthBridge combined Container",
+		"spireEnabled", spireEnabled,
+		"clientRegistrationEnabled", clientRegistrationEnabled)
+
+	clientName := namespace + "/" + name
+
+	var env []corev1.EnvVar
+	if b.resolved != nil {
+		env = b.buildAuthBridgeEnvResolved(clientName, spireEnabled, clientRegistrationEnabled)
+	} else {
+		env = b.buildAuthBridgeEnvLegacy(clientName, spireEnabled, clientRegistrationEnabled)
+	}
+
+	// Volume mounts: union of envoy-proxy + spiffe-helper + client-registration mounts.
+	// shared-data and svid-output are read-write (same container reads and writes).
+	volumeMounts := []corev1.VolumeMount{
+		{
+			Name:      "envoy-config",
+			MountPath: "/etc/envoy",
+			ReadOnly:  true,
+		},
+		{
+			Name:      "authproxy-routes",
+			MountPath: "/etc/authproxy",
+			ReadOnly:  true,
+		},
+		{
+			Name:      "shared-data",
+			MountPath: "/shared",
+		},
+	}
+	if spireEnabled {
+		volumeMounts = append(volumeMounts,
+			corev1.VolumeMount{
+				Name:      "svid-output",
+				MountPath: "/opt",
+			},
+			corev1.VolumeMount{
+				Name:      "spiffe-helper-config",
+				MountPath: "/etc/spiffe-helper",
+				ReadOnly:  true,
+			},
+			corev1.VolumeMount{
+				Name:      "spire-agent-socket",
+				MountPath: "/spiffe-workload-api",
+				ReadOnly:  true,
+			},
+		)
+	}
+
+	return corev1.Container{
+		Name:            AuthBridgeContainerName,
+		Image:           b.cfg.Images.AuthBridge,
+		ImagePullPolicy: b.cfg.Images.PullPolicy,
+		Resources:       b.cfg.Resources.AuthBridge,
+		Ports: []corev1.ContainerPort{
+			{
+				Name:          "envoy-outbound",
+				ContainerPort: b.cfg.Proxy.Port,
+				Protocol:      corev1.ProtocolTCP,
+			},
+			{
+				Name:          "envoy-inbound",
+				ContainerPort: b.cfg.Proxy.InboundProxyPort,
+				Protocol:      corev1.ProtocolTCP,
+			},
+			{
+				Name:          "envoy-admin",
+				ContainerPort: b.cfg.Proxy.AdminPort,
+				Protocol:      corev1.ProtocolTCP,
+			},
+			{
+				Name:          "ext-proc",
+				ContainerPort: 9090,
+				Protocol:      corev1.ProtocolTCP,
+			},
+		},
+		Env: env,
+		SecurityContext: &corev1.SecurityContext{
+			RunAsUser:  ptr.To(b.cfg.Proxy.UID),
+			RunAsGroup: ptr.To(b.cfg.Proxy.UID),
+		},
+		VolumeMounts: volumeMounts,
+	}
+}
+
+// buildAuthBridgeEnvResolved returns env vars for the combined container from resolved config.
+func (b *ContainerBuilder) buildAuthBridgeEnvResolved(clientName string, spireEnabled, clientRegistrationEnabled bool) []corev1.EnvVar {
+	secretName := b.resolved.AdminCredentialsSecretName
+	if secretName == "" {
+		secretName = KeycloakAdminSecretName
+	}
+
+	env := []corev1.EnvVar{
+		// Control flags for the entrypoint
+		{Name: "SPIRE_ENABLED", Value: fmt.Sprintf("%t", spireEnabled)},
+		{Name: "CLIENT_REGISTRATION_ENABLED", Value: fmt.Sprintf("%t", clientRegistrationEnabled)},
+		// Envoy/go-processor env vars
+		{Name: "KEYCLOAK_URL", Value: b.resolved.KeycloakURL},
+		{Name: "KEYCLOAK_REALM", Value: b.resolved.KeycloakRealm},
+		{Name: "TOKEN_URL", Value: b.resolved.TokenURL},
+		{Name: "ISSUER", Value: b.resolved.Issuer},
+		{Name: "EXPECTED_AUDIENCE", Value: b.resolved.ExpectedAudience},
+		{Name: "TARGET_AUDIENCE", Value: b.resolved.TargetAudience},
+		{Name: "TARGET_SCOPES", Value: b.resolved.TargetScopes},
+		{Name: "CLIENT_ID_FILE", Value: "/shared/client-id.txt"},
+		{Name: "CLIENT_SECRET_FILE", Value: "/shared/client-secret.txt"},
+		{Name: "ROUTES_CONFIG_PATH", Value: "/etc/authproxy/routes.yaml"},
+		{Name: "DEFAULT_OUTBOUND_POLICY", Value: b.resolved.DefaultOutboundPolicy},
+		// Client-registration env vars (sensitive values stay as SecretKeyRef)
+		{
+			Name: "KEYCLOAK_ADMIN_USERNAME",
+			ValueFrom: &corev1.EnvVarSource{
+				SecretKeyRef: &corev1.SecretKeySelector{
+					LocalObjectReference: corev1.LocalObjectReference{Name: secretName},
+					Key:                  "KEYCLOAK_ADMIN_USERNAME",
+				},
+			},
+		},
+		{
+			Name: "KEYCLOAK_ADMIN_PASSWORD",
+			ValueFrom: &corev1.EnvVarSource{
+				SecretKeyRef: &corev1.SecretKeySelector{
+					LocalObjectReference: corev1.LocalObjectReference{Name: secretName},
+					Key:                  "KEYCLOAK_ADMIN_PASSWORD",
+				},
+			},
+		},
+		{Name: "CLIENT_NAME", Value: clientName},
+		{Name: "SECRET_FILE_PATH", Value: "/shared/client-secret.txt"},
+		{Name: "PLATFORM_CLIENT_IDS", Value: b.resolved.PlatformClientIDs},
+	}
+
+	return env
+}
+
+// buildAuthBridgeEnvLegacy returns ValueFrom-based env vars for the combined container.
+func (b *ContainerBuilder) buildAuthBridgeEnvLegacy(clientName string, spireEnabled, clientRegistrationEnabled bool) []corev1.EnvVar {
+	return []corev1.EnvVar{
+		// Control flags for the entrypoint
+		{Name: "SPIRE_ENABLED", Value: fmt.Sprintf("%t", spireEnabled)},
+		{Name: "CLIENT_REGISTRATION_ENABLED", Value: fmt.Sprintf("%t", clientRegistrationEnabled)},
+		// Envoy/go-processor env vars (from ConfigMap)
+		{
+			Name: "KEYCLOAK_URL",
+			ValueFrom: &corev1.EnvVarSource{
+				ConfigMapKeyRef: &corev1.ConfigMapKeySelector{
+					LocalObjectReference: corev1.LocalObjectReference{Name: AuthBridgeConfigMapName},
+					Key:                  "KEYCLOAK_URL",
+					Optional:             ptr.To(true),
+				},
+			},
+		},
+		{
+			Name: "KEYCLOAK_REALM",
+			ValueFrom: &corev1.EnvVarSource{
+				ConfigMapKeyRef: &corev1.ConfigMapKeySelector{
+					LocalObjectReference: corev1.LocalObjectReference{Name: AuthBridgeConfigMapName},
+					Key:                  "KEYCLOAK_REALM",
+					Optional:             ptr.To(true),
+				},
+			},
+		},
+		{
+			Name: "TOKEN_URL",
+			ValueFrom: &corev1.EnvVarSource{
+				ConfigMapKeyRef: &corev1.ConfigMapKeySelector{
+					LocalObjectReference: corev1.LocalObjectReference{Name: "authbridge-config"},
+					Key:                  "TOKEN_URL",
+					Optional:             ptr.To(true),
+				},
+			},
+		},
+		{
+			Name: "ISSUER",
+			ValueFrom: &corev1.EnvVarSource{
+				ConfigMapKeyRef: &corev1.ConfigMapKeySelector{
+					LocalObjectReference: corev1.LocalObjectReference{Name: "authbridge-config"},
+					Key:                  "ISSUER",
+					Optional:             ptr.To(false),
+				},
+			},
+		},
+		{
+			Name: "EXPECTED_AUDIENCE",
+			ValueFrom: &corev1.EnvVarSource{
+				ConfigMapKeyRef: &corev1.ConfigMapKeySelector{
+					LocalObjectReference: corev1.LocalObjectReference{Name: "authbridge-config"},
+					Key:                  "EXPECTED_AUDIENCE",
+					Optional:             ptr.To(true),
+				},
+			},
+		},
+		{
+			Name: "TARGET_AUDIENCE",
+			ValueFrom: &corev1.EnvVarSource{
+				ConfigMapKeyRef: &corev1.ConfigMapKeySelector{
+					LocalObjectReference: corev1.LocalObjectReference{Name: "authbridge-config"},
+					Key:                  "TARGET_AUDIENCE",
+					Optional:             ptr.To(true),
+				},
+			},
+		},
+		{
+			Name: "TARGET_SCOPES",
+			ValueFrom: &corev1.EnvVarSource{
+				ConfigMapKeyRef: &corev1.ConfigMapKeySelector{
+					LocalObjectReference: corev1.LocalObjectReference{Name: "authbridge-config"},
+					Key:                  "TARGET_SCOPES",
+					Optional:             ptr.To(true),
+				},
+			},
+		},
+		{Name: "CLIENT_ID_FILE", Value: "/shared/client-id.txt"},
+		{Name: "CLIENT_SECRET_FILE", Value: "/shared/client-secret.txt"},
+		{Name: "ROUTES_CONFIG_PATH", Value: "/etc/authproxy/routes.yaml"},
+		{
+			Name: "DEFAULT_OUTBOUND_POLICY",
+			ValueFrom: &corev1.EnvVarSource{
+				ConfigMapKeyRef: &corev1.ConfigMapKeySelector{
+					LocalObjectReference: corev1.LocalObjectReference{Name: "authbridge-config"},
+					Key:                  "DEFAULT_OUTBOUND_POLICY",
+					Optional:             ptr.To(true),
+				},
+			},
+		},
+		// Client-registration env vars
+		{
+			Name: "KEYCLOAK_ADMIN_USERNAME",
+			ValueFrom: &corev1.EnvVarSource{
+				SecretKeyRef: &corev1.SecretKeySelector{
+					LocalObjectReference: corev1.LocalObjectReference{Name: "keycloak-admin-secret"},
+					Key:                  "KEYCLOAK_ADMIN_USERNAME",
+				},
+			},
+		},
+		{
+			Name: "KEYCLOAK_ADMIN_PASSWORD",
+			ValueFrom: &corev1.EnvVarSource{
+				SecretKeyRef: &corev1.SecretKeySelector{
+					LocalObjectReference: corev1.LocalObjectReference{Name: "keycloak-admin-secret"},
+					Key:                  "KEYCLOAK_ADMIN_PASSWORD",
+				},
+			},
+		},
+		{Name: "CLIENT_NAME", Value: clientName},
+		{Name: "SECRET_FILE_PATH", Value: "/shared/client-secret.txt"},
+		{
+			Name: "PLATFORM_CLIENT_IDS",
+			ValueFrom: &corev1.EnvVarSource{
+				ConfigMapKeyRef: &corev1.ConfigMapKeySelector{
+					LocalObjectReference: corev1.LocalObjectReference{Name: AuthBridgeConfigMapName},
+					Key:                  "PLATFORM_CLIENT_IDS",
 					Optional:             ptr.To(true),
 				},
 			},

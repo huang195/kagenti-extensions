@@ -13,6 +13,7 @@ func CompiledDefaults() *PlatformConfig {
 			ProxyInit:          "ghcr.io/kagenti/kagenti-extensions/proxy-init:latest",
 			SpiffeHelper:       "ghcr.io/spiffe/spiffe-helper:0.11.0",
 			ClientRegistration: "ghcr.io/kagenti/kagenti-extensions/client-registration:latest",
+			AuthBridge:         "ghcr.io/kagenti/kagenti-extensions/authbridge:latest",
 			PullPolicy:         corev1.PullIfNotPresent,
 		},
 		Proxy: ProxyConfig{
@@ -60,6 +61,16 @@ func CompiledDefaults() *PlatformConfig {
 				Limits: corev1.ResourceList{
 					corev1.ResourceCPU:    resource.MustParse("100m"),
 					corev1.ResourceMemory: resource.MustParse("128Mi"),
+				},
+			},
+			AuthBridge: corev1.ResourceRequirements{
+				Requests: corev1.ResourceList{
+					corev1.ResourceCPU:    resource.MustParse("100m"),
+					corev1.ResourceMemory: resource.MustParse("128Mi"),
+				},
+				Limits: corev1.ResourceList{
+					corev1.ResourceCPU:    resource.MustParse("300m"),
+					corev1.ResourceMemory: resource.MustParse("384Mi"),
 				},
 			},
 		},

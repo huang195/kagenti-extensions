@@ -169,6 +169,30 @@ var _ = Describe("AuthBridge Pod Webhook", func() {
 			Expect(count).To(Equal(1))
 		})
 	})
+
+	Context("when a Pod already has the combined authbridge container (idempotency)", func() {
+		It("should not double-inject", func() {
+			pod := newTestPod("already-combined-pod", map[string]string{
+				"kagenti.io/type":   "agent",
+				"kagenti.io/inject": "enabled",
+			})
+			// Pre-add the authbridge container to simulate prior combined injection
+			pod.Spec.Containers = append(pod.Spec.Containers, corev1.Container{
+				Name:  injector.AuthBridgeContainerName,
+				Image: "authbridge:test",
+			})
+
+			err := k8sClient.Create(ctx, pod)
+			Expect(err).NotTo(HaveOccurred())
+
+			err = k8sClient.Get(ctx, client.ObjectKeyFromObject(pod), pod)
+			Expect(err).NotTo(HaveOccurred())
+
+			// Should not have added any additional sidecar containers
+			Expect(containerNames(pod.Spec.Containers)).NotTo(ContainElement(injector.EnvoyProxyContainerName))
+			Expect(containerNames(pod.Spec.Containers)).To(ContainElement(injector.AuthBridgeContainerName))
+		})
+	})
 })
 
 var _ = Describe("deriveWorkloadName", func() {

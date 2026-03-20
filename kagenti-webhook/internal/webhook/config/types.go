@@ -22,6 +22,7 @@ type ImageConfig struct {
 	ProxyInit          string            `json:"proxyInit" yaml:"proxyInit"`
 	SpiffeHelper       string            `json:"spiffeHelper" yaml:"spiffeHelper"`
 	ClientRegistration string            `json:"clientRegistration" yaml:"clientRegistration"`
+	AuthBridge         string            `json:"authbridge" yaml:"authbridge"`
 	PullPolicy         corev1.PullPolicy `json:"pullPolicy" yaml:"pullPolicy"`
 }
 
@@ -37,6 +38,7 @@ type ResourcesConfig struct {
 	ProxyInit          corev1.ResourceRequirements `json:"proxyInit" yaml:"proxyInit"`
 	SpiffeHelper       corev1.ResourceRequirements `json:"spiffeHelper" yaml:"spiffeHelper"`
 	ClientRegistration corev1.ResourceRequirements `json:"clientRegistration" yaml:"clientRegistration"`
+	AuthBridge         corev1.ResourceRequirements `json:"authbridge" yaml:"authbridge"`
 }
 
 type TokenExchangeDefaults struct {
@@ -86,6 +88,7 @@ func (c *PlatformConfig) DeepCopy() *PlatformConfig {
 	result.Resources.ProxyInit = deepCopyResourceRequirements(c.Resources.ProxyInit)
 	result.Resources.SpiffeHelper = deepCopyResourceRequirements(c.Resources.SpiffeHelper)
 	result.Resources.ClientRegistration = deepCopyResourceRequirements(c.Resources.ClientRegistration)
+	result.Resources.AuthBridge = deepCopyResourceRequirements(c.Resources.AuthBridge)
 
 	return &result
 }

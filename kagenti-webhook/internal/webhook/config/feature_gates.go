@@ -16,6 +16,11 @@ type FeatureGates struct {
 	//   true            → resolved path: webhook reads namespace ConfigMaps at
 	//                     admission time and injects literal env var values.
 	PerWorkloadConfigResolution bool `json:"perWorkloadConfigResolution" yaml:"perWorkloadConfigResolution"`
+	// CombinedSidecar controls whether sidecars are injected as a single combined
+	// "authbridge" container (true) or as separate containers (false, default).
+	// When true, envoy-proxy + spiffe-helper + client-registration are combined
+	// into one container. proxy-init is still injected as a separate init container.
+	CombinedSidecar bool `json:"combinedSidecar" yaml:"combinedSidecar"`
 }
 
 // DefaultFeatureGates returns feature gates with sidecar injection enabled for

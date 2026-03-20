@@ -85,6 +85,48 @@ graph LR
     style APP fill:#87CEEB
 ```
 
+### Combined mode (`featureGates.combinedSidecar: true`)
+
+All sidecars are merged into a single `authbridge` container:
+
+```mermaid
+graph LR
+    subgraph "Pod Spec"
+        APP[Application<br/>Container]
+    end
+
+    subgraph "AuthBridge Injection"
+        INIT[proxy-init<br/>Init Container]
+        AB[authbridge<br/>Combined Sidecar]
+    end
+
+    subgraph "Inside authbridge container"
+        ENVOY_I[Envoy Proxy]
+        PROC[go-processor]
+        SPIFFE_I[spiffe-helper]
+        CREG[client-registration]
+    end
+
+    subgraph "External Dependencies"
+        SPIRE[SPIRE Agent]
+        KC[Keycloak]
+    end
+
+    INIT -->|1. Setup iptables| AB
+    SPIFFE_I -->|2. Get JWT-SVID| SPIRE
+    CREG -->|3. Register| KC
+    AB -->|4. Proxy ready| APP
+    APP -->|All traffic via| ENVOY_I
+
+    style INIT fill:#FFA500
+    style AB fill:#4169E1
+    style APP fill:#87CEEB
+    style ENVOY_I fill:#4169E1
+    style PROC fill:#4169E1
+    style SPIFFE_I fill:#32CD32
+    style CREG fill:#9370DB
+```
+
 ### Without SPIRE (opt-out via `kagenti.io/spiffe-helper-inject: "false"`)
 
 When spiffe-helper is disabled, only envoy-proxy and proxy-init are injected:
@@ -163,3 +205,9 @@ graph TD
 | 2. Workload opt-out label | `kagenti.io/envoy-proxy-inject: "false"` etc. on pod template | Disables sidecar for that workload |
 
 `proxy-init` is not independently evaluated — it always mirrors the `envoy-proxy` decision.
+
+### Combined sidecar mode
+
+| Config | Default | Effect |
+| --- | --- | --- |
+| `featureGates.combinedSidecar` | `false` | When `true`, injects a single `authbridge` container instead of separate `envoy-proxy` + `spiffe-helper` + `kagenti-client-registration` containers. `proxy-init` is still a separate init container. Per-sidecar gates/labels control flags passed to the combined entrypoint. |

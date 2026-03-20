@@ -1,0 +1,45 @@
+# Combined AuthBridge sidecar image
+# Includes: Envoy proxy, go-processor (ext-proc), spiffe-helper, client-registration (Python)
+#
+# Build context: ./AuthBridge (needs access to both AuthProxy/ and client-registration/)
+
+# Stage 1: Build go-processor
+FROM golang:1.26-alpine AS go-builder
+
+WORKDIR /app
+
+COPY AuthProxy/go.mod AuthProxy/go.sum ./AuthProxy/
+RUN cd AuthProxy && go mod download
+
+COPY AuthProxy/go-processor/ ./AuthProxy/go-processor/
+RUN cd AuthProxy && CGO_ENABLED=0 GOOS=linux go build -o /go-processor ./go-processor
+
+# Stage 2: Get spiffe-helper binary
+FROM ghcr.io/spiffe/spiffe-helper:0.11.0 AS spiffe
+
+# Stage 3: Combined runtime
+FROM docker.io/envoyproxy/envoy:v1.37.1
+
+USER root
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends ca-certificates python3 python3-pip && \
+    rm -rf /var/lib/apt/lists/*
+
+# Copy binaries
+COPY --from=go-builder /go-processor /usr/local/bin/go-processor
+COPY --from=spiffe /spiffe-helper /usr/local/bin/spiffe-helper
+
+# Copy client-registration Python code
+COPY client-registration/client_registration.py /app/
+COPY client-registration/requirements.txt /app/
+RUN pip3 install --no-cache-dir -r /app/requirements.txt
+
+# Copy entrypoint
+COPY AuthProxy/entrypoint-authbridge.sh /usr/local/bin/entrypoint-authbridge.sh
+RUN chmod +x /usr/local/bin/entrypoint-authbridge.sh
+
+USER 1337
+
+EXPOSE 15123 15124 9090 9901
+
+ENTRYPOINT ["/usr/local/bin/entrypoint-authbridge.sh"]

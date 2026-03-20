@@ -377,6 +377,169 @@ func TestInjectAuthBridge_InboundPortsExcludeAnnotation(t *testing.T) {
 	t.Fatal("proxy-init container not found in initContainers")
 }
 
+// ========================================
+// Combined sidecar mode tests
+// ========================================
+
+func newTestMutatorWithCombinedSidecar(objs ...client.Object) *PodMutator {
+	scheme := runtime.NewScheme()
+	_ = corev1.AddToScheme(scheme)
+	fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(objs...).Build()
+	return &PodMutator{
+		Client:                   fakeClient,
+		EnableClientRegistration: true,
+		GetPlatformConfig:        config.CompiledDefaults,
+		GetFeatureGates: func() *config.FeatureGates {
+			fg := config.DefaultFeatureGates()
+			fg.CombinedSidecar = true
+			return fg
+		},
+	}
+}
+
+func TestInjectAuthBridge_CombinedMode_SingleContainer(t *testing.T) {
+	m := newTestMutatorWithCombinedSidecar()
+	ctx := context.Background()
+
+	podSpec := &corev1.PodSpec{}
+	labels := map[string]string{
+		KagentiTypeLabel: KagentiTypeAgent,
+	}
+
+	injected, err := m.InjectAuthBridge(ctx, podSpec, "test-ns", "my-agent", labels, nil)
+	if err != nil {
+		t.Fatalf("InjectAuthBridge() returned error: %v", err)
+	}
+	if !injected {
+		t.Fatal("expected InjectAuthBridge to return true")
+	}
+
+	// Should have exactly 1 sidecar container (authbridge) — NOT envoy-proxy, spiffe-helper, or client-registration
+	if !containerExists(podSpec.Containers, AuthBridgeContainerName) {
+		t.Error("expected authbridge container to be injected")
+	}
+	if containerExists(podSpec.Containers, EnvoyProxyContainerName) {
+		t.Error("unexpected envoy-proxy container in combined mode")
+	}
+	if containerExists(podSpec.Containers, SpiffeHelperContainerName) {
+		t.Error("unexpected spiffe-helper container in combined mode")
+	}
+	if containerExists(podSpec.Containers, ClientRegistrationContainerName) {
+		t.Error("unexpected client-registration container in combined mode")
+	}
+
+	// Should still have proxy-init
+	if !containerExists(podSpec.InitContainers, ProxyInitContainerName) {
+		t.Error("expected proxy-init init container to be injected")
+	}
+}
+
+func TestInjectAuthBridge_CombinedMode_EnvoyDisabled_NoInjection(t *testing.T) {
+	scheme := runtime.NewScheme()
+	_ = corev1.AddToScheme(scheme)
+	fakeClient := fake.NewClientBuilder().WithScheme(scheme).Build()
+	m := &PodMutator{
+		Client:                   fakeClient,
+		EnableClientRegistration: true,
+		GetPlatformConfig:        config.CompiledDefaults,
+		GetFeatureGates: func() *config.FeatureGates {
+			fg := config.DefaultFeatureGates()
+			fg.CombinedSidecar = true
+			fg.EnvoyProxy = false
+			return fg
+		},
+	}
+	ctx := context.Background()
+
+	podSpec := &corev1.PodSpec{}
+	labels := map[string]string{
+		KagentiTypeLabel: KagentiTypeAgent,
+	}
+
+	injected, err := m.InjectAuthBridge(ctx, podSpec, "test-ns", "my-agent", labels, nil)
+	if err != nil {
+		t.Fatalf("InjectAuthBridge() returned error: %v", err)
+	}
+	// With envoy-proxy disabled, spiffe-helper and client-registration may still inject
+	// but the combined container should NOT be present
+	if containerExists(podSpec.Containers, AuthBridgeContainerName) {
+		t.Error("authbridge container should not be injected when envoy-proxy is disabled")
+	}
+	_ = injected
+}
+
+func TestInjectAuthBridge_CombinedMode_SpiffeDisabled_FlagPassed(t *testing.T) {
+	m := newTestMutatorWithCombinedSidecar()
+	ctx := context.Background()
+
+	podSpec := &corev1.PodSpec{}
+	labels := map[string]string{
+		KagentiTypeLabel:        KagentiTypeAgent,
+		LabelSpiffeHelperInject: "false",
+	}
+
+	injected, err := m.InjectAuthBridge(ctx, podSpec, "test-ns", "my-agent", labels, nil)
+	if err != nil {
+		t.Fatalf("InjectAuthBridge() returned error: %v", err)
+	}
+	if !injected {
+		t.Fatal("expected InjectAuthBridge to return true")
+	}
+
+	// authbridge container should be present with SPIRE_ENABLED=false
+	if !containerExists(podSpec.Containers, AuthBridgeContainerName) {
+		t.Fatal("expected authbridge container to be injected")
+	}
+
+	for _, c := range podSpec.Containers {
+		if c.Name != AuthBridgeContainerName {
+			continue
+		}
+		for _, env := range c.Env {
+			if env.Name == "SPIRE_ENABLED" {
+				if env.Value != "false" {
+					t.Errorf("SPIRE_ENABLED = %q, want %q", env.Value, "false")
+				}
+				return
+			}
+		}
+		t.Fatal("missing SPIRE_ENABLED env var on authbridge container")
+	}
+}
+
+func TestInjectAuthBridge_CombinedMode_Idempotency(t *testing.T) {
+	m := newTestMutatorWithCombinedSidecar()
+	ctx := context.Background()
+
+	podSpec := &corev1.PodSpec{
+		Containers: []corev1.Container{
+			{Name: AuthBridgeContainerName, Image: "authbridge:test"},
+		},
+	}
+	labels := map[string]string{
+		KagentiTypeLabel: KagentiTypeAgent,
+	}
+
+	injected, err := m.InjectAuthBridge(ctx, podSpec, "test-ns", "my-agent", labels, nil)
+	if err != nil {
+		t.Fatalf("InjectAuthBridge() returned error: %v", err)
+	}
+	if !injected {
+		t.Fatal("expected InjectAuthBridge to return true")
+	}
+
+	// Should still be exactly 1 authbridge container
+	count := 0
+	for _, c := range podSpec.Containers {
+		if c.Name == AuthBridgeContainerName {
+			count++
+		}
+	}
+	if count != 1 {
+		t.Errorf("expected exactly 1 authbridge container, got %d", count)
+	}
+}
+
 func TestInjectAuthBridge_NilAnnotations(t *testing.T) {
 	m := newTestMutator()
 	ctx := context.Background()

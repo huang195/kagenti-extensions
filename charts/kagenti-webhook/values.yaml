@@ -109,6 +109,13 @@ featureGates:
   # Default false — cached mode is faster and sufficient when namespace ConfigMaps
   # rarely change. Cache is cleared on webhook pod restart.
   perWorkloadConfigResolution: false
+  # combinedSidecar controls whether sidecars are injected as a single combined
+  # "authbridge" container (true) or as separate containers (false).
+  # When true, envoy-proxy + spiffe-helper + client-registration are combined
+  # into one container, reducing per-pod overhead from 3 sidecars to 1.
+  # proxy-init is still injected as a separate init container.
+  # Default false — existing separate-container behavior is preserved.
+  combinedSidecar: false
 
 # custom values for kagenti-webhook injection configuration
 # This is your "source of truth" for platform defaults.
@@ -121,6 +128,8 @@ defaults:
     proxyInit: ghcr.io/kagenti/kagenti-extensions/proxy-init:latest
     spiffeHelper: ghcr.io/spiffe/spiffe-helper:0.11.0
     clientRegistration: ghcr.io/kagenti/kagenti-extensions/client-registration:latest
+    # authbridge is the combined sidecar image (used when featureGates.combinedSidecar=true)
+    authbridge: ghcr.io/kagenti/kagenti-extensions/authbridge:latest
     pullPolicy: IfNotPresent
 
   # Proxy settings
@@ -161,6 +170,15 @@ defaults:
       limits:
         cpu: 100m
         memory: 128Mi
+    # authbridge is the combined sidecar (used when featureGates.combinedSidecar=true).
+    # Resource budget covers envoy + go-processor + spiffe-helper + client-registration.
+    authbridge:
+      requests:
+        cpu: 100m
+        memory: 128Mi
+      limits:
+        cpu: 300m
+        memory: 384Mi
 
   # Per-sidecar enable/disable at the platform level (lowest-priority layer).
   # These are overridden by feature gates, namespace labels, and workload labels.

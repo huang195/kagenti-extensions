@@ -1,30 +1,28 @@
-FROM golang:1.26-alpine AS builder
-
+FROM golang:1.26-alpine AS go-builder
 WORKDIR /app
-
 COPY go.mod go.sum ./
 RUN go mod download
-
 COPY go-processor/ ./go-processor/
+ARG TARGETARCH
+RUN CGO_ENABLED=0 GOOS=linux GOARCH=${TARGETARCH} go build -o /go-processor ./go-processor
 
-RUN CGO_ENABLED=0 GOOS=linux go build -o /go-processor ./go-processor
+FROM docker.io/envoyproxy/envoy:v1.37.1 AS envoy-source
 
-# Use official Envoy image as base
-FROM docker.io/envoyproxy/envoy:v1.37.1
+FROM registry.access.redhat.com/ubi9/ubi-minimal@sha256:65ae2af1716629ec539fc567a0a29c13fb75d98d03e78449e650293050d2cc87
 
-# Install ca-certificates for TLS connections
-USER root
-RUN apt-get update && apt-get install -y ca-certificates && rm -rf /var/lib/apt/lists/*
+RUN microdnf install -y ca-certificates && microdnf clean all
 
-# Copy the go-processor binary from builder
-COPY --from=builder /go-processor /usr/local/bin/go-processor
-
-# Copy the entrypoint script
+COPY --from=envoy-source /usr/local/bin/envoy /usr/local/bin/envoy
+COPY --from=go-builder /go-processor /usr/local/bin/go-processor
 COPY entrypoint-envoy.sh /usr/local/bin/entrypoint-envoy.sh
-RUN chmod +x /usr/local/bin/entrypoint-envoy.sh
+RUN chmod 755 /usr/local/bin/entrypoint-envoy.sh \
+             /usr/local/bin/envoy \
+             /usr/local/bin/go-processor
 
-# Switch to envoy user (UID 1337 as per deployment)
-USER 1337
+# Envoy writes hot-restart lock files and admin socket here
+RUN mkdir -p /tmp/envoy && chmod 775 /tmp/envoy
+
+USER 1001
 
 EXPOSE 15123 9901 9090
 

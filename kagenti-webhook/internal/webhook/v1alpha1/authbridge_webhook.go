@@ -84,17 +84,16 @@ func (w *AuthBridgeWebhook) Handle(ctx context.Context, req admission.Request) a
 	resourceName := deriveWorkloadName(&pod)
 
 	keycloakClientCredentialsSecret := strings.TrimSpace(pod.Annotations[injector.AnnotationKeycloakClientSecretName])
-	authbridgelog.Info("AuthBridge webhook: processing Pod (from workload controller)",
+	alreadyInjected := w.isAlreadyInjected(&pod.Spec)
+	authbridgelog.Info("AuthBridge webhook: Pod admission details",
 		"namespace", req.Namespace,
 		"workloadKey", resourceName,
-		"podGenerateName", pod.GenerateName,
-		"podName", pod.Name,
 		"kagentiType", pod.Labels[injector.KagentiTypeLabel],
 		"keycloakClientCredentialsSecretName", keycloakClientCredentialsSecret,
-		"alreadyInjected", w.isAlreadyInjected(&pod.Spec))
+		"alreadyInjected", alreadyInjected)
 
 	// Check if already injected (idempotency)
-	if w.isAlreadyInjected(&pod.Spec) {
+	if alreadyInjected {
 		// Reinvocation / upgrade: sidecars exist but operator-managed registration Secret mounts may
 		// still be missing (annotation added after first injection pass).
 		if injector.NeedsKeycloakClientCredentialsVolumePatch(&pod.Spec, pod.Annotations) {
@@ -104,14 +103,14 @@ func (w *AuthBridgeWebhook) Handle(ctx context.Context, req admission.Request) a
 				authbridgelog.Error(err, "Failed to marshal Pod for operator client-reg volumes")
 				return admission.Errored(http.StatusInternalServerError, err)
 			}
-			authbridgelog.Info("Applied operator client-reg Secret mounts on already-injected Pod (reinvocation)",
+			authbridgelog.V(1).Info("Applied operator client-reg Secret mounts on already-injected Pod (reinvocation)",
 				"namespace", req.Namespace,
 				"workloadKey", resourceName,
 				"secretName", keycloakClientCredentialsSecret,
-				"path", "keycloak_client_credentials_secret_mount_only")
+				"path", "operator-secret-only")
 			return admission.PatchResponseFromRaw(req.Object.Raw, marshaledMutated)
 		}
-		authbridgelog.Info("Skipping - sidecars already injected",
+		authbridgelog.V(1).Info("Skipping - sidecars already injected",
 			"namespace", req.Namespace,
 			"name", resourceName)
 		return admission.Allowed("already injected")

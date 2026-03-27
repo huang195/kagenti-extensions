@@ -306,24 +306,25 @@ func (m *PodMutator) InjectAuthBridge(ctx context.Context, podSpec *corev1.PodSp
 
 // logClientRegistrationPaths records how Keycloak client credentials are delivered for this Pod:
 // Secret mounted from annotation (kagenti-operator), legacy kagenti-client-registration sidecar, or combined authbridge.
+// deliveryPaths is comma-separated short tokens: operator-secret, combined-authbridge, sidecar, skip.
 func logClientRegistrationPaths(namespace, crName string, labels map[string]string, combinedSidecar bool, decision InjectionDecision, annotations map[string]string) {
 	keycloakClientCredentialsSecret := strings.TrimSpace(annotations[AnnotationKeycloakClientSecretName])
 
 	var paths []string
 	if keycloakClientCredentialsSecret != "" {
-		paths = append(paths, "keycloak_client_credentials_secret_mount")
+		paths = append(paths, "operator-secret")
 	}
 
 	if combinedSidecar {
 		if decision.EnvoyProxy.Inject && decision.ClientRegistration.Inject {
-			paths = append(paths, "client_registration_in_combined_authbridge_container")
+			paths = append(paths, "combined-authbridge")
 		}
 	} else if decision.ClientRegistration.Inject {
-		paths = append(paths, "client_registration_sidecar_kagenti_client_registration")
+		paths = append(paths, "sidecar")
 	}
 
 	if len(paths) == 0 {
-		paths = append(paths, "none_webhook_skips_in_pod_credentials")
+		paths = append(paths, "skip")
 	}
 
 	mutatorLog.Info("AuthBridge client registration: how credentials are supplied for this Pod",

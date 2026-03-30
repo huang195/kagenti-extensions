@@ -8,7 +8,7 @@ RUN CGO_ENABLED=0 GOOS=linux GOARCH=${TARGETARCH} go build -o /go-processor ./go
 
 FROM docker.io/envoyproxy/envoy:v1.37.1 AS envoy-source
 
-FROM registry.access.redhat.com/ubi9/ubi-minimal@sha256:65ae2af1716629ec539fc567a0a29c13fb75d98d03e78449e650293050d2cc87
+FROM registry.access.redhat.com/ubi9/ubi-minimal@sha256:83006d535923fcf1345067873524a3980316f51794f01d8655be55d6e9387183
 
 RUN microdnf install -y ca-certificates && microdnf clean all
 

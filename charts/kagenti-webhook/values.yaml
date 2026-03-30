@@ -126,7 +126,7 @@ defaults:
   images:
     envoyProxy: ghcr.io/kagenti/kagenti-extensions/envoy-with-processor:latest
     proxyInit: ghcr.io/kagenti/kagenti-extensions/proxy-init:latest
-    spiffeHelper: ghcr.io/spiffe/spiffe-helper:0.11.0
+    spiffeHelper: ghcr.io/kagenti/kagenti-extensions/spiffe-helper:v0.11.0
     clientRegistration: ghcr.io/kagenti/kagenti-extensions/client-registration:latest
     # authbridge is the combined sidecar image (used when featureGates.combinedSidecar=true)
     authbridge: ghcr.io/kagenti/kagenti-extensions/authbridge:latest

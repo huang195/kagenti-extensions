@@ -35,16 +35,7 @@ const (
 	ProxyInitContainerName   = "proxy-init"
 	AuthBridgeContainerName  = "authbridge"
 
-	// Client registration container configuration
-	// Keep in sync with AuthBridge/client-registration/Dockerfile
-	ClientRegistrationUID = 1000
-	ClientRegistrationGID = 1000
-
-	// FSGroup for shared volume access in SPIRE mode.
-	// Sets group ownership of emptyDir volumes (like svid-output) to enable
-	// multiple containers with different UIDs to read/write shared files.
-	// All sidecar containers get this as a supplemental group ID.
-	SharedVolumesFSGroup = 1000
+	SharedVolumesFSGroup = 0
 )
 
 // ContainerBuilder creates container specs from resolved config.
@@ -110,10 +101,13 @@ func (b *ContainerBuilder) BuildSpiffeHelperContainer() corev1.Container {
 				MountPath: "/shared",
 			},
 		},
+		// No hardcoded UID/GID — let the platform assign the user.
+		// On OpenShift, MustRunAsRange assigns a UID from the namespace range.
+		// On vanilla Kubernetes, the container runs as the image's default UID.
+		// fsGroup=0 on the pod ensures all containers share GID 0 for file access.
 		SecurityContext: &corev1.SecurityContext{
-			RunAsUser:    ptr.To(int64(ClientRegistrationUID)),
-			RunAsGroup:   ptr.To(int64(ClientRegistrationGID)),
-			RunAsNonRoot: ptr.To(true),
+			RunAsNonRoot:             ptr.To(true),
+			AllowPrivilegeEscalation: ptr.To(false),
 		},
 	}
 }
@@ -218,9 +212,8 @@ tail -f /dev/null
 		Env:          env,
 		VolumeMounts: volumeMounts,
 		SecurityContext: &corev1.SecurityContext{
-			RunAsUser:    ptr.To(int64(ClientRegistrationUID)),
-			RunAsGroup:   ptr.To(int64(ClientRegistrationGID)),
-			RunAsNonRoot: ptr.To(true),
+			RunAsNonRoot:             ptr.To(true),
+			AllowPrivilegeEscalation: ptr.To(false),
 		},
 	}
 }
@@ -434,8 +427,10 @@ func (b *ContainerBuilder) BuildEnvoyProxyContainerWithSpireOption(spireEnabled 
 		},
 		Env: env,
 		SecurityContext: &corev1.SecurityContext{
-			RunAsUser:  ptr.To(b.cfg.Proxy.UID),
-			RunAsGroup: ptr.To(b.cfg.Proxy.UID),
+			RunAsUser:                ptr.To(b.cfg.Proxy.UID),
+			RunAsGroup:               ptr.To(b.cfg.Proxy.UID),
+			RunAsNonRoot:             ptr.To(true),
+			AllowPrivilegeEscalation: ptr.To(false),
 		},
 		VolumeMounts: volumeMounts,
 	}
@@ -639,8 +634,10 @@ func (b *ContainerBuilder) BuildAuthBridgeContainer(name, namespace string, spir
 		},
 		Env: env,
 		SecurityContext: &corev1.SecurityContext{
-			RunAsUser:  ptr.To(b.cfg.Proxy.UID),
-			RunAsGroup: ptr.To(b.cfg.Proxy.UID),
+			RunAsUser:                ptr.To(b.cfg.Proxy.UID),
+			RunAsGroup:               ptr.To(b.cfg.Proxy.UID),
+			RunAsNonRoot:             ptr.To(true),
+			AllowPrivilegeEscalation: ptr.To(false),
 		},
 		VolumeMounts: volumeMounts,
 	}

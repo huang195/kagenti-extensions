@@ -11,9 +11,12 @@ Injection decision (from pod_mutator.go):
   - `kagenti.io/inject: disabled` → skip injection (whole-workload opt-out)
   - No label → skip injection
 
-Injected containers for agent workloads:
+Injected containers for agent workloads (default feature gates):
   Init:    proxy-init
-  Sidecars: envoy-proxy, spiffe-helper, kagenti-client-registration
+  Sidecars: envoy-proxy, spiffe-helper
+
+Legacy `kagenti-client-registration` is opt-in via
+`kagenti.io/client-registration-inject: "true"` (default is operator-managed).
 
 Note: Injected pods may remain in Pending state (sidecars can't start without
 Keycloak/SPIRE), but the API server stores and returns the mutated pod spec.
@@ -35,12 +38,16 @@ _PROXY_INIT = "proxy-init"
 _SPIFFE_HELPER = "spiffe-helper"
 _CLIENT_REGISTRATION = "kagenti-client-registration"
 
-_ALL_SIDECARS = {_ENVOY_PROXY, _SPIFFE_HELPER, _CLIENT_REGISTRATION}
+# Default agent injection (envoy + spiffe); legacy client-registration is opt-in.
+_DEFAULT_AGENT_SIDECARS = {_ENVOY_PROXY, _SPIFFE_HELPER}
+# Any sidecar the webhook may inject (for opt-out / idempotency assertions).
+_ALL_POSSIBLE_SIDECARS = _DEFAULT_AGENT_SIDECARS | {_CLIENT_REGISTRATION}
 _ALL_INIT = {_PROXY_INIT}
 
 # Labels
 _TYPE_LABEL = "kagenti.io/type"
 _INJECT_LABEL = "kagenti.io/inject"
+_CLIENT_REGISTRATION_INJECT_LABEL = "kagenti.io/client-registration-inject"
 
 # App container included in every test pod
 _APP_CONTAINER = "app"
@@ -149,9 +156,11 @@ class TestAgentSidecarInjection:
             f"Containers: {sorted(container_names)}"
         )
 
-    def test_agent_pod_gets_client_registration(self, k8s_client, test_namespace):
-        """Agent pod must have kagenti-client-registration sidecar injected."""
-        name = _make_pod_name("agent-clientreg")
+    def test_agent_pod_has_no_client_registration_without_opt_in(
+        self, k8s_client, test_namespace
+    ):
+        """Default agent pods do not get the legacy kagenti-client-registration sidecar."""
+        name = _make_pod_name("agent-noclientreg")
         pod = _build_test_pod(name, {_TYPE_LABEL: "agent"})
 
         try:
@@ -165,13 +174,40 @@ class TestAgentSidecarInjection:
                 pass
 
         container_names = {c.name for c in created.spec.containers}
+        assert _CLIENT_REGISTRATION not in container_names, (
+            f"legacy kagenti-client-registration injected without opt-in label.\n"
+            f"Containers: {sorted(container_names)}"
+        )
+
+    def test_agent_pod_gets_client_registration_when_opt_in(self, k8s_client, test_namespace):
+        """With kagenti.io/client-registration-inject=true, legacy sidecar is injected."""
+        name = _make_pod_name("agent-clientreg-optin")
+        pod = _build_test_pod(
+            name,
+            {
+                _TYPE_LABEL: "agent",
+                _CLIENT_REGISTRATION_INJECT_LABEL: "true",
+            },
+        )
+
+        try:
+            created = k8s_client.create_namespaced_pod(namespace=test_namespace, body=pod)
+        except ApiException as e:
+            pytest.fail(f"Pod creation failed: {e}")
+        finally:
+            try:
+                k8s_client.delete_namespaced_pod(name=name, namespace=test_namespace)
+            except ApiException:
+                pass
+
+        container_names = {c.name for c in created.spec.containers}
         assert _CLIENT_REGISTRATION in container_names, (
-            f"kagenti-client-registration not injected into agent pod.\n"
+            f"kagenti-client-registration not injected with opt-in label.\n"
             f"Containers: {sorted(container_names)}"
         )
 
     def test_agent_pod_gets_all_sidecars(self, k8s_client, test_namespace):
-        """Agent pod must have all four AuthBridge containers in one assertion."""
+        """Agent pod must have default injected containers (envoy, spiffe, proxy-init)."""
         name = _make_pod_name("agent-all")
         pod = _build_test_pod(name, {_TYPE_LABEL: "agent"})
 
@@ -187,7 +223,7 @@ class TestAgentSidecarInjection:
 
         container_names = {c.name for c in created.spec.containers}
         init_names = {c.name for c in (created.spec.init_containers or [])}
-        missing_sidecars = _ALL_SIDECARS - container_names
+        missing_sidecars = _DEFAULT_AGENT_SIDECARS - container_names
         missing_init = _ALL_INIT - init_names
 
         assert not missing_sidecars and not missing_init, (
@@ -234,7 +270,7 @@ class TestInjectionOptOut:
         """Assert that none of the AuthBridge containers are in the pod spec."""
         container_names = {c.name for c in created_pod.spec.containers}
         init_names = {c.name for c in (created_pod.spec.init_containers or [])}
-        injected = (_ALL_SIDECARS & container_names) | (_ALL_INIT & init_names)
+        injected = (_ALL_POSSIBLE_SIDECARS & container_names) | (_ALL_INIT & init_names)
         assert not injected, (
             f"Expected no AuthBridge injection, but found: {injected}\n"
             f"Sidecars: {sorted(container_names)}\n"

@@ -24,4 +24,7 @@ rules:
 - apiGroups: ["apps"]
   resources: ["replicasets"]
   verbs: ["get", "list", "watch"]
+- apiGroups: ["agent.kagenti.dev"]
+  resources: ["agentruntimes"]
+  verbs: ["get", "list", "watch"]
 {{- end }}

@@ -1,5 +1,16 @@
 # kagenti-webhook
 
+> **The kagenti-webhook (Kubernetes admission webhook for AuthBridge sidecar injection) has been migrated to [kagenti/kagenti-operator](https://github.com/kagenti/kagenti-operator).**
+>
+> All new development, bug fixes, and feature work should be directed to the
+> [kagenti-operator](https://github.com/kagenti/kagenti-operator) repository,
+> where the webhook is co-located with the AgentRuntime CRD and operator controllers.
+>
+> This version is deprecated and will soon be removed from this repository.
+> See [kagenti-operator#238](https://github.com/kagenti/kagenti-operator/issues/238) for migration details.
+
+---
+
 A Kubernetes admission webhook that automatically injects sidecar containers to enable Keycloak client registration and optional SPIFFE/SPIRE token exchanges for secure service-to-service authentication within the Kagenti platform.
 
 ## Overview

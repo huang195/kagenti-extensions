@@ -288,7 +288,12 @@ Confirm the tool service port is correct and the tool responds:
 ```bash
 kubectl run test-mcp --image=curlimages/curl -n team1 --restart=Never --rm -it -- \
   curl -s -o /dev/null -w "%{http_code}" --max-time 5 http://github-tool-mcp:9090/mcp
-# Expected: 200 (SSE connection, may timeout after 5s — that's OK)
+```
+
+Expected:
+
+```bash
+200 (SSE connection, may timeout after 5s — that's OK)`
 ```
 
 ---
@@ -379,7 +384,11 @@ Wait for the Shipwright build to complete and the deployment to become ready.
 kubectl get pods -n team1
 ```
 
-Expected output:
+Expected output depends on how the **kagenti-webhook** feature gate
+[`combinedSidecar`](https://github.com/kagenti/kagenti/blob/main/docs/authbridge-combined-sidecar.md)
+is set (cluster-wide Helm / `kagenti-feature-gates` ConfigMap — not the import UI).
+
+**Legacy separate sidecars** (`combinedSidecar: false`, default in many installs):
 
 ```
 NAME                               READY   STATUS    RESTARTS   AGE
@@ -387,9 +396,22 @@ git-issue-agent-58768bdb67-xxxxx   4/4     Running   0          2m
 github-tool-7f8c9d6b44-yyyyy      1/1     Running   0          5m
 ```
 
-> **Note:** The agent pod should show **4/4** containers — the agent itself plus
-> three AuthBridge sidecars (spiffe-helper, kagenti-client-registration, envoy-proxy)
-> injected by the webhook.
+> **Note:** The agent pod shows **4/4** — the agent container plus three AuthBridge
+> sidecars (envoy-proxy, spiffe-helper, kagenti-client-registration) and an init
+> container (`proxy-init`) that does not count toward `READY` the same way.
+
+**Combined AuthBridge** (`combinedSidecar: true`, [kagenti-extensions#254](https://github.com/kagenti/kagenti-extensions/pull/254)):
+
+```
+NAME                               READY   STATUS    RESTARTS   AGE
+git-issue-agent-77fc7dc6cd-xxxxx   2/2     Running   0          2m
+github-tool-7f8c9d6b44-yyyyy      1/1     Running   0          5m
+```
+
+> **Note:** The agent pod shows **2/2** — the **agent** container plus a single
+> **authbridge** container (Envoy, go-processor, spiffe-helper, and client-registration
+> processes inside it), plus **`proxy-init`** as an init container. Shipwright
+> **BuildRun** pods may still appear as `Completed` with a different ready count.
 
 ### Verify injected containers
 
@@ -397,19 +419,33 @@ github-tool-7f8c9d6b44-yyyyy      1/1     Running   0          5m
 kubectl get pod -n team1 -l app.kubernetes.io/name=git-issue-agent -o jsonpath='{.items[0].spec.containers[*].name}'
 ```
 
-Expected:
+Expected — **legacy** (three sidecars):
 
 ```
 agent kagenti-client-registration envoy-proxy spiffe-helper
 ```
 
+Expected — **combined** (`combinedSidecar: true`):
+
+```
+agent authbridge
+```
+
 ### Check client registration
+
+**Legacy** — logs are in the client-registration sidecar:
 
 ```bash
 kubectl logs deployment/git-issue-agent -n team1 -c kagenti-client-registration
 ```
 
-Expected:
+**Combined** — use the `authbridge` container (client-registration runs inside it):
+
+```bash
+kubectl logs deployment/git-issue-agent -n team1 -c authbridge --tail=200
+```
+
+Expected (same messages; search for “Client registration” / `SPIFFE` if the stream is busy):
 
 ```
 SPIFFE credentials ready!
@@ -589,7 +625,12 @@ for `/.well-known/*`, `/healthz`, `/readyz`, and `/livez` by default:
 ```bash
 kubectl exec test-client -n team1 -- curl -s \
   http://git-issue-agent:8080/.well-known/agent.json | jq .name
-# Expected: "Github issue agent"
+```
+
+Expected:
+
+```
+"Github issue agent"
 ```
 
 ### 9b. Inbound Rejection - No Token
@@ -599,7 +640,12 @@ Non-public endpoints require a valid JWT:
 ```bash
 kubectl exec test-client -n team1 -- curl -s \
   http://git-issue-agent:8080/
-# Expected: {"error":"unauthorized","message":"missing Authorization header"}
+```
+
+Expected:
+
+```
+ {"error":"unauthorized","message":"missing Authorization header"}
 ```
 
 ### 9c. Inbound Rejection - Invalid Token (Signature Check)
@@ -610,7 +656,12 @@ A malformed or tampered token fails the JWKS signature check:
 kubectl exec test-client -n team1 -- curl -s \
   -H "Authorization: Bearer invalid-token" \
   http://git-issue-agent:8080/
-# Expected: {"error":"unauthorized","message":"token validation failed: failed to parse/validate token: ..."}
+```
+
+Expected:
+
+```
+ {"error":"unauthorized","message":"token validation failed: failed to parse/validate token: ..."}
 ```
 
 ### 9d. End-to-End Test with Valid Token
@@ -693,7 +744,10 @@ exit
 ### 9e. Verify AuthProxy Logs (Inbound + Outbound)
 
 Check the ext_proc logs to confirm both inbound validation and outbound token
-exchange are working:
+exchange are working. Envoy and go-processor log to the **`envoy-proxy`** container in
+legacy mode, or to **`authbridge`** when
+[`combinedSidecar`](https://github.com/kagenti/kagenti/blob/main/docs/authbridge-combined-sidecar.md)
+is enabled — replace `-c envoy-proxy` with `-c authbridge` below.
 
 **Inbound validation logs:**
 
@@ -955,6 +1009,7 @@ shape) and never serves ext_proc, so Envoy cannot complete the request.
 **Diagnose:**
 
 ```bash
+# Legacy: -c envoy-proxy  |  Combined sidecar: -c authbridge
 kubectl logs deployment/git-issue-agent -n team1 -c envoy-proxy 2>&1 | grep -E "failed to load routes|unmarshal"
 kubectl get configmap authproxy-routes -n team1 -o jsonpath='{.data.routes\.yaml}{"\n"}'
 ```
@@ -1048,17 +1103,26 @@ creates the correct defaults) and restart the agent:
 kubectl rollout restart deployment/git-issue-agent -n team1
 ```
 
-### Agent Pod Not Starting (4/4 containers)
+### Agent Pod Not Starting (not fully ready)
 
-**Symptom:** Pod shows 3/4 or less containers ready
+**Symptom:** Pod never reaches the expected ready count — **4/4** (legacy sidecars) or
+**2/2** (combined `authbridge` mode). Example: `3/4`, `1/2`, or `CrashLoopBackOff`.
 
-**Fix:** Check each container's logs:
+**Fix:** Check logs on the containers that exist. **Legacy** (`combinedSidecar: false`):
 
 ```bash
 kubectl logs deployment/git-issue-agent -n team1 -c kagenti-client-registration
 kubectl logs deployment/git-issue-agent -n team1 -c spiffe-helper
 kubectl logs deployment/git-issue-agent -n team1 -c envoy-proxy
 kubectl logs deployment/git-issue-agent -n team1 -c agent
+```
+
+**Combined** (`combinedSidecar: true` — single `authbridge` sidecar):
+
+```bash
+kubectl logs deployment/git-issue-agent -n team1 -c authbridge
+kubectl logs deployment/git-issue-agent -n team1 -c agent
+kubectl logs deployment/git-issue-agent -n team1 -c proxy-init
 ```
 
 ### Tool MCP Server Unreachable / Connection Reset

@@ -292,8 +292,8 @@ kubectl run test-mcp --image=curlimages/curl -n team1 --restart=Never --rm -it -
 
 Expected:
 
-```bash
-200 (SSE connection, may timeout after 5s — that's OK)`
+```
+200 (SSE connection, may timeout after 5s — that's OK)
 ```
 
 ---
@@ -645,7 +645,7 @@ kubectl exec test-client -n team1 -- curl -s \
 Expected:
 
 ```
- {"error":"unauthorized","message":"missing Authorization header"}
+{"error":"unauthorized","message":"missing Authorization header"}
 ```
 
 ### 9c. Inbound Rejection - Invalid Token (Signature Check)
@@ -661,7 +661,7 @@ kubectl exec test-client -n team1 -- curl -s \
 Expected:
 
 ```
- {"error":"unauthorized","message":"token validation failed: failed to parse/validate token: ..."}
+{"error":"unauthorized","message":"token validation failed: failed to parse/validate token: ..."}
 ```
 
 ### 9d. End-to-End Test with Valid Token
@@ -1009,8 +1009,8 @@ shape) and never serves ext_proc, so Envoy cannot complete the request.
 **Diagnose:**
 
 ```bash
-# Legacy: -c envoy-proxy  |  Combined sidecar: -c authbridge
 kubectl logs deployment/git-issue-agent -n team1 -c envoy-proxy 2>&1 | grep -E "failed to load routes|unmarshal"
+kubectl logs deployment/git-issue-agent -n team1 -c authbridge 2>&1 | grep -E "failed to load routes|unmarshal"
 kubectl get configmap authproxy-routes -n team1 -o jsonpath='{.data.routes\.yaml}{"\n"}'
 ```
 

@@ -1,7 +1,7 @@
 # Root Makefile for kagenti-extensions monorepo
 # Orchestrates linting and formatting across all sub-projects
 
-.PHONY: lint fmt pre-commit help
+.PHONY: lint fmt pre-commit build-images help
 
 help: ## Display this help
 	@awk 'BEGIN {FS = ":.*##"; printf "\nUsage:\n  make \033[36m<target>\033[0m\n"} /^[a-zA-Z_0-9-]+:.*?##/ { printf "  \033[36m%-20s\033[0m %s\n", $$1, $$2 } /^##@/ { printf "\n\033[1m%s\033[0m\n", substr($$0, 5) } ' $(MAKEFILE_LIST)
@@ -12,7 +12,6 @@ lint: ## Run all linters (pre-commit hooks)
 	pre-commit run --all-files
 
 fmt: ## Run formatters across all sub-projects
-	cd kagenti-webhook && go fmt ./...
 	cd AuthBridge/AuthProxy && go fmt ./...
 	ruff format AuthBridge/
 
@@ -20,15 +19,6 @@ pre-commit: ## Install pre-commit hooks (including commit-msg)
 	pre-commit install --hook-type pre-commit --hook-type commit-msg
 
 ##@ Sub-project Targets
-
-lint-webhook: ## Run golangci-lint on kagenti-webhook
-	cd kagenti-webhook && make lint
-
-test-webhook: ## Run kagenti-webhook unit tests
-	cd kagenti-webhook && make test
-
-build-webhook: ## Build kagenti-webhook binary
-	cd kagenti-webhook && make build
 
 build-images: ## Build AuthProxy Docker images
 	cd AuthBridge/AuthProxy && make build-images

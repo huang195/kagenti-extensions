@@ -350,7 +350,7 @@ data:
 EOF
 
 # 4. envoy-config ConfigMap (for envoy-proxy)
-# Copy from authbridge/k8s/authbridge-deployment.yaml or use:
+# Copy from authbridge/demos/single-target/k8s/authbridge-deployment.yaml or use:
 kubectl get configmap envoy-config -n authbridge -o yaml | \\
   sed 's/namespace: authbridge/namespace: {namespace}/' | \\
   kubectl apply -f -

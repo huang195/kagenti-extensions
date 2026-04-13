@@ -76,16 +76,6 @@ load_image_to_kind ghcr.io/kagenti/kagenti-extensions/client-registration:local
 echo "✅ Built and loaded: client-registration:local"
 echo ""
 
-# Build kagenti-webhook (CHANGED - container_builder.go)
-echo "=========================================="
-echo "Building kagenti-webhook"
-echo "=========================================="
-cd "${SCRIPT_DIR}/kagenti-webhook"
-make docker-build IMG=ghcr.io/kagenti/kagenti-extensions/kagenti-webhook:local CONTAINER_TOOL=${CONTAINER_RUNTIME}
-load_image_to_kind ghcr.io/kagenti/kagenti-extensions/kagenti-webhook:local
-echo "✅ Built and loaded: kagenti-webhook:local"
-echo ""
-
 # Build envoy-with-processor (Envoy runs as UID 1337)
 echo "=========================================="
 echo "Building envoy-with-processor"
@@ -113,7 +103,6 @@ echo ""
 echo "Images loaded into cluster '${CLUSTER_NAME}':"
 echo "  - ghcr.io/kagenti/kagenti/spiffe-idp-setup:local"
 echo "  - ghcr.io/kagenti/kagenti-extensions/client-registration:local"
-echo "  - ghcr.io/kagenti/kagenti-extensions/kagenti-webhook:local"
 echo "  - ghcr.io/kagenti/kagenti-extensions/envoy-with-processor:local"
 echo "  - ghcr.io/kagenti/kagenti-extensions/proxy-init:local"
 echo ""

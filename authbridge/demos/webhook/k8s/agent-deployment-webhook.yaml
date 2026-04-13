@@ -1,6 +1,6 @@
 # Agent Deployment for AuthBridge Webhook Demo
 #
-# This deployment uses the kagenti-webhook to automatically inject:
+# This deployment uses the kagenti-operator webhook to automatically inject:
 # - proxy-init (init container for iptables setup)
 # - spiffe-helper (SPIFFE credential fetcher) - only with kagenti.io/spire: enabled
 # - kagenti-client-registration (registers with Keycloak)

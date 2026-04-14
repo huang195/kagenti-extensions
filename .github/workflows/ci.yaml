@@ -63,6 +63,9 @@ jobs:
       - name: Build
         run: go build -v ./...
 
+      - name: Test
+        run: go test -v -race -cover ./...
+
   python-test:
     name: Python Tests
     runs-on: ubuntu-latest
@@ -79,4 +82,4 @@ jobs:
           pip install pytest==8.* python-keycloak==5.3.1 pyjwt==2.10.1 pyyaml==6.*
 
       - name: Run tests
-        run: pytest tests/ -v --ignore=tests/e2e
+        run: pytest tests/ -v -x --ignore=tests/e2e

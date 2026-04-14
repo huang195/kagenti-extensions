@@ -149,6 +149,54 @@ func TestExchange_WithActorToken(t *testing.T) {
 	}
 }
 
+func TestExchange_ConnectionFailure(t *testing.T) {
+	client := NewClient("http://127.0.0.1:1", &ClientSecretAuth{ClientID: "c", ClientSecret: "s"})
+	_, err := client.Exchange(context.Background(), &ExchangeRequest{
+		SubjectToken: "token",
+		Audience:     "aud",
+	})
+	if err == nil {
+		t.Fatal("expected error for connection failure")
+	}
+}
+
+func TestExchange_MalformedJSON(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.Write([]byte("not-json"))
+	}))
+	defer srv.Close()
+
+	client := NewClient(srv.URL, &ClientSecretAuth{ClientID: "c", ClientSecret: "s"})
+	_, err := client.Exchange(context.Background(), &ExchangeRequest{
+		SubjectToken: "token",
+		Audience:     "aud",
+	})
+	if err == nil {
+		t.Fatal("expected error for malformed JSON")
+	}
+}
+
+func TestExchange_ContextCancellation(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		// Simulate slow server — but context should cancel before we respond
+		select {}
+	}))
+	defer srv.Close()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel() // cancel immediately
+
+	client := NewClient(srv.URL, &ClientSecretAuth{ClientID: "c", ClientSecret: "s"})
+	_, err := client.Exchange(ctx, &ExchangeRequest{
+		SubjectToken: "token",
+		Audience:     "aud",
+	})
+	if err == nil {
+		t.Fatal("expected error for cancelled context")
+	}
+}
+
 func TestJWTAssertionAuth(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if err := r.ParseForm(); err != nil {

@@ -18,6 +18,9 @@ func TestResolve_ExactMatch(t *testing.T) {
 	if resolved == nil {
 		t.Fatal("expected match")
 	}
+	if !resolved.Matched {
+		t.Error("expected Matched=true for explicit route match")
+	}
 	if resolved.Audience != "auth-target" {
 		t.Errorf("audience = %q, want %q", resolved.Audience, "auth-target")
 	}
@@ -74,6 +77,9 @@ func TestResolve_NoMatch_Exchange(t *testing.T) {
 	resolved := r.Resolve("any-service")
 	if resolved == nil {
 		t.Fatal("expected non-nil for exchange default")
+	}
+	if resolved.Matched {
+		t.Error("expected Matched=false for default action fallback")
 	}
 	if resolved.Passthrough {
 		t.Error("expected passthrough=false for exchange default")

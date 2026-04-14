@@ -7,11 +7,11 @@ This skill captures knowledge from building, debugging, and running AuthBridge d
 - **Repo:** `kagenti/kagenti-extensions` (monorepo)
 - **Container registry:** `ghcr.io/kagenti/kagenti-extensions/<image-name>`
 - **Agent examples repo:** `kagenti/agent-examples` (separate repo, images NOT published to GHCR)
-- **Demo guides:** `AuthBridge/demos/<demo-name>/demo-manual.md` (manual kubectl) and `demo-ui.md` (UI-driven)
+- **Demo guides:** `authbridge/demos/<demo-name>/demo-manual.md` (manual kubectl) and `demo-ui.md` (UI-driven)
 
 ## Demo Directory Convention
 
-Each demo lives under `AuthBridge/demos/<demo-name>/`:
+Each demo lives under `authbridge/demos/<demo-name>/`:
 
 ```
 demos/<demo-name>/
@@ -35,7 +35,7 @@ docker build -t ghcr.io/kagenti/agent-examples/<agent>:latest ./a2a/<agent>/
 docker build -t ghcr.io/kagenti/agent-examples/<tool>:latest ./mcp/<tool>/
 
 # Build AuthBridge sidecar images
-cd kagenti-extensions/AuthBridge/AuthProxy
+cd kagenti-extensions/authbridge/authproxy
 docker build -f Dockerfile.init -t ghcr.io/kagenti/kagenti-extensions/proxy-init:latest .
 docker build -f Dockerfile.envoy -t ghcr.io/kagenti/kagenti-extensions/envoy-with-processor:latest .
 
@@ -49,11 +49,11 @@ Use fully qualified image names in Dockerfiles (e.g., `docker.io/library/golang:
 
 All five envoy configs in the repo share the same inbound listener pattern. When modifying the inbound listener, update ALL of them:
 
-1. `AuthBridge/demos/github-issue/k8s/configmaps.yaml`
-2. `AuthBridge/demos/single-target/k8s/configmaps-webhook.yaml`
-3. `AuthBridge/demos/single-target/k8s/authbridge-deployment.yaml`
-4. `AuthBridge/demos/single-target/k8s/authbridge-deployment-no-spiffe.yaml`
-5. `AuthBridge/AuthProxy/k8s/auth-proxy-deployment.yaml`
+1. `authbridge/demos/github-issue/k8s/configmaps.yaml`
+2. `authbridge/demos/single-target/k8s/configmaps-webhook.yaml`
+3. `authbridge/demos/single-target/k8s/authbridge-deployment.yaml`
+4. `authbridge/demos/single-target/k8s/authbridge-deployment-no-spiffe.yaml`
+5. `authbridge/authproxy/k8s/auth-proxy-deployment.yaml`
 
 ## Critical Bugs and Fixes
 
@@ -168,7 +168,7 @@ curl -s -H "Authorization: Bearer $ADMIN_TOKEN" \
 6. **Ollama** — Must be running (`ollama serve`) before end-to-end queries with local LLM.
 7. **A2A protocol** — git-issue-agent uses v0.3.0 with method `message/send` (NOT `tasks/send`). Requires `messageId` field.
 8. **Keycloak client ID with SPIRE** — Full SPIFFE ID (e.g., `spiffe://localtest.me/ns/team1/sa/git-issue-agent`), not a short name.
-9. **webhook-rollout.sh** — Set `AUTHBRIDGE_K8S_DIR=AuthBridge/demos/<demo-name>/k8s`.
+9. **webhook-rollout.sh** — Set `AUTHBRIDGE_K8S_DIR=authbridge/demos/<demo-name>/k8s`.
 10. **Keycloak scopes** — `github-full-access` is OPTIONAL; must be explicitly requested in token requests.
 11. **ISSUER vs TOKEN_URL** — `ISSUER` = Keycloak frontend URL (in token `iss` claim). `TOKEN_URL` = internal service URL. They differ in K8s.
 12. **Keycloak port 8080** — Must be in `OUTBOUND_PORTS_EXCLUDE` to prevent ext_proc token exchange redirect loop.

@@ -70,7 +70,6 @@ export KIND_EXPERIMENTAL_PROVIDER=podman  # Only needed for Podman
 
 **From kagenti-extensions repo**:
 - `ghcr.io/kagenti/kagenti-extensions/client-registration:local` - Registers agents as Keycloak clients
-- `ghcr.io/kagenti/kagenti-extensions/kagenti-webhook:local` - Admission webhook for sidecar injection
 - `ghcr.io/kagenti/kagenti-extensions/envoy-with-processor:local` - Envoy proxy with token exchange
 - `ghcr.io/kagenti/kagenti-extensions/proxy-init:local` - iptables initialization
 
@@ -107,7 +106,7 @@ deployments/ansible/run-install.sh --env dev \
 **About the values files:**
 - `dev_values.yaml`: Base Kind development configuration (components, Keycloak, domain, SPIRE config, openshift: false)
 - `dev_values_local_images.yaml`: **Local testing overlay**:
-  - Image tags: `:local` for spiffe-idp-setup, client-registration, envoy-proxy, proxy-init, kagenti-webhook
+  - Image tags: `:local` for spiffe-idp-setup, client-registration, envoy-proxy, proxy-init
   - Image pull policy: `Never`
   - Disables mcp-gateway component
   - Sets `create_kind_cluster: false` (assumes cluster already exists)
@@ -728,10 +727,7 @@ kubectl create rolebinding kagenti-spiffe-idp-pod-reader \
    ```bash
    kubectl delete pod -n <namespace> <pod-name>
    ```
-2. For webhook changes, restart the webhook deployment:
-   ```bash
-   kubectl rollout restart deployment -n kagenti-webhook-system kagenti-webhook
-   ```
+2. For webhook changes, see [kagenti-operator](https://github.com/kagenti/kagenti-operator) for redeployment instructions.
 3. Verify new images are loaded:
    ```bash
    kind get images --name kagenti-dev | grep :local

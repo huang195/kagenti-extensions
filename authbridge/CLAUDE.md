@@ -1,8 +1,8 @@
 # CLAUDE.md - AuthBridge
 
 This file provides context for Claude (AI assistant) when working with the `AuthBridge` codebase.
-For the full monorepo context (webhook, CI/CD, Helm, cross-component relationships), see [`../CLAUDE.md`](../CLAUDE.md).
-For the webhook (now in kagenti-operator), see the [kagenti-operator repo](https://github.com/kagenti/kagenti-operator).
+For repo-level context (CI/CD, cross-component relationships), see [`../CLAUDE.md`](../CLAUDE.md).
+The sidecar injection webhook lives in [kagenti-operator](https://github.com/kagenti/kagenti-operator).
 
 ## What AuthBridge Does
 
@@ -30,6 +30,9 @@ authbridge/
 ├── client-registration/              # Keycloak auto-registration (Python)
 │   ├── client_registration.py        #   Main script: register client, write secret
 │   └── Dockerfile                    #   Python 3.12-slim, UID/GID 1000
+│
+├── spiffe-helper/                    # SPIFFE helper (Dockerfile only)
+│   └── Dockerfile                    #   Fetches JWT-SVIDs from SPIRE agent
 │
 ├── demos/                            # Demo scenarios with full setup
 │   ├── README.md                     #   Demo index (recommended starting order)

@@ -1,12 +1,12 @@
 # AuthBridge Webhook Demo
 
-> **Note:** The kagenti-webhook has been migrated to [kagenti/kagenti-operator](https://github.com/kagenti/kagenti-operator). The instructions below remain valid when using the operator-deployed webhook.
+This guide demonstrates how the **kagenti-operator** webhook automatically injects AuthBridge sidecars into your deployments for transparent OAuth 2.0 token exchange.
 
-This guide demonstrates how to use the **kagenti-webhook** to automatically inject AuthBridge sidecars into your deployments for transparent OAuth 2.0 token exchange.
+> **Note:** The webhook is deployed via [kagenti/kagenti-operator](https://github.com/kagenti/kagenti-operator). See the operator docs for installation.
 
 ## Overview
 
-The kagenti-webhook watches for deployments with the `kagenti.io/inject: enabled` label and automatically injects AuthBridge sidecars. There are two injection modes controlled by the `combinedSidecar` feature gate:
+The operator webhook watches for deployments with the `kagenti.io/inject: enabled` label and automatically injects AuthBridge sidecars. There are two injection modes controlled by the `combinedSidecar` feature gate:
 
 ### Separate mode (default: `combinedSidecar: false`)
 
@@ -64,7 +64,7 @@ Combined mode reduces per-pod overhead from 3 long-running sidecars to 1, simpli
 
 ## Prerequisites
 
-1. **Kubernetes cluster** with the kagenti-webhook installed
+1. **Kubernetes cluster** with the [kagenti-operator](https://github.com/kagenti/kagenti-operator) installed
 2. **Keycloak** deployed in the `keycloak` namespace
 3. **SPIRE** deployed (optional, for SPIFFE-based identity)
 4. **AuthBridge images** available from GitHub Container Registry:
@@ -77,25 +77,16 @@ Combined mode reduces per-pod overhead from 3 long-running sidecars to 1, simpli
 
 ## Deploy Webhook
 
-Deploy the webhook and its prerequisites with a single command:
+Deploy the operator webhook following the [kagenti-operator installation docs](https://github.com/kagenti/kagenti-operator).
+
+Then create the namespace and apply the required ConfigMaps:
 
 ```bash
-cd kagenti-webhook
-
-# Deploy webhook + create namespace + apply ConfigMaps
-AUTHBRIDGE_DEMO=true ./scripts/webhook-rollout.sh
+kubectl create namespace team1
+kubectl apply -f k8s/configmaps-webhook.yaml -n team1
 ```
 
-Or specify a custom namespace:
-
-```bash
-AUTHBRIDGE_DEMO=true AUTHBRIDGE_NAMESPACE=myapp ./scripts/webhook-rollout.sh
-```
-
-This automatically:
-1. Builds and deploys the kagenti-webhook
-2. Creates the namespace
-3. Applies all required ConfigMaps (authbridge-config, envoy-config, spiffe-helper-config)
+The ConfigMaps provide:
 
 **Note for custom deployments:** `TOKEN_URL` and `ISSUER` are auto-derived from `KEYCLOAK_URL` + `KEYCLOAK_REALM`. Set `ISSUER` explicitly only when the internal `KEYCLOAK_URL` differs from the frontend URL that appears in token `iss` claims (split-horizon DNS). Audience validation is automatic using the agent's CLIENT_ID from `/shared/client-id.txt`.
 
@@ -127,25 +118,15 @@ The ConfigMaps include:
 
 To use the combined `authbridge` container instead of separate sidecars, enable the `combinedSidecar` feature gate:
 
-### Via Helm values
+### Via operator Helm values
 
-```yaml
-# values.yaml
-featureGates:
-  combinedSidecar: true
-```
-
-```bash
-helm upgrade kagenti-webhook oci://ghcr.io/kagenti/kagenti-extensions/kagenti-webhook-chart \
-  --set featureGates.combinedSidecar=true \
-  --namespace kagenti-webhook-system
-```
+See the [kagenti-operator docs](https://github.com/kagenti/kagenti-operator) for Helm-based configuration.
 
 ### Via ConfigMap (for existing deployments)
 
 ```bash
 # Edit the feature gates ConfigMap directly
-kubectl edit configmap kagenti-webhook-feature-gates -n kagenti-webhook-system
+kubectl edit configmap kagenti-webhook-feature-gates -n kagenti-system
 ```
 
 Add `combinedSidecar: true` to the `feature-gates.yaml` data key:
@@ -196,7 +177,7 @@ Then continue with:
 Run the Keycloak setup script to configure the realm, clients, and scopes:
 
 ```bash
-cd AuthBridge
+cd authbridge
 
 # Activate virtual environment
 python -m venv venv
@@ -414,7 +395,7 @@ kubectl logs deployment/agent -n team1 -c authbridge | grep "Token Exchange"
      kind load docker-image --name <cluster> localhost/proxy-init:latest
      kind load docker-image --name <cluster> localhost/envoy-with-processor:latest
      ```
-   - Update `container_builder.go` to use `localhost/` images if testing locally
+   - See the [kagenti-operator](https://github.com/kagenti/kagenti-operator) for image configuration
 
 4. **SPIFFE credentials not ready**
    - Ensure SPIRE is deployed and the workload is registered
@@ -487,11 +468,7 @@ kubectl delete namespace team1
 
 ### 5. Remove Webhook (Optional)
 
-If you want to remove the AuthBridge webhook entirely:
-
-```bash
-kubectl delete mutatingwebhookconfiguration kagenti-webhook-authbridge-mutating-webhook-configuration
-```
+To remove the webhook, see the [kagenti-operator](https://github.com/kagenti/kagenti-operator) uninstall instructions.
 
 ### Quick Cleanup (Delete Everything)
 
@@ -500,7 +477,4 @@ For a complete cleanup including the namespace:
 ```bash
 # Delete namespace (removes all resources inside)
 kubectl delete namespace team1
-
-# Remove webhook configuration
-kubectl delete mutatingwebhookconfiguration kagenti-webhook-authbridge-mutating-webhook-configuration
 ```

@@ -216,11 +216,9 @@ kind load docker-image --name kagenti ghcr.io/kagenti/agent-examples/git-issue-a
 
 ---
 
-## Step 1: Deploy the Webhook with AuthBridge Support
+## Step 1: Deploy the Operator Webhook with AuthBridge Support
 
-The kagenti-webhook automatically injects AuthBridge sidecars into agent deployments.
-
-> **Note:** The kagenti-webhook has been migrated to [kagenti/kagenti-operator](https://github.com/kagenti/kagenti-operator). Deploy the webhook via the operator. See the [operator installation docs](https://github.com/kagenti/kagenti-operator) for details.
+The [kagenti-operator](https://github.com/kagenti/kagenti-operator) webhook automatically injects AuthBridge sidecars into agent deployments. See the operator docs for installation.
 
 Once the webhook is deployed, create the namespace and apply the ConfigMaps:
 
@@ -251,7 +249,7 @@ kubectl port-forward service/keycloak-service -n keycloak 8080:8080
 ### Run the setup script
 
 ```bash
-cd AuthBridge
+cd authbridge
 
 # Create virtual environment (if not already done)
 python -m venv venv
@@ -305,7 +303,7 @@ configures per-route token exchange (target audience and scopes for the
 inbound audience validation. Apply this **before** deploying the agent.
 
 ```bash
-cd AuthBridge
+cd authbridge
 
 # Apply demo ConfigMaps (authbridge-config and authproxy-routes)
 kubectl apply -f demos/github-issue/k8s/configmaps.yaml

@@ -8,9 +8,9 @@ This file provides context for Claude (AI assistant) when working with the `kage
 
 ## Repository Overview
 
-**kagenti-extensions** is a monorepo containing Kubernetes security extensions for the [Kagenti](https://github.com/kagenti/kagenti) ecosystem. It provides **zero-trust authentication** for Kubernetes workloads through transparent token exchange and dynamic Keycloak client registration using SPIFFE/SPIRE identities.
+**kagenti-extensions** contains Kubernetes security extensions for the [Kagenti](https://github.com/kagenti/kagenti) ecosystem. It provides **zero-trust authentication** for Kubernetes workloads through transparent token exchange and dynamic Keycloak client registration using SPIFFE/SPIRE identities.
 
-> **Note:** The kagenti-webhook (admission webhook for sidecar injection) has been migrated to [kagenti/kagenti-operator](https://github.com/kagenti/kagenti-operator). See [kagenti-operator#238](https://github.com/kagenti/kagenti-operator/issues/238) for details.
+The sidecar injection webhook lives in a separate repo: [kagenti/kagenti-operator](https://github.com/kagenti/kagenti-operator).
 
 **GitHub:** `github.com/kagenti/kagenti-extensions`
 **Container registry:** `ghcr.io/kagenti/kagenti-extensions/<image-name>`
@@ -23,12 +23,15 @@ kagenti-extensions/
 ├── authbridge/               # Authentication bridge components
 │   ├── authproxy/            #   Envoy + ext-proc sidecar (Go) — token validation & exchange
 │   │   ├── go-processor/     #     gRPC ext-proc server (inbound JWT validation, outbound token exchange)
-│   │   └── quickstart/       #     Standalone demo (no SPIFFE)
+│   │   ├── quickstart/       #     Standalone demo (no SPIFFE)
+│   │   └── k8s/              #     Standalone K8s manifests
 │   ├── client-registration/  #   Keycloak auto-registration (Python)
+│   ├── spiffe-helper/        #   SPIFFE helper Dockerfile (fetches JWT-SVIDs from SPIRE)
 │   ├── demos/                #   Demo scenarios (weather-agent, github-issue, webhook, single-target, multi-target)
 │   └── keycloak_sync.py      #   Declarative Keycloak sync tool
+├── tests/                    # Python tests (client-registration, keycloak_sync)
 ├── .github/
-│   ├── workflows/            # CI/CD (ci.yaml, build.yaml, spellcheck, security-scans)
+│   ├── workflows/            # CI/CD (ci.yaml, build.yaml, security-scans, scorecard, spellcheck)
 │   └── ISSUE_TEMPLATE/       # Bug report, feature request, epic templates
 ├── .pre-commit-config.yaml   # Pre-commit hooks (trailing whitespace, go fmt/vet, ruff)
 └── CLAUDE.md                 # This file
@@ -114,6 +117,7 @@ All images are pushed to `ghcr.io/kagenti/kagenti-extensions/`:
 | `envoy-with-processor` | `authbridge/authproxy/Dockerfile.envoy` | Envoy 1.28 + go-processor ext-proc |
 | `proxy-init` | `authbridge/authproxy/Dockerfile.init` | Alpine + iptables init container |
 | `client-registration` | `authbridge/client-registration/Dockerfile` | Python Keycloak client registrar |
+| `spiffe-helper` | `authbridge/spiffe-helper/Dockerfile` | Fetches SPIFFE credentials from SPIRE |
 | `authbridge` | `authbridge/authproxy/Dockerfile.authbridge` | Combined sidecar (Envoy + go-processor + spiffe-helper + client-registration) |
 | `auth-proxy` | `authbridge/authproxy/Dockerfile` | Example pass-through proxy (for demos) |
 | `demo-app` | `authbridge/authproxy/quickstart/demo-app/Dockerfile` | Demo target service |
@@ -146,9 +150,9 @@ Hooks:
 | Service | Required | Purpose |
 |---------|----------|---------|
 | Kubernetes | Yes | Target platform (v1.25+ recommended) |
-| Keycloak | Yes (for AuthBridge) | OAuth2/OIDC provider, token exchange |
+| [kagenti-operator](https://github.com/kagenti/kagenti-operator) | Yes | Injects AuthBridge sidecars into workload pods |
+| Keycloak | Yes | OAuth2/OIDC provider, token exchange |
 | SPIRE | Optional | SPIFFE identity (JWT-SVIDs) for workloads |
-| Prometheus | Optional | Metrics collection (ServiceMonitor) |
 
 ## ConfigMaps and Secrets Expected at Runtime
 

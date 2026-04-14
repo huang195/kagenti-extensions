@@ -1,6 +1,6 @@
 # GitHub Issue Agent Deployment with AuthBridge
 #
-# This deployment uses the kagenti-webhook to automatically inject AuthBridge sidecars:
+# This deployment uses the kagenti-operator webhook to automatically inject AuthBridge sidecars:
 # - proxy-init (init container for iptables setup)
 # - spiffe-helper (SPIFFE credential fetcher) - only with kagenti.io/spire: enabled
 # - kagenti-client-registration (registers agent with Keycloak using SPIFFE ID)

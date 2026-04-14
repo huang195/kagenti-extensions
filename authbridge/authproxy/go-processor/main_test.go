@@ -2,6 +2,8 @@ package main
 
 import (
 	"context"
+	"crypto/rand"
+	"crypto/rsa"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -17,6 +19,10 @@ import (
 
 	core "github.com/envoyproxy/go-control-plane/envoy/config/core/v3"
 	v3 "github.com/envoyproxy/go-control-plane/envoy/service/ext_proc/v3"
+	typev3 "github.com/envoyproxy/go-control-plane/envoy/type/v3"
+	"github.com/lestrrat-go/jwx/v2/jwa"
+	"github.com/lestrrat-go/jwx/v2/jwk"
+	"github.com/lestrrat-go/jwx/v2/jwt"
 	"github.com/kagenti/kagenti-extensions/authbridge/authproxy/go-processor/internal/resolver"
 )
 
@@ -617,9 +623,9 @@ func TestGetHostFromHeaders(t *testing.T) {
 			want:    "",
 		},
 		{
-			name: "nil headers",
+			name:    "nil headers",
 			headers: nil,
-			want: "",
+			want:    "",
 		},
 	}
 
@@ -630,6 +636,343 @@ func TestGetHostFromHeaders(t *testing.T) {
 				t.Errorf("getHostFromHeaders() = %q, want %q", got, tt.want)
 			}
 		})
+	}
+}
+
+// --- Inbound JWT validation tests ---
+
+// buildInboundHeaders creates a HeaderMap for inbound requests with configurable path and auth.
+func buildInboundHeaders(path, authHeader string) *core.HeaderMap {
+	headers := []*core.HeaderValue{
+		{Key: ":authority", RawValue: []byte("agent-service")},
+		{Key: ":path", RawValue: []byte(path)},
+		{Key: ":method", RawValue: []byte("GET")},
+		{Key: "x-authbridge-direction", RawValue: []byte("inbound")},
+	}
+	if authHeader != "" {
+		headers = append(headers, &core.HeaderValue{
+			Key:      "authorization",
+			RawValue: []byte(authHeader),
+		})
+	}
+	return &core.HeaderMap{Headers: headers}
+}
+
+// isDenied401 returns true if the response is an ImmediateResponse with 401 status
+// and the body contains the expected substring.
+func isDenied401(resp *v3.ProcessingResponse, msgSubstr string) bool {
+	ir, ok := resp.Response.(*v3.ProcessingResponse_ImmediateResponse)
+	if !ok {
+		return false
+	}
+	if ir.ImmediateResponse.Status.Code != typev3.StatusCode_Unauthorized {
+		return false
+	}
+	return strings.Contains(string(ir.ImmediateResponse.Body), msgSubstr)
+}
+
+// isForwarded returns true if the response forwards the request (not an ImmediateResponse).
+func isForwarded(resp *v3.ProcessingResponse) bool {
+	_, ok := resp.Response.(*v3.ProcessingResponse_RequestHeaders)
+	return ok
+}
+
+// removesDirectionHeader returns true if the response removes x-authbridge-direction.
+func removesDirectionHeader(resp *v3.ProcessingResponse) bool {
+	rh, ok := resp.Response.(*v3.ProcessingResponse_RequestHeaders)
+	if !ok {
+		return false
+	}
+	if rh.RequestHeaders.Response == nil || rh.RequestHeaders.Response.HeaderMutation == nil {
+		return false
+	}
+	for _, h := range rh.RequestHeaders.Response.HeaderMutation.RemoveHeaders {
+		if h == "x-authbridge-direction" {
+			return true
+		}
+	}
+	return false
+}
+
+// setupTestJWKS generates an RSA key pair, serves the public key as JWKS,
+// and initializes the global jwksCache. Returns the private key for signing
+// test JWTs and a cleanup function.
+func setupTestJWKS(t *testing.T) (jwk.Key, func()) {
+	t.Helper()
+
+	// Generate RSA key pair
+	raw, err := rsa.GenerateKey(rand.Reader, 2048)
+	if err != nil {
+		t.Fatalf("failed to generate RSA key: %v", err)
+	}
+
+	privKey, err := jwk.FromRaw(raw)
+	if err != nil {
+		t.Fatalf("failed to create private JWK: %v", err)
+	}
+	privKey.Set(jwk.KeyIDKey, "test-key-1")
+	privKey.Set(jwk.AlgorithmKey, "RS256")
+
+	pubKey, err := jwk.FromRaw(&raw.PublicKey)
+	if err != nil {
+		t.Fatalf("failed to create public JWK: %v", err)
+	}
+	pubKey.Set(jwk.KeyIDKey, "test-key-1")
+	pubKey.Set(jwk.AlgorithmKey, "RS256")
+
+	// Create JWKS (key set) with the public key
+	keySet := jwk.NewSet()
+	keySet.AddKey(pubKey)
+
+	// Serve JWKS via HTTP
+	jwksServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if err := json.NewEncoder(w).Encode(keySet); err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+		}
+	}))
+
+	// Initialize the global jwksCache
+	jwksURL := jwksServer.URL
+	ctx := context.Background()
+	cache := jwk.NewCache(ctx)
+	if err := cache.Register(jwksURL); err != nil {
+		t.Fatalf("failed to register JWKS URL: %v", err)
+	}
+	// Prefetch to ensure keys are cached
+	if _, err := cache.Refresh(ctx, jwksURL); err != nil {
+		t.Fatalf("failed to prefetch JWKS: %v", err)
+	}
+
+	// Save and replace globals
+	origCache := jwksCache
+	origURL := inboundJWKSURL
+	origIssuer := inboundIssuer
+	origAudience := expectedAudience
+
+	jwksCache = cache
+	inboundJWKSURL = jwksURL
+	inboundIssuer = "https://keycloak.example.com/realms/kagenti"
+	expectedAudience = "spiffe://localtest.me/ns/team1/sa/agent"
+
+	cleanup := func() {
+		jwksServer.Close()
+		jwksCache = origCache
+		inboundJWKSURL = origURL
+		inboundIssuer = origIssuer
+		expectedAudience = origAudience
+	}
+
+	return privKey, cleanup
+}
+
+// signTestJWT creates a signed JWT with the given issuer and audience.
+func signTestJWT(t *testing.T, privKey jwk.Key, issuer string, audience []string) string {
+	t.Helper()
+
+	builder := jwt.NewBuilder().
+		Issuer(issuer).
+		IssuedAt(time.Now()).
+		Expiration(time.Now().Add(5 * time.Minute)).
+		Subject("test-subject")
+	if len(audience) > 0 {
+		builder = builder.Audience(audience)
+	}
+
+	token, err := builder.Build()
+	if err != nil {
+		t.Fatalf("failed to build JWT: %v", err)
+	}
+
+	signed, err := jwt.Sign(token, jwt.WithKey(jwa.RS256, privKey))
+	if err != nil {
+		t.Fatalf("failed to sign JWT: %v", err)
+	}
+	return string(signed)
+}
+
+func TestHandleInbound_NotConfigured(t *testing.T) {
+	// Save and clear globals
+	origCache := jwksCache
+	origIssuer := inboundIssuer
+	jwksCache = nil
+	inboundIssuer = ""
+	defer func() {
+		jwksCache = origCache
+		inboundIssuer = origIssuer
+	}()
+
+	p := &processor{}
+	headers := buildInboundHeaders("/api/data", "Bearer some-token")
+	resp := p.handleInbound(headers)
+
+	if !isForwarded(resp) {
+		t.Error("expected request to be forwarded when inbound validation is not configured")
+	}
+}
+
+func TestHandleInbound_MissingAuthHeader(t *testing.T) {
+	_, cleanup := setupTestJWKS(t)
+	defer cleanup()
+
+	p := &processor{}
+	headers := buildInboundHeaders("/api/data", "")
+	resp := p.handleInbound(headers)
+
+	if !isDenied401(resp, "missing Authorization header") {
+		t.Error("expected 401 with 'missing Authorization header'")
+	}
+}
+
+func TestHandleInbound_MalformedAuthHeader(t *testing.T) {
+	_, cleanup := setupTestJWKS(t)
+	defer cleanup()
+
+	p := &processor{}
+	// Auth header without "Bearer " prefix
+	headers := buildInboundHeaders("/api/data", "Basic dXNlcjpwYXNz")
+	resp := p.handleInbound(headers)
+
+	if !isDenied401(resp, "invalid Authorization header format") {
+		t.Error("expected 401 with 'invalid Authorization header format'")
+	}
+}
+
+func TestHandleInbound_InvalidSignature(t *testing.T) {
+	_, cleanup := setupTestJWKS(t)
+	defer cleanup()
+
+	// Generate a DIFFERENT key to sign with (won't match JWKS)
+	otherRaw, _ := rsa.GenerateKey(rand.Reader, 2048)
+	otherKey, _ := jwk.FromRaw(otherRaw)
+	otherKey.Set(jwk.KeyIDKey, "other-key")
+
+	badToken := signTestJWT(t, otherKey, inboundIssuer,
+		[]string{expectedAudience})
+
+	p := &processor{}
+	headers := buildInboundHeaders("/api/data", "Bearer "+badToken)
+	resp := p.handleInbound(headers)
+
+	if !isDenied401(resp, "token validation failed") {
+		t.Error("expected 401 with 'token validation failed' for JWT signed with wrong key")
+	}
+}
+
+func TestHandleInbound_WrongIssuer(t *testing.T) {
+	privKey, cleanup := setupTestJWKS(t)
+	defer cleanup()
+
+	token := signTestJWT(t, privKey, "https://wrong-issuer.example.com/realms/other",
+		[]string{expectedAudience})
+
+	p := &processor{}
+	headers := buildInboundHeaders("/api/data", "Bearer "+token)
+	resp := p.handleInbound(headers)
+
+	if !isDenied401(resp, "invalid issuer") {
+		t.Error("expected 401 with 'invalid issuer'")
+	}
+}
+
+func TestHandleInbound_WrongAudience(t *testing.T) {
+	privKey, cleanup := setupTestJWKS(t)
+	defer cleanup()
+
+	token := signTestJWT(t, privKey, inboundIssuer,
+		[]string{"spiffe://localtest.me/ns/other/sa/wrong-agent"})
+
+	p := &processor{}
+	headers := buildInboundHeaders("/api/data", "Bearer "+token)
+	resp := p.handleInbound(headers)
+
+	if !isDenied401(resp, "invalid audience") {
+		t.Error("expected 401 with 'invalid audience'")
+	}
+}
+
+func TestHandleInbound_ValidToken(t *testing.T) {
+	privKey, cleanup := setupTestJWKS(t)
+	defer cleanup()
+
+	token := signTestJWT(t, privKey, inboundIssuer,
+		[]string{expectedAudience})
+
+	p := &processor{}
+	headers := buildInboundHeaders("/api/data", "Bearer "+token)
+	resp := p.handleInbound(headers)
+
+	if !isForwarded(resp) {
+		t.Fatal("expected valid token to be forwarded")
+	}
+	if !removesDirectionHeader(resp) {
+		t.Error("expected x-authbridge-direction header to be removed")
+	}
+}
+
+func TestHandleInbound_ExpiredToken(t *testing.T) {
+	privKey, cleanup := setupTestJWKS(t)
+	defer cleanup()
+
+	token, err := jwt.NewBuilder().
+		Issuer(inboundIssuer).
+		Audience([]string{expectedAudience}).
+		Subject("test-subject").
+		IssuedAt(time.Now().Add(-2 * time.Hour)).
+		Expiration(time.Now().Add(-1 * time.Hour)).
+		Build()
+	if err != nil {
+		t.Fatalf("failed to build expired JWT: %v", err)
+	}
+	signed, err := jwt.Sign(token, jwt.WithKey(jwa.RS256, privKey))
+	if err != nil {
+		t.Fatalf("failed to sign expired JWT: %v", err)
+	}
+
+	p := &processor{}
+	headers := buildInboundHeaders("/api/data", "Bearer "+string(signed))
+	resp := p.handleInbound(headers)
+
+	if !isDenied401(resp, "token validation failed") {
+		t.Error("expected 401 with 'token validation failed' for expired token")
+	}
+}
+
+func TestHandleInbound_BypassPath(t *testing.T) {
+	_, cleanup := setupTestJWKS(t)
+	defer cleanup()
+
+	p := &processor{}
+	// /.well-known/* is a default bypass path — no token needed
+	headers := buildInboundHeaders("/.well-known/agent.json", "")
+	resp := p.handleInbound(headers)
+
+	if !isForwarded(resp) {
+		t.Error("expected bypass path to be forwarded without auth")
+	}
+	if !removesDirectionHeader(resp) {
+		t.Error("expected x-authbridge-direction header to be removed on bypass")
+	}
+}
+
+func TestHandleInbound_NoAudienceCheck(t *testing.T) {
+	privKey, cleanup := setupTestJWKS(t)
+	defer cleanup()
+
+	// Clear expected audience — token should pass without audience check
+	origAud := expectedAudience
+	expectedAudience = ""
+	defer func() { expectedAudience = origAud }()
+
+	token := signTestJWT(t, privKey, inboundIssuer,
+		[]string{"any-audience"})
+
+	p := &processor{}
+	headers := buildInboundHeaders("/api/data", "Bearer "+token)
+	resp := p.handleInbound(headers)
+
+	if !isForwarded(resp) {
+		t.Error("expected token to be forwarded when no audience check is configured")
 	}
 }
 

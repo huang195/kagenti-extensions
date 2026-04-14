@@ -2,7 +2,7 @@
 * @kagenti/maintainers
 
 # AuthBridge components
-AuthBridge/ @kagenti/maintainers
+authbridge/ @kagenti/maintainers
 
 # CI/CD and GitHub configuration
 .github/ @kagenti/platform

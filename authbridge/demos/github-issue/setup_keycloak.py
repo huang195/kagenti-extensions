@@ -475,7 +475,7 @@ Token flow:
   6. GitHub tool validates exchanged token and uses appropriate PAT
 
 Next steps:
-  1. Deploy webhook:     cd kagenti-webhook && AUTHBRIDGE_DEMO=true ./scripts/webhook-rollout.sh
+  1. Deploy operator:    See https://github.com/kagenti/kagenti-operator for webhook setup
   2. Apply ConfigMaps:   kubectl apply -f demos/github-issue/k8s/configmaps.yaml
   3. Create PAT secret:  kubectl create secret generic github-tool-secrets -n {namespace} \\
                            --from-literal=INIT_AUTH_HEADER="Bearer <PRIVILEGED_PAT>" \\

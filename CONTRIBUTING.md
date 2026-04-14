@@ -16,11 +16,9 @@ Comment `/claim` on an issue to have it automatically assigned to you. Issues la
 
 ## Prerequisites
 
-- **Go 1.24+** (for kagenti-webhook)
-- **Go 1.23+** (for AuthProxy go-processor)
+- **Go 1.24+** (for AuthProxy go-processor)
 - **Python 3.12+** (for client-registration and Keycloak sync)
 - **Docker** (for building container images)
-- **Helm 3** (for chart development)
 - **pre-commit** (for local hooks)
 
 ## Development Setup
@@ -32,9 +30,6 @@ cd kagenti-extensions
 
 # Install pre-commit hooks
 pre-commit install
-
-# Build the webhook
-cd kagenti-webhook && make build && make test
 
 # Build AuthProxy images
 cd authbridge/authproxy && make build-images
@@ -75,7 +70,7 @@ Smaller pull requests are typically easier to review and merge. If your pull req
 
 ## Code Style
 
-### Go Code (webhook, AuthProxy)
+### Go Code (AuthProxy)
 - Use `go fmt` (enforced by pre-commit and CI)
 - Use `go vet` (enforced by pre-commit and CI)
 - Apache 2.0 license header in all Go files
@@ -83,10 +78,6 @@ Smaller pull requests are typically easier to review and merge. If your pull req
 ### Python Code (client-registration)
 - Python 3.12+ syntax (type hints with `str | None`)
 - Dependencies version-pinned in `requirements.txt`
-
-### Helm Charts
-- Charts in `charts/` directory
-- Linted by pre-commit hooks
 
 ## Licensing
 

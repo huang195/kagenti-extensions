@@ -43,7 +43,7 @@ The AuthProxy automatically exchanges tokens based on the destination host:
 Build the AuthProxy images (includes the ext-proc with route-based exchange):
 
 ```bash
-cd AuthProxy
+cd authproxy
 
 # Build all images
 make build-images
@@ -75,7 +75,7 @@ kubectl port-forward service/keycloak-service -n keycloak 8080:8080
 Use `keycloak_sync.py` to reconcile the routes configuration with Keycloak:
 
 ```bash
-cd AuthBridge
+cd authbridge
 
 # Create virtual environment (if not already done)
 python -m venv venv

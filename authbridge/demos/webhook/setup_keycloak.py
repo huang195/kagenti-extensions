@@ -1,9 +1,9 @@
 """
 setup_keycloak.py - Keycloak Setup for AuthBridge Webhook
 
-This script configures Keycloak for deployments using the kagenti-webhook
+This script configures Keycloak for deployments using the kagenti-operator
 to inject AuthBridge sidecars. Unlike the standalone demo, this setup supports
-any namespace where the webhook is enabled.
+any namespace where the operator webhook is enabled.
 
 Usage:
   python setup_keycloak.py [--namespace NAMESPACE] [--service-account SA]

@@ -269,7 +269,7 @@ kubectl port-forward service/keycloak-service -n keycloak 8080:8080
 In a new terminal, run the setup script:
 
 ```bash
-cd AuthBridge
+cd authbridge
 
 # Create virtual environment
 python -m venv venv
@@ -305,7 +305,7 @@ kubectl get secret ghcr-secret -n team1 -o yaml | sed 's/namespace: team1/namesp
 ### Step 4: Deploy the Demo
 
 ```bash
-cd AuthBridge
+cd authbridge
 
 # With SPIFFE (requires SPIRE)
 kubectl apply -f demos/single-target/k8s/authbridge-deployment.yaml

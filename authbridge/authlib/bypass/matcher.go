@@ -13,6 +13,8 @@ var DefaultPatterns = []string{"/.well-known/*", "/healthz", "/readyz", "/livez"
 
 // Matcher checks request paths against a set of bypass patterns.
 // Patterns use Go's path.Match syntax (e.g., "/.well-known/*").
+// Note: path.Match's "*" does NOT cross "/" separators, so "/.well-known/*"
+// matches "/.well-known/agent.json" but NOT "/.well-known/foo/bar".
 type Matcher struct {
 	patterns []string
 }

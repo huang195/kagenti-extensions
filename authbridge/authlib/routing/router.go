@@ -20,6 +20,7 @@ type Route struct {
 
 // ResolvedRoute is the result of resolving a host against the router.
 type ResolvedRoute struct {
+	Matched       bool   // true if a configured route matched; false for default action fallback
 	Audience      string
 	Scopes        string
 	TokenEndpoint string
@@ -76,6 +77,7 @@ func (r *Router) Resolve(host string) *ResolvedRoute {
 				action = "exchange"
 			}
 			return &ResolvedRoute{
+				Matched:       true,
 				Audience:      entry.route.Audience,
 				Scopes:        entry.route.Scopes,
 				TokenEndpoint: entry.route.TokenEndpoint,
@@ -84,7 +86,7 @@ func (r *Router) Resolve(host string) *ResolvedRoute {
 		}
 	}
 	if r.defaultAction == "exchange" {
-		return &ResolvedRoute{}
+		return &ResolvedRoute{Matched: false}
 	}
 	return nil
 }

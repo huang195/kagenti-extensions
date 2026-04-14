@@ -9,6 +9,7 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"strings"
 	"time"
 )
 
@@ -99,14 +100,22 @@ func (c *Client) ClientCredentials(ctx context.Context, scopes string) (*Exchang
 	return c.doTokenRequest(ctx, form)
 }
 
-func (c *Client) doTokenRequest(_ context.Context, form url.Values) (*ExchangeResponse, error) {
-	resp, err := c.httpClient.PostForm(c.tokenURL, form)
+func (c *Client) doTokenRequest(ctx context.Context, form url.Values) (*ExchangeResponse, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.tokenURL,
+		strings.NewReader(form.Encode()))
+	if err != nil {
+		return nil, fmt.Errorf("creating request: %w", err)
+	}
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+
+	resp, err := c.httpClient.Do(req)
 	if err != nil {
 		return nil, fmt.Errorf("token request: %w", err)
 	}
 	defer resp.Body.Close()
 
-	body, err := io.ReadAll(resp.Body)
+	// Limit response body to 1MB to prevent OOM from malicious endpoints.
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 	if err != nil {
 		return nil, fmt.Errorf("reading response: %w", err)
 	}

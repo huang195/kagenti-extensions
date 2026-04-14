@@ -42,18 +42,14 @@ func New(opts ...Option) *Cache {
 }
 
 // Get returns a cached token for the given subject token and audience.
-// Returns ("", false) if not found or expired.
+// Returns ("", false) if not found or expired. Expired entries are left
+// for eviction during Set() to avoid write-lock contention on reads.
 func (c *Cache) Get(subjectToken, audience string) (string, bool) {
 	key := cacheKey(subjectToken, audience)
 	c.mu.RLock()
 	e, ok := c.entries[key]
 	c.mu.RUnlock()
 	if !ok || time.Now().After(e.expiresAt) {
-		if ok {
-			c.mu.Lock()
-			delete(c.entries, key)
-			c.mu.Unlock()
-		}
 		return "", false
 	}
 	return e.token, true

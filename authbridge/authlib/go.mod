@@ -2,6 +2,8 @@ module github.com/kagenti/kagenti-extensions/authbridge/authlib
 
 go 1.24.0
 
+toolchain go1.24.5
+
 require (
 	github.com/gobwas/glob v0.2.3
 	github.com/lestrrat-go/jwx/v2 v2.1.6
@@ -17,6 +19,6 @@ require (
 	github.com/lestrrat-go/iter v1.0.2 // indirect
 	github.com/lestrrat-go/option v1.0.1 // indirect
 	github.com/segmentio/asm v1.2.0 // indirect
-	golang.org/x/crypto v0.32.0 // indirect
-	golang.org/x/sys v0.31.0 // indirect
+	golang.org/x/crypto v0.48.0 // indirect
+	golang.org/x/sys v0.41.0 // indirect
 )

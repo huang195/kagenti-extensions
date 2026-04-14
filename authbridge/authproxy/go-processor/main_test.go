@@ -482,7 +482,9 @@ func TestReadFileContent(t *testing.T) {
 	t.Run("existing file with whitespace", func(t *testing.T) {
 		dir := t.TempDir()
 		path := filepath.Join(dir, "test.txt")
-		os.WriteFile(path, []byte("  hello world  \n"), 0644)
+		if err := os.WriteFile(path, []byte("  hello world  \n"), 0644); err != nil {
+			t.Fatal(err)
+		}
 
 		content, err := readFileContent(path)
 		if err != nil {
@@ -503,7 +505,9 @@ func TestReadFileContent(t *testing.T) {
 	t.Run("empty file", func(t *testing.T) {
 		dir := t.TempDir()
 		path := filepath.Join(dir, "empty.txt")
-		os.WriteFile(path, []byte(""), 0644)
+		if err := os.WriteFile(path, []byte(""), 0644); err != nil {
+			t.Fatal(err)
+		}
 
 		content, err := readFileContent(path)
 		if err != nil {
@@ -556,8 +560,12 @@ func TestLoadConfig(t *testing.T) {
 		dir := t.TempDir()
 		idPath := filepath.Join(dir, "client-id.txt")
 		secretPath := filepath.Join(dir, "client-secret.txt")
-		os.WriteFile(idPath, []byte("file-client-id\n"), 0644)
-		os.WriteFile(secretPath, []byte("file-client-secret\n"), 0644)
+		if err := os.WriteFile(idPath, []byte("file-client-id\n"), 0644); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(secretPath, []byte("file-client-secret\n"), 0644); err != nil {
+			t.Fatal(err)
+		}
 
 		t.Setenv("CLIENT_ID_FILE", idPath)
 		t.Setenv("CLIENT_SECRET_FILE", secretPath)

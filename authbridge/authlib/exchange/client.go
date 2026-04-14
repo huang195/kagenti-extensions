@@ -1,0 +1,145 @@
+// Package exchange implements RFC 8693 OAuth 2.0 Token Exchange
+// and client credentials grant.
+package exchange
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"io"
+	"net/http"
+	"net/url"
+	"time"
+)
+
+// ExchangeRequest contains the parameters for a token exchange.
+type ExchangeRequest struct {
+	SubjectToken string
+	Audience     string
+	Scopes       string
+	ActorToken   string // optional, RFC 8693 Section 4.1
+}
+
+// ExchangeResponse contains the result of a successful token exchange.
+type ExchangeResponse struct {
+	AccessToken string
+	TokenType   string
+	ExpiresIn   int // seconds
+}
+
+// Client performs OAuth token exchange and client credentials requests.
+type Client struct {
+	tokenURL   string
+	auth       ClientAuth
+	httpClient *http.Client
+}
+
+// Option configures the exchange client.
+type Option func(*Client)
+
+// WithHTTPClient sets the HTTP client used for token requests.
+func WithHTTPClient(c *http.Client) Option {
+	return func(cl *Client) { cl.httpClient = c }
+}
+
+// NewClient creates a token exchange client.
+func NewClient(tokenURL string, auth ClientAuth, opts ...Option) *Client {
+	c := &Client{
+		tokenURL: tokenURL,
+		auth:     auth,
+		httpClient: &http.Client{
+			Timeout: 30 * time.Second,
+		},
+	}
+	for _, o := range opts {
+		o(c)
+	}
+	return c
+}
+
+// Exchange performs an RFC 8693 token exchange.
+func (c *Client) Exchange(ctx context.Context, req *ExchangeRequest) (*ExchangeResponse, error) {
+	form := url.Values{
+		"grant_type":           {"urn:ietf:params:oauth:grant-type:token-exchange"},
+		"requested_token_type": {"urn:ietf:params:oauth:token-type:access_token"},
+		"subject_token":        {req.SubjectToken},
+		"subject_token_type":   {"urn:ietf:params:oauth:token-type:access_token"},
+	}
+	if req.Audience != "" {
+		form.Set("audience", req.Audience)
+	}
+	if req.Scopes != "" {
+		form.Set("scope", req.Scopes)
+	}
+	if req.ActorToken != "" {
+		form.Set("actor_token", req.ActorToken)
+		form.Set("actor_token_type", "urn:ietf:params:oauth:token-type:access_token")
+	}
+
+	if err := c.auth.Apply(ctx, form, nil); err != nil {
+		return nil, fmt.Errorf("applying client auth: %w", err)
+	}
+
+	return c.doTokenRequest(ctx, form)
+}
+
+// ClientCredentials performs a client credentials grant.
+func (c *Client) ClientCredentials(ctx context.Context, scopes string) (*ExchangeResponse, error) {
+	form := url.Values{
+		"grant_type": {"client_credentials"},
+	}
+	if scopes != "" {
+		form.Set("scope", scopes)
+	}
+
+	if err := c.auth.Apply(ctx, form, nil); err != nil {
+		return nil, fmt.Errorf("applying client auth: %w", err)
+	}
+
+	return c.doTokenRequest(ctx, form)
+}
+
+func (c *Client) doTokenRequest(_ context.Context, form url.Values) (*ExchangeResponse, error) {
+	resp, err := c.httpClient.PostForm(c.tokenURL, form)
+	if err != nil {
+		return nil, fmt.Errorf("token request: %w", err)
+	}
+	defer resp.Body.Close()
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, fmt.Errorf("reading response: %w", err)
+	}
+
+	if resp.StatusCode != http.StatusOK {
+		var oauthErr struct {
+			Error       string `json:"error"`
+			Description string `json:"error_description"`
+		}
+		_ = json.Unmarshal(body, &oauthErr)
+		return nil, &ExchangeError{
+			StatusCode:       resp.StatusCode,
+			OAuthError:       oauthErr.Error,
+			OAuthDescription: oauthErr.Description,
+		}
+	}
+
+	var tokenResp struct {
+		AccessToken string `json:"access_token"`
+		TokenType   string `json:"token_type"`
+		ExpiresIn   int    `json:"expires_in"`
+	}
+	if err := json.Unmarshal(body, &tokenResp); err != nil {
+		return nil, fmt.Errorf("parsing token response: %w", err)
+	}
+	if tokenResp.AccessToken == "" {
+		return nil, fmt.Errorf("token response missing access_token")
+	}
+
+	return &ExchangeResponse{
+		AccessToken: tokenResp.AccessToken,
+		TokenType:   tokenResp.TokenType,
+		ExpiresIn:   tokenResp.ExpiresIn,
+	}, nil
+}
+

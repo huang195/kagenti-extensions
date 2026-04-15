@@ -27,7 +27,8 @@ func Validate(cfg *Config) error {
 		return fmt.Errorf("inbound.jwks_url is required")
 	}
 	if cfg.Outbound.TokenURL == "" {
-		return fmt.Errorf("outbound.token_url is required")
+		// token_url may have been derived from keycloak_url + keycloak_realm in Resolve()
+		return fmt.Errorf("outbound.token_url is required (or set keycloak_url + keycloak_realm)")
 	}
 
 	// Identity validation
@@ -52,15 +53,15 @@ func validateIdentity(cfg *Config) error {
 		if cfg.Identity.SocketPath == "" && cfg.Identity.JWTSVIDPath == "" {
 			return fmt.Errorf("identity.type=spiffe requires socket_path or jwt_svid_path")
 		}
-		if cfg.Identity.ClientID == "" {
-			return fmt.Errorf("identity.type=spiffe requires client_id")
+		if cfg.Identity.ClientID == "" && cfg.Identity.ClientIDFile == "" {
+			return fmt.Errorf("identity.type=spiffe requires client_id or client_id_file")
 		}
 	case "client-secret":
-		if cfg.Identity.ClientID == "" {
-			return fmt.Errorf("identity.type=client-secret requires client_id")
+		if cfg.Identity.ClientID == "" && cfg.Identity.ClientIDFile == "" {
+			return fmt.Errorf("identity.type=client-secret requires client_id or client_id_file")
 		}
-		if cfg.Identity.ClientSecret == "" {
-			return fmt.Errorf("identity.type=client-secret requires client_secret")
+		if cfg.Identity.ClientSecret == "" && cfg.Identity.ClientSecretFile == "" {
+			return fmt.Errorf("identity.type=client-secret requires client_secret or client_secret_file")
 		}
 	case "k8s-sa":
 		// Future: validate service account token path

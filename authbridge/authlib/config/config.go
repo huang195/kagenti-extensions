@@ -29,17 +29,21 @@ type InboundConfig struct {
 // OutboundConfig holds token exchange settings.
 type OutboundConfig struct {
 	TokenURL      string `yaml:"token_url"`
+	KeycloakURL   string `yaml:"keycloak_url"`   // alternative: derives token_url and issuer
+	KeycloakRealm string `yaml:"keycloak_realm"`  // used with keycloak_url
 	DefaultPolicy string `yaml:"default_policy"` // "exchange" or "passthrough"
 }
 
 // IdentityConfig holds agent identity and credentials.
 type IdentityConfig struct {
-	Type         string   `yaml:"type"`          // "spiffe", "client-secret", "k8s-sa"
-	ClientID     string   `yaml:"client_id"`
-	ClientSecret string   `yaml:"client_secret"`
-	SocketPath   string   `yaml:"socket_path"`   // SPIFFE Workload API
-	JWTSVIDPath  string   `yaml:"jwt_svid_path"` // file-based SPIFFE
-	JWTAudience  []string `yaml:"jwt_audience"`  // SPIFFE JWT audience
+	Type             string   `yaml:"type"`               // "spiffe", "client-secret", "k8s-sa"
+	ClientID         string   `yaml:"client_id"`
+	ClientSecret     string   `yaml:"client_secret"`
+	ClientIDFile     string   `yaml:"client_id_file"`     // alternative: read client_id from file
+	ClientSecretFile string   `yaml:"client_secret_file"` // alternative: read client_secret from file
+	SocketPath       string   `yaml:"socket_path"`        // SPIFFE Workload API
+	JWTSVIDPath      string   `yaml:"jwt_svid_path"`      // file-based SPIFFE
+	JWTAudience      []string `yaml:"jwt_audience"`       // SPIFFE JWT audience
 }
 
 // ListenerConfig holds per-mode listener addresses.

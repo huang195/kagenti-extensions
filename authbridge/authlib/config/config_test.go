@@ -4,6 +4,7 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 )
 
 // --- Preset Tests ---
@@ -210,6 +211,99 @@ func TestRouteConfig_LegacyPassthrough(t *testing.T) {
 	}
 	if action != "passthrough" {
 		t.Errorf("expected passthrough, got %q", action)
+	}
+}
+
+// --- Keycloak URL derivation ---
+
+func TestDeriveKeycloakURLs(t *testing.T) {
+	cfg := &Config{
+		Mode:     ModeWaypoint,
+		Outbound: OutboundConfig{KeycloakURL: "http://keycloak:8080", KeycloakRealm: "kagenti"},
+		Identity: IdentityConfig{Type: "client-secret", ClientID: "svc", ClientSecret: "secret"},
+	}
+	deriveKeycloakURLs(cfg)
+	if cfg.Outbound.TokenURL != "http://keycloak:8080/realms/kagenti/protocol/openid-connect/token" {
+		t.Errorf("token_url = %q", cfg.Outbound.TokenURL)
+	}
+	if cfg.Inbound.Issuer != "http://keycloak:8080/realms/kagenti" {
+		t.Errorf("issuer = %q", cfg.Inbound.Issuer)
+	}
+}
+
+func TestDeriveKeycloakURLs_ExplicitTakesPrecedence(t *testing.T) {
+	cfg := &Config{
+		Inbound:  InboundConfig{Issuer: "http://explicit-issuer"},
+		Outbound: OutboundConfig{TokenURL: "http://explicit-token", KeycloakURL: "http://keycloak:8080", KeycloakRealm: "kagenti"},
+	}
+	deriveKeycloakURLs(cfg)
+	if cfg.Outbound.TokenURL != "http://explicit-token" {
+		t.Errorf("explicit token_url should not be overridden, got %q", cfg.Outbound.TokenURL)
+	}
+	if cfg.Inbound.Issuer != "http://explicit-issuer" {
+		t.Errorf("explicit issuer should not be overridden, got %q", cfg.Inbound.Issuer)
+	}
+}
+
+// --- JWKS URL derivation ---
+
+func TestDeriveJWKSURL(t *testing.T) {
+	cfg := &Config{
+		Outbound: OutboundConfig{TokenURL: "http://keycloak:8080/realms/kagenti/protocol/openid-connect/token"},
+	}
+	deriveJWKSURL(cfg)
+	if cfg.Inbound.JWKSURL != "http://keycloak:8080/realms/kagenti/protocol/openid-connect/certs" {
+		t.Errorf("jwks_url = %q", cfg.Inbound.JWKSURL)
+	}
+}
+
+func TestDeriveJWKSURL_ExplicitTakesPrecedence(t *testing.T) {
+	cfg := &Config{
+		Inbound:  InboundConfig{JWKSURL: "http://explicit-jwks"},
+		Outbound: OutboundConfig{TokenURL: "http://keycloak:8080/realms/kagenti/protocol/openid-connect/token"},
+	}
+	deriveJWKSURL(cfg)
+	if cfg.Inbound.JWKSURL != "http://explicit-jwks" {
+		t.Errorf("explicit jwks_url should not be overridden, got %q", cfg.Inbound.JWKSURL)
+	}
+}
+
+// --- Credential file validation ---
+
+func TestValidate_ClientIDFile(t *testing.T) {
+	cfg := &Config{
+		Mode:     ModeWaypoint,
+		Inbound:  InboundConfig{JWKSURL: "http://jwks", Issuer: "http://issuer"},
+		Outbound: OutboundConfig{TokenURL: "http://token"},
+		Identity: IdentityConfig{Type: "client-secret", ClientIDFile: "/shared/client-id.txt", ClientSecretFile: "/shared/client-secret.txt"},
+	}
+	// Should pass validation — file paths accepted as alternatives
+	if err := Validate(cfg); err != nil {
+		t.Errorf("unexpected error: %v", err)
+	}
+}
+
+// --- Credential file reading ---
+
+func TestWaitAndReadFile(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "client-id.txt")
+	if err := os.WriteFile(path, []byte("  my-agent  \n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	var dest string
+	if err := waitAndReadFile(path, &dest, 5*time.Second); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if dest != "my-agent" {
+		t.Errorf("got %q, want trimmed value", dest)
+	}
+}
+
+func TestWaitForFile_Timeout(t *testing.T) {
+	err := waitForFile("/nonexistent/file", 1*time.Second)
+	if err == nil {
+		t.Error("expected timeout error")
 	}
 }
 

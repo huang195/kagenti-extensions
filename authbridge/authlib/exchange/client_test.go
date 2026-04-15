@@ -11,7 +11,8 @@ import (
 func TestExchange_Success(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if err := r.ParseForm(); err != nil {
-			t.Fatal(err)
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
 		}
 		if got := r.FormValue("grant_type"); got != "urn:ietf:params:oauth:grant-type:token-exchange" {
 			t.Errorf("grant_type = %q", got)
@@ -91,7 +92,8 @@ func TestExchange_OAuthError(t *testing.T) {
 func TestClientCredentials_Success(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if err := r.ParseForm(); err != nil {
-			t.Fatal(err)
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
 		}
 		if got := r.FormValue("grant_type"); got != "client_credentials" {
 			t.Errorf("grant_type = %q", got)
@@ -118,7 +120,8 @@ func TestClientCredentials_Success(t *testing.T) {
 func TestExchange_WithActorToken(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if err := r.ParseForm(); err != nil {
-			t.Fatal(err)
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
 		}
 		if got := r.FormValue("actor_token"); got != "actor-jwt" {
 			t.Errorf("actor_token = %q, want %q", got, "actor-jwt")
@@ -200,7 +203,8 @@ func TestExchange_ContextCancellation(t *testing.T) {
 func TestJWTAssertionAuth(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if err := r.ParseForm(); err != nil {
-			t.Fatal(err)
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
 		}
 		if got := r.FormValue("client_assertion"); got != "jwt-svid-token" {
 			t.Errorf("client_assertion = %q", got)

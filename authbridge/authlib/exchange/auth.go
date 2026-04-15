@@ -2,13 +2,13 @@ package exchange
 
 import (
 	"context"
-	"net/http"
 	"net/url"
 )
 
 // ClientAuth applies client authentication to a token exchange request.
+// Implementations modify the form values to include credentials.
 type ClientAuth interface {
-	Apply(ctx context.Context, form url.Values, headers http.Header) error
+	Apply(ctx context.Context, form url.Values) error
 }
 
 // ClientSecretAuth authenticates using client_id and client_secret in the form body.
@@ -17,7 +17,7 @@ type ClientSecretAuth struct {
 	ClientSecret string
 }
 
-func (a *ClientSecretAuth) Apply(_ context.Context, form url.Values, _ http.Header) error {
+func (a *ClientSecretAuth) Apply(_ context.Context, form url.Values) error {
 	form.Set("client_id", a.ClientID)
 	form.Set("client_secret", a.ClientSecret)
 	return nil
@@ -31,7 +31,7 @@ type JWTAssertionAuth struct {
 	TokenSource   func(ctx context.Context) (string, error)
 }
 
-func (a *JWTAssertionAuth) Apply(ctx context.Context, form url.Values, _ http.Header) error {
+func (a *JWTAssertionAuth) Apply(ctx context.Context, form url.Values) error {
 	token, err := a.TokenSource(ctx)
 	if err != nil {
 		return err

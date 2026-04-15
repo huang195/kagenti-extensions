@@ -60,6 +60,9 @@ func NewClient(tokenURL string, auth ClientAuth, opts ...Option) *Client {
 
 // Exchange performs an RFC 8693 token exchange.
 func (c *Client) Exchange(ctx context.Context, req *ExchangeRequest) (*ExchangeResponse, error) {
+	if req.SubjectToken == "" {
+		return nil, fmt.Errorf("subject_token is required for token exchange")
+	}
 	form := url.Values{
 		"grant_type":           {"urn:ietf:params:oauth:grant-type:token-exchange"},
 		"requested_token_type": {"urn:ietf:params:oauth:token-type:access_token"},
@@ -77,7 +80,7 @@ func (c *Client) Exchange(ctx context.Context, req *ExchangeRequest) (*ExchangeR
 		form.Set("actor_token_type", "urn:ietf:params:oauth:token-type:access_token")
 	}
 
-	if err := c.auth.Apply(ctx, form, nil); err != nil {
+	if err := c.auth.Apply(ctx, form); err != nil {
 		return nil, fmt.Errorf("applying client auth: %w", err)
 	}
 
@@ -93,7 +96,7 @@ func (c *Client) ClientCredentials(ctx context.Context, scopes string) (*Exchang
 		form.Set("scope", scopes)
 	}
 
-	if err := c.auth.Apply(ctx, form, nil); err != nil {
+	if err := c.auth.Apply(ctx, form); err != nil {
 		return nil, fmt.Errorf("applying client auth: %w", err)
 	}
 

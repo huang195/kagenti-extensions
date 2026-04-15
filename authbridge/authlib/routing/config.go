@@ -1,6 +1,7 @@
 package routing
 
 import (
+	"errors"
 	"fmt"
 	"os"
 
@@ -10,11 +11,11 @@ import (
 // LoadRoutes loads routes from a YAML file.
 // Returns an empty slice (not error) if the file doesn't exist.
 func LoadRoutes(path string) ([]Route, error) {
-	if _, err := os.Stat(path); os.IsNotExist(err) {
-		return nil, nil
-	}
 	data, err := os.ReadFile(path)
 	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil, nil
+		}
 		return nil, fmt.Errorf("reading routes config: %w", err)
 	}
 	var routes []Route

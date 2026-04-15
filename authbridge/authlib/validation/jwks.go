@@ -62,13 +62,15 @@ func (v *JWKSVerifier) Verify(ctx context.Context, tokenStr string, audience str
 		return nil, fmt.Errorf("fetching JWKS: %w", err)
 	}
 
+	if audience == "" {
+		return nil, fmt.Errorf("audience is required (prevents confused deputy attacks)")
+	}
+
 	parseOpts := []jwt.ParseOption{
 		jwt.WithKeySet(keySet),
 		jwt.WithValidate(true),
 		jwt.WithIssuer(v.issuer),
-	}
-	if audience != "" {
-		parseOpts = append(parseOpts, jwt.WithAudience(audience))
+		jwt.WithAudience(audience),
 	}
 
 	token, err := jwt.Parse([]byte(tokenStr), parseOpts...)

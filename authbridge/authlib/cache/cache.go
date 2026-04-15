@@ -67,6 +67,8 @@ func (c *Cache) Set(subjectToken, audience, token string, ttl time.Duration) {
 	if len(c.entries) >= c.maxSize {
 		c.evictExpired()
 		if len(c.entries) >= c.maxSize {
+			// TODO: Consider LRU or random-sample eviction for high-cardinality
+			// traffic. Full clear can cause temporary cache-miss storms.
 			c.entries = make(map[string]entry)
 		}
 	}

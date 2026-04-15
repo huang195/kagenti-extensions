@@ -1,4 +1,5 @@
 #!/bin/bash
+# Deprecated: Use authbridge/cmd/authbridge/entrypoint.sh instead (unified binary).
 set -eu
 
 # Envoy + go-processor entrypoint with process supervision.

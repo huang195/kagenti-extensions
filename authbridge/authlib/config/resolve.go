@@ -66,7 +66,7 @@ func Resolve(ctx context.Context, cfg *Config) (*auth.Config, error) {
 		return nil, fmt.Errorf("router: %w", err)
 	}
 
-	return &auth.Config{
+	result := &auth.Config{
 		Verifier:      verifier,
 		Exchanger:     exchanger,
 		Cache:         cache.New(),
@@ -77,7 +77,14 @@ func Resolve(ctx context.Context, cfg *Config) (*auth.Config, error) {
 			Audience: cfg.Identity.ClientID, // inbound audience defaults to client ID
 		},
 		NoTokenPolicy: NoTokenPolicyForMode(cfg.Mode),
-	}, nil
+	}
+
+	// Waypoint mode: derive audience from destination hostname when no route matches
+	if cfg.Mode == ModeWaypoint {
+		result.AudienceDeriver = serviceNameFromHost
+	}
+
+	return result, nil
 }
 
 // deriveKeycloakURLs derives TOKEN_URL and ISSUER from KEYCLOAK_URL + KEYCLOAK_REALM.
@@ -160,6 +167,25 @@ func waitForFile(path string, timeout time.Duration) error {
 		time.Sleep(2 * time.Second)
 	}
 	return fmt.Errorf("timeout waiting for %s (%v)", path, timeout)
+}
+
+// serviceNameFromHost extracts the service name from a Kubernetes host.
+// "auth-target-service.team1.svc.cluster.local:8081" → "auth-target-service"
+func serviceNameFromHost(host string) string {
+	// Strip port
+	for i, c := range host {
+		if c == ':' {
+			host = host[:i]
+			break
+		}
+	}
+	// Take first DNS label
+	for i, c := range host {
+		if c == '.' {
+			return host[:i]
+		}
+	}
+	return host
 }
 
 func resolveClientAuth(cfg *Config) (exchange.ClientAuth, error) {

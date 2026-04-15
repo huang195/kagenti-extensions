@@ -90,9 +90,14 @@ func (c *Client) Exchange(ctx context.Context, req *ExchangeRequest) (*ExchangeR
 }
 
 // ClientCredentials performs a client credentials grant.
-func (c *Client) ClientCredentials(ctx context.Context, scopes string) (*ExchangeResponse, error) {
+// audience is included as a form parameter so Keycloak issues a token
+// scoped to the target service (matching the old go-processor behavior).
+func (c *Client) ClientCredentials(ctx context.Context, audience, scopes string) (*ExchangeResponse, error) {
 	form := url.Values{
 		"grant_type": {"client_credentials"},
+	}
+	if audience != "" {
+		form.Set("audience", audience)
 	}
 	if scopes != "" {
 		form.Set("scope", scopes)

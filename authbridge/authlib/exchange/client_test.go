@@ -96,6 +96,9 @@ func TestClientCredentials_Success(t *testing.T) {
 		if got := r.FormValue("grant_type"); got != "client_credentials" {
 			t.Errorf("grant_type = %q", got)
 		}
+		if got := r.FormValue("audience"); got != "target-aud" {
+			t.Errorf("audience = %q, want target-aud", got)
+		}
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(map[string]any{
 			"access_token": "cc-token",
@@ -106,7 +109,7 @@ func TestClientCredentials_Success(t *testing.T) {
 	defer srv.Close()
 
 	client := NewClient(srv.URL, &ClientSecretAuth{ClientID: "c", ClientSecret: "s"})
-	resp, err := client.ClientCredentials(context.Background(), "openid")
+	resp, err := client.ClientCredentials(context.Background(), "target-aud", "openid")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}

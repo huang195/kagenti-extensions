@@ -25,6 +25,11 @@ type IdentityConfig struct {
 // Returns ("", nil) when no actor token is available.
 type ActorTokenSource func(ctx context.Context) (string, error)
 
+// AudienceDeriver derives a target audience from a request host.
+// Used by waypoint mode to auto-derive audience from the destination service name.
+// Returns "" if no derivation is possible (falls back to route config).
+type AudienceDeriver func(host string) string
+
 // Config holds the resolved dependencies for the auth layer.
 type Config struct {
 	Verifier         validation.Verifier
@@ -35,6 +40,7 @@ type Config struct {
 	Identity         IdentityConfig
 	NoTokenPolicy    string // NoTokenClientCredentials, NoTokenAllow, or NoTokenDeny
 	ActorTokenSource ActorTokenSource // optional, for act claim chaining
+	AudienceDeriver  AudienceDeriver  // optional, derives audience from host (waypoint mode)
 	Logger           *slog.Logger
 }
 
@@ -48,6 +54,7 @@ type Auth struct {
 	identity         IdentityConfig
 	noTokenPolicy    string
 	actorTokenSource ActorTokenSource
+	audienceDeriver  AudienceDeriver
 	log              *slog.Logger
 }
 
@@ -66,6 +73,7 @@ func New(cfg Config) *Auth {
 		identity:         cfg.Identity,
 		noTokenPolicy:    cfg.NoTokenPolicy,
 		actorTokenSource: cfg.ActorTokenSource,
+		audienceDeriver:  cfg.AudienceDeriver,
 		log:              logger,
 	}
 }
@@ -145,6 +153,11 @@ func (a *Auth) HandleOutbound(ctx context.Context, authHeader, host string) *Out
 	audience := resolved.Audience
 	scopes := resolved.Scopes
 
+	// If no audience from route and deriver is set, derive from host (waypoint pattern)
+	if audience == "" && a.audienceDeriver != nil {
+		audience = a.audienceDeriver(host)
+	}
+
 	// 4. Extract bearer token
 	subjectToken := extractBearer(authHeader)
 
@@ -218,7 +231,7 @@ func (a *Auth) handleNoToken(ctx context.Context, audience, scopes string) *Outb
 			}
 		}
 		a.log.Debug("no token, falling back to client_credentials")
-		resp, err := a.exchanger.ClientCredentials(ctx, scopes)
+		resp, err := a.exchanger.ClientCredentials(ctx, audience, scopes)
 		if err != nil {
 			a.log.Info("client credentials grant failed", "error", err)
 			return &OutboundResult{

@@ -21,8 +21,21 @@ The sidecar injection webhook lives in a separate repo: [kagenti/kagenti-operato
 ```
 kagenti-extensions/
 ├── authbridge/               # Authentication bridge components
-│   ├── authproxy/            #   Envoy + ext-proc sidecar (Go) — token validation & exchange
-│   │   ├── go-processor/     #     gRPC ext-proc server (inbound JWT validation, outbound token exchange)
+│   ├── authlib/              #   Shared auth building blocks (Go module)
+│   │   ├── validation/       #     JWKS-backed JWT verifier
+│   │   ├── exchange/         #     RFC 8693 token exchange client
+│   │   ├── cache/            #     SHA-256 keyed token cache
+│   │   ├── bypass/           #     Path pattern matcher
+│   │   ├── spiffe/           #     SPIFFE credential sources
+│   │   ├── routing/          #     Host-to-audience router
+│   │   ├── auth/             #     HandleInbound + HandleOutbound composition
+│   │   └── config/           #     Mode presets, YAML config, validation
+│   ├── cmd/authbridge/       #   Unified binary — 3 modes, 1 codebase
+│   │   ├── listener/         #     Protocol adapters (ext_proc, ext_authz, forward/reverse proxy)
+│   │   ├── entrypoint.sh     #     Envoy + authbridge process supervision
+│   │   └── Dockerfile        #     Combined Envoy + authbridge image
+│   ├── authproxy/            #   [DEPRECATED] Old Envoy + ext-proc sidecar
+│   │   ├── go-processor/     #     [DEPRECATED] Use cmd/authbridge instead
 │   │   ├── quickstart/       #     Standalone demo (no SPIFFE)
 │   │   └── k8s/              #     Standalone K8s manifests
 │   ├── client-registration/  #   Keycloak auto-registration (Python)
@@ -88,12 +101,34 @@ The kagenti-operator (in a separate repo) injects AuthBridge sidecars into workl
          └────────────────────────────────────┘
 ```
 
+## Unified AuthBridge Binary
+
+The `cmd/authbridge/` directory contains a unified binary that replaces three separate
+codebases (go-processor, waypoint, klaviger) with a single binary supporting three modes:
+
+| Mode | Interception | Listeners | Use Case |
+|------|-------------|-----------|----------|
+| `envoy-sidecar` | Envoy iptables + ext_proc | gRPC ext_proc on :9090 | Sidecar per agent pod |
+| `waypoint` | Istio ambient + ext_authz | gRPC ext_authz + HTTP forward proxy | Shared service |
+| `proxy-sidecar` | Reverse proxy + forward proxy | HTTP reverse proxy + forward proxy | Sidecar without Envoy |
+
+**Go modules:**
+- `authbridge/authlib/` — pure library, no protocol deps (validation, exchange, cache, bypass, spiffe, routing, auth, config)
+- `authbridge/cmd/authbridge/` — binary + listeners, imports authlib + gRPC/Envoy deps
+- `authbridge/go.work` — workspace linking both modules for local development
+
+**Config format:** YAML with `${ENV_VAR}` expansion, mode presets, and startup validation.
+Supports `keycloak_url` + `keycloak_realm` derivation for operator compatibility.
+
+**Image:** `ghcr.io/kagenti/kagenti-extensions/authbridge-unified` — Envoy + authbridge
+in one container (drop-in replacement for `envoy-with-processor`).
+
 ## CI/CD Workflows
 
 | Workflow | Trigger | Purpose |
 |----------|---------|---------|
-| `ci.yaml` | PR to main/release-* | Go fmt, vet, build for AuthProxy; Python tests |
-| `build.yaml` | Tag push (`v*`) or manual | Multi-arch Docker builds for: client-registration, auth-proxy, proxy-init, envoy-with-processor, authbridge, demo-app |
+| `ci.yaml` | PR to main/release-* | Go fmt, vet, build, test for authproxy, authlib, and cmd/authbridge; Python tests |
+| `build.yaml` | Tag push (`v*`) or manual | Multi-arch Docker builds for: client-registration, auth-proxy, proxy-init, envoy-with-processor, authbridge, authbridge-unified, demo-app |
 | `security-scans.yaml` | PR to main | Dependency review, shellcheck, YAML lint, Hadolint, Bandit, Trivy, CodeQL |
 | `scorecard.yaml` | Weekly / push to main | OpenSSF Scorecard security health metrics |
 | `spellcheck_action.yml` | PR | Spellcheck on markdown files |
@@ -114,11 +149,12 @@ All images are pushed to `ghcr.io/kagenti/kagenti-extensions/`:
 
 | Image | Source | Description |
 |-------|--------|-------------|
-| `envoy-with-processor` | `authbridge/authproxy/Dockerfile.envoy` | Envoy 1.28 + go-processor ext-proc |
+| **`authbridge-unified`** | **`authbridge/cmd/authbridge/Dockerfile`** | **Unified Envoy + authbridge binary (recommended)** |
+| `envoy-with-processor` | `authbridge/authproxy/Dockerfile.envoy` | [DEPRECATED] Envoy + go-processor ext-proc |
 | `proxy-init` | `authbridge/authproxy/Dockerfile.init` | Alpine + iptables init container |
 | `client-registration` | `authbridge/client-registration/Dockerfile` | Python Keycloak client registrar |
 | `spiffe-helper` | `authbridge/spiffe-helper/Dockerfile` | Fetches SPIFFE credentials from SPIRE |
-| `authbridge` | `authbridge/authproxy/Dockerfile.authbridge` | Combined sidecar (Envoy + go-processor + spiffe-helper + client-registration) |
+| `authbridge` | `authbridge/authproxy/Dockerfile.authbridge` | [DEPRECATED] Combined sidecar (old architecture) |
 | `auth-proxy` | `authbridge/authproxy/Dockerfile` | Example pass-through proxy (for demos) |
 | `demo-app` | `authbridge/authproxy/quickstart/demo-app/Dockerfile` | Demo target service |
 

@@ -1,3 +1,7 @@
+// Deprecated: This go-processor ext_proc server is replaced by the unified
+// authbridge binary at cmd/authbridge/. The unified binary supports envoy-sidecar,
+// waypoint, and proxy-sidecar modes with a shared auth library (authlib/).
+// This file is kept for backwards compatibility during migration.
 package main
 
 import (

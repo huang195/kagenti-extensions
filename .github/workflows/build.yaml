@@ -50,6 +50,12 @@ jobs:
             context: ./authbridge
             dockerfile: authproxy/Dockerfile.authbridge
 
+          # Unified AuthBridge binary (Envoy + authbridge in one container)
+          # Drop-in replacement for envoy-with-processor
+          - name: authbridge-unified
+            context: ./authbridge
+            dockerfile: cmd/authbridge/Dockerfile
+
           # Demo application for testing
           - name: demo-app
             context: ./authbridge/authproxy/quickstart/demo-app

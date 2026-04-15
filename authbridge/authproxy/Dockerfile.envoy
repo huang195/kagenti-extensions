@@ -1,3 +1,5 @@
+# Deprecated: This Dockerfile builds the old envoy-with-processor image.
+# Use authbridge/cmd/authbridge/Dockerfile instead (unified binary).
 FROM golang:1.26-alpine AS go-builder
 WORKDIR /app
 COPY go.mod go.sum ./

@@ -2,7 +2,6 @@ package auth
 
 import (
 	"context"
-	"fmt"
 	"log/slog"
 	"net/http"
 	"strings"
@@ -119,11 +118,13 @@ func (a *Auth) HandleInbound(ctx context.Context, authHeader, path, audience str
 	}
 	claims, err := a.verifier.Verify(ctx, token, audience)
 	if err != nil {
+		// Log full error server-side; return generic message to client
+		// to avoid leaking issuer URL, audience, or algorithm details.
 		a.log.Info("JWT validation failed", "error", err)
 		return &InboundResult{
 			Action:     ActionDeny,
 			DenyStatus: http.StatusUnauthorized,
-			DenyReason: fmt.Sprintf("token validation failed: %v", err),
+			DenyReason: "token validation failed",
 		}
 	}
 

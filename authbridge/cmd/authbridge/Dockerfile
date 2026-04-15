@@ -21,7 +21,7 @@ ENV GOWORK=off
 RUN cd cmd/authbridge && CGO_ENABLED=0 GOOS=linux go build -o /authbridge .
 
 # Stage 2: Get Envoy binary
-FROM docker.io/envoyproxy/envoy:v1.37.1@sha256:70e7c82d8c82fecdebe3408f7227e9abc3c34b4fdc7f9c1c2842d87bcda1e5ff AS envoy-source
+FROM docker.io/envoyproxy/envoy:v1.37.1 AS envoy-source
 
 # Stage 3: Runtime — same base as Dockerfile.envoy
 FROM registry.access.redhat.com/ubi9/ubi-minimal@sha256:83006d535923fcf1345067873524a3980316f51794f01d8655be55d6e9387183

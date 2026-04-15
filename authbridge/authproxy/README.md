@@ -1,5 +1,10 @@
 # AuthProxy
 
+> **Deprecated:** The go-processor ext_proc server and `Dockerfile.envoy` are replaced by
+> the [unified authbridge binary](../cmd/authbridge/). The unified binary is a drop-in
+> replacement for `envoy-with-processor` with the same image structure, UID, and ports.
+> This directory is kept for backwards compatibility during migration.
+
 AuthProxy is a **token validation and exchange sidecar** for Kubernetes workloads. It enables secure service-to-service communication by:
 - **Validating** incoming requests with JWT token verification (inbound)
 - **Exchanging** tokens for ones with the correct audience for downstream services (outbound)

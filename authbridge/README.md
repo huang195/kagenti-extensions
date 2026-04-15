@@ -4,7 +4,25 @@ AuthBridge provides **secure, transparent token management** for Kubernetes work
 
 > **📘 Looking to run the demo?** See the [Single-Target Demo](./demos/single-target/demo.md) or [Multi-Target Demo](./demos/multi-target/demo.md) for step-by-step instructions.
 
-## What AuthBridge Does
+## Unified AuthBridge Binary (New)
+
+The [`cmd/authbridge/`](./cmd/authbridge/) directory contains a unified binary that supports three deployment modes in a single codebase:
+
+| Mode | Use Case | Replaces |
+|------|----------|----------|
+| `envoy-sidecar` | Sidecar per agent pod (Envoy + ext_proc) | `envoy-with-processor` (go-processor) |
+| `waypoint` | Shared service in Istio ambient mesh | Waypoint token-exchange-service |
+| `proxy-sidecar` | Sidecar without Envoy (reverse + forward proxy) | Klaviger |
+
+The unified image (`authbridge-unified`) is a **drop-in replacement** for `envoy-with-processor` with the same base image, UID (1337), and ports. See [`cmd/authbridge/README.md`](./cmd/authbridge/README.md) for config format and usage.
+
+The shared auth library at [`authlib/`](./authlib/) contains the building blocks (JWT validation, token exchange, caching, routing) with no protocol dependencies. See [`authlib/README.md`](./authlib/README.md) for package reference.
+
+## Classic Architecture (Operator-Injected)
+
+The following describes the current production deployment using operator-injected split sidecars. The unified binary (`cmd/authbridge/`) replaces the `envoy-proxy` sidecar in this architecture.
+
+### What AuthBridge Does
 
 AuthBridge solves the challenge of **secure service-to-service authentication** in Kubernetes:
 
@@ -357,7 +375,9 @@ This creates target clients, audience scopes, and assigns scopes to the agent.
 
 ## Component Documentation
 
-- [AuthProxy](authproxy/README.md) - Token validation and exchange proxy
+- [Unified AuthBridge Binary](cmd/authbridge/README.md) - Single binary, three modes (recommended)
+- [authlib](authlib/README.md) - Shared auth building blocks (Go library)
+- [AuthProxy](authproxy/README.md) - Token validation and exchange proxy (deprecated, use cmd/authbridge)
 - [Client Registration](client-registration/README.md) - Automatic Keycloak client registration with SPIFFE
 
 ## References

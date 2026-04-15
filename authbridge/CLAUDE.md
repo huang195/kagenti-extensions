@@ -4,6 +4,16 @@ This file provides context for Claude (AI assistant) when working with the `Auth
 For repo-level context (CI/CD, cross-component relationships), see [`../CLAUDE.md`](../CLAUDE.md).
 The sidecar injection webhook lives in [kagenti-operator](https://github.com/kagenti/kagenti-operator).
 
+## Unified Binary
+
+The `cmd/authbridge/` directory contains the unified authbridge binary that replaces the
+old `go-processor` ext_proc server. It supports three modes (`envoy-sidecar`, `waypoint`,
+`proxy-sidecar`) with shared auth logic in `authlib/`. See [`cmd/authbridge/README.md`](cmd/authbridge/README.md)
+for config format and [`authlib/README.md`](authlib/README.md) for the library reference.
+
+The old `authproxy/go-processor/` is deprecated. New development should target
+`authlib/` and `cmd/authbridge/`.
+
 ## What AuthBridge Does
 
 AuthBridge provides **zero-trust, transparent token management** for Kubernetes workloads. It combines three capabilities:

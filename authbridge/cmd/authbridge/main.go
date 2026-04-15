@@ -145,7 +145,11 @@ func startGRPCExtAuthz(handler *auth.Auth, addr string) *grpc.Server {
 }
 
 func startHTTPServer(name string, handler http.Handler, addr string) *http.Server {
-	srv := &http.Server{Addr: addr, Handler: handler}
+	srv := &http.Server{
+		Addr:              addr,
+		Handler:           handler,
+		ReadHeaderTimeout: 10 * time.Second,
+	}
 	go func() {
 		slog.Info("HTTP server listening", "name", name, "addr", addr)
 		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {

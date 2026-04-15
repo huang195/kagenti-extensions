@@ -1,5 +1,5 @@
 #!/bin/bash
-set -eu
+set -euo pipefail
 
 # Envoy + authbridge entrypoint with process supervision.
 # Both processes run in the background; the shell stays as PID 1.

@@ -4,6 +4,10 @@ This directory contains demo scenarios showing AuthBridge providing zero-trust
 authentication for Kubernetes agent workloads. Each demo progressively introduces
 more AuthBridge capabilities.
 
+> **Note:** These demos use the classic `envoy-with-processor` image with operator-injected
+> sidecars. A [unified authbridge binary](../cmd/authbridge/) is available as a drop-in
+> replacement. See [`cmd/authbridge/README.md`](../cmd/authbridge/README.md) for details.
+
 ## Available Demos
 
 | Demo | Difficulty | What It Shows | Deployment |

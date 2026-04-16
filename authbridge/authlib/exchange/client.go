@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"net/url"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -32,6 +33,7 @@ type ExchangeResponse struct {
 // Client performs OAuth token exchange and client credentials requests.
 type Client struct {
 	tokenURL   string
+	authMu     sync.RWMutex
 	auth       ClientAuth
 	httpClient *http.Client
 }
@@ -59,6 +61,21 @@ func NewClient(tokenURL string, auth ClientAuth, opts ...Option) *Client {
 	return c
 }
 
+// UpdateAuth replaces the client authentication used for token requests.
+// This supports dynamic credential loading after the server has started.
+func (c *Client) UpdateAuth(auth ClientAuth) {
+	c.authMu.Lock()
+	c.auth = auth
+	c.authMu.Unlock()
+}
+
+// getAuth returns the current client authentication under a read lock.
+func (c *Client) getAuth() ClientAuth {
+	c.authMu.RLock()
+	defer c.authMu.RUnlock()
+	return c.auth
+}
+
 // Exchange performs an RFC 8693 token exchange.
 func (c *Client) Exchange(ctx context.Context, req *ExchangeRequest) (*ExchangeResponse, error) {
 	if req.SubjectToken == "" {
@@ -81,7 +98,7 @@ func (c *Client) Exchange(ctx context.Context, req *ExchangeRequest) (*ExchangeR
 		form.Set("actor_token_type", "urn:ietf:params:oauth:token-type:access_token")
 	}
 
-	if err := c.auth.Apply(ctx, form); err != nil {
+	if err := c.getAuth().Apply(ctx, form); err != nil {
 		return nil, fmt.Errorf("applying client auth: %w", err)
 	}
 
@@ -106,7 +123,7 @@ func (c *Client) ClientCredentials(ctx context.Context, audience, scopes string)
 		form.Set("scope", scopes)
 	}
 
-	if err := c.auth.Apply(ctx, form); err != nil {
+	if err := c.getAuth().Apply(ctx, form); err != nil {
 		return nil, fmt.Errorf("applying client auth: %w", err)
 	}
 

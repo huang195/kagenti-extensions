@@ -5,6 +5,7 @@ import (
 	"log/slog"
 	"net/http"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/kagenti/kagenti-extensions/authbridge/authlib/bypass"
@@ -50,7 +51,7 @@ type Auth struct {
 	cache            *cache.Cache
 	bypass           *bypass.Matcher
 	router           *routing.Router
-	identity         IdentityConfig
+	identity         atomic.Pointer[IdentityConfig]
 	noTokenPolicy    string
 	actorTokenSource ActorTokenSource
 	audienceDeriver  AudienceDeriver
@@ -63,18 +64,31 @@ func New(cfg Config) *Auth {
 	if logger == nil {
 		logger = slog.Default()
 	}
-	return &Auth{
+	a := &Auth{
 		verifier:         cfg.Verifier,
 		exchanger:        cfg.Exchanger,
 		cache:            cfg.Cache,
 		bypass:           cfg.Bypass,
 		router:           cfg.Router,
-		identity:         cfg.Identity,
 		noTokenPolicy:    cfg.NoTokenPolicy,
 		actorTokenSource: cfg.ActorTokenSource,
 		audienceDeriver:  cfg.AudienceDeriver,
 		log:              logger,
 	}
+	id := cfg.Identity
+	a.identity.Store(&id)
+	return a
+}
+
+// UpdateIdentity updates the agent's identity and exchanger credentials
+// after credential files have been resolved. This is called from a background
+// goroutine after the gRPC listener has started.
+func (a *Auth) UpdateIdentity(id IdentityConfig, clientAuth exchange.ClientAuth) {
+	a.identity.Store(&id)
+	if clientAuth != nil {
+		a.exchanger.UpdateAuth(clientAuth)
+	}
+	a.log.Info("identity updated", "client_id", id.ClientID)
 }
 
 // HandleInbound validates an inbound request's JWT token.
@@ -114,7 +128,7 @@ func (a *Auth) HandleInbound(ctx context.Context, authHeader, path, audience str
 		}
 	}
 	if audience == "" {
-		audience = a.identity.Audience
+		audience = a.identity.Load().Audience
 	}
 	claims, err := a.verifier.Verify(ctx, token, audience)
 	if err != nil {

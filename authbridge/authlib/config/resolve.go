@@ -19,7 +19,7 @@ import (
 
 // Resolve applies presets, validates, and instantiates all authlib components
 // from the configuration. Returns a fully wired auth.Config ready for auth.New().
-func Resolve(ctx context.Context, cfg *Config) (*auth.Config, error) {
+func Resolve(_ context.Context, cfg *Config) (*auth.Config, error) {
 	ApplyPreset(cfg)
 
 	// Derive URLs from KEYCLOAK_URL + KEYCLOAK_REALM when explicit values are missing
@@ -28,10 +28,9 @@ func Resolve(ctx context.Context, cfg *Config) (*auth.Config, error) {
 	// Derive JWKS URL from TOKEN_URL when not explicitly set (Keycloak convention)
 	deriveJWKSURL(cfg)
 
-	// Wait for and load credentials from files when configured
-	if err := resolveCredentialFiles(cfg); err != nil {
-		return nil, fmt.Errorf("credential files: %w", err)
-	}
+	// Credential files are NOT resolved here — caller handles them
+	// asynchronously via ResolveCredentialFiles() after the listener starts.
+	// This avoids blocking gRPC startup for up to 2 minutes.
 
 	if err := Validate(cfg); err != nil {
 		return nil, fmt.Errorf("config validation: %w", err)
@@ -46,14 +45,12 @@ func Resolve(ctx context.Context, cfg *Config) (*auth.Config, error) {
 		return nil, fmt.Errorf("bypass patterns: %w", err)
 	}
 
-	// JWT verifier
-	verifier, err := validation.NewJWKSVerifier(ctx, cfg.Inbound.JWKSURL, cfg.Inbound.Issuer)
-	if err != nil {
-		return nil, fmt.Errorf("JWKS verifier: %w", err)
-	}
+	// JWT verifier — lazy initialization defers the JWKS HTTP fetch to the
+	// first Verify() call, so the gRPC listener can start immediately.
+	verifier := validation.NewLazyJWKSVerifier(cfg.Inbound.JWKSURL, cfg.Inbound.Issuer)
 
 	// Client auth for token exchange
-	clientAuth, err := resolveClientAuth(cfg)
+	clientAuth, err := ResolveClientAuth(cfg)
 	if err != nil {
 		return nil, fmt.Errorf("client auth: %w", err)
 	}
@@ -121,9 +118,10 @@ func deriveJWKSURL(cfg *Config) {
 	}
 }
 
-// resolveCredentialFiles waits for and reads credential files when configured.
+// ResolveCredentialFiles waits for and reads credential files when configured.
+// Call this after the server listener starts to avoid blocking startup.
 // This handles the startup race with client-registration and spiffe-helper.
-func resolveCredentialFiles(cfg *Config) error {
+func ResolveCredentialFiles(cfg *Config) {
 	if cfg.Identity.ClientIDFile != "" {
 		if err := waitAndReadFile(cfg.Identity.ClientIDFile, &cfg.Identity.ClientID, 60*time.Second); err != nil {
 			slog.Warn("client_id_file not available, using client_id from config", "error", err)
@@ -140,7 +138,6 @@ func resolveCredentialFiles(cfg *Config) error {
 			slog.Warn("jwt_svid_path not available at startup, will be read on each exchange", "error", err)
 		}
 	}
-	return nil
 }
 
 // waitAndReadFile polls for a file to exist, then reads its content into dest.
@@ -169,7 +166,9 @@ func waitForFile(path string, timeout time.Duration) error {
 	return fmt.Errorf("timeout waiting for %s (%v)", path, timeout)
 }
 
-func resolveClientAuth(cfg *Config) (exchange.ClientAuth, error) {
+// ResolveClientAuth creates the appropriate client authentication from config.
+// Exported so main.go can rebuild it after credential files are loaded.
+func ResolveClientAuth(cfg *Config) (exchange.ClientAuth, error) {
 	switch cfg.Identity.Type {
 	case "spiffe":
 		if cfg.Identity.JWTSVIDPath != "" {

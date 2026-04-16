@@ -50,20 +50,20 @@ func main() {
 		cfg.Mode = *mode // flag overrides YAML
 	}
 
-	// Resolve config into auth dependencies
+	// Resolve config into auth dependencies.
+	// Credential files and JWKS are resolved lazily — the gRPC listener
+	// starts immediately so Envoy can connect without waiting.
 	resolved, err := config.Resolve(ctx, cfg)
 	if err != nil {
 		log.Fatalf("resolving config: %v", err)
 	}
 	handler := auth.New(*resolved)
 
-	slog.Info("authbridge starting", "mode", cfg.Mode)
-
 	// Track servers for graceful shutdown
 	var grpcServers []*grpc.Server
 	var httpServers []*http.Server
 
-	// Start listeners based on mode
+	// Start listeners FIRST — before credential resolution
 	switch cfg.Mode {
 	case config.ModeEnvoySidecar:
 		grpcServers = append(grpcServers, startGRPCExtProc(handler, cfg.Listener.ExtProcAddr))
@@ -83,6 +83,27 @@ func main() {
 	default:
 		log.Fatalf("unhandled mode %q", cfg.Mode)
 	}
+
+	slog.Info("authbridge starting", "mode", cfg.Mode)
+
+	// Resolve credentials in background — doesn't block the listener.
+	// Once credential files are available, update the handler's identity
+	// and exchanger so token exchange requests use the loaded credentials.
+	go func() {
+		slog.Info("resolving credentials in background...")
+		config.ResolveCredentialFiles(cfg)
+		// Safe to read cfg.Identity here — ResolveCredentialFiles completed
+		// and this is the only goroutine that writes these fields.
+		clientAuth, err := config.ResolveClientAuth(cfg)
+		if err != nil {
+			slog.Warn("failed to resolve client auth after credential load", "error", err)
+			return
+		}
+		handler.UpdateIdentity(auth.IdentityConfig{
+			ClientID: cfg.Identity.ClientID,
+			Audience: cfg.Identity.ClientID,
+		}, clientAuth)
+	}()
 
 	// Wait for shutdown signal
 	sigCh := make(chan os.Signal, 1)

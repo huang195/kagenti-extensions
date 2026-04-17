@@ -143,7 +143,7 @@ func (a *Auth) HandleInbound(ctx context.Context, authHeader, path, audience str
 	}
 
 	// 4. Allow with claims
-	a.log.Debug("JWT validated", "subject", claims.Subject, "client_id", claims.ClientID)
+	a.log.Info("inbound authorized", "subject", claims.Subject, "client_id", claims.ClientID, "audience", audience)
 	return &InboundResult{Action: ActionAllow, Claims: claims}
 }
 
@@ -157,10 +157,11 @@ func (a *Auth) HandleOutbound(ctx context.Context, authHeader, host string) *Out
 
 	// 2. Passthrough
 	if resolved == nil {
+		a.log.Info("outbound passthrough (no route)", "host", host)
 		return &OutboundResult{Action: ActionAllow}
 	}
 	if resolved.Passthrough {
-		a.log.Debug("passthrough route", "host", host)
+		a.log.Info("outbound passthrough", "host", host)
 		return &OutboundResult{Action: ActionAllow}
 	}
 
@@ -227,7 +228,7 @@ func (a *Auth) HandleOutbound(ctx context.Context, authHeader, host string) *Out
 			time.Duration(resp.ExpiresIn)*time.Second)
 	}
 
-	a.log.Debug("token exchanged", "host", host, "audience", audience)
+	a.log.Info("outbound token exchanged", "host", host, "audience", audience)
 	return &OutboundResult{Action: ActionReplaceToken, Token: resp.AccessToken}
 }
 

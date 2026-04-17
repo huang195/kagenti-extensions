@@ -36,16 +36,12 @@ jobs:
             context: ./authbridge/authproxy
             dockerfile: Dockerfile.init
 
-          - name: envoy-with-processor
-            context: ./authbridge/authproxy
-            dockerfile: Dockerfile.envoy
-
           # SPIFFE Helper - fetches SPIFFE credentials from SPIRE (UBI-based fork)
           - name: spiffe-helper
             context: ./authbridge/spiffe-helper
             dockerfile: Dockerfile
 
-          # Combined AuthBridge sidecar (envoy + go-processor + spiffe-helper + client-registration)
+          # Combined AuthBridge sidecar (envoy + authbridge + spiffe-helper + client-registration)
           - name: authbridge
             context: ./authbridge
             dockerfile: authproxy/Dockerfile.authbridge

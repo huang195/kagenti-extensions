@@ -16,7 +16,7 @@ Comment `/claim` on an issue to have it automatically assigned to you. Issues la
 
 ## Prerequisites
 
-- **Go 1.24+** (for AuthProxy go-processor)
+- **Go 1.24+** (for authbridge and authlib)
 - **Python 3.12+** (for client-registration and Keycloak sync)
 - **Docker** (for building container images)
 - **pre-commit** (for local hooks)

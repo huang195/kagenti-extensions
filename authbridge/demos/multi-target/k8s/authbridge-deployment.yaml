@@ -434,7 +434,7 @@ spec:
         # Uses dynamic credentials from /shared/ (populated by client-registration)
         # The SPIFFE ID is both the client_id AND the token audience, enabling exchange
         - name: envoy-proxy
-          image: envoy-with-processor:latest
+          image: authbridge-unified:latest
           imagePullPolicy: IfNotPresent
           securityContext:
             runAsUser: 1337

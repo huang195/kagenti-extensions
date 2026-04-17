@@ -2,20 +2,20 @@
 set -eu
 
 # AuthBridge combined entrypoint with process supervision.
-# Manages: spiffe-helper, client-registration, go-processor, envoy
+# Manages: spiffe-helper, client-registration, authbridge (unified binary), envoy
 #
 # Startup order preserves current multi-container timing:
 #   1. spiffe-helper (background, long-running) -- writes JWT SVID
-#   2. go-processor (background) -- handles missing credentials via waitForCredentials
+#   2. authbridge (background) -- resolves credentials lazily via file polling
 #   3. client-registration (background one-shot) -- writes credentials when ready
 #   4. envoy (background) -- inbound JWT validation works immediately
 #
 # Runs as UID 1337 (Envoy UID, excluded from iptables redirect).
 #
 # Process management: The shell stays as PID 1 and monitors critical long-running
-# processes (envoy, go-processor, spiffe-helper). If any critical process exits,
+# processes (envoy, authbridge, spiffe-helper). If any critical process exits,
 # all others are killed and the container exits non-zero so Kubernetes restarts it.
-# Client-registration is a one-shot process and is NOT monitored -- go-processor
+# Client-registration is a one-shot process and is NOT monitored -- authbridge
 # handles missing credentials gracefully via passthrough mode.
 
 # PIDs of critical long-running processes to monitor.
@@ -37,17 +37,17 @@ if [ "${SPIRE_ENABLED:-}" = "true" ]; then
   CRITICAL_PIDS="$CRITICAL_PIDS $!"
 fi
 
-# --- Phase 2: Start go-processor ---
-# go-processor waits internally for credential files (waitForCredentials, 60s timeout).
-# Inbound JWT validation works immediately (doesn't need credentials).
-echo "[AuthBridge] Starting go-processor..."
-/usr/local/bin/go-processor &
+# --- Phase 2: Start authbridge (unified binary) ---
+# authbridge resolves credentials lazily via file polling (60s timeout).
+# The gRPC listener starts immediately so Envoy can connect without waiting.
+echo "[AuthBridge] Starting authbridge..."
+/usr/local/bin/authbridge --config /etc/authbridge/config.yaml &
 CRITICAL_PIDS="$CRITICAL_PIDS $!"
 sleep 2
 
 # --- Phase 3: Start client-registration (background, non-blocking) ---
 # This runs asynchronously so Envoy starts immediately.
-# Failures are non-fatal: go-processor handles missing credentials gracefully.
+# Failures are non-fatal: authbridge handles missing credentials gracefully.
 # NOT added to CRITICAL_PIDS -- this is a one-shot process.
 (
   if [ "${SPIRE_ENABLED:-}" = "true" ]; then

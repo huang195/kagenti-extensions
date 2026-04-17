@@ -18,10 +18,11 @@ All images are published to `ghcr.io/kagenti/kagenti-extensions/`:
 
 | Image | Description |
 |-------|-------------|
-| `envoy-with-processor` | Envoy 1.28 + go-processor ext-proc |
+| `authbridge-unified` | Unified Envoy + authbridge binary (recommended) |
+| `authbridge` | Combined sidecar (Envoy + authbridge + spiffe-helper + client-registration) |
 | `proxy-init` | Alpine + iptables init container |
 | `client-registration` | Python Keycloak client registrar |
-| `authbridge` | Combined sidecar (Envoy + go-processor + spiffe-helper + client-registration) |
+| `spiffe-helper` | Fetches SPIFFE credentials from SPIRE |
 | `auth-proxy` | Example pass-through proxy (for demos) |
 | `demo-app` | Demo target service |
 

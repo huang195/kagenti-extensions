@@ -40,7 +40,7 @@ token exchange and scope-based access control, see the
 │  │                                                                           │   │
 │  │  ┌───────────────────────────────────────────────────────────────────┐    │   │
 │  │  │                AuthProxy Sidecar (envoy-proxy container)          │    │   │
-│  │  │  Envoy + ext_proc (go-processor)                                  │    │   │
+│  │  │  Envoy + ext_proc (authbridge)                                    │    │   │
 │  │  │  Inbound (port 15124):                                            │    │   │
 │  │  │    - Validates JWT (signature + issuer + audience via JWKS)       │    │   │
 │  │  │    - Returns 401 Unauthorized for invalid/missing tokens          │    │   │
@@ -395,8 +395,8 @@ kubectl wait --for=condition=ready pod/test-client -n team1 --timeout=30s
 
 ### 6a. Agent Card - Public Endpoint (No Token Required)
 
-The `/.well-known/agent.json` endpoint is publicly accessible — AuthBridge's
-go-processor bypasses JWT validation for `/.well-known/*`, `/healthz`, `/readyz`,
+The `/.well-known/agent.json` endpoint is publicly accessible — authbridge
+bypasses JWT validation for `/.well-known/*`, `/healthz`, `/readyz`,
 and `/livez` by default:
 
 ```bash
@@ -625,7 +625,7 @@ kubectl delete namespace team1
 
 - **Advanced Demo**: See the [GitHub Issue Agent demo](../github-issue/demo.md) for
   outbound token exchange, scope-based access control, and Alice vs Bob scenarios
-- **AuthProxy Details**: See the [AuthProxy README](../../authproxy/README.md) for inbound
+- **AuthBridge Binary**: See the [AuthBridge README](../../cmd/authbridge/README.md) for inbound
   JWT validation and outbound token exchange internals
 - **Multi-Target Demo**: See the [multi-target demo](../multi-target/demo.md) for
   route-based token exchange to multiple tool services

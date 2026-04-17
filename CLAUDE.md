@@ -34,8 +34,7 @@ kagenti-extensions/
 │   │   ├── listener/         #     Protocol adapters (ext_proc, ext_authz, forward/reverse proxy)
 │   │   ├── entrypoint.sh     #     Envoy + authbridge process supervision
 │   │   └── Dockerfile        #     Combined Envoy + authbridge image
-│   ├── authproxy/            #   [DEPRECATED] Old Envoy + ext-proc sidecar
-│   │   ├── go-processor/     #     [DEPRECATED] Use cmd/authbridge instead
+│   ├── authproxy/            #   Auth proxy support files and demos
 │   │   ├── quickstart/       #     Standalone demo (no SPIFFE)
 │   │   └── k8s/              #     Standalone K8s manifests
 │   ├── client-registration/  #   Keycloak auto-registration (Python)
@@ -52,20 +51,22 @@ kagenti-extensions/
 
 ## Major Components
 
-### 1. AuthProxy (Go)
+### 1. AuthBridge Unified Binary (Go)
 
-An **Envoy proxy with a gRPC external processor** that provides transparent traffic interception for both inbound JWT validation and outbound OAuth 2.0 token exchange (RFC 8693).
+A **single binary** providing transparent traffic interception for both inbound JWT validation and outbound OAuth 2.0 token exchange (RFC 8693), supporting three deployment modes.
 
-**Location:** `authbridge/authproxy/`
+**Location:** `authbridge/cmd/authbridge/`
+**Library:** `authbridge/authlib/`
 **Language:** Go 1.24
 **Detailed guide:** [`authbridge/CLAUDE.md`](authbridge/CLAUDE.md)
 
 **Core components:**
-- `go-processor/main.go` — gRPC ext-proc server (inbound JWT validation, outbound token exchange)
-- `init-iptables.sh` — Traffic interception setup (Istio ambient mesh compatible)
-- `Dockerfile.{envoy,init}` — Container images
+- `cmd/authbridge/main.go` — Unified binary (ext_proc, ext_authz, forward/reverse proxy modes)
+- `authlib/` — Shared auth library (JWT validation, token exchange, caching, routing)
+- `authproxy/init-iptables.sh` — Traffic interception setup (Istio ambient mesh compatible)
+- `authproxy/Dockerfile.init` — Init container image
 
-**Ports:** 15123 (outbound), 15124 (inbound), 9090 (ext-proc), 9901 (admin)
+**Ports:** 15123 (outbound), 15124 (inbound), 9090 (ext-proc/ext-authz), 9901 (admin)
 
 ### 2. Client Registration (Python)
 
@@ -93,7 +94,7 @@ The kagenti-operator (in a separate repo) injects AuthBridge sidecars into workl
          │  client-registration ──► Keycloak  │
          │       │ writes client secret       │
          │       ▼                            │
-         │  envoy-proxy (+ go-processor)      │
+         │  envoy-proxy (+ authbridge)        │
          │    - Inbound: JWT validation       │
          │    - Outbound: token exchange       │
          │       │                            │
@@ -128,7 +129,7 @@ in one container (drop-in replacement for `envoy-with-processor`).
 | Workflow | Trigger | Purpose |
 |----------|---------|---------|
 | `ci.yaml` | PR to main/release-* | Go fmt, vet, build, test for authproxy, authlib, and cmd/authbridge; Python tests |
-| `build.yaml` | Tag push (`v*`) or manual | Multi-arch Docker builds for: client-registration, auth-proxy, proxy-init, envoy-with-processor, authbridge, authbridge-unified, demo-app |
+| `build.yaml` | Tag push (`v*`) or manual | Multi-arch Docker builds for: client-registration, auth-proxy, proxy-init, authbridge, authbridge-unified, spiffe-helper, demo-app |
 | `security-scans.yaml` | PR to main | Dependency review, shellcheck, YAML lint, Hadolint, Bandit, Trivy, CodeQL |
 | `scorecard.yaml` | Weekly / push to main | OpenSSF Scorecard security health metrics |
 | `spellcheck_action.yml` | PR | Spellcheck on markdown files |
@@ -150,11 +151,10 @@ All images are pushed to `ghcr.io/kagenti/kagenti-extensions/`:
 | Image | Source | Description |
 |-------|--------|-------------|
 | **`authbridge-unified`** | **`authbridge/cmd/authbridge/Dockerfile`** | **Unified Envoy + authbridge binary (recommended)** |
-| `envoy-with-processor` | `authbridge/authproxy/Dockerfile.envoy` | [DEPRECATED] Envoy + go-processor ext-proc |
+| `authbridge` | `authbridge/authproxy/Dockerfile.authbridge` | Combined sidecar (Envoy + authbridge + spiffe-helper + client-registration) |
 | `proxy-init` | `authbridge/authproxy/Dockerfile.init` | Alpine + iptables init container |
 | `client-registration` | `authbridge/client-registration/Dockerfile` | Python Keycloak client registrar |
 | `spiffe-helper` | `authbridge/spiffe-helper/Dockerfile` | Fetches SPIFFE credentials from SPIRE |
-| `authbridge` | `authbridge/authproxy/Dockerfile.authbridge` | [DEPRECATED] Combined sidecar (old architecture) |
 | `auth-proxy` | `authbridge/authproxy/Dockerfile` | Example pass-through proxy (for demos) |
 | `demo-app` | `authbridge/authproxy/quickstart/demo-app/Dockerfile` | Demo target service |
 
@@ -172,7 +172,7 @@ Hooks:
 
 | Area | Technology |
 |------|------------|
-| AuthProxy ext-proc | Go 1.24, envoy-control-plane, lestrrat-go/jwx |
+| AuthBridge unified binary | Go 1.24, envoy-control-plane, lestrrat-go/jwx |
 | Client Registration | Python 3.12, python-keycloak, PyJWT |
 | Proxy | Envoy 1.28 |
 | Traffic interception | iptables (via init container) |
@@ -196,9 +196,9 @@ When the operator injects sidecars, the target namespace needs these resources:
 
 | Resource | Kind | Used by | Keys |
 |----------|------|---------|------|
-| `authbridge-config` | ConfigMap | client-registration, envoy-proxy (ext-proc) | `KEYCLOAK_URL`, `KEYCLOAK_REALM`, `PLATFORM_CLIENT_IDS` (optional), `TOKEN_URL` (optional, derived from KEYCLOAK_URL+KEYCLOAK_REALM), `ISSUER` (optional, derived or explicit for split-horizon DNS), `DEFAULT_OUTBOUND_POLICY` (optional, defaults to `passthrough`). Inbound audience validation uses `CLIENT_ID` from `/shared/client-id.txt`. Target audience and scopes are configured per-route in `authproxy-routes`. |
+| `authbridge-config` | ConfigMap | client-registration, authbridge | `KEYCLOAK_URL`, `KEYCLOAK_REALM`, `PLATFORM_CLIENT_IDS` (optional), `TOKEN_URL` (optional, derived from KEYCLOAK_URL+KEYCLOAK_REALM), `ISSUER` (optional, derived or explicit for split-horizon DNS), `DEFAULT_OUTBOUND_POLICY` (optional, defaults to `passthrough`). Inbound audience validation uses `CLIENT_ID` from `/shared/client-id.txt`. Target audience and scopes are configured per-route in `authproxy-routes`. |
 | `keycloak-admin-secret` | Secret | client-registration | `KEYCLOAK_ADMIN_USERNAME`, `KEYCLOAK_ADMIN_PASSWORD` |
-| `authproxy-routes` | ConfigMap (optional) | envoy-proxy (ext-proc) | `routes.yaml` -- per-host token exchange rules (see authbridge/CLAUDE.md for format) |
+| `authproxy-routes` | ConfigMap (optional) | authbridge | `routes.yaml` -- per-host token exchange rules (see authbridge/CLAUDE.md for format) |
 | `spiffe-helper-config` | ConfigMap | spiffe-helper | SPIFFE helper configuration file |
 | `envoy-config` | ConfigMap | envoy-proxy | Envoy YAML configuration |
 
@@ -269,7 +269,7 @@ cd authbridge/authproxy && make build-images
 
 3. **Envoy config not embedded:** The envoy-proxy sidecar mounts `envoy-config` ConfigMap at `/etc/envoy`. This ConfigMap must exist in the target namespace before workloads are created.
 
-4. **Outbound policy is passthrough by default:** The go-processor defaults to passing outbound traffic through unchanged. Token exchange only happens for hosts explicitly listed in the `authproxy-routes` ConfigMap. Target audience and scopes are configured per-route in `authproxy-routes`.
+4. **Outbound policy is passthrough by default:** AuthBridge defaults to passing outbound traffic through unchanged. Token exchange only happens for hosts explicitly listed in the `authproxy-routes` ConfigMap. Target audience and scopes are configured per-route in `authproxy-routes`.
 
 5. **Route host patterns use short service names:** The `host` field in `authproxy-routes` matches against the HTTP `Host` header, which is typically just the short Kubernetes service name (e.g., `github-tool-mcp`), not the FQDN. Glob patterns (`*`) are supported but the most common case is a plain service name.
 

@@ -11,7 +11,7 @@ old `go-processor` ext_proc server. It supports three modes (`envoy-sidecar`, `w
 `proxy-sidecar`) with shared auth logic in `authlib/`. See [`cmd/authbridge/README.md`](cmd/authbridge/README.md)
 for config format and [`authlib/README.md`](authlib/README.md) for the library reference.
 
-The old `authproxy/go-processor/` is deprecated. New development should target
+The old `authproxy/go-processor/` has been removed. All development targets
 `authlib/` and `cmd/authbridge/`.
 
 ## What AuthBridge Does
@@ -19,7 +19,7 @@ The old `authproxy/go-processor/` is deprecated. New development should target
 AuthBridge provides **zero-trust, transparent token management** for Kubernetes workloads. It combines three capabilities:
 
 1. **Automatic Identity** -- Workloads obtain SPIFFE IDs from SPIRE and auto-register as Keycloak clients
-2. **Inbound JWT Validation** -- Incoming requests are validated (signature, issuer, audience) by an Envoy ext-proc
+2. **Inbound JWT Validation** -- Incoming requests are validated (signature, issuer, audience) by the authbridge binary
 3. **Outbound Token Exchange** -- Outgoing requests get their tokens automatically exchanged for the correct target audience (OAuth 2.0 RFC 8693)
 
 All of this happens transparently via sidecar injection -- no application code changes required.
@@ -28,10 +28,25 @@ All of this happens transparently via sidecar injection -- no application code c
 
 ```
 authbridge/
-├── authproxy/                        # Envoy + ext-proc sidecar (Go)
-│   ├── go-processor/main.go          #   gRPC ext-proc: inbound validation + outbound token exchange
+├── authlib/                          # Shared auth library (Go module)
+│   ├── validation/                   #   JWKS-backed JWT verifier
+│   ├── exchange/                     #   RFC 8693 token exchange client
+│   ├── cache/                        #   SHA-256 keyed token cache
+│   ├── bypass/                       #   Path pattern matcher
+│   ├── spiffe/                       #   SPIFFE credential sources
+│   ├── routing/                      #   Host-to-audience router
+│   ├── auth/                         #   HandleInbound + HandleOutbound composition
+│   └── config/                       #   Mode presets, YAML config, validation
+│
+├── cmd/authbridge/                   # Unified binary -- 3 modes, 1 codebase
+│   ├── listener/                     #   Protocol adapters (ext_proc, ext_authz, forward/reverse proxy)
+│   ├── entrypoint.sh                 #   Envoy + authbridge process supervision
+│   └── Dockerfile                    #   Combined Envoy + authbridge image
+│
+├── authproxy/                        # Legacy sidecar support (iptables, quickstart)
 │   ├── init-iptables.sh              #   iptables setup (outbound + inbound, Istio ambient compatible)
-│   ├── Dockerfile.{envoy,init}       #   Container images
+│   ├── Dockerfile.init               #   proxy-init container image
+│   ├── Dockerfile.authbridge         #   Combined sidecar image
 │   ├── k8s/                          #   Standalone K8s manifests
 │   └── quickstart/                   #   Standalone demo (no SPIFFE)
 │       ├── setup_keycloak.py
@@ -68,9 +83,10 @@ authbridge/
 
 ## Component Details
 
-### AuthProxy (go-processor/main.go)
+### AuthBridge Unified Binary (cmd/authbridge/)
 
-The core ext-proc that handles both traffic directions:
+The unified authbridge binary handles both traffic directions. Auth logic lives in `authlib/`,
+with protocol-specific listeners in `cmd/authbridge/listener/`:
 
 **Inbound path** (`x-authbridge-direction: inbound`):
 - Validates JWT signature via JWKS (auto-refreshing cache from `TOKEN_URL`-derived JWKS endpoint)
@@ -95,20 +111,25 @@ The core ext-proc that handles both traffic directions:
 - Routes file is loaded once at startup; restart the pod to pick up changes
 
 **Configuration loading:**
-- Waits up to 60s for credential files from client-registration (`waitForCredentials`)
+- YAML config with `${ENV_VAR}` expansion, mode presets, and startup validation
+- Supports `keycloak_url` + `keycloak_realm` derivation for operator compatibility
+- Waits up to 60s for credential files from client-registration
 - Reads `CLIENT_ID` from `/shared/client-id.txt` (file) or `CLIENT_ID` env var (fallback)
 - Reads `CLIENT_SECRET` from `/shared/client-secret.txt` (file) or `CLIENT_SECRET` env var (fallback)
 - `TOKEN_URL`: explicit env var, or auto-derived from `KEYCLOAK_URL` + `KEYCLOAK_REALM` (i.e. `{KEYCLOAK_URL}/realms/{KEYCLOAK_REALM}/protocol/openid-connect/token`)
 - `ISSUER`: explicit env var, or auto-derived from `KEYCLOAK_URL` + `KEYCLOAK_REALM` (i.e. `{KEYCLOAK_URL}/realms/{KEYCLOAK_REALM}`)
-- Inbound audience validation uses `CLIENT_ID` (from `/shared/client-id.txt` or `CLIENT_ID` env var) — automatic, per-agent
+- Inbound audience validation uses `CLIENT_ID` (from `/shared/client-id.txt` or `CLIENT_ID` env var) -- automatic, per-agent
 - Outbound route config from `/etc/authproxy/routes.yaml` (default; override with `ROUTES_CONFIG_PATH` env var in standalone deployments). Target audience and scopes are configured per-route only.
 - Default outbound policy from `DEFAULT_OUTBOUND_POLICY` env var: `"passthrough"` (default) or `"exchange"`
 - JWKS URL is derived from TOKEN_URL: replaces `/token` suffix with `/certs`
 
-**Key types:**
-- `Config` struct -- holds client credentials and token exchange params (thread-safe via `sync.RWMutex`)
-- `processor` struct -- implements `ExternalProcessorServer` gRPC interface
-- `tokenExchangeResponse` -- JSON response from Keycloak token endpoint
+**Key library packages (authlib/):**
+- `authlib/validation/` -- JWKS-backed JWT verifier
+- `authlib/exchange/` -- RFC 8693 token exchange client
+- `authlib/cache/` -- SHA-256 keyed token cache
+- `authlib/routing/` -- Host-to-audience route resolver
+- `authlib/auth/` -- `HandleInbound` + `HandleOutbound` composition
+- `authlib/config/` -- Mode presets, YAML config, validation
 
 ### init-iptables.sh
 
@@ -155,7 +176,7 @@ Declarative Keycloak synchronization tool that maintains client scope mappings b
 
 ### Envoy Configuration
 
-Envoy config lives in `demos/webhook/k8s/configmaps-webhook.yaml` (the `envoy-config` ConfigMap). Key listeners: `outbound_listener` (15123), `inbound_listener` (15124). Inbound listener injects `x-authbridge-direction: inbound` header. Both use ext_proc cluster pointing to localhost:9090.
+Envoy config lives in `demos/webhook/k8s/configmaps-webhook.yaml` (the `envoy-config` ConfigMap). Key listeners: `outbound_listener` (15123), `inbound_listener` (15124). Inbound listener injects `x-authbridge-direction: inbound` header. Both use ext_proc cluster pointing to the authbridge binary on localhost:9090.
 
 ## Demo Scenarios
 
@@ -191,11 +212,11 @@ When the webhook injects sidecars (via [kagenti-operator](https://github.com/kag
 
 | Resource | Kind | Consumer | Key Fields |
 |----------|------|----------|------------|
-| `authbridge-config` | ConfigMap | client-registration, envoy-proxy (ext-proc) | `KEYCLOAK_URL`, `KEYCLOAK_REALM`, `PLATFORM_CLIENT_IDS` (optional), `TOKEN_URL` (optional, derived), `ISSUER` (optional, derived or explicit), `DEFAULT_OUTBOUND_POLICY` (optional). Inbound audience validation uses `CLIENT_ID` from `/shared/client-id.txt`. Target audience and scopes are configured per-route in `authproxy-routes`. |
+| `authbridge-config` | ConfigMap | client-registration, authbridge | `KEYCLOAK_URL`, `KEYCLOAK_REALM`, `PLATFORM_CLIENT_IDS` (optional), `TOKEN_URL` (optional, derived), `ISSUER` (optional, derived or explicit), `DEFAULT_OUTBOUND_POLICY` (optional). Inbound audience validation uses `CLIENT_ID` from `/shared/client-id.txt`. Target audience and scopes are configured per-route in `authproxy-routes`. |
 | `keycloak-admin-secret` | Secret | client-registration | `KEYCLOAK_ADMIN_USERNAME`, `KEYCLOAK_ADMIN_PASSWORD` |
-| `authproxy-routes` | ConfigMap (optional) | envoy-proxy (ext-proc) | `routes.yaml` with per-host token exchange rules |
+| `authproxy-routes` | ConfigMap (optional) | authbridge | `routes.yaml` with per-host token exchange rules |
 | `spiffe-helper-config` | ConfigMap | spiffe-helper | `helper.conf` (SPIRE agent address, cert paths, JWT SVID config) |
-| `envoy-config` | ConfigMap | envoy-proxy | `envoy.yaml` (full Envoy configuration) |
+| `envoy-config` | ConfigMap | envoy (in authbridge-unified image) | `envoy.yaml` (full Envoy configuration) |
 
 **`authproxy-routes` format** (`routes.yaml`):
 ```yaml
@@ -208,7 +229,7 @@ routes:
     token_scopes: "openid auth-target-aud"
 ```
 
-The go-processor defaults to **passthrough** for outbound requests that don't match any route. Token exchange only happens for hosts with explicit entries in `authproxy-routes`, where target audience and scopes are configured per-route.
+Authbridge defaults to **passthrough** for outbound requests that don't match any route. Token exchange only happens for hosts with explicit entries in `authproxy-routes`, where target audience and scopes are configured per-route.
 
 ## Shared Volume Contract
 
@@ -217,8 +238,8 @@ Sidecars communicate through files on shared volumes:
 | Path | Writer | Reader | Content |
 |------|--------|--------|---------|
 | `/opt/jwt_svid.token` | spiffe-helper | client-registration | JWT SVID from SPIRE |
-| `/shared/client-id.txt` | client-registration | envoy-proxy (ext-proc) | SPIFFE ID or CLIENT_NAME |
-| `/shared/client-secret.txt` | client-registration | envoy-proxy (ext-proc) | Keycloak client secret |
+| `/shared/client-id.txt` | client-registration | authbridge | SPIFFE ID or CLIENT_NAME |
+| `/shared/client-secret.txt` | client-registration | authbridge | Keycloak client secret |
 
 ## Build and Deploy
 
@@ -227,11 +248,15 @@ Sidecars communicate through files on shared volumes:
 ```bash
 cd authbridge/authproxy
 
-# Build all images (auth-proxy, demo-app, proxy-init, envoy-with-processor)
+# Build demo images (auth-proxy, demo-app, proxy-init)
 make build-images
 
 # Load into Kind cluster
 make load-images                    # Uses KIND_CLUSTER_NAME env var (default: kagenti)
+
+# Build the authbridge-unified sidecar image separately (from authbridge/ context)
+cd .. && podman build -f cmd/authbridge/Dockerfile -t authbridge-unified:latest .
+kind load docker-image authbridge-unified:latest --name kagenti
 
 # Deploy auth-proxy + demo-app
 make deploy
@@ -264,7 +289,7 @@ kubectl apply -f k8s/auth-target-deployment-webhook.yaml     # Target service
 |------|-----------|----------|---------|
 | 15123 | Envoy | TCP | Outbound listener (iptables redirects app traffic here) |
 | 15124 | Envoy | TCP | Inbound listener (iptables redirects incoming traffic here) |
-| 9090 | go-processor | gRPC | Ext-proc server (called by Envoy) |
+| 9090 | authbridge | gRPC | Ext-proc server (called by Envoy) |
 | 9901 | Envoy | HTTP | Admin interface (bound to 127.0.0.1) |
 | 8080 | auth-proxy | HTTP | Example app (NOT part of sidecar) |
 | 8081 | demo-app | HTTP | Demo target (JWT validation) |
@@ -272,12 +297,13 @@ kubectl apply -f k8s/auth-target-deployment-webhook.yaml     # Target service
 
 ## Code Conventions
 
-### Go (AuthProxy, go-processor, demo-app)
-- Go 1.24 (module: `github.com/kagenti/kagenti-extensions/authbridge/authproxy`)
+### Go (authlib, cmd/authbridge, demo-app)
+- Go 1.24
+- Two modules: `authbridge/authlib/` (pure library) and `authbridge/cmd/authbridge/` (binary + listeners)
+- `authbridge/go.work` workspace links both modules for local development
 - Logging with `log.Printf` (stdlib), prefixed by `[Config]`, `[Token Exchange]`, `[Inbound]`, `[JWT Debug]`
-- Thread-safe config via `sync.RWMutex` in the `Config` struct
-- gRPC ext-proc using `envoyproxy/go-control-plane` types
-- JWT validation with `lestrrat-go/jwx/v2`
+- gRPC ext-proc using `envoyproxy/go-control-plane` types (in cmd/authbridge)
+- JWT validation with `lestrrat-go/jwx/v2` (in authlib/validation)
 
 ### Python (client-registration, setup scripts)
 - Python 3.12 syntax (type hints: `str | None`)
@@ -294,13 +320,13 @@ kubectl apply -f k8s/auth-target-deployment-webhook.yaml     # Target service
 ## Common Tasks for Code Changes
 
 ### Modifying Token Exchange Logic
-- Edit `go-processor/main.go`, function `exchangeToken()`
+- Edit `authlib/exchange/` -- the RFC 8693 token exchange client
 - The token exchange POST parameters follow RFC 8693 exactly
-- Test by rebuilding: `make docker-build-envoy && make load-images`
+- Test by rebuilding: `make build-images && make load-images`
 
 ### Modifying Inbound JWT Validation
-- Edit `go-processor/main.go`, functions `validateInboundJWT()` and `handleInbound()`
-- JWKS cache is initialized in `initJWKSCache()` and auto-refreshes
+- Edit `authlib/validation/` -- the JWKS-backed JWT verifier
+- JWKS cache auto-refreshes
 - Direction detection: `x-authbridge-direction: inbound` header (injected by Envoy inbound listener config)
 
 ### Adding New iptables Rules
@@ -327,13 +353,13 @@ kubectl apply -f k8s/auth-target-deployment-webhook.yaml     # Target service
 
 ## Gotchas and Known Issues
 
-1. **Credential file race condition**: The ext-proc waits up to 60s for `/shared/client-id.txt` and `/shared/client-secret.txt`. If client-registration takes longer (e.g., Keycloak slow to start), the ext-proc will fall back to env vars which may be empty.
+1. **Credential file race condition**: Authbridge waits up to 60s for `/shared/client-id.txt` and `/shared/client-secret.txt`. If client-registration takes longer (e.g., Keycloak slow to start), authbridge will fall back to env vars which may be empty.
 
 2. **ISSUER vs TOKEN_URL**: `ISSUER` must be the Keycloak **frontend URL** (what appears in the `iss` claim of tokens), while `TOKEN_URL` is the **internal service URL**. These are often different in Kubernetes (e.g., `http://keycloak.localtest.me:8080` vs `http://keycloak-service.keycloak.svc:8080`).
 
-3. **Keycloak port exclusion**: When using iptables interception, Keycloak's port (8080) must be excluded from redirect via `OUTBOUND_PORTS_EXCLUDE=8080`. Otherwise, token exchange requests from the ext-proc get redirected back to Envoy, creating a loop.
+3. **Keycloak port exclusion**: When using iptables interception, Keycloak's port (8080) must be excluded from redirect via `OUTBOUND_PORTS_EXCLUDE=8080`. Otherwise, token exchange requests from authbridge get redirected back to Envoy, creating a loop.
 
-4. **TLS passthrough is one-way**: Outbound HTTPS traffic passes through Envoy without token exchange via the TLS passthrough filter chain. Only plaintext HTTP outbound traffic reaches the ext_proc. With the default outbound policy of `"passthrough"`, even plaintext HTTP traffic is forwarded unchanged unless it matches an explicit route in `authproxy-routes`.
+4. **TLS passthrough is one-way**: Outbound HTTPS traffic passes through Envoy without token exchange via the TLS passthrough filter chain. Only plaintext HTTP outbound traffic reaches authbridge. With the default outbound policy of `"passthrough"`, even plaintext HTTP traffic is forwarded unchanged unless it matches an explicit route in `authproxy-routes`.
 
 5. **Virtualenv directory**: For local development you may create `authproxy/quickstart/venv/`, but it should be gitignored and is not committed to the repo.
 
@@ -341,7 +367,7 @@ kubectl apply -f k8s/auth-target-deployment-webhook.yaml     # Target service
 
 7. **Admin credentials in ConfigMap**: `demos/webhook/k8s/configmaps-webhook.yaml` stores Keycloak admin credentials in a ConfigMap (not a Secret). This is for demo only -- production should use Kubernetes Secrets.
 
-8. **Envoy Lua filter required for inbound**: The `x-authbridge-direction: inbound` header MUST be injected via a Lua filter before ext_proc in the inbound listener. Route-level `request_headers_to_add` does NOT work because the router filter runs after ext_proc.
+8. **Envoy Lua filter required for inbound**: The `x-authbridge-direction: inbound` header MUST be injected via a Lua filter before the ext_proc filter in the inbound listener. Route-level `request_headers_to_add` does NOT work because the router filter runs after ext_proc.
 
 9. **iptables backend auto-detection**: `init-iptables.sh` auto-detects `iptables-legacy` vs `iptables-nft`. Override with `IPTABLES_CMD` env var if needed. Always verify with proxy-init logs after deployment.
 

@@ -101,7 +101,7 @@ jobs:
         working-directory: authbridge/cmd/authbridge
     env:
       # Disable go.work — the workspace at authbridge/ includes ./authproxy
-      # which would pull in the old go-processor module. The replace directive
+      # which would pull in that module's dependencies. The replace directive
       # in go.mod handles the authlib dependency for CI builds.
       GOWORK: "off"
     steps:

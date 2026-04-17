@@ -357,7 +357,7 @@ spec:
               memory: 128Mi
         # Envoy proxy - intercepts outgoing traffic and performs token exchange
         - name: envoy-proxy
-          image: envoy-with-processor:latest
+          image: authbridge-unified:latest
           imagePullPolicy: IfNotPresent
           securityContext:
             runAsUser: 1337

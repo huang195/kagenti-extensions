@@ -138,7 +138,7 @@ kubectl logs deployment/<agent> -n <ns> -c envoy-proxy --since=30s 2>&1 | head -
 # "Traffic direction INBOUND" → Envoy knows it's inbound (from listener)
 ```
 
-### go-processor Logs
+### AuthBridge Logs
 
 ```bash
 # Inbound JWT validation
@@ -185,7 +185,7 @@ curl -s -H "Authorization: Bearer $ADMIN_TOKEN" \
 | Change | Action |
 |--------|--------|
 | `init-iptables.sh` or `Dockerfile.init` | Rebuild proxy-init image, `kind load`, delete pod |
-| `go-processor/main.go` | Rebuild envoy-with-processor image, `kind load`, delete pod |
+| `authlib/` or `cmd/authbridge/` | Rebuild authbridge-unified image, `kind load`, delete pod |
 | `configmaps.yaml` (envoy-config section) | `kubectl apply -f configmaps.yaml`, delete pod |
 | `configmaps.yaml` (other sections) | `kubectl apply -f configmaps.yaml`, delete pod |
 | `*-deployment.yaml` | `kubectl apply -f <file>` (rolling update) |

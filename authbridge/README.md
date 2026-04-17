@@ -377,7 +377,7 @@ This creates target clients, audience scopes, and assigns scopes to the agent.
 
 - [Unified AuthBridge Binary](cmd/authbridge/README.md) - Single binary, three modes (recommended)
 - [authlib](authlib/README.md) - Shared auth building blocks (Go library)
-- [AuthProxy](authproxy/README.md) - Token validation and exchange proxy (deprecated, use cmd/authbridge)
+- [AuthProxy](authproxy/README.md) - Proxy-init, combined sidecar, demo app, and quickstart
 - [Client Registration](client-registration/README.md) - Automatic Keycloak client registration with SPIFFE
 
 ## References

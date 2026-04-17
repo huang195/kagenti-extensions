@@ -70,7 +70,7 @@ spec:
             cpu: 100m
             memory: 128Mi
       - name: envoy-proxy
-        image: localhost/envoy-with-processor:latest
+        image: localhost/authbridge-unified:latest
         imagePullPolicy: IfNotPresent
         securityContext:
           runAsUser: 1337

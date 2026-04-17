@@ -1,9 +1,8 @@
 # AuthProxy
 
-> **Deprecated:** The go-processor ext_proc server and `Dockerfile.envoy` are replaced by
-> the [unified authbridge binary](../cmd/authbridge/). The unified binary is a drop-in
-> replacement for `envoy-with-processor` with the same image structure, UID, and ports.
-> This directory is kept for backwards compatibility during migration.
+> **Note:** The go-processor ext_proc server has been removed. Auth logic now lives in
+> the [unified authbridge binary](../cmd/authbridge/). This directory contains the
+> proxy-init iptables setup, combined sidecar image, demo app, and quickstart.
 
 AuthProxy is a **token validation and exchange sidecar** for Kubernetes workloads. It enables secure service-to-service communication by:
 - **Validating** incoming requests with JWT token verification (inbound)
@@ -52,7 +51,7 @@ AuthProxy is a **single sidecar container** that consists of:
 
 The sidecar runs an Envoy proxy with an external processor (ext-proc) filter:
 - **Envoy Proxy** (port **15123** outbound, port **15124** inbound): Intercepts all traffic from and to the application container
-- **Ext Proc Filter** (`go-processor/main.go`, port **9090**): Handles both directions:
+- **Ext Proc Filter** ([unified authbridge binary](../cmd/authbridge/), port **9090**): Handles both directions:
   - **Inbound**: Validates JWT tokens (signature, issuer) using JWKS. Returns 401 Unauthorized for invalid tokens.
   - **Outbound HTTP**: Performs **OAuth 2.0 Token Exchange** ([RFC 8693](https://datatracker.ietf.org/doc/html/rfc8693)), replacing the `Authorization` header with an exchanged token for the target audience.
   - **Outbound HTTPS**: Envoy detects TLS via `tls_inspector` and passes traffic through as-is using `tcp_proxy` (no ext_proc, no token exchange). This ensures HTTPS connections are not broken by the sidecar.

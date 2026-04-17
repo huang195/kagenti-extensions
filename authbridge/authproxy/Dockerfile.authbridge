@@ -1,18 +1,26 @@
 # Combined AuthBridge sidecar image
-# Includes: Envoy proxy, go-processor (ext-proc), spiffe-helper, client-registration (Python)
+# Includes: Envoy proxy, unified authbridge binary, spiffe-helper, client-registration (Python)
 #
-# Build context: ./authbridge (needs access to both authproxy/ and client-registration/)
+# Build context: ./authbridge (needs access to authlib/, cmd/authbridge/, and client-registration/)
 
-# Stage 1: Build go-processor
-FROM golang:1.26.1-alpine AS go-builder
+# Stage 1: Build unified authbridge binary
+FROM golang:1.24.5-alpine AS go-builder
+
+RUN apk add --no-cache git
 
 WORKDIR /app
 
-COPY authproxy/go.mod authproxy/go.sum ./authproxy/
-RUN cd authproxy && go mod download
+# Copy go.mod/go.sum first for better Docker layer caching —
+# dependency layer is only invalidated when go.mod/go.sum change.
+COPY cmd/authbridge/go.mod cmd/authbridge/go.sum cmd/authbridge/
+COPY authlib/go.mod authlib/go.sum authlib/
+ENV GOWORK=off
+RUN cd cmd/authbridge && go mod download
 
-COPY authproxy/go-processor/ ./authproxy/go-processor/
-RUN cd authproxy && CGO_ENABLED=0 GOOS=linux go build -o /go-processor ./go-processor
+COPY authlib/ authlib/
+COPY cmd/authbridge/ cmd/authbridge/
+
+RUN cd cmd/authbridge && CGO_ENABLED=0 GOOS=linux go build -o /authbridge .
 
 # Stage 2: Get spiffe-helper binary
 FROM ghcr.io/spiffe/spiffe-helper:0.11.0 AS spiffe
@@ -26,7 +34,7 @@ RUN apt-get update && \
     rm -rf /var/lib/apt/lists/*
 
 # Copy binaries
-COPY --from=go-builder /go-processor /usr/local/bin/go-processor
+COPY --from=go-builder /authbridge /usr/local/bin/authbridge
 COPY --from=spiffe /spiffe-helper /usr/local/bin/spiffe-helper
 
 # Copy client-registration Python code
@@ -34,8 +42,9 @@ COPY client-registration/client_registration.py /app/
 COPY client-registration/requirements.txt /app/
 RUN pip3 install --no-cache-dir -r /app/requirements.txt
 
-# Copy entrypoint
+# Copy entrypoint and default config
 COPY authproxy/entrypoint-authbridge.sh /usr/local/bin/entrypoint-authbridge.sh
+COPY authproxy/authbridge-combined.yaml /etc/authbridge/config.yaml
 RUN chmod +x /usr/local/bin/entrypoint-authbridge.sh
 
 USER 1337

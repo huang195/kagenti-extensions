@@ -43,7 +43,7 @@ providing end-to-end security:
 │  │                                                                           │   │
 │  │  ┌───────────────────────────────────────────────────────────────────┐    │   │
 │  │  │                AuthProxy Sidecar (envoy-proxy container)          │    │   │
-│  │  │  Envoy + ext_proc (go-processor)                                  │    │   │
+│  │  │  Envoy + ext_proc (authbridge)                                    │    │   │
 │  │  │  Inbound (port 15124):                                            │    │   │
 │  │  │    - Validates JWT (signature + issuer + audience via JWKS)       │    │   │
 │  │  │    - Returns 401 Unauthorized for invalid/missing tokens          │    │   │
@@ -113,7 +113,7 @@ see issues on public repositories.
 - **Outbound routes from the UI (Step 5, item 12):** The API must write `authproxy-routes`
   `routes.yaml` as a **YAML list** of route objects (same shape as
   [k8s/configmaps.yaml](k8s/configmaps.yaml)). Older Kagenti backends wrapped routes in a
-  top-level `routes:` **map**, which **AuthProxy go-processor cannot parse**, so ext_proc
+  top-level `routes:` **map**, which **authbridge cannot parse**, so ext_proc
   never starts, Envoy returns **500** through the Service, and the UI shows **Agent card not
   available**. Use a build that includes [kagenti/kagenti#1194](https://github.com/kagenti/kagenti/pull/1194)
   ([#1195](https://github.com/kagenti/kagenti/issues/1195)), or use **Step 2 Option B**
@@ -255,7 +255,7 @@ kubectl create secret generic github-tool-secrets -n team1 \
 
    > The GitHub tool does not need AuthBridge sidecars — it validates incoming tokens
    > directly using its own JWKS logic. Injecting sidecars would cause a port 9090
-   > conflict between the tool's MCP broker and the go-processor gRPC server.
+   > conflict between the tool's MCP broker and the authbridge gRPC server.
 
 9. Under **Port Configuration**, set **Service Port** to `9090` and **Target Port** to `9090`
 
@@ -409,7 +409,7 @@ github-tool-7f8c9d6b44-yyyyy      1/1     Running   0          5m
 ```
 
 > **Note:** The agent pod shows **2/2** — the **agent** container plus a single
-> **authbridge** container (Envoy, go-processor, spiffe-helper, and client-registration
+> **authbridge** container (Envoy, authbridge, spiffe-helper, and client-registration
 > processes inside it), plus **`proxy-init`** as an init container. Shipwright
 > **BuildRun** pods may still appear as `Completed` with a different ready count.
 
@@ -618,8 +618,8 @@ kubectl wait --for=condition=ready pod/test-client -n team1 --timeout=30s
 
 ### 9a. Agent Card - Public Endpoint (No Token Required)
 
-The `/.well-known/agent.json` endpoint is publicly accessible — AuthBridge's
-go-processor [bypasses JWT validation](https://github.com/kagenti/kagenti-extensions/pull/133)
+The `/.well-known/agent.json` endpoint is publicly accessible — authbridge
+[bypasses JWT validation](https://github.com/kagenti/kagenti-extensions/pull/133)
 for `/.well-known/*`, `/healthz`, `/readyz`, and `/livez` by default:
 
 ```bash
@@ -744,7 +744,7 @@ exit
 ### 9e. Verify AuthProxy Logs (Inbound + Outbound)
 
 Check the ext_proc logs to confirm both inbound validation and outbound token
-exchange are working. Envoy and go-processor log to the **`envoy-proxy`** container in
+exchange are working. Envoy and authbridge log to the **`envoy-proxy`** container in
 legacy mode, or to **`authbridge`** when
 [`combinedSidecar`](https://github.com/kagenti/kagenti/blob/main/docs/authbridge-combined-sidecar.md)
 is enabled — replace `-c envoy-proxy` with `-c authbridge` below.
@@ -790,12 +790,12 @@ kubectl delete pod test-client -n team1 --ignore-not-found
 ## Step 10: Access Control — Alice vs Bob
 
 <!-- WORKAROUND: Remove this note once kagenti-extensions#139 is implemented.
-     The full scope-forwarding feature in go-processor is required for this step to work
+     The full scope-forwarding feature in authbridge is required for this step to work
      end-to-end. Until that lands, the exchanged token always includes github-full-access
      (from the static token_scopes in the authproxy-routes ConfigMap).
      Track: https://github.com/kagenti/kagenti-extensions/issues/139 -->
 
-> **Known limitation:** This step requires the go-processor scope forwarding feature
+> **Known limitation:** This step requires the authbridge scope forwarding feature
 > ([kagenti-extensions#139](https://github.com/kagenti/kagenti-extensions/issues/139)).
 > Currently, `token_scopes` in the `authproxy-routes` ConfigMap is static per-route, so
 > all exchanged tokens include `github-full-access` regardless of the original user's
@@ -1003,7 +1003,7 @@ Service returns **500** (often with `server: envoy`); curling
 `/.well-known/agent-card.json` or `/.well-known/agent.json` from the **agent**
 container on port **8000** still works.
 
-**Cause:** Commonly **go-processor** failed to load `authproxy-routes` (invalid YAML
+**Cause:** Commonly **authbridge** failed to load `authproxy-routes` (invalid YAML
 shape) and never serves ext_proc, so Envoy cannot complete the request.
 
 **Diagnose:**
@@ -1122,7 +1122,7 @@ kubectl logs deployment/git-issue-agent -n team1 -c agent
 ```bash
 kubectl logs deployment/git-issue-agent -n team1 -c authbridge
 kubectl logs deployment/git-issue-agent -n team1 -c agent
-kubectl logs deployment/git-issue-agent -n team1 -c proxy-init
+kubectl logs deployment/git-issue-agent -n team1 -c proxy-init --previous 2>/dev/null
 ```
 
 ### Tool MCP Server Unreachable / Connection Reset
@@ -1133,7 +1133,7 @@ direct curl to the tool gets `Connection reset by peer`.
 **Possible causes:**
 
 1. **AuthBridge sidecars injected** — If the webhook injected envoy-proxy into the tool
-   pod, the go-processor gRPC server and tool MCP broker both bind to port 9090. Check container count:
+   pod, the authbridge gRPC server and tool MCP broker both bind to port 9090. Check container count:
    ```bash
    kubectl get pods -n team1 | grep github-tool
    # If you see 3/3 instead of 1/1, sidecars were injected
@@ -1202,7 +1202,7 @@ kubectl delete namespace team1
 ## Next Steps
 
 - **Manual Deployment**: See [demo-manual.md](demo-manual.md) for deploying everything via `kubectl`
-- **AuthProxy Details**: See the [AuthProxy README](../../authproxy/README.md) for inbound
+- **AuthBridge Binary**: See the [AuthBridge README](../../cmd/authbridge/README.md) for inbound
   JWT validation and outbound token exchange internals
 - **Multi-Target Demo**: See the [multi-target demo](../multi-target/demo.md) for
   route-based token exchange to multiple tool services

@@ -12,21 +12,17 @@ docker-build-target:
 docker-build-init:
 	podman build -f Dockerfile.init -t proxy-init:latest .
 
-docker-build-go-processor:
-	podman build -f go-processor/Dockerfile -t go-processor:latest .
-
-docker-build-envoy:
-	podman build -f Dockerfile.envoy -t envoy-with-processor:latest .
-
-# Build all Docker images
-build-images: docker-build-proxy docker-build-target docker-build-init docker-build-envoy
+# Build demo Docker images (auth-proxy, demo-app, proxy-init).
+# The authbridge-unified sidecar image is built from cmd/authbridge/Dockerfile:
+#   cd authbridge && podman build -f cmd/authbridge/Dockerfile -t authbridge-unified:latest .
+build-images: docker-build-proxy docker-build-target docker-build-init
 
 # Load Docker images into kind cluster and re-tag for podman compatibility.
 # Podman tags images with a localhost/ prefix, but Kubernetes resolves bare
 # image names to docker.io/library/. Re-tagging inside the node ensures the
 # images are found when pods are scheduled.
 KIND_NODE ?= $(KIND_CLUSTER_NAME)-control-plane
-LOCAL_IMAGES = auth-proxy demo-app proxy-init envoy-with-processor
+LOCAL_IMAGES = auth-proxy demo-app proxy-init
 load-images:
 	@for img in $(LOCAL_IMAGES); do \
 		kind load docker-image $$img:latest --name $(KIND_CLUSTER_NAME); \
@@ -52,7 +48,7 @@ kind-delete:
 
 # Run Go unit tests
 unit-test:
-	go test ./go-processor/... -v
+	go test ./... -v
 
 # Integration test via curl
 test:

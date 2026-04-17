@@ -22,7 +22,7 @@ The operator webhook watches for deployments with the `kagenti.io/inject: enable
 | Container | Purpose |
 |-----------|---------|
 | `proxy-init` | Init container that sets up iptables (same as separate mode) |
-| `authbridge` | Single sidecar combining Envoy, go-processor, spiffe-helper, and client-registration |
+| `authbridge` | Single sidecar combining Envoy, authbridge, spiffe-helper, and client-registration |
 
 Combined mode reduces per-pod overhead from 3 long-running sidecars to 1, simplifies debugging, and speeds up pod startup. See [Enabling Combined Sidecar Mode](#enabling-combined-sidecar-mode) below.
 
@@ -69,7 +69,7 @@ Combined mode reduces per-pod overhead from 3 long-running sidecars to 1, simpli
 3. **SPIRE** deployed (optional, for SPIFFE-based identity)
 4. **AuthBridge images** available from GitHub Container Registry:
    - `ghcr.io/kagenti/kagenti-extensions/proxy-init:latest`
-   - `ghcr.io/kagenti/kagenti-extensions/envoy-with-processor:latest`
+   - `ghcr.io/kagenti/kagenti-extensions/authbridge-unified:latest`
    - `ghcr.io/kagenti/kagenti-extensions/demo-app:latest`
    - `ghcr.io/kagenti/kagenti-extensions/client-registration:latest`
 
@@ -147,12 +147,12 @@ The webhook watches this ConfigMap for changes and reloads automatically. New po
 
 | Aspect | Separate mode | Combined mode |
 |--------|---------------|---------------|
-| Sidecar containers | 3 (`envoy-proxy`, `spiffe-helper`, `kagenti-client-registration`) | 1 (`authbridge`) |
+| Sidecar containers | 3 (`envoy-proxy`, `spiffe-helper`, `kagenti-client-registration`) | 1 (`authbridge`)  |
 | Init containers | 1 (`proxy-init`) | 1 (`proxy-init`) |
 | Container to read credentials | `-c envoy-proxy` | `-c authbridge` |
 | Container for Envoy logs | `-c envoy-proxy` | `-c authbridge` |
 | Per-sidecar opt-out labels | Each sidecar can be independently disabled | `spiffeHelper` and `clientRegistration` are passed as flags to the entrypoint; `envoy-proxy` disabled = no combined container |
-| Image | `envoy-with-processor` + `spiffe-helper` + `client-registration` | `authbridge` (single image) |
+| Image | `authbridge-unified` + `spiffe-helper` + `client-registration` | `authbridge` (single image) |
 
 ### Per-sidecar control in combined mode
 
@@ -393,7 +393,7 @@ kubectl logs deployment/agent -n team1 -c authbridge | grep "Token Exchange"
      make build
      # Load into Kind cluster
      kind load docker-image --name <cluster> localhost/proxy-init:latest
-     kind load docker-image --name <cluster> localhost/envoy-with-processor:latest
+     kind load docker-image --name <cluster> localhost/authbridge-unified:latest
      ```
    - See the [kagenti-operator](https://github.com/kagenti/kagenti-operator) for image configuration
 

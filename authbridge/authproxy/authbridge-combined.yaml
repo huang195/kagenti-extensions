@@ -1,0 +1,23 @@
+# Default config for the combined AuthBridge sidecar image.
+# Env vars are expanded at startup by the unified binary's config loader.
+# These env vars match the operator's ConfigMap contract (authbridge-config).
+mode: envoy-sidecar
+inbound:
+  issuer: "${ISSUER}"
+outbound:
+  token_url: "${TOKEN_URL}"
+  keycloak_url: "${KEYCLOAK_URL}"
+  keycloak_realm: "${KEYCLOAK_REALM}"
+  default_policy: "${DEFAULT_OUTBOUND_POLICY}"
+identity:
+  client_id: "${CLIENT_ID}"
+  client_id_file: "/shared/client-id.txt"
+  client_secret_file: "/shared/client-secret.txt"
+bypass:
+  inbound_paths:
+    - "/.well-known/*"
+    - "/healthz"
+    - "/readyz"
+    - "/livez"
+routes:
+  file: "/etc/authproxy/routes.yaml"

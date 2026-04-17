@@ -4,9 +4,9 @@ This directory contains demo scenarios showing AuthBridge providing zero-trust
 authentication for Kubernetes agent workloads. Each demo progressively introduces
 more AuthBridge capabilities.
 
-> **Note:** These demos use the classic `envoy-with-processor` image with operator-injected
-> sidecars. A [unified authbridge binary](../cmd/authbridge/) is available as a drop-in
-> replacement. See [`cmd/authbridge/README.md`](../cmd/authbridge/README.md) for details.
+> **Note:** These demos use the `authbridge-unified` image with operator-injected
+> sidecars. See [`cmd/authbridge/README.md`](../cmd/authbridge/README.md) for details
+> on the unified authbridge binary.
 
 ## Available Demos
 
@@ -109,6 +109,6 @@ pip install -r requirements.txt
 ## Related Documentation
 
 - [AuthBridge Overview](../README.md) — Architecture and design
-- [AuthProxy README](../authproxy/README.md) — Inbound JWT validation and outbound
-  token exchange internals
+- [AuthBridge Binary](../cmd/authbridge/README.md) — Unified authbridge binary
+  supporting ext_proc, ext_authz, and proxy modes
 - [Kagenti Operator](https://github.com/kagenti/kagenti-operator) — Admission webhook for sidecar injection (migrated from this repo)

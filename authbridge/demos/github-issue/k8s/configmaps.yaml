@@ -6,7 +6,7 @@
 # - authbridge-config: Keycloak connection, inbound validation, and outbound exchange settings
 # - authproxy-routes: per-target token exchange routes
 #
-# The go-processor defaults to "passthrough" for outbound traffic, meaning
+# Authbridge defaults to "passthrough" for outbound traffic, meaning
 # requests to unknown hosts (LLM APIs, telemetry, etc.) pass through without
 # token exchange. Only hosts listed in authproxy-routes get token exchange.
 #

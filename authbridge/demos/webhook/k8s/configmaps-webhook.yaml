@@ -20,11 +20,11 @@ stringData:
   KEYCLOAK_ADMIN_PASSWORD: "admin"
 
 ---
-# authbridge-config ConfigMap - Unified config for both client-registration and envoy-proxy (go-processor)
+# authbridge-config ConfigMap - Unified config for both client-registration and envoy-proxy (authbridge)
 #
 # client-registration reads: KEYCLOAK_URL, KEYCLOAK_REALM, PLATFORM_CLIENT_IDS
-# go-processor reads: KEYCLOAK_URL, KEYCLOAK_REALM (to derive TOKEN_URL/ISSUER), TOKEN_URL, ISSUER,
-#                     DEFAULT_OUTBOUND_POLICY
+# authbridge reads: KEYCLOAK_URL, KEYCLOAK_REALM (to derive TOKEN_URL/ISSUER), TOKEN_URL, ISSUER,
+#                   DEFAULT_OUTBOUND_POLICY
 apiVersion: v1
 kind: ConfigMap
 metadata:

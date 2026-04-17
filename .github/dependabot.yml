@@ -30,12 +30,6 @@ updates:
     schedule:
       interval: weekly
 
-  # Docker - AuthProxy go-processor
-  - package-ecosystem: docker
-    directory: /authbridge/authproxy/go-processor
-    schedule:
-      interval: weekly
-
   # Docker - AuthProxy quickstart demo-app
   - package-ecosystem: docker
     directory: /authbridge/authproxy/quickstart/demo-app

@@ -62,15 +62,16 @@ func (v *JWKSVerifier) Verify(ctx context.Context, tokenStr string, audience str
 		return nil, fmt.Errorf("fetching JWKS: %w", err)
 	}
 
-	if audience == "" {
-		return nil, fmt.Errorf("audience is required (prevents confused deputy attacks)")
-	}
-
 	parseOpts := []jwt.ParseOption{
 		jwt.WithKeySet(keySet),
 		jwt.WithValidate(true),
 		jwt.WithIssuer(v.issuer),
-		jwt.WithAudience(audience),
+	}
+	// When audience is configured, enforce it. When empty (credentials not yet
+	// loaded), skip audience validation — matches the old go-processor behavior
+	// that logged "Audience validation disabled (CLIENT_ID not available)".
+	if audience != "" {
+		parseOpts = append(parseOpts, jwt.WithAudience(audience))
 	}
 
 	token, err := jwt.Parse([]byte(tokenStr), parseOpts...)

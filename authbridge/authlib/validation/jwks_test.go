@@ -187,7 +187,7 @@ func TestJWKSVerifier_WrongAudience(t *testing.T) {
 	}
 }
 
-func TestJWKSVerifier_EmptyAudience_Rejected(t *testing.T) {
+func TestJWKSVerifier_EmptyAudience_SkipsValidation(t *testing.T) {
 	privKey, jwksSrv := setupTestJWKS(t)
 	defer jwksSrv.Close()
 
@@ -202,9 +202,14 @@ func TestJWKSVerifier_EmptyAudience_Rejected(t *testing.T) {
 		"iat": time.Now().Unix(),
 	})
 
-	_, err := v.Verify(ctx, token, "")
-	if err == nil {
-		t.Fatal("expected error for empty audience (confused deputy protection)")
+	// When audience is empty (credentials not yet loaded), audience validation
+	// is skipped — signature, expiry, and issuer are still checked.
+	claims, err := v.Verify(ctx, token, "")
+	if err != nil {
+		t.Fatalf("expected success with empty audience (skips validation), got: %v", err)
+	}
+	if claims.Subject != "user" {
+		t.Errorf("subject = %q, want %q", claims.Subject, "user")
 	}
 }
 

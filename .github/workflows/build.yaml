@@ -48,9 +48,22 @@ jobs:
 
           # Unified AuthBridge binary (Envoy + authbridge in one container)
           # Drop-in replacement for envoy-with-processor
+          # DEPRECATED: use authbridge-envoy instead
           - name: authbridge-unified
             context: ./authbridge
             dockerfile: cmd/authbridge/Dockerfile
+
+          # AuthBridge with Envoy (envoy-sidecar mode)
+          # New canonical name for authbridge-unified
+          - name: authbridge-envoy
+            context: ./authbridge
+            dockerfile: cmd/authbridge/Dockerfile
+
+          # Lightweight AuthBridge (Go binary only, no Envoy)
+          # Used for waypoint and proxy-sidecar modes
+          - name: authbridge-light
+            context: ./authbridge
+            dockerfile: cmd/authbridge/Dockerfile.light
 
           # Demo application for testing
           - name: demo-app

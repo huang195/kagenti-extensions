@@ -41,7 +41,7 @@ fi
 # authbridge resolves credentials lazily via file polling (60s timeout).
 # The gRPC listener starts immediately so Envoy can connect without waiting.
 echo "[AuthBridge] Starting authbridge..."
-/usr/local/bin/authbridge --mode envoy-sidecar --config /etc/authbridge/config.yaml &
+/usr/local/bin/authbridge --config /etc/authbridge/config.yaml &
 CRITICAL_PIDS="$CRITICAL_PIDS $!"
 sleep 2
 

@@ -10,10 +10,16 @@ RUN apk add --no-cache git
 
 WORKDIR /app
 
+# Copy go.mod/go.sum first for better Docker layer caching —
+# dependency layer is only invalidated when go.mod/go.sum change.
+COPY cmd/authbridge/go.mod cmd/authbridge/go.sum cmd/authbridge/
+COPY authlib/go.mod authlib/go.sum authlib/
+ENV GOWORK=off
+RUN cd cmd/authbridge && go mod download
+
 COPY authlib/ authlib/
 COPY cmd/authbridge/ cmd/authbridge/
 
-ENV GOWORK=off
 RUN cd cmd/authbridge && CGO_ENABLED=0 GOOS=linux go build -o /authbridge .
 
 # Stage 2: Get spiffe-helper binary

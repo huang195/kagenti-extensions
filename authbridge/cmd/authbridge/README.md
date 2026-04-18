@@ -29,14 +29,34 @@ In proxy-sidecar mode, the kagenti-operator webhook transparently intercepts the
 
 The operator passes the dynamically assigned ports via env vars (`REVERSE_PROXY_ADDR`, `REVERSE_PROXY_BACKEND`, `FORWARD_PROXY_ADDR`) which are expanded via `${...}` in the config YAML.
 
+## Selecting a Mode
+
+The operator selects the mode via annotation on the workload's pod template:
+
+```yaml
+# Default (envoy-sidecar) — no annotation needed
+metadata:
+  labels:
+    kagenti.io/type: agent
+
+# Proxy-sidecar mode
+metadata:
+  labels:
+    kagenti.io/type: agent
+  annotations:
+    kagenti.io/authbridge-mode: "proxy-sidecar"
+```
+
 ## Building
+
+All builds run from the **repo root** with `authbridge/` as the build context:
 
 ```bash
 # Envoy variant (envoy-sidecar mode)
-podman build -f cmd/authbridge/Dockerfile -t authbridge-envoy:local authbridge/
+podman build -f authbridge/cmd/authbridge/Dockerfile -t authbridge-envoy:local authbridge/
 
 # Lightweight variant (proxy-sidecar / waypoint modes)
-podman build -f cmd/authbridge/Dockerfile.light -t authbridge-light:local authbridge/
+podman build -f authbridge/cmd/authbridge/Dockerfile.light -t authbridge-light:local authbridge/
 
 # Load into Kind
 kind load docker-image authbridge-envoy:local --name kagenti

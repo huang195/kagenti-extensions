@@ -31,9 +31,9 @@ The operator selects the mode via the `kagenti.io/authbridge-mode` annotation on
 
 The shared auth library at [`authlib/`](./authlib/) contains the building blocks (JWT validation, token exchange, caching, routing) with no protocol dependencies. See [`authlib/README.md`](./authlib/README.md) for package reference.
 
-## Classic Architecture (Operator-Injected)
+## Architecture (Operator-Injected)
 
-The following describes the current production deployment using operator-injected split sidecars. The unified binary (`cmd/authbridge/`) replaces the `envoy-proxy` sidecar in this architecture.
+The following describes the operator-injected sidecar deployment. The `authbridge-envoy` image replaces the legacy `envoy-with-processor` in envoy-sidecar mode. The `authbridge-light` image is used for proxy-sidecar mode.
 
 ### What AuthBridge Does
 

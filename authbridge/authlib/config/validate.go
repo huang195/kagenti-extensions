@@ -76,31 +76,30 @@ func validateIdentity(cfg *Config) error {
 func validateListeners(cfg *Config) error {
 	switch cfg.Mode {
 	case ModeEnvoySidecar:
-		if cfg.Listener.ReverseProxyAddr != "" {
-			return fmt.Errorf("envoy-sidecar mode does not support reverse_proxy_addr (use proxy-sidecar mode)")
-		}
-		if cfg.Listener.ExtAuthzAddr != "" {
-			return fmt.Errorf("envoy-sidecar mode does not support ext_authz_addr (use waypoint mode)")
-		}
+		// Cross-mode fields are warnings, not errors. The shared ConfigMap may
+		// contain ${...} placeholders for other modes that remain as literal
+		// strings when those env vars are unset. These fields are unused at
+		// runtime in envoy-sidecar mode and cause no harm.
+		warnCrossModeField(cfg.Mode, "reverse_proxy_addr", cfg.Listener.ReverseProxyAddr)
+		warnCrossModeField(cfg.Mode, "ext_authz_addr", cfg.Listener.ExtAuthzAddr)
 	case ModeWaypoint:
-		if cfg.Listener.ExtProcAddr != "" {
-			return fmt.Errorf("waypoint mode does not support ext_proc_addr (use envoy-sidecar mode)")
-		}
-		if cfg.Listener.ReverseProxyAddr != "" {
-			return fmt.Errorf("waypoint mode does not support reverse_proxy_addr")
-		}
+		warnCrossModeField(cfg.Mode, "ext_proc_addr", cfg.Listener.ExtProcAddr)
+		warnCrossModeField(cfg.Mode, "reverse_proxy_addr", cfg.Listener.ReverseProxyAddr)
 	case ModeProxySidecar:
-		if cfg.Listener.ExtProcAddr != "" {
-			return fmt.Errorf("proxy-sidecar mode does not support ext_proc_addr (use envoy-sidecar mode)")
-		}
-		if cfg.Listener.ExtAuthzAddr != "" {
-			return fmt.Errorf("proxy-sidecar mode does not support ext_authz_addr (use waypoint mode)")
-		}
+		warnCrossModeField(cfg.Mode, "ext_proc_addr", cfg.Listener.ExtProcAddr)
+		warnCrossModeField(cfg.Mode, "ext_authz_addr", cfg.Listener.ExtAuthzAddr)
 		if cfg.Listener.ReverseProxyBackend == "" {
 			return fmt.Errorf("proxy-sidecar mode requires listener.reverse_proxy_backend")
 		}
 	}
 	return nil
+}
+
+func warnCrossModeField(mode, field, value string) {
+	if value != "" {
+		slog.Warn("listener field ignored in this mode",
+			"mode", mode, "field", field, "value", value)
+	}
 }
 
 func warnUnusual(cfg *Config) {
@@ -127,4 +126,3 @@ func ValidateOutboundPolicy(policy string) error {
 		return fmt.Errorf("unknown outbound.default_policy %q (valid: exchange, passthrough)", policy)
 	}
 }
-

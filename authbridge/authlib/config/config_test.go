@@ -50,7 +50,7 @@ func TestApplyPreset_ProxySidecar(t *testing.T) {
 
 func TestApplyPreset_UserOverride(t *testing.T) {
 	cfg := &Config{
-		Mode: ModeEnvoySidecar,
+		Mode:     ModeEnvoySidecar,
 		Identity: IdentityConfig{Type: "client-secret"}, // user override
 	}
 	ApplyPreset(cfg)
@@ -61,7 +61,7 @@ func TestApplyPreset_UserOverride(t *testing.T) {
 
 func TestNoTokenPolicyForMode(t *testing.T) {
 	tests := []struct {
-		mode   string
+		mode string
 		want string
 	}{
 		{ModeEnvoySidecar, "client-credentials"},
@@ -130,19 +130,45 @@ func TestValidate_SpiffeIdentityRequiresPath(t *testing.T) {
 	}
 }
 
-func TestValidate_InvalidListenerCombo(t *testing.T) {
-	cfg := validEnvoySidecarConfig()
-	cfg.Listener.ReverseProxyAddr = ":8080" // invalid for envoy-sidecar
-	if err := Validate(cfg); err == nil {
-		t.Error("expected error for envoy-sidecar + reverse_proxy_addr")
+func TestValidate_CrossModeFieldsAreWarnings(t *testing.T) {
+	// Cross-mode listener fields are now warnings, not errors.
+	// This allows a shared ConfigMap with ${...} placeholders for all modes.
+	tests := []struct {
+		name string
+		cfg  *Config
+	}{
+		{"envoy-sidecar + reverse_proxy_addr", func() *Config {
+			c := validEnvoySidecarConfig()
+			c.Listener.ReverseProxyAddr = "${REVERSE_PROXY_ADDR}"
+			return c
+		}()},
+		{"envoy-sidecar + ext_authz_addr", func() *Config {
+			c := validEnvoySidecarConfig()
+			c.Listener.ExtAuthzAddr = ":9091"
+			return c
+		}()},
+		{"waypoint + ext_proc_addr", func() *Config {
+			c := validWaypointConfig()
+			c.Listener.ExtProcAddr = ":9090"
+			return c
+		}()},
+		{"waypoint + reverse_proxy_addr", func() *Config {
+			c := validWaypointConfig()
+			c.Listener.ReverseProxyAddr = ":8080"
+			return c
+		}()},
+		{"proxy-sidecar + ext_proc_addr", func() *Config {
+			c := validProxySidecarConfig()
+			c.Listener.ExtProcAddr = ":9090"
+			return c
+		}()},
 	}
-}
-
-func TestValidate_WaypointRejectsExtProc(t *testing.T) {
-	cfg := validWaypointConfig()
-	cfg.Listener.ExtProcAddr = ":9090"
-	if err := Validate(cfg); err == nil {
-		t.Error("expected error for waypoint + ext_proc_addr")
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if err := Validate(tt.cfg); err != nil {
+				t.Errorf("cross-mode field should warn, not error: %v", err)
+			}
+		})
 	}
 }
 

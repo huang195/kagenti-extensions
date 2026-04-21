@@ -162,6 +162,32 @@ Explicit values always take precedence over derived values.
 
 When `client_id_file`, `client_secret_file`, or `jwt_svid_path` are configured, the binary polls for the file to exist (up to 60 seconds) before starting. This handles the startup race with client-registration and spiffe-helper sidecars.
 
+## Logging
+
+AuthBridge uses Go's `slog` structured logger. The log level is configurable at startup and at runtime.
+
+### Set level at startup
+
+Set the `LOG_LEVEL` env var (`debug`, `info`, `warn`, `error`). Default: `info`.
+
+```bash
+# In a deployment
+kubectl set env deployment/weather-service -n team1 -c authbridge-proxy LOG_LEVEL=debug
+
+# Standalone
+LOG_LEVEL=debug authbridge --config /etc/authbridge/config.yaml
+```
+
+### Toggle at runtime (no restart)
+
+Send `SIGUSR1` to toggle between `info` and `debug`:
+
+```bash
+kubectl exec deploy/weather-service -n team1 -c authbridge-proxy -- kill -USR1 1
+```
+
+Send again to toggle back. The current level is logged on each toggle.
+
 ## Architecture
 
 ```

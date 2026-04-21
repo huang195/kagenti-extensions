@@ -38,7 +38,7 @@ type Config struct {
 	Bypass           *bypass.Matcher
 	Router           *routing.Router
 	Identity         IdentityConfig
-	NoTokenPolicy    string // NoTokenClientCredentials, NoTokenAllow, or NoTokenDeny
+	NoTokenPolicy    string           // NoTokenClientCredentials, NoTokenAllow, or NoTokenDeny
 	ActorTokenSource ActorTokenSource // optional, for act claim chaining
 	AudienceDeriver  AudienceDeriver  // optional, derives audience from host (waypoint mode)
 	Logger           *slog.Logger
@@ -104,6 +104,7 @@ func (a *Auth) HandleInbound(ctx context.Context, authHeader, path, audience str
 
 	// 2. Extract bearer token
 	if authHeader == "" {
+		a.log.Debug("inbound denied: no Authorization header", "path", path)
 		return &InboundResult{
 			Action:     ActionDeny,
 			DenyStatus: http.StatusUnauthorized,
@@ -112,6 +113,7 @@ func (a *Auth) HandleInbound(ctx context.Context, authHeader, path, audience str
 	}
 	token := extractBearer(authHeader)
 	if token == "" {
+		a.log.Debug("inbound denied: malformed Authorization header", "path", path)
 		return &InboundResult{
 			Action:     ActionDeny,
 			DenyStatus: http.StatusUnauthorized,
@@ -130,11 +132,17 @@ func (a *Auth) HandleInbound(ctx context.Context, authHeader, path, audience str
 	if audience == "" {
 		audience = a.identity.Load().Audience
 	}
+	a.log.Debug("validating inbound JWT", "path", path, "expectedAudience", audience)
 	claims, err := a.verifier.Verify(ctx, token, audience)
 	if err != nil {
-		// Log full error server-side; return generic message to client
-		// to avoid leaking issuer URL, audience, or algorithm details.
+		// Log full error at Info; log detailed context at Debug.
+		// Generic message returned to client to avoid leaking details.
 		a.log.Info("JWT validation failed", "error", err)
+		a.log.Debug("JWT validation details",
+			"path", path,
+			"expectedAudience", audience,
+			"expectedIssuer", a.identity.Load().Audience,
+			"error", err)
 		return &InboundResult{
 			Action:     ActionDeny,
 			DenyStatus: http.StatusUnauthorized,
@@ -143,7 +151,12 @@ func (a *Auth) HandleInbound(ctx context.Context, authHeader, path, audience str
 	}
 
 	// 4. Allow with claims
-	a.log.Info("inbound authorized", "subject", claims.Subject, "client_id", claims.ClientID, "audience", audience)
+	a.log.Debug("inbound authorized",
+		"path", path,
+		"subject", claims.Subject,
+		"clientID", claims.ClientID,
+		"audience", claims.Audience,
+		"scopes", claims.Scopes)
 	return &InboundResult{Action: ActionAllow, Claims: claims}
 }
 
@@ -157,11 +170,11 @@ func (a *Auth) HandleOutbound(ctx context.Context, authHeader, host string) *Out
 
 	// 2. Passthrough
 	if resolved == nil {
-		a.log.Info("outbound passthrough (no route)", "host", host)
+		a.log.Debug("outbound passthrough: no matching route", "host", host)
 		return &OutboundResult{Action: ActionAllow}
 	}
 	if resolved.Passthrough {
-		a.log.Info("outbound passthrough", "host", host)
+		a.log.Debug("outbound passthrough: route configured as passthrough", "host", host)
 		return &OutboundResult{Action: ActionAllow}
 	}
 
@@ -172,27 +185,35 @@ func (a *Auth) HandleOutbound(ctx context.Context, authHeader, host string) *Out
 	// If no audience from route and deriver is set, derive from host (waypoint pattern)
 	if audience == "" && a.audienceDeriver != nil {
 		audience = a.audienceDeriver(host)
+		a.log.Debug("audience derived from host", "host", host, "audience", audience)
 	}
+
+	a.log.Debug("outbound exchange requested",
+		"host", host, "audience", audience, "scopes", scopes,
+		"hasSubjectToken", authHeader != "")
 
 	// 4. Extract bearer token
 	subjectToken := extractBearer(authHeader)
 
 	if subjectToken == "" {
 		// No token — apply no-token policy
+		a.log.Debug("no subject token, applying no-token policy",
+			"policy", a.noTokenPolicy, "host", host, "audience", audience)
 		return a.handleNoToken(ctx, audience, scopes)
 	}
 
 	// 5. Cache check
 	if a.cache != nil {
 		if cached, ok := a.cache.Get(subjectToken, audience); ok {
-			a.log.Debug("cache hit", "host", host, "audience", audience)
+			a.log.Debug("outbound cache hit", "host", host, "audience", audience)
 			return &OutboundResult{Action: ActionReplaceToken, Token: cached}
 		}
 	}
 
 	// 6. Token exchange
 	if a.exchanger == nil {
-		a.log.Warn("exchanger not configured, passing through")
+		a.log.Warn("exchanger not configured, passing through",
+			"host", host, "audience", audience)
 		return &OutboundResult{Action: ActionAllow}
 	}
 
@@ -202,7 +223,8 @@ func (a *Auth) HandleOutbound(ctx context.Context, authHeader, host string) *Out
 		var err error
 		actorToken, err = a.actorTokenSource(ctx)
 		if err != nil {
-			a.log.Warn("failed to obtain actor token, proceeding without", "error", err)
+			a.log.Warn("failed to obtain actor token, proceeding without",
+				"error", err, "host", host)
 		}
 	}
 
@@ -215,6 +237,13 @@ func (a *Auth) HandleOutbound(ctx context.Context, authHeader, host string) *Out
 	})
 	if err != nil {
 		a.log.Info("token exchange failed", "host", host, "error", err)
+		a.log.Debug("token exchange failure details",
+			"host", host,
+			"audience", audience,
+			"scopes", scopes,
+			"hasActorToken", actorToken != "",
+			"tokenEndpoint", resolved.TokenEndpoint,
+			"error", err)
 		return &OutboundResult{
 			Action:     ActionDeny,
 			DenyStatus: http.StatusServiceUnavailable,
@@ -228,7 +257,8 @@ func (a *Auth) HandleOutbound(ctx context.Context, authHeader, host string) *Out
 			time.Duration(resp.ExpiresIn)*time.Second)
 	}
 
-	a.log.Info("outbound token exchanged", "host", host, "audience", audience)
+	a.log.Debug("outbound token exchanged",
+		"host", host, "audience", audience, "expiresIn", resp.ExpiresIn)
 	return &OutboundResult{Action: ActionReplaceToken, Token: resp.AccessToken}
 }
 
@@ -240,16 +270,21 @@ func (a *Auth) handleNoToken(ctx context.Context, audience, scopes string) *Outb
 
 	case NoTokenPolicyClientCredentials:
 		if a.exchanger == nil {
+			a.log.Debug("no token, client_credentials requested but exchanger not configured",
+				"audience", audience)
 			return &OutboundResult{
 				Action:     ActionDeny,
 				DenyStatus: http.StatusServiceUnavailable,
 				DenyReason: "exchanger not configured for client credentials",
 			}
 		}
-		a.log.Debug("no token, falling back to client_credentials")
+		a.log.Debug("no token, falling back to client_credentials",
+			"audience", audience, "scopes", scopes)
 		resp, err := a.exchanger.ClientCredentials(ctx, audience, scopes)
 		if err != nil {
 			a.log.Info("client credentials grant failed", "error", err)
+			a.log.Debug("client credentials failure details",
+				"audience", audience, "scopes", scopes, "error", err)
 			return &OutboundResult{
 				Action:     ActionDeny,
 				DenyStatus: http.StatusServiceUnavailable,
@@ -259,6 +294,8 @@ func (a *Auth) handleNoToken(ctx context.Context, audience, scopes string) *Outb
 		return &OutboundResult{Action: ActionReplaceToken, Token: resp.AccessToken}
 
 	default: // NoTokenDeny or unknown
+		a.log.Debug("no token, policy denies request",
+			"policy", a.noTokenPolicy, "audience", audience)
 		return &OutboundResult{
 			Action:     ActionDeny,
 			DenyStatus: http.StatusUnauthorized,

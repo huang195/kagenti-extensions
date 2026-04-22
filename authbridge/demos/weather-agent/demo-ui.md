@@ -496,13 +496,17 @@ exit
 Check the authbridge logs to confirm inbound validation is working:
 
 ```bash
+# For envoy-sidecar mode:
 kubectl logs deployment/weather-service -n team1 -c envoy-proxy 2>&1 | grep "inbound authorized"
+
+# For proxy-sidecar mode:
+kubectl logs deployment/weather-service -n team1 -c authbridge-proxy 2>&1 | grep "inbound authorized"
 ```
 
 Expected:
 
 ```
-level=INFO msg="inbound authorized" subject=... client_id=... audience=spiffe://localtest.me/ns/team1/sa/weather-service
+level=INFO msg="inbound authorized" subject=... clientID=kagenti
 ```
 
 > **Tip:** For detailed debug logs (audience, scopes, request path), enable debug

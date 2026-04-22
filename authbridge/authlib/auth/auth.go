@@ -151,10 +151,10 @@ func (a *Auth) HandleInbound(ctx context.Context, authHeader, path, audience str
 	}
 
 	// 4. Allow with claims
-	a.log.Debug("inbound authorized",
+	a.log.Info("inbound authorized",
+		"subject", claims.Subject, "clientID", claims.ClientID)
+	a.log.Debug("inbound authorized details",
 		"path", path,
-		"subject", claims.Subject,
-		"clientID", claims.ClientID,
 		"audience", claims.Audience,
 		"scopes", claims.Scopes)
 	return &InboundResult{Action: ActionAllow, Claims: claims}
@@ -170,11 +170,11 @@ func (a *Auth) HandleOutbound(ctx context.Context, authHeader, host string) *Out
 
 	// 2. Passthrough
 	if resolved == nil {
-		a.log.Debug("outbound passthrough: no matching route", "host", host)
+		a.log.Info("outbound passthrough", "host", host, "reason", "no matching route")
 		return &OutboundResult{Action: ActionAllow}
 	}
 	if resolved.Passthrough {
-		a.log.Debug("outbound passthrough: route configured as passthrough", "host", host)
+		a.log.Info("outbound passthrough", "host", host, "reason", "route action")
 		return &OutboundResult{Action: ActionAllow}
 	}
 
@@ -257,7 +257,8 @@ func (a *Auth) HandleOutbound(ctx context.Context, authHeader, host string) *Out
 			time.Duration(resp.ExpiresIn)*time.Second)
 	}
 
-	a.log.Debug("outbound token exchanged",
+	a.log.Info("outbound token exchanged", "host", host, "audience", audience)
+	a.log.Debug("outbound exchange details",
 		"host", host, "audience", audience, "expiresIn", resp.ExpiresIn)
 	return &OutboundResult{Action: ActionReplaceToken, Token: resp.AccessToken}
 }

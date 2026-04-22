@@ -691,12 +691,13 @@ At DEBUG level, every auth decision logs full context:
 - **Bypass**: which paths were skipped
 - **Cache**: hit/miss for token exchange results
 
-Example:
+Example (Info lines are always visible; Debug lines appear after SIGUSR1 toggle):
 
 ```
 level=DEBUG msg="validating inbound JWT" path=/ expectedAudience=spiffe://localtest.me/ns/team1/sa/weather-service
-level=DEBUG msg="inbound authorized" path=/ subject=... clientID=kagenti audience="[spiffe://...]" scopes="[openid ...]"
-level=DEBUG msg="outbound passthrough: no matching route" host=weather-tool-mcp.team1.svc.cluster.local:8000
+level=INFO  msg="inbound authorized" subject=... clientID=kagenti
+level=DEBUG msg="inbound authorized details" path=/ audience="[spiffe://...]" scopes="[openid ...]"
+level=INFO  msg="outbound passthrough" host=weather-tool-mcp.team1.svc.cluster.local:8000 reason="no matching route"
 ```
 
 ---

@@ -98,7 +98,7 @@ The Kagenti installer creates everything this demo needs in the target namespace
 
 - **`kagenti` realm** in Keycloak
 - **`keycloak-admin-secret`** Secret (Keycloak admin credentials)
-- **`authbridge-config`**, **`spiffe-helper-config`**, **`envoy-config`** ConfigMaps
+- **`authbridge-config`**, **`authbridge-runtime-config`**, **`spiffe-helper-config`**, **`envoy-config`** ConfigMaps
 
 No additional Keycloak configuration, Secrets, or ConfigMaps are required for
 this demo. The weather agent uses outbound passthrough (no token exchange), and
@@ -491,20 +491,26 @@ Exit the pod when done:
 exit
 ```
 
-### 6e. Verify AuthProxy Logs (Inbound)
+### 6e. Verify AuthBridge Logs (Inbound)
 
-Check the ext_proc logs to confirm inbound validation is working:
+Check the authbridge logs to confirm inbound validation is working:
 
 ```bash
-kubectl logs deployment/weather-service -n team1 -c envoy-proxy 2>&1 | grep "\[Inbound\]"
+# For envoy-sidecar mode:
+kubectl logs deployment/weather-service -n team1 -c envoy-proxy 2>&1 | grep "inbound authorized"
+
+# For proxy-sidecar mode:
+kubectl logs deployment/weather-service -n team1 -c authbridge-proxy 2>&1 | grep "inbound authorized"
 ```
 
 Expected:
 
 ```
-[Inbound] Token validated - issuer: http://keycloak.localtest.me:8080/realms/kagenti, audience: [spiffe://localtest.me/ns/team1/sa/weather-service ...]
-[Inbound] JWT validation succeeded, forwarding request
+level=INFO msg="inbound authorized" subject=... clientID=kagenti
 ```
+
+> **Tip:** For detailed debug logs (audience, scopes, request path), enable debug
+> logging — see [Debug Logging](#debug-logging) below.
 
 ### Clean Up Test Client
 
@@ -592,6 +598,106 @@ kubectl logs deployment/weather-service -n team1 -c kagenti-client-registration
 kubectl logs deployment/weather-service -n team1 -c spiffe-helper
 kubectl logs deployment/weather-service -n team1 -c envoy-proxy
 kubectl logs deployment/weather-service -n team1 -c agent
+```
+
+---
+
+## Proxy-Sidecar Mode
+
+By default, the weather agent deploys in **envoy-sidecar mode** (Envoy + iptables).
+You can switch to **proxy-sidecar mode** which uses a lightweight reverse/forward
+proxy (29 MB image, no Envoy, no iptables).
+
+### Deploy in proxy-sidecar mode
+
+Add the mode annotation to the deployment:
+
+```bash
+kubectl patch deployment weather-service -n team1 --type=merge \
+  -p '{"spec":{"template":{"metadata":{"annotations":{"kagenti.io/authbridge-mode":"proxy-sidecar"}}}}}'
+kubectl rollout status deployment weather-service -n team1 --timeout=120s
+```
+
+### Verify proxy-sidecar mode
+
+```bash
+# Containers: agent, authbridge-proxy, spiffe-helper, kagenti-client-registration
+# No envoy-proxy or proxy-init
+kubectl get pod -n team1 -l app.kubernetes.io/name=weather-service \
+  -o jsonpath='{range .spec.containers[*]}{.name}{"\n"}{end}'
+
+# AuthBridge should show mode=proxy-sidecar
+kubectl logs deployment/weather-service -n team1 -c authbridge-proxy --tail=5
+```
+
+### Switch back to envoy-sidecar mode
+
+Remove the annotation (envoy-sidecar is the default):
+
+```bash
+kubectl patch deployment weather-service -n team1 --type=json \
+  -p '[{"op":"remove","path":"/spec/template/metadata/annotations/kagenti.io~1authbridge-mode"}]'
+kubectl rollout status deployment weather-service -n team1 --timeout=120s
+```
+
+### Key differences
+
+| | envoy-sidecar (default) | proxy-sidecar |
+|---|---|---|
+| Image | `authbridge-envoy` (140 MB) | `authbridge-light` (29 MB) |
+| Traffic interception | iptables + Envoy | HTTP_PROXY env vars |
+| Init container | proxy-init (NET_ADMIN) | None |
+| Container name | `envoy-proxy` | `authbridge-proxy` |
+| Ollama port exclusion | Required (annotation) | Not needed |
+
+> **Note:** Proxy-sidecar mode requires the agent to read the `PORT` env var.
+> All agents in [kagenti/agent-examples](https://github.com/kagenti/agent-examples)
+> support this since v0.1.0-alpha.11.
+
+---
+
+## Debug Logging
+
+AuthBridge supports dynamic log-level switching for debugging auth failures
+without redeploying.
+
+### Toggle debug logging at runtime
+
+Send `SIGUSR1` to the authbridge process using an ephemeral debug container:
+
+```bash
+POD=$(kubectl get pod -n team1 -l app.kubernetes.io/name=weather-service \
+  --no-headers | grep Running | head -1 | awk '{print $1}')
+
+# For envoy-sidecar mode:
+kubectl debug -n team1 "$POD" \
+  --image=ghcr.io/kagenti/kagenti-extensions/proxy-init:latest \
+  --target=envoy-proxy -- kill -USR1 1
+
+# For proxy-sidecar mode:
+kubectl debug -n team1 "$POD" \
+  --image=ghcr.io/kagenti/kagenti-extensions/proxy-init:latest \
+  --target=authbridge-proxy -- kill -USR1 1
+```
+
+Send `SIGUSR1` again to toggle back to INFO level.
+
+### What debug logs show
+
+At DEBUG level, every auth decision logs full context:
+
+- **Inbound**: request path, expected audience, token audience, scopes, subject
+- **Outbound**: target host, audience, scopes, exchange success/failure details
+- **Bypass**: which paths were skipped
+- **Cache**: hit/miss for token exchange results
+
+Example (Info lines are always visible; Debug lines appear after SIGUSR1 toggle):
+
+```
+level=DEBUG msg="validating inbound JWT" path=/ expectedAudience=spiffe://localtest.me/ns/team1/sa/weather-service
+level=INFO  msg="inbound authorized" subject=... clientID=kagenti
+level=DEBUG msg="inbound authorized details" path=/ audience="[spiffe://...]" scopes="[openid ...]"
+level=INFO  msg="outbound passthrough" host=weather-tool-mcp.team1.svc.cluster.local:8000 reason="no matching route"
 ```
 
 ---

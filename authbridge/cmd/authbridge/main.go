@@ -21,6 +21,7 @@ import (
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/health"
 	healthpb "google.golang.org/grpc/health/grpc_health_v1"
+	"google.golang.org/grpc/reflection"
 
 	"github.com/kagenti/kagenti-extensions/authbridge/authlib/auth"
 	"github.com/kagenti/kagenti-extensions/authbridge/authlib/config"
@@ -175,6 +176,7 @@ func startGRPCExtProc(handler *auth.Auth, addr string) *grpc.Server {
 	srv := grpc.NewServer()
 	extprocv3.RegisterExternalProcessorServer(srv, &extproc.Server{Auth: handler})
 	registerHealth(srv)
+	reflection.Register(srv)
 
 	go func() {
 		lis, err := net.Listen("tcp", addr)

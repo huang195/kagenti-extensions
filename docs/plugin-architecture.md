@@ -88,7 +88,7 @@ type Context struct {
     Body      []byte          // nil unless plugin declared body_access: true
 
     // Identity — what makes AuthBridge plugins unique
-    Agent     *AgentIdentity  // this agent's own identity (SPIFFE ID, client_id)
+    Agent     *AgentIdentity  // this agent's own identity (workload identity + client_id)
     Claims    *Claims         // caller's validated JWT claims (nil before jwt-validation runs)
     Route     *ResolvedRoute  // resolved routing decision (audience, scopes, passthrough)
 
@@ -97,10 +97,10 @@ type Context struct {
 }
 ```
 
-**`Agent`** carries the agent's own identity — its SPIFFE ID or OAuth
-client_id. This is always populated (from `auth.IdentityConfig`), even
-before any plugin runs. Plugins can make decisions based on *who this agent
-is*, not just who is calling it.
+**`Agent`** carries the agent's own workload identity. This is always
+populated (from `auth.IdentityConfig`), even before any plugin runs.
+Plugins can make decisions based on *who this agent is*, not just who is
+calling it.
 
 **`Claims`** contains the caller's validated JWT claims (subject, issuer,
 audience, client_id, scopes) and is nil until the `jwt-validation` plugin
@@ -123,18 +123,24 @@ envelope, and sets `ctx.Values["mcp.tool_name"]` for downstream plugins.
 
 ```go
 type AgentIdentity struct {
-    ClientID string // OAuth client_id
-    SPIFFEID string // SPIFFE ID (e.g., spiffe://cluster.local/ns/team1/sa/weather-agent)
+    ClientID    string // OAuth client_id
+    WorkloadID  string // workload identity URI (SPIFFE, k8s SA, platform-specific)
+    TrustDomain string // trust domain of the workload identity
 }
 ```
 
-This dual identity is what makes AuthBridge plugins fundamentally different
-from generic proxy extensions. A guardrails plugin can allow tool X for
-internal callers (same SPIFFE trust domain) but block it for external
-callers. An audit plugin can correlate every request with the agent's
-workload identity. No Envoy filter or Nginx module has access to both the
-caller's JWT identity *and* the agent's workload identity in a single
-context.
+The identity type is deliberately abstract — it works with SPIFFE, plain
+Kubernetes service accounts, or any platform-specific workload identity
+scheme. AuthBridge supports multiple identity backends (`identity.type` in
+config: `spiffe`, `client-secret`, `k8s-sa`), and the plugin context
+normalizes them into one struct.
+
+This is what makes AuthBridge plugins fundamentally different from generic
+proxy extensions. A guardrails plugin can allow tool X for internal callers
+(same trust domain) but block it for external callers. An audit plugin can
+correlate every request with the agent's workload identity. No proxy
+extension has access to both the caller's JWT identity *and* the agent's
+workload identity in a single context.
 
 ### Action
 
@@ -189,22 +195,6 @@ func (p *Pipeline) RunResponse(ctx *Context) Action {
     return Action{Type: Continue}
 }
 ```
-
-### Observability by Default
-
-The pipeline wraps every plugin invocation automatically — individual
-plugins do not implement observability themselves:
-
-- **Structured logging**: each plugin invocation emits `plugin_name`,
-  `action`, `duration_ms`, and `direction` at Debug level
-- **OpenTelemetry spans**: `authbridge.plugin.<name>` span per invocation,
-  with `agent.spiffe_id` and `caller.subject` attributes
-- **Metrics**: `authbridge_plugin_duration_seconds{plugin,direction,action}`
-  histogram, broken down by agent identity
-
-For AI workloads this matters: when a guardrails plugin adds 200ms to
-every tool call for a specific agent, the metrics surface it immediately.
-Plugin authors get observability for free.
 
 ## Pipeline Configuration
 
@@ -384,7 +374,7 @@ pipeline:
           - tool: "execute_sql"
             require_scope: "sql:write"
           - tool: "read_file"
-            deny_spiffe_pattern: "spiffe://external.example.com/*"
+            deny_trust_domain: "external.example.com"
           - tool: "*"
             allow: all
 ```
@@ -392,7 +382,7 @@ pipeline:
 The `tool-policy` plugin:
 1. Reads `ctx.Values["mcp.tool_name"]` (set by `mcp-parser`)
 2. Reads `ctx.Claims.Scopes` (set by `jwt-validation`)
-3. Reads `ctx.Agent.SPIFFEID` (always available)
+3. Reads `ctx.Agent.TrustDomain` (always available)
 4. Matches against rules and returns `Continue` or `Reject`
 
 This is a three-layer composition — identity, protocol, policy — where
@@ -400,35 +390,47 @@ each layer is an independent plugin that communicates through `ctx`. No
 plugin needs to understand the others. The same pattern works for A2A
 task-level authorization.
 
-## Praxis Alignment
+## Praxis as Envoy Replacement
+
+AuthBridge currently depends on Envoy for traffic interception in two of its
+three modes (envoy-sidecar via ext_proc, waypoint via ext_authz). This
+creates constraints: body access requires Envoy-specific configuration,
+ext_authz cannot forward body data at all, and AI protocol awareness
+(MCP, A2A) must be implemented entirely inside AuthBridge because Envoy
+has no concept of agent protocols.
 
 [Praxis](https://github.com/praxis-proxy/praxis) is a security-first proxy
-framework for AI workloads with a plugin model that shares design goals with
-this proposal:
+framework designed for AI workloads. It is building native support for the
+protocols AuthBridge cares about:
 
-- **Plugin-first architecture** — everything is a plugin, same trait for
-  built-in and custom ([architecture](https://github.com/praxis-proxy/praxis/blob/main/docs/architecture.md))
-- **Body access modes** — Stream, Buffer, StreamBuffer with per-plugin
-  declaration ([filters](https://github.com/praxis-proxy/praxis/blob/main/docs/filters.md))
-- **Composable plugin chains** — named chains referenced by listeners
-- **Tighten-only policy hooks** — plugins can strengthen but never weaken
-  security ([#63](https://github.com/praxis-proxy/praxis/issues/63))
-
-Praxis is also building AI-specific capabilities relevant to AuthBridge:
 - [MCP Protocol Support](https://github.com/praxis-proxy/praxis/issues/25)
 - [A2A Protocol Support](https://github.com/praxis-proxy/praxis/issues/26)
 - [Agent Sessions](https://github.com/praxis-proxy/praxis/issues/27)
 
-### Integration Models
+If Praxis replaces Envoy as the traffic interception layer, AuthBridge
+benefits indirectly:
 
-| Model | How it works | Tradeoff |
-|-------|-------------|----------|
-| **A: Side-by-side** | Praxis handles protocol parsing (MCP/A2A), AuthBridge handles identity/exchange. Coordinated via shared headers or a sidecar API. | Least coupling. Each project evolves independently. Duplicated pipeline infrastructure. |
-| **B: AuthBridge plugins as Praxis plugins** | AuthBridge's jwt-validation and token-exchange become Praxis filter implementations. AuthBridge ships as a Praxis plugin bundle. | Maximum reuse of Praxis infrastructure. AuthBridge loses control of its pipeline. |
-| **C: Praxis as listener layer** | Praxis handles traffic interception and protocol parsing. AuthBridge's pipeline runs inside Praxis as a composite plugin. | Clean separation: Praxis owns the network, AuthBridge owns identity. Requires Praxis to support nested plugin chains. |
+- **Body access becomes universal** — no more ext_proc `BUFFERED` mode
+  configuration or ext_authz header-only limitation. Praxis gives full
+  body access natively.
+- **Protocol parsing moves to the proxy** — Praxis plugins for MCP/A2A
+  parsing run at the proxy level, so AuthBridge receives pre-parsed
+  protocol metadata instead of raw bytes. The `mcp-parser` plugin in this
+  proposal becomes unnecessary; `ctx.Values["mcp.tool_name"]` arrives
+  already populated.
+- **Simpler adapter layer** — instead of three adapters (ext_proc, ext_authz,
+  HTTP proxy), AuthBridge needs one adapter for Praxis's extension API.
+- **Tighten-only at the proxy** — Praxis shares the tighten-only principle
+  ([#63](https://github.com/praxis-proxy/praxis/issues/63)), so the
+  security model composes naturally.
 
-**Recommendation**: Model A for Phase 1 (zero coupling, ship independently).
-Evaluate Model C for Phase 3 when both projects have stable plugin APIs.
+AuthBridge's role in a Praxis world narrows to what it does best: identity,
+JWT validation, token exchange, and identity-aware policy. The proxy
+infrastructure, protocol parsing, and traffic interception move to Praxis.
+
+This is a Phase 3 consideration. The plugin architecture proposed here is
+designed to work with or without Praxis — the adapter layer abstracts the
+interception mechanism, and plugins are mode-agnostic by design.
 
 ## Migration Path
 
@@ -531,11 +533,10 @@ func (a *AuditReject) OnResponse(ctx *pipeline.Context) pipeline.Action {
 
 - **Phase 1**: Plugin interface, pipeline runner, config-based ordering,
   registry loading. Refactor jwt-validation and token-exchange as built-in
-  plugins. Compiled-in only. Tighten-only enforcement. Observability
-  instrumentation.
+  plugins. Compiled-in only. Tighten-only enforcement.
 - **Phase 2**: Body access with configurable buffering. Protocol parser
   plugin (MCP/A2A). Tool-level authorization. Enable guardrails and PII
   redaction use cases. Auto-configure ext_proc body mode via operator.
-- **Phase 3**: Evaluate Praxis integration (Model C). Evaluate WASM or
+- **Phase 3**: Evaluate Praxis as Envoy replacement. Evaluate WASM or
   sidecar loading for non-compiled extensibility. Multi-turn session
   context.

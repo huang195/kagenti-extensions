@@ -254,6 +254,9 @@ verifies **end-to-end** without relying on an LLM:
    often returns **406** even when AuthBridge already accepted the JWT). **HTTP
    401 is a hard failure**; a **2xx** response means the JWT was accepted and
    the initialize handshake completed.
+4. The same `initialize` request **without** an `Authorization` header must
+   return **401** (AuthBridge rejects the call before the MCP app runs).
+   `deploy_and_verify_advanced.sh` checks this as a negative test.
 
 Run from anywhere:
 

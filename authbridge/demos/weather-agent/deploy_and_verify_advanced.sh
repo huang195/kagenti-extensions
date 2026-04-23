@@ -207,6 +207,19 @@ if ! [[ \${HTTP_CODE} =~ ^2[0-9][0-9]\$ ]]; then
   head -c 2000 /tmp/mcp.body >&2 || true
   exit 1
 fi
+
+echo "POST /mcp without Authorization (expect 401 from AuthBridge)..."
+NEG_CODE=\$(curl -sS -o /tmp/mcp.neg -w '%{http_code}' \\
+  -H "Content-Type: application/json" \\
+  -H "Accept: application/json, text/event-stream" \\
+  -X POST "http://weather-tool-advanced-mcp:8000/mcp" \\
+  -d '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"verify-neg","version":"0.1"}}}')
+echo "MCP_NEG_HTTP_CODE=\${NEG_CODE}"
+if test "\$NEG_CODE" != "401"; then
+  echo "expected HTTP 401 without bearer token, got \${NEG_CODE}" >&2
+  head -c 2000 /tmp/mcp.neg >&2 || true
+  exit 1
+fi
 VERIFYEOS
 )
 
@@ -224,6 +237,13 @@ if ! [[ "$HTTP_CODE" =~ ^2[0-9][0-9]$ ]]; then
   die "MCP returned HTTP $HTTP_CODE — expected 2xx after initialize (401=auth, 406=missing Accept: application/json, text/event-stream)"
 fi
 log "MCP HTTP status: ${HTTP_CODE} (2xx: JWT accepted at ingress and streamable HTTP handshake OK)"
+
+grep -q 'MCP_NEG_HTTP_CODE=' /tmp/adv-verify.out || die "verify pod produced no MCP_NEG_HTTP_CODE line"
+NEG_HTTP_CODE=$(grep 'MCP_NEG_HTTP_CODE=' /tmp/adv-verify.out | tail -1 | cut -d= -f2)
+if [[ "$NEG_HTTP_CODE" != "401" ]]; then
+  die "negative check: without Authorization, expected HTTP 401 from tool ingress, got $NEG_HTTP_CODE"
+fi
+log "Negative check: unauthenticated MCP request returned 401 (expected)"
 
 log "Checking tool AuthBridge logs for successful inbound validation..."
 sleep 3

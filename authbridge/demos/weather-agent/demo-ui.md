@@ -9,7 +9,9 @@ This is the recommended **getting-started** demo for AuthBridge. It demonstrates
 inbound JWT validation and automatic identity registration with a simple agent
 that doesn't require token exchange. For a more advanced demo showing outbound
 token exchange and scope-based access control, see the
-[GitHub Issue Agent demo](../github-issue/demo.md).
+[GitHub Issue Agent demo](../github-issue/demo.md). For the same weather images
+with **token exchange and AuthBridge on the tool** (plus a CI-style verify script),
+see [Weather Agent — Advanced](demo-ui-advanced.md).
 
 ## What This Demo Shows
 

@@ -13,6 +13,7 @@ more AuthBridge capabilities.
 | Demo | Difficulty | What It Shows | Deployment |
 |------|:----------:|---------------|:----------:|
 | **[Weather Agent](weather-agent/demo-ui.md)** | Beginner | Inbound JWT validation, automatic identity registration, outbound passthrough | UI |
+| **[Weather Agent (advanced)](weather-agent/demo-ui-advanced.md)** | Intermediate | Inbound on agent **and** tool, outbound token exchange, ingress JWT verification on the tool | [kubectl + script](weather-agent/demo-ui-advanced.md#automated-deploy-and-verify-ci-oriented) |
 | **[GitHub Issue Agent](github-issue/demo.md)** | Intermediate | Inbound validation + outbound token exchange + scope-based access control | [UI](github-issue/demo-ui.md) or [Manual](github-issue/demo-manual.md) |
 | **[Webhook](webhook/README.md)** | Intermediate | Webhook-based sidecar injection with auth-target demo app | Manual |
 | **[Single Target](single-target/demo.md)** | Advanced | Manual AuthBridge deployment (no webhook) with SPIFFE identity | Manual |
@@ -44,6 +45,14 @@ more AuthBridge capabilities.
 - Automatic SPIFFE identity registration with Keycloak
 - Default outbound passthrough — agents work out-of-the-box with any tool or LLM
 - CLI testing: public endpoints, token rejection, valid token
+
+### Weather Agent (Advanced)
+- Same images as the beginner demo, separate **`*-advanced`** Deployments so the
+  getting-started flow stays untouched
+- Outbound **token exchange** to the tool SPIFFE audience (`authproxy-routes`)
+- AuthBridge **injected on the MCP tool** — JWT checks at Envoy before the tool process
+- `deploy_and_verify_advanced.sh` for reproducible CI-style verification (Keycloak
+  exchange + MCP `initialize` without requiring a working LLM)
 
 ### GitHub Issue Agent (Full AuthBridge Flow)
 - Deploy agent + tool via **Kagenti UI** or **kubectl**

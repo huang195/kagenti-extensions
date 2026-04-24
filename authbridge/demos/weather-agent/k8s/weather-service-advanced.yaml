@@ -21,6 +21,8 @@ metadata:
   labels:
     app.kubernetes.io/name: weather-service-advanced
 spec:
+  # Match tool deployment: slow Kind rollouts can hit the 600s default.
+  progressDeadlineSeconds: 1800
   replicas: 1
   selector:
     matchLabels:

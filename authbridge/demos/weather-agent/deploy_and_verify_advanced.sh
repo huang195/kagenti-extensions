@@ -15,9 +15,10 @@
 #   SKIP_DEPLOY=1 ./deploy_and_verify_advanced.sh    # verify only (resources must exist)
 #
 # Timeouts (optional, for slow clusters / GitHub Kind: image pull + many sidecars):
-#   WEATHER_TOOL_ROLLOUT_TIMEOUT  kubectl rollout status for the tool (default: 900s)
-#   WEATHER_AGENT_ROLLOUT_TIMEOUT kubectl rollout status for the agent (default: 600s)
-#   WEATHER_TOOL_KC_CLIENT_SEC    setup_keycloak --tool-client-timeout, seconds (default: 600)
+#   WEATHER_TOOL_ROLLOUT_TIMEOUT  kubectl rollout status for the tool (default: 1800s;
+#                                 should be >= spec.progressDeadlineSeconds in the YAML)
+#   WEATHER_AGENT_ROLLOUT_TIMEOUT kubectl rollout status for the agent (default: 1800s)
+#   WEATHER_TOOL_KC_CLIENT_SEC    setup_keycloak --tool-client-timeout, seconds (default: 900)
 #
 set -euo pipefail
 
@@ -37,11 +38,11 @@ KC_REALM="${KC_REALM:-kagenti}"
 KC_USER_CLIENT_ID="${KC_USER_CLIENT_ID:-weather-advanced-e2e}"
 # For confidential "kagenti" UI client, set KC_USER_CLIENT_SECRET in the environment.
 #
-# Rollout: defaults are higher than 5m so Kind CI (cold ghcr.io pulls + 4+ containers) does
-# not fail on kubectl rollout status. Override when testing on fast clusters.
-WEATHER_TOOL_ROLLOUT_TIMEOUT="${WEATHER_TOOL_ROLLOUT_TIMEOUT:-900s}"
-WEATHER_AGENT_ROLLOUT_TIMEOUT="${WEATHER_AGENT_ROLLOUT_TIMEOUT:-600s}"
-WEATHER_TOOL_KC_CLIENT_SEC="${WEATHER_TOOL_KC_CLIENT_SEC:-600}"
+# Rollout: align with spec.progressDeadlineSeconds: 1800 on the tool/agent Deployments (Kind
+# can exceed 600s default) and with kubectl --timeout below.
+WEATHER_TOOL_ROLLOUT_TIMEOUT="${WEATHER_TOOL_ROLLOUT_TIMEOUT:-1800s}"
+WEATHER_AGENT_ROLLOUT_TIMEOUT="${WEATHER_AGENT_ROLLOUT_TIMEOUT:-1800s}"
+WEATHER_TOOL_KC_CLIENT_SEC="${WEATHER_TOOL_KC_CLIENT_SEC:-900}"
 
 log() { printf '%s\n' "$*"; }
 die() { printf 'ERROR: %s\n' "$*" >&2; exit 1; }

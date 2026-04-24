@@ -14,6 +14,11 @@
 #   NAMESPACE=team1 ./deploy_and_verify_advanced.sh
 #   SKIP_DEPLOY=1 ./deploy_and_verify_advanced.sh    # verify only (resources must exist)
 #
+# Timeouts (optional, for slow clusters / GitHub Kind: image pull + many sidecars):
+#   WEATHER_TOOL_ROLLOUT_TIMEOUT  kubectl rollout status for the tool (default: 900s)
+#   WEATHER_AGENT_ROLLOUT_TIMEOUT kubectl rollout status for the agent (default: 600s)
+#   WEATHER_TOOL_KC_CLIENT_SEC    setup_keycloak --tool-client-timeout, seconds (default: 600)
+#
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -31,6 +36,12 @@ KC_REALM="${KC_REALM:-kagenti}"
 # client often has direct access grants disabled).
 KC_USER_CLIENT_ID="${KC_USER_CLIENT_ID:-weather-advanced-e2e}"
 # For confidential "kagenti" UI client, set KC_USER_CLIENT_SECRET in the environment.
+#
+# Rollout: defaults are higher than 5m so Kind CI (cold ghcr.io pulls + 4+ containers) does
+# not fail on kubectl rollout status. Override when testing on fast clusters.
+WEATHER_TOOL_ROLLOUT_TIMEOUT="${WEATHER_TOOL_ROLLOUT_TIMEOUT:-900s}"
+WEATHER_AGENT_ROLLOUT_TIMEOUT="${WEATHER_AGENT_ROLLOUT_TIMEOUT:-600s}"
+WEATHER_TOOL_KC_CLIENT_SEC="${WEATHER_TOOL_KC_CLIENT_SEC:-600}"
 
 log() { printf '%s\n' "$*"; }
 die() { printf 'ERROR: %s\n' "$*" >&2; exit 1; }
@@ -55,7 +66,7 @@ if [[ "$SKIP_DEPLOY" != "1" ]]; then
   else
     log "WARNING: agentruntimes.agent.kagenti.dev CRD not found — sidecars may not inject."
   fi
-  kubectl rollout status "deployment/weather-tool-advanced" -n "$NAMESPACE" --timeout=300s
+  kubectl rollout status "deployment/weather-tool-advanced" -n "$NAMESPACE" --timeout="$WEATHER_TOOL_ROLLOUT_TIMEOUT"
 
   log "Running Keycloak setup (wait for tool client + enable token exchange)..."
   (
@@ -71,7 +82,7 @@ if [[ "$SKIP_DEPLOY" != "1" ]]; then
       -a "$AGENT_SA" \
       -t "$TOOL_SA" \
       --wait-tool-client \
-      --tool-client-timeout 300
+      --tool-client-timeout "$WEATHER_TOOL_KC_CLIENT_SEC"
   )
 
   log "Deploying weather agent (advanced)..."
@@ -80,7 +91,7 @@ if [[ "$SKIP_DEPLOY" != "1" ]]; then
     kubectl apply -f "$SCRIPT_DIR/k8s/agentruntime-weather-service-advanced.yaml"
     kubectl rollout restart "deployment/weather-service-advanced" -n "$NAMESPACE"
   fi
-  kubectl rollout status "deployment/weather-service-advanced" -n "$NAMESPACE" --timeout=420s
+  kubectl rollout status "deployment/weather-service-advanced" -n "$NAMESPACE" --timeout="$WEATHER_AGENT_ROLLOUT_TIMEOUT"
 
   log "Re-running Keycloak setup so the agent client receives optional exchange scopes..."
   (

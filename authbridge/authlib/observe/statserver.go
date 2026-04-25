@@ -47,15 +47,7 @@ func handleConfigFactory(cfg *config.Config) func(http.ResponseWriter, *http.Req
 		w.Header().Set("Content-Type", "application/json")
 		// Rather than outputting the entire config,
 		// customize the output to redact the client secret.
-		json.NewEncoder(w).Encode(struct {
-			Mode     string                `json:"host"`
-			Inbound  config.InboundConfig  `yaml:"inbound"`
-			Outbound config.OutboundConfig `yaml:"outbound"`
-			Identity config.IdentityConfig `yaml:"identity"`
-			Listener config.ListenerConfig `yaml:"listener"`
-			Bypass   config.BypassConfig   `yaml:"bypass"`
-			Routes   config.RoutesConfig   `yaml:"routes"`
-		}{
+		json.NewEncoder(w).Encode(config.Config{
 			Mode:     cfg.Mode,
 			Inbound:  cfg.Inbound,
 			Outbound: cfg.Outbound,
@@ -72,6 +64,7 @@ func handleConfigFactory(cfg *config.Config) func(http.ResponseWriter, *http.Req
 			Listener: cfg.Listener,
 			Bypass:   cfg.Bypass,
 			Routes:   cfg.Routes,
+			Stats:    cfg.Stats,
 		})
 	}
 }

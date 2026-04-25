@@ -18,6 +18,7 @@ type Config struct {
 	Listener ListenerConfig `yaml:"listener"`
 	Bypass   BypassConfig   `yaml:"bypass"`
 	Routes   RoutesConfig   `yaml:"routes"`
+	Stats    StatsConfig    `yaml:"stats"`
 }
 
 // InboundConfig holds JWT validation settings.
@@ -30,13 +31,13 @@ type InboundConfig struct {
 type OutboundConfig struct {
 	TokenURL      string `yaml:"token_url"`
 	KeycloakURL   string `yaml:"keycloak_url"`   // alternative: derives token_url and issuer
-	KeycloakRealm string `yaml:"keycloak_realm"`  // used with keycloak_url
+	KeycloakRealm string `yaml:"keycloak_realm"` // used with keycloak_url
 	DefaultPolicy string `yaml:"default_policy"` // "exchange" or "passthrough"
 }
 
 // IdentityConfig holds agent identity and credentials.
 type IdentityConfig struct {
-	Type             string   `yaml:"type"`               // "spiffe", "client-secret", "k8s-sa"
+	Type             string   `yaml:"type"` // "spiffe", "client-secret", "k8s-sa"
 	ClientID         string   `yaml:"client_id"`
 	ClientSecret     string   `yaml:"client_secret"`
 	ClientIDFile     string   `yaml:"client_id_file"`     // alternative: read client_id from file
@@ -69,12 +70,17 @@ type RoutesConfig struct {
 // RouteConfig is the YAML representation of an outbound route.
 // Supports both legacy `passthrough: true` and new `action: passthrough` formats.
 type RouteConfig struct {
-	Host          string `yaml:"host"`
+	Host           string `yaml:"host"`
 	TargetAudience string `yaml:"target_audience,omitempty"`
-	TokenScopes   string `yaml:"token_scopes,omitempty"`
-	TokenURL      string `yaml:"token_url,omitempty"`
-	Passthrough   bool   `yaml:"passthrough,omitempty"` // legacy format
-	Action        string `yaml:"action,omitempty"`       // "exchange" or "passthrough"
+	TokenScopes    string `yaml:"token_scopes,omitempty"`
+	TokenURL       string `yaml:"token_url,omitempty"`
+	Passthrough    bool   `yaml:"passthrough,omitempty"` // legacy format
+	Action         string `yaml:"action,omitempty"`      // "exchange" or "passthrough"
+}
+
+// StatsConfig represents the configuration for reporting config and statistics
+type StatsConfig struct {
+	StatsAddress string `yaml:"address"` // for example, ":9093"
 }
 
 // Valid mode strings.

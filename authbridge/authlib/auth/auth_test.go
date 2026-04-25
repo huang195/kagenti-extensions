@@ -566,6 +566,8 @@ func TestStatsConcurrentAccess(t *testing.T) {
 		<-done
 	}
 
+	// (This function has the only copy of the stats so we don't need to hold
+	// the mutex to read these counters.)
 	if got := a.Stats.inboundApprovals[APPROVE_AUTHORIZED]; got != 25 {
 		t.Errorf("concurrent inbound approvals = %d, want 25", got)
 	}

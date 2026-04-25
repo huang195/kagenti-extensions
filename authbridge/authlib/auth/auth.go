@@ -389,7 +389,7 @@ func (a *Auth) HandleOutbound(ctx context.Context, authHeader, host string) *Out
 
 	// 6. Token exchange
 	if a.exchanger == nil {
-		a.IncOutboundApprove(OutboundApprovalReason(OUTBOUND_NO_EXCHANGER))
+		a.IncOutboundApprove(OUTBOUND_NO_EXCHANGER)
 		a.log.Warn("exchanger not configured, passing through",
 			"host", host, "audience", audience)
 		return &OutboundResult{Action: ActionAllow}

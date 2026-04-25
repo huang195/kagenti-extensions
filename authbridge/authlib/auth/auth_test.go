@@ -653,6 +653,7 @@ func TestOutboundApprovalReasonString(t *testing.T) {
 		{OUTBOUND_NO_MATCHING_ROUTE, "no_matching_route"},
 		{OUTBOUND_PASSTHROUGH, "passthrough"},
 		{OUTBOUND_NO_TOKEN_POLICY, "no_token_policy"},
+		{OUTBOUND_NO_EXCHANGER, "no_exchanger"},
 		{OutboundApprovalReason(99), "unknown"},
 	}
 	for _, tc := range tests {

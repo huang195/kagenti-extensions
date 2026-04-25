@@ -69,6 +69,8 @@ type RoutesConfig struct {
 
 // RouteConfig is the YAML representation of an outbound route.
 // Supports both legacy `passthrough: true` and new `action: passthrough` formats.
+// Note that the JSON doesn't omitempty because we want to make it obvious
+// to human readers which fields are empty.
 type RouteConfig struct {
 	Host           string `yaml:"host" json:"host"`
 	TargetAudience string `yaml:"target_audience,omitempty" json:"target_audience"`

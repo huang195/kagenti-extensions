@@ -334,3 +334,364 @@ func TestHandleOutbound_ActorToken(t *testing.T) {
 		t.Errorf("expected delegated token, got action=%s token=%q", result.Action, result.Token)
 	}
 }
+
+// --- Stats Tests ---
+
+func TestNewStats(t *testing.T) {
+	s := NewStats()
+	if s == nil {
+		t.Fatal("NewStats() returned nil")
+	}
+	if len(s.inboundApprovals) != 0 {
+		t.Errorf("inboundApprovals = %d entries, want 0", len(s.inboundApprovals))
+	}
+	if len(s.inboundDenials) != 0 {
+		t.Errorf("inboundDenials = %d entries, want 0", len(s.inboundDenials))
+	}
+	if len(s.outboundApprovals) != 0 {
+		t.Errorf("outboundApprovals = %d entries, want 0", len(s.outboundApprovals))
+	}
+	if len(s.outboundDenials) != 0 {
+		t.Errorf("outboundDenials = %d entries, want 0", len(s.outboundDenials))
+	}
+}
+
+func TestIncInboundApprove(t *testing.T) {
+	a := New(Config{})
+
+	a.IncInboundApprove(APPROVE_PASSTHROUGH)
+	a.IncInboundApprove(APPROVE_PASSTHROUGH)
+	a.IncInboundApprove(APPROVE_AUTHORIZED)
+
+	if got := a.Stats.inboundApprovals[APPROVE_PASSTHROUGH]; got != 2 {
+		t.Errorf("APPROVE_PASSTHROUGH = %d, want 2", got)
+	}
+	if got := a.Stats.inboundApprovals[APPROVE_AUTHORIZED]; got != 1 {
+		t.Errorf("APPROVE_AUTHORIZED = %d, want 1", got)
+	}
+}
+
+func TestIncInboundDeny(t *testing.T) {
+	a := New(Config{})
+
+	a.IncInboundDeny(DENY_NO_HEADER)
+	a.IncInboundDeny(DENY_MALFORMED_HEADER)
+	a.IncInboundDeny(DENY_VALIDATOR_MISSING)
+	a.IncInboundDeny(DENY_JWT_FAILED)
+	a.IncInboundDeny(DENY_JWT_FAILED)
+
+	expected := map[InboundDenialReason]int{
+		DENY_NO_HEADER:       1,
+		DENY_MALFORMED_HEADER: 1,
+		DENY_VALIDATOR_MISSING: 1,
+		DENY_JWT_FAILED:       2,
+	}
+	for reason, want := range expected {
+		if got := a.Stats.inboundDenials[reason]; got != want {
+			t.Errorf("%s = %d, want %d", reason, got, want)
+		}
+	}
+}
+
+func TestIncOutboundApprove(t *testing.T) {
+	a := New(Config{})
+
+	a.IncOutboundApprove(APPROVE_REPLACE_TOKEN)
+	a.IncOutboundApprove(OUTBOUND_ACTION_ALLOW)
+	a.IncOutboundApprove(OUTBOUND_ACTION_ALLOW)
+
+	if got := a.Stats.outboundApprovals[APPROVE_REPLACE_TOKEN]; got != 1 {
+		t.Errorf("APPROVE_REPLACE_TOKEN = %d, want 1", got)
+	}
+	if got := a.Stats.outboundApprovals[OUTBOUND_ACTION_ALLOW]; got != 2 {
+		t.Errorf("OUTBOUND_ACTION_ALLOW = %d, want 2", got)
+	}
+}
+
+func TestIncOutboundDeny(t *testing.T) {
+	a := New(Config{})
+
+	a.IncOutboundDeny(TOKEN_ACQUISITION_FAILED)
+	a.IncOutboundDeny(TOKEN_ACQUISITION_FAILED)
+	a.IncOutboundDeny(TOKEN_ACQUISITION_FAILED)
+
+	if got := a.Stats.outboundDenials[TOKEN_ACQUISITION_FAILED]; got != 3 {
+		t.Errorf("TOKEN_ACQUISITION_FAILED = %d, want 3", got)
+	}
+}
+
+func TestStatsMarshalJSON_Empty(t *testing.T) {
+	s := NewStats()
+	data, err := json.Marshal(s)
+	if err != nil {
+		t.Fatalf("MarshalJSON: %v", err)
+	}
+
+	var got map[string]map[string]int
+	if err := json.Unmarshal(data, &got); err != nil {
+		t.Fatalf("Unmarshal: %v", err)
+	}
+
+	for _, key := range []string{"inbound_approvals", "inbound_denials", "outbound_approvals", "outbound_denials"} {
+		m, ok := got[key]
+		if !ok {
+			t.Errorf("missing key %q", key)
+			continue
+		}
+		if len(m) != 0 {
+			t.Errorf("%s = %v, want empty map", key, m)
+		}
+	}
+}
+
+func TestStatsMarshalJSON_WithCounts(t *testing.T) {
+	a := New(Config{})
+
+	a.IncInboundApprove(APPROVE_AUTHORIZED)
+	a.IncInboundApprove(APPROVE_AUTHORIZED)
+	a.IncInboundApprove(APPROVE_PASSTHROUGH)
+	a.IncInboundDeny(DENY_NO_HEADER)
+	a.IncInboundDeny(DENY_JWT_FAILED)
+	a.IncInboundDeny(DENY_JWT_FAILED)
+	a.IncOutboundApprove(APPROVE_REPLACE_TOKEN)
+	a.IncOutboundDeny(TOKEN_ACQUISITION_FAILED)
+
+	data, err := json.Marshal(a.Stats)
+	if err != nil {
+		t.Fatalf("MarshalJSON: %v", err)
+	}
+
+	var got map[string]map[string]int
+	if err := json.Unmarshal(data, &got); err != nil {
+		t.Fatalf("Unmarshal: %v", err)
+	}
+
+	checks := []struct {
+		section string
+		key     string
+		want    int
+	}{
+		{"inbound_approvals", "authorized", 2},
+		{"inbound_approvals", "passthrough", 1},
+		{"inbound_denials", "no_header", 1},
+		{"inbound_denials", "jwt_failed", 2},
+		{"outbound_approvals", "replace_token", 1},
+		{"outbound_denials", "token_acquisition_failed", 1},
+	}
+	for _, tc := range checks {
+		if got[tc.section][tc.key] != tc.want {
+			t.Errorf("%s.%s = %d, want %d", tc.section, tc.key, got[tc.section][tc.key], tc.want)
+		}
+	}
+}
+
+func TestStatsMarshalJSON_UsesStringKeys(t *testing.T) {
+	a := New(Config{})
+	a.IncInboundApprove(APPROVE_PASSTHROUGH)
+	a.IncInboundDeny(DENY_MALFORMED_HEADER)
+	a.IncOutboundApprove(OUTBOUND_ACTION_ALLOW)
+	a.IncOutboundDeny(TOKEN_ACQUISITION_FAILED)
+
+	data, err := json.Marshal(a.Stats)
+	if err != nil {
+		t.Fatalf("MarshalJSON: %v", err)
+	}
+
+	raw := string(data)
+	expectedKeys := []string{
+		`"passthrough"`, `"malformed_header"`, `"allow"`, `"token_acquisition_failed"`,
+	}
+	for _, key := range expectedKeys {
+		if !containsSubstring(raw, key) {
+			t.Errorf("JSON missing key %s: %s", key, raw)
+		}
+	}
+}
+
+func TestStatsConcurrentAccess(t *testing.T) {
+	a := New(Config{})
+	done := make(chan struct{})
+
+	for i := range 100 {
+		go func(n int) {
+			defer func() { done <- struct{}{} }()
+			switch n % 4 {
+			case 0:
+				a.IncInboundApprove(APPROVE_AUTHORIZED)
+			case 1:
+				a.IncInboundDeny(DENY_JWT_FAILED)
+			case 2:
+				a.IncOutboundApprove(APPROVE_REPLACE_TOKEN)
+			case 3:
+				a.IncOutboundDeny(TOKEN_ACQUISITION_FAILED)
+			}
+		}(i)
+	}
+	for range 100 {
+		<-done
+	}
+
+	if got := a.Stats.inboundApprovals[APPROVE_AUTHORIZED]; got != 25 {
+		t.Errorf("concurrent inbound approvals = %d, want 25", got)
+	}
+	if got := a.Stats.inboundDenials[DENY_JWT_FAILED]; got != 25 {
+		t.Errorf("concurrent inbound denials = %d, want 25", got)
+	}
+	if got := a.Stats.outboundApprovals[APPROVE_REPLACE_TOKEN]; got != 25 {
+		t.Errorf("concurrent outbound approvals = %d, want 25", got)
+	}
+	if got := a.Stats.outboundDenials[TOKEN_ACQUISITION_FAILED]; got != 25 {
+		t.Errorf("concurrent outbound denials = %d, want 25", got)
+	}
+}
+
+func TestStatsConcurrentMarshal(t *testing.T) {
+	a := New(Config{})
+	done := make(chan struct{})
+
+	for range 50 {
+		go func() {
+			defer func() { done <- struct{}{} }()
+			a.IncInboundApprove(APPROVE_AUTHORIZED)
+		}()
+		go func() {
+			defer func() { done <- struct{}{} }()
+			if _, err := json.Marshal(a.Stats); err != nil {
+				t.Errorf("concurrent MarshalJSON: %v", err)
+			}
+		}()
+	}
+	for range 100 {
+		<-done
+	}
+}
+
+// --- Reason Stringer Tests ---
+
+func TestInboundDenialReasonString(t *testing.T) {
+	tests := []struct {
+		reason InboundDenialReason
+		want   string
+	}{
+		{DENY_NO_HEADER, "no_header"},
+		{DENY_MALFORMED_HEADER, "malformed_header"},
+		{DENY_VALIDATOR_MISSING, "validator_missing"},
+		{DENY_JWT_FAILED, "jwt_failed"},
+		{InboundDenialReason(99), "unknown"},
+	}
+	for _, tc := range tests {
+		if got := tc.reason.String(); got != tc.want {
+			t.Errorf("InboundDenialReason(%d).String() = %q, want %q", tc.reason, got, tc.want)
+		}
+	}
+}
+
+func TestInboundApprovalReasonString(t *testing.T) {
+	tests := []struct {
+		reason InboundApprovalReason
+		want   string
+	}{
+		{APPROVE_PASSTHROUGH, "passthrough"},
+		{APPROVE_AUTHORIZED, "authorized"},
+		{InboundApprovalReason(99), "unknown"},
+	}
+	for _, tc := range tests {
+		if got := tc.reason.String(); got != tc.want {
+			t.Errorf("InboundApprovalReason(%d).String() = %q, want %q", tc.reason, got, tc.want)
+		}
+	}
+}
+
+func TestOutboundApprovalReasonString(t *testing.T) {
+	tests := []struct {
+		reason OutboundApprovalReason
+		want   string
+	}{
+		{APPROVE_REPLACE_TOKEN, "replace_token"},
+		{OUTBOUND_ACTION_ALLOW, "allow"},
+		{OutboundApprovalReason(99), "unknown"},
+	}
+	for _, tc := range tests {
+		if got := tc.reason.String(); got != tc.want {
+			t.Errorf("OutboundApprovalReason(%d).String() = %q, want %q", tc.reason, got, tc.want)
+		}
+	}
+}
+
+func TestOutboundDenialReasonString(t *testing.T) {
+	tests := []struct {
+		reason OutboundDenialReason
+		want   string
+	}{
+		{TOKEN_ACQUISITION_FAILED, "token_acquisition_failed"},
+		{OutboundDenialReason(99), "unknown"},
+	}
+	for _, tc := range tests {
+		if got := tc.reason.String(); got != tc.want {
+			t.Errorf("OutboundDenialReason(%d).String() = %q, want %q", tc.reason, got, tc.want)
+		}
+	}
+}
+
+// --- Integration: HandleInbound/HandleOutbound increment stats ---
+
+func TestHandleInbound_IncrementsStats(t *testing.T) {
+	m, _ := bypass.NewMatcher(bypass.DefaultPatterns)
+	a := New(Config{
+		Bypass:   m,
+		Verifier: &mockVerifier{claims: validClaims()},
+		Identity: IdentityConfig{Audience: "my-agent"},
+	})
+
+	a.HandleInbound(context.Background(), "", "/healthz", "")
+	a.HandleInbound(context.Background(), "", "/api/test", "")
+	a.HandleInbound(context.Background(), "Basic bad", "/api/test", "")
+	a.HandleInbound(context.Background(), "Bearer valid", "/api/test", "")
+
+	if got := a.Stats.inboundApprovals[APPROVE_PASSTHROUGH]; got != 1 {
+		t.Errorf("bypass approval = %d, want 1", got)
+	}
+	if got := a.Stats.inboundDenials[DENY_NO_HEADER]; got != 1 {
+		t.Errorf("no_header denial = %d, want 1", got)
+	}
+	if got := a.Stats.inboundDenials[DENY_MALFORMED_HEADER]; got != 1 {
+		t.Errorf("malformed_header denial = %d, want 1", got)
+	}
+	if got := a.Stats.inboundApprovals[APPROVE_AUTHORIZED]; got != 1 {
+		t.Errorf("authorized approval = %d, want 1", got)
+	}
+}
+
+func TestHandleInbound_NoVerifier_IncrementsStats(t *testing.T) {
+	a := New(Config{})
+	a.HandleInbound(context.Background(), "Bearer token", "/api/test", "")
+
+	if got := a.Stats.inboundDenials[DENY_VALIDATOR_MISSING]; got != 1 {
+		t.Errorf("validator_missing denial = %d, want 1", got)
+	}
+}
+
+func TestHandleInbound_JWTFailed_IncrementsStats(t *testing.T) {
+	a := New(Config{
+		Verifier: &mockVerifier{err: fmt.Errorf("bad token")},
+		Identity: IdentityConfig{Audience: "aud"},
+	})
+	a.HandleInbound(context.Background(), "Bearer bad", "/api", "")
+
+	if got := a.Stats.inboundDenials[DENY_JWT_FAILED]; got != 1 {
+		t.Errorf("jwt_failed denial = %d, want 1", got)
+	}
+}
+
+func containsSubstring(s, substr string) bool {
+	return len(s) >= len(substr) && (s == substr || len(s) > 0 && findSubstring(s, substr))
+}
+
+func findSubstring(s, substr string) bool {
+	for i := 0; i <= len(s)-len(substr); i++ {
+		if s[i:i+len(substr)] == substr {
+			return true
+		}
+	}
+	return false
+}

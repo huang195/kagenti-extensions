@@ -208,15 +208,17 @@ func (s *Stats) MarshalJSON() ([]byte, error) {
 	}
 
 	return json.Marshal(struct {
-		InboundApprovals  map[string]int `json:"inbound_approvals"`
-		InboundDenials    map[string]int `json:"inbound_denials"`
-		OutboundApprovals map[string]int `json:"outbound_approvals"`
-		OutboundDenials   map[string]int `json:"outbound_denials"`
+		InboundApprovals      map[string]int `json:"inbound_approvals"`
+		InboundDenials        map[string]int `json:"inbound_denials"`
+		OutboundApprovals     map[string]int `json:"outbound_approvals"`
+		OutboundDenials       map[string]int `json:"outbound_denials"`
+		OutboundReplaceTokens map[string]int `json:"outbound_replace_tokens"`
 	}{
-		InboundApprovals:  inApprovals,
-		InboundDenials:    inDenials,
-		OutboundApprovals: outApprovals,
-		OutboundDenials:   outDenials,
+		InboundApprovals:      inApprovals,
+		InboundDenials:        inDenials,
+		OutboundApprovals:     outApprovals,
+		OutboundDenials:       outDenials,
+		OutboundReplaceTokens: outReplaceTokens,
 	})
 }
 

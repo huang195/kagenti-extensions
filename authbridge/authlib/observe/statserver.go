@@ -22,7 +22,15 @@ func NewStatServer(addr string, config *config.Config, stats *auth.Stats) *StatS
 	mux.HandleFunc("/stats", handleStatsFactory(stats))
 
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
-		fmt.Fprint(w, "Hello world")
+		fmt.Fprint(w, `
+<html>
+  <body>
+    <ul>
+    <li><a href="/config">Kagenti AuthBridge configuration</a>
+    <li><a href="/stats">Kagenti AuthBridge statistics</a>
+	</ul>
+  </body>
+</html>`)
 	})
 
 	return &StatServer{

@@ -127,4 +127,3 @@ func ValidateOutboundPolicy(policy string) error {
 		return fmt.Errorf("unknown outbound.default_policy %q (valid: exchange, passthrough)", policy)
 	}
 }
-

@@ -25,6 +25,7 @@ import (
 
 	"github.com/kagenti/kagenti-extensions/authbridge/authlib/auth"
 	"github.com/kagenti/kagenti-extensions/authbridge/authlib/config"
+	"github.com/kagenti/kagenti-extensions/authbridge/authlib/observe"
 	"github.com/kagenti/kagenti-extensions/authbridge/cmd/authbridge/listener/extauthz"
 	"github.com/kagenti/kagenti-extensions/authbridge/cmd/authbridge/listener/extproc"
 	"github.com/kagenti/kagenti-extensions/authbridge/cmd/authbridge/listener/forwardproxy"
@@ -127,6 +128,8 @@ func main() {
 		log.Fatalf("unhandled mode %q", cfg.Mode)
 	}
 
+	statSrv := startStatServer(cfg, handler)
+
 	slog.Info("authbridge starting", "mode", cfg.Mode, "logLevel", logLevel.Level().String())
 
 	// Resolve credentials in background — doesn't block the listener.
@@ -170,6 +173,7 @@ func main() {
 	for _, srv := range httpServers {
 		srv.Shutdown(shutdownCtx)
 	}
+	statSrv.Shutdown(shutdownCtx)
 }
 
 func startGRPCExtProc(handler *auth.Auth, addr string) *grpc.Server {
@@ -220,6 +224,17 @@ func startHTTPServer(name string, handler http.Handler, addr string) *http.Serve
 		slog.Info("HTTP server listening", "name", name, "addr", addr)
 		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 			log.Fatalf("%s serve: %v", name, err)
+		}
+	}()
+	return srv
+}
+
+func startStatServer(config *config.Config, handler *auth.Auth) *observe.StatServer {
+	srv := observe.NewStatServer(config.Stats.StatsAddress, config, handler.Stats)
+	go func() {
+		slog.Info("stat server listening", "addr", config.Stats.StatsAddress)
+		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			log.Fatalf("stat server: %v", err)
 		}
 	}()
 	return srv

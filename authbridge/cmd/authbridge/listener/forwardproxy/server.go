@@ -8,21 +8,22 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"strings"
 	"time"
 
-	"github.com/kagenti/kagenti-extensions/authbridge/authlib/auth"
+	"github.com/kagenti/kagenti-extensions/authbridge/authlib/pipeline"
 )
 
 // Server is an HTTP forward proxy that performs token exchange on outbound requests.
 type Server struct {
-	Auth   *auth.Auth
-	Client *http.Client
+	OutboundPipeline *pipeline.Pipeline
+	Client           *http.Client
 }
 
 // NewServer creates a forward proxy server with a default HTTP client.
-func NewServer(a *auth.Auth) *Server {
+func NewServer(outbound *pipeline.Pipeline) *Server {
 	return &Server{
-		Auth: a,
+		OutboundPipeline: outbound,
 		Client: &http.Client{
 			Timeout: 30 * time.Second,
 			CheckRedirect: func(_ *http.Request, _ []*http.Request) error {
@@ -38,23 +39,32 @@ func (s *Server) Handler() http.Handler {
 }
 
 func (s *Server) handleRequest(w http.ResponseWriter, r *http.Request) {
-	// Reject CONNECT (HTTPS tunneling) — only handle plain HTTP
 	if r.Method == http.MethodConnect {
 		http.Error(w, `{"error":"HTTPS CONNECT not supported — only HTTP proxy"}`, http.StatusMethodNotAllowed)
 		return
 	}
 
-	result := s.Auth.HandleOutbound(r.Context(), r.Header.Get("Authorization"), r.Host)
+	pctx := &pipeline.Context{
+		Direction: pipeline.Outbound,
+		Host:      r.Host,
+		Path:      r.URL.Path,
+		Headers:   r.Header.Clone(),
+	}
 
-	switch result.Action {
-	case auth.ActionDeny:
+	originalAuth := pctx.Headers.Get("Authorization")
+	action := s.OutboundPipeline.Run(r.Context(), pctx)
+
+	if action.Type == pipeline.Reject {
 		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(result.DenyStatus)
-		body, _ := json.Marshal(map[string]string{"error": result.DenyReason})
+		w.WriteHeader(action.Status)
+		body, _ := json.Marshal(map[string]string{"error": action.Reason})
 		w.Write(body)
 		return
-	case auth.ActionReplaceToken:
-		r.Header.Set("Authorization", "Bearer "+result.Token)
+	}
+
+	newAuth := pctx.Headers.Get("Authorization")
+	if newAuth != originalAuth {
+		r.Header.Set("Authorization", "Bearer "+extractBearer(newAuth))
 	}
 
 	// Remove hop-by-hop headers
@@ -87,4 +97,11 @@ func (s *Server) handleRequest(w http.ResponseWriter, r *http.Request) {
 	if _, err := io.Copy(w, resp.Body); err != nil {
 		slog.Debug("response copy error", "host", r.Host, "error", err)
 	}
+}
+
+func extractBearer(authHeader string) string {
+	if len(authHeader) > 7 && strings.EqualFold(authHeader[:7], "bearer ") {
+		return authHeader[7:]
+	}
+	return ""
 }

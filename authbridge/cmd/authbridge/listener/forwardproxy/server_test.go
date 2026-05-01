@@ -11,6 +11,8 @@ import (
 	"github.com/kagenti/kagenti-extensions/authbridge/authlib/auth"
 	"github.com/kagenti/kagenti-extensions/authbridge/authlib/cache"
 	"github.com/kagenti/kagenti-extensions/authbridge/authlib/exchange"
+	"github.com/kagenti/kagenti-extensions/authbridge/authlib/pipeline"
+	"github.com/kagenti/kagenti-extensions/authbridge/authlib/plugins"
 	"github.com/kagenti/kagenti-extensions/authbridge/authlib/routing"
 	"github.com/kagenti/kagenti-extensions/authbridge/authlib/validation"
 )
@@ -22,6 +24,15 @@ type mockVerifier struct {
 
 func (m *mockVerifier) Verify(_ context.Context, _ string, _ string) (*validation.Claims, error) {
 	return m.claims, m.err
+}
+
+func outboundPipelineFromAuth(t *testing.T, a *auth.Auth) *pipeline.Pipeline {
+	t.Helper()
+	p, err := plugins.DefaultOutboundPipeline(a)
+	if err != nil {
+		t.Fatalf("building outbound pipeline: %v", err)
+	}
+	return p
 }
 
 func TestForwardProxy_Exchange(t *testing.T) {
@@ -57,7 +68,7 @@ func TestForwardProxy_Exchange(t *testing.T) {
 		Cache:     cache.New(),
 	})
 
-	srv := &Server{Auth: a, Client: http.DefaultClient}
+	srv := &Server{OutboundPipeline: outboundPipelineFromAuth(t, a), Client: http.DefaultClient}
 	proxy := httptest.NewServer(srv.Handler())
 	defer proxy.Close()
 
@@ -83,7 +94,7 @@ func TestForwardProxy_Exchange(t *testing.T) {
 
 func TestForwardProxy_CONNECT_Rejected(t *testing.T) {
 	a := auth.New(auth.Config{})
-	srv := NewServer(a)
+	srv := NewServer(outboundPipelineFromAuth(t, a))
 	proxy := httptest.NewServer(srv.Handler())
 	defer proxy.Close()
 
@@ -104,7 +115,7 @@ func TestForwardProxy_Deny(t *testing.T) {
 		NoTokenPolicy: auth.NoTokenPolicyDeny,
 	})
 
-	srv := NewServer(a)
+	srv := NewServer(outboundPipelineFromAuth(t, a))
 	proxy := httptest.NewServer(srv.Handler())
 	defer proxy.Close()
 

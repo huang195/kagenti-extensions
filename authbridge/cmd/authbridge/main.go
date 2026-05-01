@@ -26,6 +26,8 @@ import (
 	"github.com/kagenti/kagenti-extensions/authbridge/authlib/auth"
 	"github.com/kagenti/kagenti-extensions/authbridge/authlib/config"
 	"github.com/kagenti/kagenti-extensions/authbridge/authlib/observe"
+	"github.com/kagenti/kagenti-extensions/authbridge/authlib/pipeline"
+	"github.com/kagenti/kagenti-extensions/authbridge/authlib/plugins"
 	"github.com/kagenti/kagenti-extensions/authbridge/cmd/authbridge/listener/extauthz"
 	"github.com/kagenti/kagenti-extensions/authbridge/cmd/authbridge/listener/extproc"
 	"github.com/kagenti/kagenti-extensions/authbridge/cmd/authbridge/listener/forwardproxy"
@@ -103,6 +105,16 @@ func main() {
 	}
 	handler := auth.New(*resolved)
 
+	// Build pipelines from config (falls back to defaults if pipeline section is omitted)
+	inboundPipeline, err := buildInboundPipeline(cfg, handler)
+	if err != nil {
+		log.Fatalf("building inbound pipeline: %v", err)
+	}
+	outboundPipeline, err := buildOutboundPipeline(cfg, handler)
+	if err != nil {
+		log.Fatalf("building outbound pipeline: %v", err)
+	}
+
 	// Track servers for graceful shutdown
 	var grpcServers []*grpc.Server
 	var httpServers []*http.Server
@@ -110,19 +122,19 @@ func main() {
 	// Start listeners FIRST — before credential resolution
 	switch cfg.Mode {
 	case config.ModeEnvoySidecar:
-		grpcServers = append(grpcServers, startGRPCExtProc(handler, cfg.Listener.ExtProcAddr))
+		grpcServers = append(grpcServers, startGRPCExtProc(inboundPipeline, outboundPipeline, cfg.Listener.ExtProcAddr))
 
 	case config.ModeWaypoint:
-		grpcServers = append(grpcServers, startGRPCExtAuthz(handler, cfg.Listener.ExtAuthzAddr))
-		httpServers = append(httpServers, startHTTPServer("forward-proxy", forwardproxy.NewServer(handler).Handler(), cfg.Listener.ForwardProxyAddr))
+		grpcServers = append(grpcServers, startGRPCExtAuthz(inboundPipeline, outboundPipeline, cfg.Listener.ExtAuthzAddr))
+		httpServers = append(httpServers, startHTTPServer("forward-proxy", forwardproxy.NewServer(outboundPipeline).Handler(), cfg.Listener.ForwardProxyAddr))
 
 	case config.ModeProxySidecar:
-		rpSrv, err := reverseproxy.NewServer(handler, cfg.Listener.ReverseProxyBackend)
+		rpSrv, err := reverseproxy.NewServer(inboundPipeline, cfg.Listener.ReverseProxyBackend)
 		if err != nil {
 			log.Fatalf("creating reverse proxy: %v", err)
 		}
 		httpServers = append(httpServers, startHTTPServer("reverse-proxy", rpSrv.Handler(), cfg.Listener.ReverseProxyAddr))
-		httpServers = append(httpServers, startHTTPServer("forward-proxy", forwardproxy.NewServer(handler).Handler(), cfg.Listener.ForwardProxyAddr))
+		httpServers = append(httpServers, startHTTPServer("forward-proxy", forwardproxy.NewServer(outboundPipeline).Handler(), cfg.Listener.ForwardProxyAddr))
 
 	default:
 		log.Fatalf("unhandled mode %q", cfg.Mode)
@@ -176,9 +188,29 @@ func main() {
 	statSrv.Shutdown(shutdownCtx)
 }
 
-func startGRPCExtProc(handler *auth.Auth, addr string) *grpc.Server {
+func buildInboundPipeline(cfg *config.Config, handler *auth.Auth) (*pipeline.Pipeline, error) {
+	if len(cfg.Pipeline.Inbound.Plugins) > 0 {
+		return plugins.Build(cfg.Pipeline.Inbound.Plugins, handler)
+	}
+	if cfg.Mode == config.ModeWaypoint {
+		return plugins.WaypointInboundPipeline(handler)
+	}
+	return plugins.DefaultInboundPipeline(handler)
+}
+
+func buildOutboundPipeline(cfg *config.Config, handler *auth.Auth) (*pipeline.Pipeline, error) {
+	if len(cfg.Pipeline.Outbound.Plugins) > 0 {
+		return plugins.Build(cfg.Pipeline.Outbound.Plugins, handler)
+	}
+	return plugins.DefaultOutboundPipeline(handler)
+}
+
+func startGRPCExtProc(inbound, outbound *pipeline.Pipeline, addr string) *grpc.Server {
 	srv := grpc.NewServer()
-	extprocv3.RegisterExternalProcessorServer(srv, &extproc.Server{Auth: handler})
+	extprocv3.RegisterExternalProcessorServer(srv, &extproc.Server{
+		InboundPipeline:  inbound,
+		OutboundPipeline: outbound,
+	})
 	registerHealth(srv)
 	reflection.Register(srv)
 
@@ -195,9 +227,12 @@ func startGRPCExtProc(handler *auth.Auth, addr string) *grpc.Server {
 	return srv
 }
 
-func startGRPCExtAuthz(handler *auth.Auth, addr string) *grpc.Server {
+func startGRPCExtAuthz(inbound, outbound *pipeline.Pipeline, addr string) *grpc.Server {
 	srv := grpc.NewServer()
-	authv3.RegisterAuthorizationServer(srv, &extauthz.Server{Auth: handler})
+	authv3.RegisterAuthorizationServer(srv, &extauthz.Server{
+		InboundPipeline:  inbound,
+		OutboundPipeline: outbound,
+	})
 	registerHealth(srv)
 	reflection.Register(srv)
 

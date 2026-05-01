@@ -9,6 +9,8 @@ import (
 
 	"github.com/kagenti/kagenti-extensions/authbridge/authlib/auth"
 	"github.com/kagenti/kagenti-extensions/authbridge/authlib/bypass"
+	"github.com/kagenti/kagenti-extensions/authbridge/authlib/pipeline"
+	"github.com/kagenti/kagenti-extensions/authbridge/authlib/plugins"
 	"github.com/kagenti/kagenti-extensions/authbridge/authlib/validation"
 )
 
@@ -19,6 +21,15 @@ type mockVerifier struct {
 
 func (m *mockVerifier) Verify(_ context.Context, _ string, _ string) (*validation.Claims, error) {
 	return m.claims, m.err
+}
+
+func inboundPipelineFromAuth(t *testing.T, a *auth.Auth) *pipeline.Pipeline {
+	t.Helper()
+	p, err := plugins.DefaultInboundPipeline(a)
+	if err != nil {
+		t.Fatalf("building inbound pipeline: %v", err)
+	}
+	return p
 }
 
 func TestReverseProxy_AllowedRequest(t *testing.T) {
@@ -32,7 +43,7 @@ func TestReverseProxy_AllowedRequest(t *testing.T) {
 		Verifier: &mockVerifier{claims: &validation.Claims{Subject: "user"}},
 		Identity: auth.IdentityConfig{Audience: "my-app"},
 	})
-	srv, err := NewServer(a, backend.URL)
+	srv, err := NewServer(inboundPipelineFromAuth(t, a), backend.URL)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -56,7 +67,7 @@ func TestReverseProxy_DeniedRequest(t *testing.T) {
 		Verifier: &mockVerifier{err: fmt.Errorf("invalid token")},
 		Identity: auth.IdentityConfig{Audience: "my-app"},
 	})
-	srv, _ := NewServer(a, "http://localhost:9999")
+	srv, _ := NewServer(inboundPipelineFromAuth(t, a), "http://localhost:9999")
 
 	proxy := httptest.NewServer(srv.Handler())
 	defer proxy.Close()
@@ -81,7 +92,7 @@ func TestReverseProxy_BypassPath(t *testing.T) {
 		Verifier: &mockVerifier{err: fmt.Errorf("should not be called")},
 		Bypass:   matcher,
 	})
-	srv, _ := NewServer(a, backend.URL)
+	srv, _ := NewServer(inboundPipelineFromAuth(t, a), backend.URL)
 
 	proxy := httptest.NewServer(srv.Handler())
 	defer proxy.Close()

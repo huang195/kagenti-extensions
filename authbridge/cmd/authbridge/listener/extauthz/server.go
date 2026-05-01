@@ -6,6 +6,8 @@ package extauthz
 import (
 	"context"
 	"encoding/json"
+	"net/http"
+	"strings"
 
 	corev3 "github.com/envoyproxy/go-control-plane/envoy/config/core/v3"
 	authv3 "github.com/envoyproxy/go-control-plane/envoy/service/auth/v3"
@@ -14,14 +16,15 @@ import (
 
 	rpcstatus "google.golang.org/genproto/googleapis/rpc/status"
 
-	authpkg "github.com/kagenti/kagenti-extensions/authbridge/authlib/auth"
+	"github.com/kagenti/kagenti-extensions/authbridge/authlib/pipeline"
 	"github.com/kagenti/kagenti-extensions/authbridge/authlib/routing"
 )
 
 // Server implements the Envoy ext_authz Authorization gRPC service.
 type Server struct {
 	authv3.UnimplementedAuthorizationServer
-	Auth *authpkg.Auth
+	InboundPipeline  *pipeline.Pipeline
+	OutboundPipeline *pipeline.Pipeline
 }
 
 // Check handles a single ext_authz authorization request.
@@ -36,30 +39,58 @@ func (s *Server) Check(ctx context.Context, req *authv3.CheckRequest) (*authv3.C
 	if host == "" {
 		host = headers["host"]
 	}
-	authHeader := headers["authorization"]
 	path := httpReq.GetPath()
 
 	// Derive audience from destination host (waypoint pattern)
 	audience := routing.ServiceNameFromHost(host)
+	_ = audience // audience derivation will be used in future waypoint-specific plugin
 
-	// Inbound validation
-	inResult := s.Auth.HandleInbound(ctx, authHeader, path, audience)
-	if inResult.Action == authpkg.ActionDeny {
-		return denied(codes.Unauthenticated, inResult.DenyStatus, inResult.DenyReason), nil
+	// Inbound validation via pipeline
+	inPctx := &pipeline.Context{
+		Direction: pipeline.Inbound,
+		Host:      host,
+		Path:      path,
+		Headers:   mapToHTTPHeader(headers),
+	}
+	inAction := s.InboundPipeline.Run(ctx, inPctx)
+	if inAction.Type == pipeline.Reject {
+		return denied(codes.Unauthenticated, inAction.Status, inAction.Reason), nil
 	}
 
-	// Outbound exchange
-	outResult := s.Auth.HandleOutbound(ctx, authHeader, host)
-	switch outResult.Action {
-	case authpkg.ActionReplaceToken:
-		return allowedWithToken(outResult.Token), nil
-	case authpkg.ActionDeny:
-		return denied(codes.PermissionDenied, outResult.DenyStatus, outResult.DenyReason), nil
-	default:
-		return allowed(), nil
+	// Outbound exchange via pipeline
+	outPctx := &pipeline.Context{
+		Direction: pipeline.Outbound,
+		Host:      host,
+		Path:      path,
+		Headers:   mapToHTTPHeader(headers),
 	}
+	originalAuth := outPctx.Headers.Get("Authorization")
+	outAction := s.OutboundPipeline.Run(ctx, outPctx)
+	if outAction.Type == pipeline.Reject {
+		return denied(codes.PermissionDenied, outAction.Status, outAction.Reason), nil
+	}
+
+	newAuth := outPctx.Headers.Get("Authorization")
+	if newAuth != originalAuth {
+		return allowedWithToken(extractBearer(newAuth)), nil
+	}
+	return allowed(), nil
 }
 
+func mapToHTTPHeader(m map[string]string) http.Header {
+	h := make(http.Header)
+	for k, v := range m {
+		h.Set(k, v)
+	}
+	return h
+}
+
+func extractBearer(authHeader string) string {
+	if len(authHeader) > 7 && strings.EqualFold(authHeader[:7], "bearer ") {
+		return authHeader[7:]
+	}
+	return ""
+}
 
 func denied(code codes.Code, httpStatus int, msg string) *authv3.CheckResponse {
 	body, _ := json.Marshal(map[string]string{"error": msg})

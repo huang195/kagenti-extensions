@@ -1,11 +1,11 @@
 // Package extproc implements an Envoy ext_proc gRPC streaming listener.
-// It translates ext_proc ProcessingRequests into auth.HandleInbound/HandleOutbound
-// calls and maps the results back to ProcessingResponses.
+// It translates ext_proc ProcessingRequests into pipeline runs and maps
+// the results back to ProcessingResponses.
 package extproc
 
 import (
-	"context"
 	"encoding/json"
+	"net/http"
 	"strings"
 
 	corev3 "github.com/envoyproxy/go-control-plane/envoy/config/core/v3"
@@ -14,13 +14,14 @@ import (
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 
-	"github.com/kagenti/kagenti-extensions/authbridge/authlib/auth"
+	"github.com/kagenti/kagenti-extensions/authbridge/authlib/pipeline"
 )
 
 // Server implements the Envoy ext_proc ExternalProcessor gRPC service.
 type Server struct {
 	extprocv3.UnimplementedExternalProcessorServer
-	Auth *auth.Auth
+	InboundPipeline  *pipeline.Pipeline
+	OutboundPipeline *pipeline.Pipeline
 }
 
 // Process handles the bidirectional ext_proc stream.
@@ -46,9 +47,9 @@ func (s *Server) Process(stream extprocv3.ExternalProcessor_ProcessServer) error
 			direction := getHeader(headers, "x-authbridge-direction")
 
 			if direction == "inbound" {
-				resp = s.handleInbound(ctx, headers)
+				resp = s.handleInbound(stream, headers)
 			} else {
-				resp = s.handleOutbound(ctx, headers)
+				resp = s.handleOutbound(stream, headers)
 			}
 
 		case *extprocv3.ProcessingRequest_ResponseHeaders:
@@ -68,38 +69,63 @@ func (s *Server) Process(stream extprocv3.ExternalProcessor_ProcessServer) error
 	}
 }
 
-func (s *Server) handleInbound(ctx context.Context, headers *corev3.HeaderMap) *extprocv3.ProcessingResponse {
-	authHeader := getHeader(headers, "authorization")
-	path := getHeader(headers, ":path")
+func (s *Server) handleInbound(stream extprocv3.ExternalProcessor_ProcessServer, headers *corev3.HeaderMap) *extprocv3.ProcessingResponse {
+	ctx := stream.Context()
+	pctx := &pipeline.Context{
+		Direction: pipeline.Inbound,
+		Path:      getHeader(headers, ":path"),
+		Headers:   headerMapToHTTP(headers),
+	}
 
-	result := s.Auth.HandleInbound(ctx, authHeader, path, "")
-
-	if result.Action == auth.ActionDeny {
-		return denyResponse(typev3.StatusCode_Unauthorized,
-			jsonError("unauthorized", result.DenyReason))
+	action := s.InboundPipeline.Run(ctx, pctx)
+	if action.Type == pipeline.Reject {
+		return denyResponse(typev3.StatusCode(action.Status),
+			jsonError("unauthorized", action.Reason))
 	}
 
 	return allowResponse()
 }
 
-func (s *Server) handleOutbound(ctx context.Context, headers *corev3.HeaderMap) *extprocv3.ProcessingResponse {
-	authHeader := getHeader(headers, "authorization")
-	host := getHeader(headers, ":authority")
-	if host == "" {
-		host = getHeader(headers, "host")
+func (s *Server) handleOutbound(stream extprocv3.ExternalProcessor_ProcessServer, headers *corev3.HeaderMap) *extprocv3.ProcessingResponse {
+	ctx := stream.Context()
+	pctx := &pipeline.Context{
+		Direction: pipeline.Outbound,
+		Host:      getHeader(headers, ":authority"),
+		Headers:   headerMapToHTTP(headers),
+	}
+	if pctx.Host == "" {
+		pctx.Host = getHeader(headers, "host")
 	}
 
-	result := s.Auth.HandleOutbound(ctx, authHeader, host)
-
-	switch result.Action {
-	case auth.ActionReplaceToken:
-		return replaceTokenResponse(result.Token)
-	case auth.ActionDeny:
+	originalAuth := pctx.Headers.Get("Authorization")
+	action := s.OutboundPipeline.Run(ctx, pctx)
+	if action.Type == pipeline.Reject {
 		return denyResponse(typev3.StatusCode_ServiceUnavailable,
-			jsonError("token_acquisition_failed", result.DenyReason))
-	default:
-		return passResponse()
+			jsonError("token_acquisition_failed", action.Reason))
 	}
+
+	newAuth := pctx.Headers.Get("Authorization")
+	if newAuth != originalAuth {
+		return replaceTokenResponse(extractBearer(newAuth))
+	}
+	return passResponse()
+}
+
+func headerMapToHTTP(headers *corev3.HeaderMap) http.Header {
+	h := make(http.Header)
+	if headers != nil {
+		for _, hdr := range headers.Headers {
+			h.Set(hdr.Key, string(hdr.RawValue))
+		}
+	}
+	return h
+}
+
+func extractBearer(authHeader string) string {
+	if len(authHeader) > 7 && strings.EqualFold(authHeader[:7], "bearer ") {
+		return authHeader[7:]
+	}
+	return ""
 }
 
 func allowResponse() *extprocv3.ProcessingResponse {

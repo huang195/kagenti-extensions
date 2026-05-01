@@ -18,7 +18,21 @@ type Config struct {
 	Listener ListenerConfig `yaml:"listener" json:"listener"`
 	Bypass   BypassConfig   `yaml:"bypass" json:"bypass"`
 	Routes   RoutesConfig   `yaml:"routes" json:"routes"`
+	Pipeline PipelineConfig `yaml:"pipeline" json:"pipeline"`
 	Stats    StatsConfig    `yaml:"stats" json:"stats"`
+}
+
+// PipelineConfig holds the plugin pipeline composition.
+// If omitted (empty), default pipelines are used:
+// inbound=[jwt-validation], outbound=[token-exchange].
+type PipelineConfig struct {
+	Inbound  PipelineStageConfig `yaml:"inbound" json:"inbound"`
+	Outbound PipelineStageConfig `yaml:"outbound" json:"outbound"`
+}
+
+// PipelineStageConfig lists the plugins for a pipeline stage in execution order.
+type PipelineStageConfig struct {
+	Plugins []string `yaml:"plugins" json:"plugins"`
 }
 
 // InboundConfig holds JWT validation settings.

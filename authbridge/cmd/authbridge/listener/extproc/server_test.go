@@ -16,6 +16,7 @@ import (
 	"github.com/kagenti/kagenti-extensions/authbridge/authlib/bypass"
 	"github.com/kagenti/kagenti-extensions/authbridge/authlib/cache"
 	"github.com/kagenti/kagenti-extensions/authbridge/authlib/exchange"
+	"github.com/kagenti/kagenti-extensions/authbridge/authlib/plugins"
 	"github.com/kagenti/kagenti-extensions/authbridge/authlib/routing"
 	"github.com/kagenti/kagenti-extensions/authbridge/authlib/validation"
 )
@@ -43,10 +44,10 @@ func (m *mockStream) Recv() (*extprocv3.ProcessingRequest, error) {
 	return req, nil
 }
 func (m *mockStream) SetHeader(metadata.MD) error  { return nil }
-func (m *mockStream) SendHeader(metadata.MD) error  { return nil }
-func (m *mockStream) SetTrailer(metadata.MD)         {}
-func (m *mockStream) SendMsg(any) error              { return nil }
-func (m *mockStream) RecvMsg(any) error              { return nil }
+func (m *mockStream) SendHeader(metadata.MD) error { return nil }
+func (m *mockStream) SetTrailer(metadata.MD)       {}
+func (m *mockStream) SendMsg(any) error            { return nil }
+func (m *mockStream) RecvMsg(any) error            { return nil }
 
 type mockVerifier struct {
 	claims *validation.Claims
@@ -55,6 +56,19 @@ type mockVerifier struct {
 
 func (v *mockVerifier) Verify(_ context.Context, _ string, _ string) (*validation.Claims, error) {
 	return v.claims, v.err
+}
+
+func serverFromAuth(t *testing.T, a *auth.Auth) *Server {
+	t.Helper()
+	inbound, err := plugins.DefaultInboundPipeline(a)
+	if err != nil {
+		t.Fatalf("building inbound pipeline: %v", err)
+	}
+	outbound, err := plugins.DefaultOutboundPipeline(a)
+	if err != nil {
+		t.Fatalf("building outbound pipeline: %v", err)
+	}
+	return &Server{InboundPipeline: inbound, OutboundPipeline: outbound}
 }
 
 func makeHeaders(kvs ...string) *corev3.HeaderMap {
@@ -91,7 +105,7 @@ func TestExtProc_Inbound_ValidJWT(t *testing.T) {
 		Verifier: &mockVerifier{claims: &validation.Claims{Subject: "user-1"}},
 		Identity: auth.IdentityConfig{Audience: "my-agent"},
 	})
-	srv := &Server{Auth: a}
+	srv := serverFromAuth(t, a)
 
 	stream := &mockStream{
 		ctx: context.Background(),
@@ -135,7 +149,7 @@ func TestExtProc_Inbound_InvalidJWT(t *testing.T) {
 		Verifier: &mockVerifier{err: fmt.Errorf("token expired")},
 		Identity: auth.IdentityConfig{Audience: "my-agent"},
 	})
-	srv := &Server{Auth: a}
+	srv := serverFromAuth(t, a)
 
 	stream := &mockStream{
 		ctx: context.Background(),
@@ -168,7 +182,7 @@ func TestExtProc_Inbound_BypassPath(t *testing.T) {
 		Verifier: &mockVerifier{err: fmt.Errorf("should not be called")},
 		Bypass:   matcher,
 	})
-	srv := &Server{Auth: a}
+	srv := serverFromAuth(t, a)
 
 	stream := &mockStream{
 		ctx: context.Background(),
@@ -213,7 +227,7 @@ func TestExtProc_Outbound_Exchange(t *testing.T) {
 		Exchanger: exchanger,
 		Cache:     cache.New(),
 	})
-	srv := &Server{Auth: a}
+	srv := serverFromAuth(t, a)
 
 	stream := &mockStream{
 		ctx: context.Background(),
@@ -246,7 +260,7 @@ func TestExtProc_Outbound_Exchange(t *testing.T) {
 func TestExtProc_Outbound_Passthrough(t *testing.T) {
 	router, _ := routing.NewRouter("passthrough", []routing.Route{})
 	a := auth.New(auth.Config{Router: router})
-	srv := &Server{Auth: a}
+	srv := serverFromAuth(t, a)
 
 	stream := &mockStream{
 		ctx: context.Background(),
@@ -279,7 +293,7 @@ func TestExtProc_Outbound_Deny(t *testing.T) {
 		Router:        router,
 		NoTokenPolicy: auth.NoTokenPolicyDeny,
 	})
-	srv := &Server{Auth: a}
+	srv := serverFromAuth(t, a)
 
 	stream := &mockStream{
 		ctx: context.Background(),
@@ -309,7 +323,7 @@ func TestExtProc_Outbound_Deny(t *testing.T) {
 
 func TestExtProc_ResponseHeaders(t *testing.T) {
 	a := auth.New(auth.Config{})
-	srv := &Server{Auth: a}
+	srv := serverFromAuth(t, a)
 
 	stream := &mockStream{
 		ctx: context.Background(),

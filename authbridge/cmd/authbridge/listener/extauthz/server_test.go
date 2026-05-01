@@ -14,6 +14,7 @@ import (
 	authpkg "github.com/kagenti/kagenti-extensions/authbridge/authlib/auth"
 	"github.com/kagenti/kagenti-extensions/authbridge/authlib/cache"
 	"github.com/kagenti/kagenti-extensions/authbridge/authlib/exchange"
+	"github.com/kagenti/kagenti-extensions/authbridge/authlib/plugins"
 	"github.com/kagenti/kagenti-extensions/authbridge/authlib/routing"
 	"github.com/kagenti/kagenti-extensions/authbridge/authlib/validation"
 )
@@ -27,6 +28,20 @@ type mockVerifier struct {
 func (m *mockVerifier) Verify(_ context.Context, _ string, audience string) (*validation.Claims, error) {
 	m.lastAudience = audience
 	return m.claims, m.err
+}
+
+func serverFromAuth(t *testing.T, a *authpkg.Auth) *Server {
+	t.Helper()
+	// ext_authz is waypoint mode — audience derived from host
+	inbound, err := plugins.WaypointInboundPipeline(a)
+	if err != nil {
+		t.Fatalf("building inbound pipeline: %v", err)
+	}
+	outbound, err := plugins.DefaultOutboundPipeline(a)
+	if err != nil {
+		t.Fatalf("building outbound pipeline: %v", err)
+	}
+	return &Server{InboundPipeline: inbound, OutboundPipeline: outbound}
 }
 
 func checkRequest(host, path, authHeader string) *authv3.CheckRequest {
@@ -76,7 +91,7 @@ func TestCheck_ValidToken_Exchange(t *testing.T) {
 		Cache:     cache.New(),
 		Identity:  authpkg.IdentityConfig{Audience: "default-aud"},
 	})
-	srv := &Server{Auth: a}
+	srv := serverFromAuth(t, a)
 
 	resp, err := srv.Check(context.Background(),
 		checkRequest("auth-target-service.authbridge.svc:8081", "/api/test", "Bearer user-token"))
@@ -107,7 +122,7 @@ func TestCheck_InvalidToken(t *testing.T) {
 		Verifier: &mockVerifier{err: fmt.Errorf("bad token")},
 		Identity: authpkg.IdentityConfig{Audience: "aud"},
 	})
-	srv := &Server{Auth: a}
+	srv := serverFromAuth(t, a)
 
 	resp, _ := srv.Check(context.Background(),
 		checkRequest("svc", "/api", "Bearer bad"))
@@ -123,7 +138,7 @@ func TestCheck_InvalidToken(t *testing.T) {
 
 func TestCheck_MissingHTTPAttributes(t *testing.T) {
 	a := authpkg.New(authpkg.Config{})
-	srv := &Server{Auth: a}
+	srv := serverFromAuth(t, a)
 
 	resp, _ := srv.Check(context.Background(), &authv3.CheckRequest{})
 

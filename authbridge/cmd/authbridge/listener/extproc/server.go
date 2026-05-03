@@ -5,10 +5,12 @@ package extproc
 
 import (
 	"encoding/json"
+	"log/slog"
 	"net/http"
 	"strings"
 
 	corev3 "github.com/envoyproxy/go-control-plane/envoy/config/core/v3"
+	extprocfilterv3 "github.com/envoyproxy/go-control-plane/envoy/extensions/filters/http/ext_proc/v3"
 	extprocv3 "github.com/envoyproxy/go-control-plane/envoy/service/ext_proc/v3"
 	typev3 "github.com/envoyproxy/go-control-plane/envoy/type/v3"
 	"google.golang.org/grpc/codes"
@@ -27,6 +29,10 @@ type Server struct {
 // Process handles the bidirectional ext_proc stream.
 func (s *Server) Process(stream extprocv3.ExternalProcessor_ProcessServer) error {
 	ctx := stream.Context()
+
+	var pendingHeaders *corev3.HeaderMap
+	var pendingDirection string
+
 	for {
 		select {
 		case <-ctx.Done():
@@ -46,11 +52,32 @@ func (s *Server) Process(stream extprocv3.ExternalProcessor_ProcessServer) error
 			headers := r.RequestHeaders.Headers
 			direction := getHeader(headers, "x-authbridge-direction")
 
+			p := s.OutboundPipeline
 			if direction == "inbound" {
-				resp = s.handleInbound(stream, headers)
-			} else {
-				resp = s.handleOutbound(stream, headers)
+				p = s.InboundPipeline
 			}
+
+			if p.NeedsBody() {
+				slog.Debug("ext_proc: requesting body from Envoy", "direction", direction)
+				pendingHeaders = headers
+				pendingDirection = direction
+				resp = requestBodyResponse()
+			} else if direction == "inbound" {
+				resp = s.handleInbound(stream, headers, nil)
+			} else {
+				resp = s.handleOutbound(stream, headers, nil)
+			}
+
+		case *extprocv3.ProcessingRequest_RequestBody:
+			body := r.RequestBody.Body
+			slog.Debug("ext_proc: received request body", "direction", pendingDirection, "bodyLen", len(body))
+			if pendingDirection == "inbound" {
+				resp = s.handleInbound(stream, pendingHeaders, body)
+			} else {
+				resp = s.handleOutbound(stream, pendingHeaders, body)
+			}
+			pendingHeaders = nil
+			pendingDirection = ""
 
 		case *extprocv3.ProcessingRequest_ResponseHeaders:
 			resp = &extprocv3.ProcessingResponse{
@@ -69,12 +96,13 @@ func (s *Server) Process(stream extprocv3.ExternalProcessor_ProcessServer) error
 	}
 }
 
-func (s *Server) handleInbound(stream extprocv3.ExternalProcessor_ProcessServer, headers *corev3.HeaderMap) *extprocv3.ProcessingResponse {
+func (s *Server) handleInbound(stream extprocv3.ExternalProcessor_ProcessServer, headers *corev3.HeaderMap, body []byte) *extprocv3.ProcessingResponse {
 	ctx := stream.Context()
 	pctx := &pipeline.Context{
 		Direction: pipeline.Inbound,
 		Path:      getHeader(headers, ":path"),
 		Headers:   headerMapToHTTP(headers),
+		Body:      body,
 	}
 
 	action := s.InboundPipeline.Run(ctx, pctx)
@@ -86,12 +114,13 @@ func (s *Server) handleInbound(stream extprocv3.ExternalProcessor_ProcessServer,
 	return allowResponse()
 }
 
-func (s *Server) handleOutbound(stream extprocv3.ExternalProcessor_ProcessServer, headers *corev3.HeaderMap) *extprocv3.ProcessingResponse {
+func (s *Server) handleOutbound(stream extprocv3.ExternalProcessor_ProcessServer, headers *corev3.HeaderMap, body []byte) *extprocv3.ProcessingResponse {
 	ctx := stream.Context()
 	pctx := &pipeline.Context{
 		Direction: pipeline.Outbound,
 		Host:      getHeader(headers, ":authority"),
 		Headers:   headerMapToHTTP(headers),
+		Body:      body,
 	}
 	if pctx.Host == "" {
 		pctx.Host = getHeader(headers, "host")
@@ -126,6 +155,17 @@ func extractBearer(authHeader string) string {
 		return authHeader[7:]
 	}
 	return ""
+}
+
+func requestBodyResponse() *extprocv3.ProcessingResponse {
+	return &extprocv3.ProcessingResponse{
+		Response: &extprocv3.ProcessingResponse_RequestHeaders{
+			RequestHeaders: &extprocv3.HeadersResponse{},
+		},
+		ModeOverride: &extprocfilterv3.ProcessingMode{
+			RequestBodyMode: extprocfilterv3.ProcessingMode_BUFFERED,
+		},
+	}
 }
 
 func allowResponse() *extprocv3.ProcessingResponse {

@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 
 	"github.com/kagenti/kagenti-extensions/authbridge/authlib/auth"
@@ -102,5 +103,90 @@ func TestReverseProxy_BypassPath(t *testing.T) {
 	resp, _ := http.DefaultClient.Do(req)
 	if resp.StatusCode != http.StatusOK {
 		t.Errorf("status = %d, want 200 for bypass path", resp.StatusCode)
+	}
+}
+
+// --- Body Buffering Tests ---
+
+// bodyRecorderPlugin records whether it received a body during OnRequest.
+type bodyRecorderPlugin struct {
+	receivedBody []byte
+}
+
+func (p *bodyRecorderPlugin) Name() string { return "body-recorder" }
+func (p *bodyRecorderPlugin) Capabilities() pipeline.PluginCapabilities {
+	return pipeline.PluginCapabilities{BodyAccess: true}
+}
+func (p *bodyRecorderPlugin) OnRequest(_ context.Context, pctx *pipeline.Context) pipeline.Action {
+	p.receivedBody = pctx.Body
+	return pipeline.Action{Type: pipeline.Continue}
+}
+func (p *bodyRecorderPlugin) OnResponse(_ context.Context, _ *pipeline.Context) pipeline.Action {
+	return pipeline.Action{Type: pipeline.Continue}
+}
+
+func TestReverseProxy_BodyBuffering(t *testing.T) {
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte("ok"))
+	}))
+	defer backend.Close()
+
+	recorder := &bodyRecorderPlugin{}
+	p, err := pipeline.New([]pipeline.Plugin{recorder})
+	if err != nil {
+		t.Fatal(err)
+	}
+	srv, err := NewServer(p, backend.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	proxy := httptest.NewServer(srv.Handler())
+	defer proxy.Close()
+
+	body := `{"method":"tools/call","id":1,"params":{"name":"get_weather"}}`
+	req, _ := http.NewRequest("POST", proxy.URL+"/mcp", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resp.StatusCode != http.StatusOK {
+		t.Errorf("status = %d, want 200", resp.StatusCode)
+	}
+
+	if string(recorder.receivedBody) != body {
+		t.Errorf("plugin got body = %q, want %q", recorder.receivedBody, body)
+	}
+}
+
+func TestReverseProxy_BodyNotBuffered_WhenNotNeeded(t *testing.T) {
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer backend.Close()
+
+	a := auth.New(auth.Config{
+		Verifier: &mockVerifier{claims: &validation.Claims{Subject: "user"}},
+		Identity: auth.IdentityConfig{Audience: "test"},
+	})
+	srv, err := NewServer(inboundPipelineFromAuth(t, a), backend.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	proxy := httptest.NewServer(srv.Handler())
+	defer proxy.Close()
+
+	body := `{"data":"should not be buffered"}`
+	req, _ := http.NewRequest("POST", proxy.URL+"/api", strings.NewReader(body))
+	req.Header.Set("Authorization", "Bearer valid-token")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resp.StatusCode != http.StatusOK {
+		t.Errorf("status = %d, want 200", resp.StatusCode)
 	}
 }

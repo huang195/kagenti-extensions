@@ -4,6 +4,7 @@
 package forwardproxy
 
 import (
+	"bytes"
 	"encoding/json"
 	"io"
 	"log/slog"
@@ -49,6 +50,13 @@ func (s *Server) handleRequest(w http.ResponseWriter, r *http.Request) {
 		Host:      r.Host,
 		Path:      r.URL.Path,
 		Headers:   r.Header.Clone(),
+	}
+
+	if s.OutboundPipeline.NeedsBody() && r.Body != nil {
+		body, _ := io.ReadAll(r.Body)
+		r.Body = io.NopCloser(bytes.NewReader(body))
+		pctx.Body = body
+		slog.Debug("forward-proxy: buffered request body", "host", r.Host, "bodyLen", len(body))
 	}
 
 	originalAuth := pctx.Headers.Get("Authorization")

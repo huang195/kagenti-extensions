@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"strings"
 	"testing"
 
 	"github.com/kagenti/kagenti-extensions/authbridge/authlib/auth"
@@ -136,4 +137,127 @@ func mustParseURL(rawURL string) *url.URL {
 		panic(err)
 	}
 	return u
+}
+
+// --- Body Buffering Tests ---
+
+// bodyRecorderPlugin records whether it received a body during OnRequest.
+type bodyRecorderPlugin struct {
+	receivedBody []byte
+}
+
+func (p *bodyRecorderPlugin) Name() string { return "body-recorder" }
+func (p *bodyRecorderPlugin) Capabilities() pipeline.PluginCapabilities {
+	return pipeline.PluginCapabilities{BodyAccess: true}
+}
+func (p *bodyRecorderPlugin) OnRequest(_ context.Context, pctx *pipeline.Context) pipeline.Action {
+	p.receivedBody = pctx.Body
+	return pipeline.Action{Type: pipeline.Continue}
+}
+func (p *bodyRecorderPlugin) OnResponse(_ context.Context, _ *pipeline.Context) pipeline.Action {
+	return pipeline.Action{Type: pipeline.Continue}
+}
+
+func TestForwardProxy_BodyBuffering(t *testing.T) {
+	recorder := &bodyRecorderPlugin{}
+	p, err := pipeline.New([]pipeline.Plugin{recorder})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer backend.Close()
+
+	srv := &Server{OutboundPipeline: p, Client: http.DefaultClient}
+	proxy := httptest.NewServer(srv.Handler())
+	defer proxy.Close()
+
+	body := `{"method":"tools/call","id":1,"params":{"name":"get_weather"}}`
+	req, _ := http.NewRequest("POST", backend.URL+"/mcp", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+
+	proxyClient := &http.Client{
+		Transport: &http.Transport{
+			Proxy: http.ProxyURL(mustParseURL(proxy.URL)),
+		},
+	}
+	resp, err := proxyClient.Do(req)
+	if err != nil {
+		t.Fatalf("request failed: %v", err)
+	}
+	if resp.StatusCode != http.StatusOK {
+		t.Errorf("status = %d, want 200", resp.StatusCode)
+	}
+
+	if string(recorder.receivedBody) != body {
+		t.Errorf("plugin got body = %q, want %q", recorder.receivedBody, body)
+	}
+}
+
+func TestForwardProxy_BodyTooLarge(t *testing.T) {
+	recorder := &bodyRecorderPlugin{}
+	p, err := pipeline.New([]pipeline.Plugin{recorder})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		t.Error("backend should not be reached for oversized body")
+	}))
+	defer backend.Close()
+
+	srv := &Server{OutboundPipeline: p, Client: http.DefaultClient}
+	proxy := httptest.NewServer(srv.Handler())
+	defer proxy.Close()
+
+	// Send body larger than maxBodySize (1MB)
+	bigBody := strings.Repeat("x", maxBodySize+1)
+	req, _ := http.NewRequest("POST", backend.URL+"/mcp", strings.NewReader(bigBody))
+	req.Header.Set("Content-Type", "application/json")
+
+	proxyClient := &http.Client{
+		Transport: &http.Transport{
+			Proxy: http.ProxyURL(mustParseURL(proxy.URL)),
+		},
+	}
+	resp, err := proxyClient.Do(req)
+	if err != nil {
+		t.Fatalf("request failed: %v", err)
+	}
+	if resp.StatusCode != http.StatusRequestEntityTooLarge {
+		t.Errorf("status = %d, want 413", resp.StatusCode)
+	}
+}
+
+func TestForwardProxy_NoBodyBuffering_WhenNotNeeded(t *testing.T) {
+	a := auth.New(auth.Config{})
+	p := outboundPipelineFromAuth(t, a) // default pipeline has no body-access plugins
+
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer backend.Close()
+
+	srv := &Server{OutboundPipeline: p, Client: http.DefaultClient}
+	proxy := httptest.NewServer(srv.Handler())
+	defer proxy.Close()
+
+	body := `{"data":"should not be buffered"}`
+	req, _ := http.NewRequest("POST", backend.URL+"/api", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+
+	proxyClient := &http.Client{
+		Transport: &http.Transport{
+			Proxy: http.ProxyURL(mustParseURL(proxy.URL)),
+		},
+	}
+	resp, err := proxyClient.Do(req)
+	if err != nil {
+		t.Fatalf("request failed: %v", err)
+	}
+	if resp.StatusCode != http.StatusOK {
+		t.Errorf("status = %d, want 200", resp.StatusCode)
+	}
 }

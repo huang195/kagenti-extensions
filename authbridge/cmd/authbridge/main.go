@@ -115,6 +115,12 @@ func main() {
 		log.Fatalf("building outbound pipeline: %v", err)
 	}
 
+	if cfg.Mode == config.ModeWaypoint {
+		if inboundPipeline.NeedsBody() || outboundPipeline.NeedsBody() {
+			log.Fatalf("waypoint mode does not support plugins that require body access (ext_authz limitation)")
+		}
+	}
+
 	// Track servers for graceful shutdown
 	var grpcServers []*grpc.Server
 	var httpServers []*http.Server

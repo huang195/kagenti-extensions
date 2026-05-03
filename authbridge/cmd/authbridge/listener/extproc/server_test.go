@@ -9,6 +9,7 @@ import (
 	"testing"
 
 	corev3 "github.com/envoyproxy/go-control-plane/envoy/config/core/v3"
+	extprocfilterv3 "github.com/envoyproxy/go-control-plane/envoy/extensions/filters/http/ext_proc/v3"
 	extprocv3 "github.com/envoyproxy/go-control-plane/envoy/service/ext_proc/v3"
 	"google.golang.org/grpc/metadata"
 
@@ -16,6 +17,7 @@ import (
 	"github.com/kagenti/kagenti-extensions/authbridge/authlib/bypass"
 	"github.com/kagenti/kagenti-extensions/authbridge/authlib/cache"
 	"github.com/kagenti/kagenti-extensions/authbridge/authlib/exchange"
+	"github.com/kagenti/kagenti-extensions/authbridge/authlib/pipeline"
 	"github.com/kagenti/kagenti-extensions/authbridge/authlib/plugins"
 	"github.com/kagenti/kagenti-extensions/authbridge/authlib/routing"
 	"github.com/kagenti/kagenti-extensions/authbridge/authlib/validation"
@@ -346,5 +348,211 @@ func TestExtProc_ResponseHeaders(t *testing.T) {
 	rh := stream.responses[0].GetResponseHeaders()
 	if rh == nil {
 		t.Fatal("expected ResponseHeaders passthrough")
+	}
+}
+
+// --- Body Buffering Tests ---
+
+// bodyRecorderPlugin records whether it received a body during OnRequest.
+type bodyRecorderPlugin struct {
+	receivedBody []byte
+}
+
+func (p *bodyRecorderPlugin) Name() string { return "body-recorder" }
+func (p *bodyRecorderPlugin) Capabilities() pipeline.PluginCapabilities {
+	return pipeline.PluginCapabilities{BodyAccess: true}
+}
+func (p *bodyRecorderPlugin) OnRequest(_ context.Context, pctx *pipeline.Context) pipeline.Action {
+	p.receivedBody = pctx.Body
+	return pipeline.Action{Type: pipeline.Continue}
+}
+func (p *bodyRecorderPlugin) OnResponse(_ context.Context, _ *pipeline.Context) pipeline.Action {
+	return pipeline.Action{Type: pipeline.Continue}
+}
+
+func TestExtProc_BodyBuffering_Inbound(t *testing.T) {
+	recorder := &bodyRecorderPlugin{}
+	p, err := pipeline.New([]pipeline.Plugin{recorder})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	outbound, err := plugins.DefaultOutboundPipeline(auth.New(auth.Config{}))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	srv := &Server{InboundPipeline: p, OutboundPipeline: outbound}
+
+	body := []byte(`{"method":"tools/call","id":1,"params":{"name":"get_weather"}}`)
+	stream := &mockStream{
+		ctx: context.Background(),
+		requests: []*extprocv3.ProcessingRequest{
+			inboundRequest(makeHeaders(
+				"x-authbridge-direction", "inbound",
+				":path", "/mcp",
+			)),
+			{
+				Request: &extprocv3.ProcessingRequest_RequestBody{
+					RequestBody: &extprocv3.HttpBody{Body: body},
+				},
+			},
+		},
+	}
+
+	_ = srv.Process(stream)
+
+	if len(stream.responses) != 2 {
+		t.Fatalf("expected 2 responses, got %d", len(stream.responses))
+	}
+
+	// First response should request body (mode override with BUFFERED)
+	first := stream.responses[0]
+	rh := first.GetRequestHeaders()
+	if rh == nil {
+		t.Fatal("first response should be HeadersResponse (requesting body)")
+	}
+	if first.ModeOverride == nil {
+		t.Fatal("expected ModeOverride requesting body buffering")
+	}
+	if first.ModeOverride.RequestBodyMode != extprocfilterv3.ProcessingMode_BUFFERED {
+		t.Errorf("RequestBodyMode = %v, want BUFFERED", first.ModeOverride.RequestBodyMode)
+	}
+
+	// Second response should be the pipeline result (allow)
+	second := stream.responses[1]
+	if second.GetRequestHeaders() == nil && second.GetImmediateResponse() == nil {
+		t.Fatal("second response should be a pipeline result")
+	}
+
+	// Plugin should have received the body
+	if string(recorder.receivedBody) != string(body) {
+		t.Errorf("plugin got body = %q, want %q", recorder.receivedBody, body)
+	}
+}
+
+func TestExtProc_BodyBuffering_Outbound(t *testing.T) {
+	recorder := &bodyRecorderPlugin{}
+	p, err := pipeline.New([]pipeline.Plugin{recorder})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	inbound, err := plugins.DefaultInboundPipeline(auth.New(auth.Config{
+		Verifier: &mockVerifier{claims: &validation.Claims{Subject: "user"}},
+		Identity: auth.IdentityConfig{Audience: "test"},
+	}))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	srv := &Server{InboundPipeline: inbound, OutboundPipeline: p}
+
+	body := []byte(`{"key":"value"}`)
+	stream := &mockStream{
+		ctx: context.Background(),
+		requests: []*extprocv3.ProcessingRequest{
+			outboundRequest(makeHeaders(
+				":authority", "target-svc",
+				"authorization", "Bearer token",
+			)),
+			{
+				Request: &extprocv3.ProcessingRequest_RequestBody{
+					RequestBody: &extprocv3.HttpBody{Body: body},
+				},
+			},
+		},
+	}
+
+	_ = srv.Process(stream)
+
+	if len(stream.responses) != 2 {
+		t.Fatalf("expected 2 responses, got %d", len(stream.responses))
+	}
+
+	// First response requests body
+	if stream.responses[0].ModeOverride == nil {
+		t.Fatal("expected ModeOverride on first response")
+	}
+
+	// Plugin should have received the body
+	if string(recorder.receivedBody) != string(body) {
+		t.Errorf("plugin got body = %q, want %q", recorder.receivedBody, body)
+	}
+}
+
+func TestExtProc_BodyTooLarge(t *testing.T) {
+	recorder := &bodyRecorderPlugin{}
+	p, err := pipeline.New([]pipeline.Plugin{recorder})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	outbound, err := plugins.DefaultOutboundPipeline(auth.New(auth.Config{}))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	srv := &Server{InboundPipeline: p, OutboundPipeline: outbound}
+
+	bigBody := make([]byte, maxBodySize+1)
+	stream := &mockStream{
+		ctx: context.Background(),
+		requests: []*extprocv3.ProcessingRequest{
+			inboundRequest(makeHeaders(
+				"x-authbridge-direction", "inbound",
+				":path", "/mcp",
+			)),
+			{
+				Request: &extprocv3.ProcessingRequest_RequestBody{
+					RequestBody: &extprocv3.HttpBody{Body: bigBody},
+				},
+			},
+		},
+	}
+
+	_ = srv.Process(stream)
+
+	if len(stream.responses) < 2 {
+		t.Fatalf("expected at least 2 responses, got %d", len(stream.responses))
+	}
+
+	// Second response should be an immediate 413 rejection
+	second := stream.responses[1]
+	ir := second.GetImmediateResponse()
+	if ir == nil {
+		t.Fatal("expected ImmediateResponse for oversized body")
+	}
+	if ir.Status.Code != 413 {
+		t.Errorf("status = %d, want 413", ir.Status.Code)
+	}
+}
+
+func TestExtProc_NoBodyBuffering_WhenNotNeeded(t *testing.T) {
+	a := auth.New(auth.Config{
+		Verifier: &mockVerifier{claims: &validation.Claims{Subject: "user"}},
+		Identity: auth.IdentityConfig{Audience: "my-agent"},
+	})
+	srv := serverFromAuth(t, a)
+
+	stream := &mockStream{
+		ctx: context.Background(),
+		requests: []*extprocv3.ProcessingRequest{
+			inboundRequest(makeHeaders(
+				"x-authbridge-direction", "inbound",
+				"authorization", "Bearer valid-token",
+				":path", "/api/test",
+			)),
+		},
+	}
+
+	_ = srv.Process(stream)
+
+	if len(stream.responses) != 1 {
+		t.Fatalf("expected 1 response (no body phase), got %d", len(stream.responses))
+	}
+	// Should NOT have ModeOverride
+	if stream.responses[0].ModeOverride != nil {
+		t.Error("should not request body when pipeline doesn't need it")
 	}
 }

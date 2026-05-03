@@ -3,6 +3,7 @@ package pipeline
 import (
 	"context"
 	"fmt"
+	"log/slog"
 )
 
 // Pipeline holds an ordered list of plugins and runs them sequentially.
@@ -59,12 +60,16 @@ func New(plugins []Plugin, opts ...Option) (*Pipeline, error) {
 func (p *Pipeline) Run(ctx context.Context, pctx *Context) Action {
 	for _, plugin := range p.plugins {
 		if ctx.Err() != nil {
+			slog.Info("pipeline: request cancelled", "plugin", plugin.Name())
 			return Action{Type: Reject, Status: 499, Reason: "request cancelled"}
 		}
 		action := plugin.OnRequest(ctx, pctx)
 		if action.Type == Reject {
+			slog.Info("pipeline: plugin rejected request",
+				"plugin", plugin.Name(), "status", action.Status, "reason", action.Reason)
 			return action
 		}
+		slog.Debug("pipeline: plugin completed", "plugin", plugin.Name())
 	}
 	return Action{Type: Continue}
 }
@@ -74,14 +79,27 @@ func (p *Pipeline) Run(ctx context.Context, pctx *Context) Action {
 func (p *Pipeline) RunResponse(ctx context.Context, pctx *Context) Action {
 	for i := len(p.plugins) - 1; i >= 0; i-- {
 		if ctx.Err() != nil {
+			slog.Info("pipeline: response cancelled", "plugin", p.plugins[i].Name())
 			return Action{Type: Reject, Status: 499, Reason: "request cancelled"}
 		}
 		action := p.plugins[i].OnResponse(ctx, pctx)
 		if action.Type == Reject {
+			slog.Info("pipeline: plugin rejected response",
+				"plugin", p.plugins[i].Name(), "status", action.Status, "reason", action.Reason)
 			return action
 		}
 	}
 	return Action{Type: Continue}
+}
+
+// NeedsBody returns true if any plugin in the pipeline declares BodyAccess.
+func (p *Pipeline) NeedsBody() bool {
+	for _, plugin := range p.plugins {
+		if plugin.Capabilities().BodyAccess {
+			return true
+		}
+	}
+	return false
 }
 
 // validateCapabilities checks that every slot a plugin reads has been written

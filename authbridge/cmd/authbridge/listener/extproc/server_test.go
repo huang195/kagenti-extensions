@@ -390,7 +390,9 @@ func TestExtProc_BodyBuffering_Inbound(t *testing.T) {
 		requests: []*extprocv3.ProcessingRequest{
 			inboundRequest(makeHeaders(
 				"x-authbridge-direction", "inbound",
+				":method", "POST",
 				":path", "/mcp",
+				"content-length", fmt.Sprintf("%d", len(body)),
 			)),
 			{
 				Request: &extprocv3.ProcessingRequest_RequestBody{
@@ -419,10 +421,10 @@ func TestExtProc_BodyBuffering_Inbound(t *testing.T) {
 		t.Errorf("RequestBodyMode = %v, want BUFFERED", first.ModeOverride.RequestBodyMode)
 	}
 
-	// Second response should be the pipeline result (allow)
+	// Second response should be the body-phase pipeline result (RequestBody response)
 	second := stream.responses[1]
-	if second.GetRequestHeaders() == nil && second.GetImmediateResponse() == nil {
-		t.Fatal("second response should be a pipeline result")
+	if second.GetRequestBody() == nil && second.GetImmediateResponse() == nil {
+		t.Fatal("second response should be a body-phase pipeline result")
 	}
 
 	// Plugin should have received the body
@@ -453,8 +455,10 @@ func TestExtProc_BodyBuffering_Outbound(t *testing.T) {
 		ctx: context.Background(),
 		requests: []*extprocv3.ProcessingRequest{
 			outboundRequest(makeHeaders(
+				":method", "POST",
 				":authority", "target-svc",
 				"authorization", "Bearer token",
+				"content-length", fmt.Sprintf("%d", len(body)),
 			)),
 			{
 				Request: &extprocv3.ProcessingRequest_RequestBody{
@@ -501,7 +505,9 @@ func TestExtProc_BodyTooLarge(t *testing.T) {
 		requests: []*extprocv3.ProcessingRequest{
 			inboundRequest(makeHeaders(
 				"x-authbridge-direction", "inbound",
+				":method", "POST",
 				":path", "/mcp",
+				"content-length", fmt.Sprintf("%d", len(bigBody)),
 			)),
 			{
 				Request: &extprocv3.ProcessingRequest_RequestBody{

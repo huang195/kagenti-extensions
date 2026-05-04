@@ -138,7 +138,7 @@ func TestA2AParser_FilePart(t *testing.T) {
 	}
 }
 
-func TestA2AParser_UnknownMethod(t *testing.T) {
+func TestA2AParser_AnyMethod(t *testing.T) {
 	p := NewA2AParser()
 	pctx := &pipeline.Context{
 		Body: []byte(`{"jsonrpc":"2.0","method":"tasks/get","id":"req-5","params":{"taskId":"task-123"}}`),
@@ -159,7 +159,88 @@ func TestA2AParser_UnknownMethod(t *testing.T) {
 		t.Errorf("RPCID = %v, want %q", ext.RPCID, "req-5")
 	}
 	if len(ext.Parts) != 0 {
-		t.Errorf("Parts should be empty for unknown method, got %d", len(ext.Parts))
+		t.Errorf("Parts should be empty when no params.message, got %d", len(ext.Parts))
+	}
+}
+
+func TestA2AParser_FutureMethodWithMessage(t *testing.T) {
+	p := NewA2AParser()
+	pctx := &pipeline.Context{
+		Body: []byte(`{"jsonrpc":"2.0","method":"message/resume","id":"req-7","params":{"message":{"role":"user","parts":[{"kind":"text","text":"Continue"}],"messageId":"msg-007"},"sessionId":"sess-future"}}`),
+	}
+
+	action := p.OnRequest(context.Background(), pctx)
+	if action.Type != pipeline.Continue {
+		t.Fatalf("expected Continue, got %v", action.Type)
+	}
+	ext := pctx.Extensions.A2A
+	if ext == nil {
+		t.Fatal("Extensions.A2A is nil")
+	}
+	if ext.Method != "message/resume" {
+		t.Errorf("Method = %q, want %q", ext.Method, "message/resume")
+	}
+	if ext.SessionID != "sess-future" {
+		t.Errorf("SessionID = %q, want %q", ext.SessionID, "sess-future")
+	}
+	if ext.Role != "user" {
+		t.Errorf("Role = %q, want %q", ext.Role, "user")
+	}
+	if len(ext.Parts) != 1 {
+		t.Fatalf("Parts len = %d, want 1", len(ext.Parts))
+	}
+	if ext.Parts[0].Content != "Continue" {
+		t.Errorf("Parts[0].Content = %q, want %q", ext.Parts[0].Content, "Continue")
+	}
+}
+
+func TestA2AParser_DataPart(t *testing.T) {
+	p := NewA2AParser()
+	pctx := &pipeline.Context{
+		Body: []byte(`{"jsonrpc":"2.0","method":"message/send","id":"req-8","params":{"message":{"role":"user","parts":[{"kind":"data","data":{"key":"value","num":42}}],"messageId":"msg-008"}}}`),
+	}
+
+	action := p.OnRequest(context.Background(), pctx)
+	if action.Type != pipeline.Continue {
+		t.Fatalf("expected Continue, got %v", action.Type)
+	}
+	ext := pctx.Extensions.A2A
+	if ext == nil {
+		t.Fatal("Extensions.A2A is nil")
+	}
+	if len(ext.Parts) != 1 {
+		t.Fatalf("Parts len = %d, want 1", len(ext.Parts))
+	}
+	if ext.Parts[0].Kind != "data" {
+		t.Errorf("Parts[0].Kind = %q, want %q", ext.Parts[0].Kind, "data")
+	}
+	if ext.Parts[0].Content == "" {
+		t.Error("Parts[0].Content should not be empty for data part")
+	}
+}
+
+func TestA2AParser_FilePartURI(t *testing.T) {
+	p := NewA2AParser()
+	pctx := &pipeline.Context{
+		Body: []byte(`{"jsonrpc":"2.0","method":"message/send","id":"req-9","params":{"message":{"role":"user","parts":[{"kind":"file","uri":"https://example.com/doc.pdf"}],"messageId":"msg-009"}}}`),
+	}
+
+	action := p.OnRequest(context.Background(), pctx)
+	if action.Type != pipeline.Continue {
+		t.Fatalf("expected Continue, got %v", action.Type)
+	}
+	ext := pctx.Extensions.A2A
+	if ext == nil {
+		t.Fatal("Extensions.A2A is nil")
+	}
+	if len(ext.Parts) != 1 {
+		t.Fatalf("Parts len = %d, want 1", len(ext.Parts))
+	}
+	if ext.Parts[0].Kind != "file" {
+		t.Errorf("Parts[0].Kind = %q, want %q", ext.Parts[0].Kind, "file")
+	}
+	if ext.Parts[0].Content != "https://example.com/doc.pdf" {
+		t.Errorf("Parts[0].Content = %q, want %q", ext.Parts[0].Content, "https://example.com/doc.pdf")
 	}
 }
 

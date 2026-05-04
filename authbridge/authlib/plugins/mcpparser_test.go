@@ -42,14 +42,15 @@ func TestMCPParser_ToolCall(t *testing.T) {
 	if pctx.Extensions.MCP.RPCID != float64(1) {
 		t.Errorf("RPCID = %v, want 1", pctx.Extensions.MCP.RPCID)
 	}
-	if pctx.Extensions.MCP.Tool == nil {
-		t.Fatal("Tool is nil")
+	if pctx.Extensions.MCP.Params["name"] != "get_weather" {
+		t.Errorf("Params[name] = %v, want %q", pctx.Extensions.MCP.Params["name"], "get_weather")
 	}
-	if pctx.Extensions.MCP.Tool.Name != "get_weather" {
-		t.Errorf("Tool.Name = %q, want %q", pctx.Extensions.MCP.Tool.Name, "get_weather")
+	args, ok := pctx.Extensions.MCP.Params["arguments"].(map[string]any)
+	if !ok {
+		t.Fatal("Params[arguments] is not a map")
 	}
-	if pctx.Extensions.MCP.Tool.Args["city"] != "NYC" {
-		t.Errorf("Tool.Args[city] = %v, want %q", pctx.Extensions.MCP.Tool.Args["city"], "NYC")
+	if args["city"] != "NYC" {
+		t.Errorf("Params[arguments][city] = %v, want %q", args["city"], "NYC")
 	}
 }
 
@@ -66,11 +67,11 @@ func TestMCPParser_ResourceRead(t *testing.T) {
 	if pctx.Extensions.MCP == nil {
 		t.Fatal("Extensions.MCP is nil")
 	}
-	if pctx.Extensions.MCP.Resource == nil {
-		t.Fatal("Resource is nil")
+	if pctx.Extensions.MCP.Method != "resources/read" {
+		t.Errorf("Method = %q, want %q", pctx.Extensions.MCP.Method, "resources/read")
 	}
-	if pctx.Extensions.MCP.Resource.URI != "file:///tmp/data.csv" {
-		t.Errorf("Resource.URI = %q, want %q", pctx.Extensions.MCP.Resource.URI, "file:///tmp/data.csv")
+	if pctx.Extensions.MCP.Params["uri"] != "file:///tmp/data.csv" {
+		t.Errorf("Params[uri] = %v, want %q", pctx.Extensions.MCP.Params["uri"], "file:///tmp/data.csv")
 	}
 }
 
@@ -87,18 +88,22 @@ func TestMCPParser_PromptGet(t *testing.T) {
 	if pctx.Extensions.MCP == nil {
 		t.Fatal("Extensions.MCP is nil")
 	}
-	if pctx.Extensions.MCP.Prompt == nil {
-		t.Fatal("Prompt is nil")
+	if pctx.Extensions.MCP.Method != "prompts/get" {
+		t.Errorf("Method = %q, want %q", pctx.Extensions.MCP.Method, "prompts/get")
 	}
-	if pctx.Extensions.MCP.Prompt.Name != "summarize" {
-		t.Errorf("Prompt.Name = %q, want %q", pctx.Extensions.MCP.Prompt.Name, "summarize")
+	if pctx.Extensions.MCP.Params["name"] != "summarize" {
+		t.Errorf("Params[name] = %v, want %q", pctx.Extensions.MCP.Params["name"], "summarize")
 	}
-	if pctx.Extensions.MCP.Prompt.Args["style"] != "brief" {
-		t.Errorf("Prompt.Args[style] = %q, want %q", pctx.Extensions.MCP.Prompt.Args["style"], "brief")
+	args, ok := pctx.Extensions.MCP.Params["arguments"].(map[string]any)
+	if !ok {
+		t.Fatal("Params[arguments] is not a map")
+	}
+	if args["style"] != "brief" {
+		t.Errorf("Params[arguments][style] = %v, want %q", args["style"], "brief")
 	}
 }
 
-func TestMCPParser_UnknownMethod(t *testing.T) {
+func TestMCPParser_AnyMethod(t *testing.T) {
 	p := NewMCPParser()
 	pctx := &pipeline.Context{
 		Body: []byte(`{"jsonrpc":"2.0","method":"notifications/initialized","id":4}`),
@@ -113,15 +118,6 @@ func TestMCPParser_UnknownMethod(t *testing.T) {
 	}
 	if pctx.Extensions.MCP.Method != "notifications/initialized" {
 		t.Errorf("Method = %q, want %q", pctx.Extensions.MCP.Method, "notifications/initialized")
-	}
-	if pctx.Extensions.MCP.Tool != nil {
-		t.Error("Tool should be nil for unknown method")
-	}
-	if pctx.Extensions.MCP.Resource != nil {
-		t.Error("Resource should be nil for unknown method")
-	}
-	if pctx.Extensions.MCP.Prompt != nil {
-		t.Error("Prompt should be nil for unknown method")
 	}
 }
 
@@ -177,11 +173,11 @@ func TestMCPParser_MissingParams(t *testing.T) {
 	if pctx.Extensions.MCP == nil {
 		t.Fatal("Extensions.MCP is nil")
 	}
-	if pctx.Extensions.MCP.Tool == nil {
-		t.Fatal("Tool should not be nil for tools/call")
+	if pctx.Extensions.MCP.Method != "tools/call" {
+		t.Errorf("Method = %q, want %q", pctx.Extensions.MCP.Method, "tools/call")
 	}
-	if pctx.Extensions.MCP.Tool.Name != "" {
-		t.Errorf("Tool.Name = %q, want empty", pctx.Extensions.MCP.Tool.Name)
+	if pctx.Extensions.MCP.Params != nil {
+		t.Errorf("Params = %v, want nil when params not present", pctx.Extensions.MCP.Params)
 	}
 }
 

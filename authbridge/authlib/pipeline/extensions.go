@@ -13,31 +13,10 @@ type Extensions struct {
 }
 
 // MCPExtension carries parsed MCP JSON-RPC metadata.
-// Exactly one of Tool, Resource, or Prompt is populated per request.
 type MCPExtension struct {
-	Method string // JSON-RPC method: "tools/call", "resources/read", "prompts/get"
-	RPCID  any    // JSON-RPC id for request-response correlation
-
-	Tool     *MCPToolMetadata
-	Resource *MCPResourceMetadata
-	Prompt   *MCPPromptMetadata
-}
-
-// MCPToolMetadata is populated for tools/call requests.
-type MCPToolMetadata struct {
-	Name string
-	Args map[string]any
-}
-
-// MCPResourceMetadata is populated for resources/read requests.
-type MCPResourceMetadata struct {
-	URI string
-}
-
-// MCPPromptMetadata is populated for prompts/get requests.
-type MCPPromptMetadata struct {
-	Name string
-	Args map[string]string
+	Method string         // JSON-RPC method (e.g. "tools/call", "resources/read", "initialize")
+	RPCID  any            // JSON-RPC id for request-response correlation
+	Params map[string]any // raw params from the JSON-RPC request
 }
 
 // A2AExtension carries parsed A2A protocol metadata.

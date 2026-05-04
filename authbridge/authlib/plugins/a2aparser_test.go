@@ -311,6 +311,31 @@ func TestA2AParser_MissingMessage(t *testing.T) {
 	}
 }
 
+func TestA2AParser_MalformedParts(t *testing.T) {
+	p := NewA2AParser()
+	pctx := &pipeline.Context{
+		Body: []byte(`{"jsonrpc":"2.0","method":"message/send","id":"req-10","params":{"message":{"role":"user","parts":[{"kind":0,"text":"bad"},{"text":"missing-kind"},{"kind":"text","text":"valid"}],"messageId":"msg-010"}}}`),
+	}
+
+	action := p.OnRequest(context.Background(), pctx)
+	if action.Type != pipeline.Continue {
+		t.Fatalf("expected Continue, got %v", action.Type)
+	}
+	ext := pctx.Extensions.A2A
+	if ext == nil {
+		t.Fatal("Extensions.A2A is nil")
+	}
+	if len(ext.Parts) != 1 {
+		t.Fatalf("Parts len = %d, want 1 (only the valid part)", len(ext.Parts))
+	}
+	if ext.Parts[0].Kind != "text" {
+		t.Errorf("Parts[0].Kind = %q, want %q", ext.Parts[0].Kind, "text")
+	}
+	if ext.Parts[0].Content != "valid" {
+		t.Errorf("Parts[0].Content = %q, want %q", ext.Parts[0].Content, "valid")
+	}
+}
+
 func TestA2AParser_OnResponse(t *testing.T) {
 	p := NewA2AParser()
 	action := p.OnResponse(context.Background(), &pipeline.Context{})

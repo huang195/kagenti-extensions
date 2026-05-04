@@ -80,7 +80,10 @@ func parseA2AParts(rawParts []any) []pipeline.A2APart {
 		if !ok {
 			continue
 		}
-		kind, _ := partMap["kind"].(string)
+		kind, ok := partMap["kind"].(string)
+		if !ok || kind == "" {
+			continue
+		}
 		var content string
 		switch kind {
 		case "text":

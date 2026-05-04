@@ -336,6 +336,34 @@ func TestA2AParser_MalformedParts(t *testing.T) {
 	}
 }
 
+func TestA2AParser_MalformedContentValues(t *testing.T) {
+	p := NewA2AParser()
+	pctx := &pipeline.Context{
+		Body: []byte(`{"jsonrpc":"2.0","method":"message/send","id":"req-11","params":{"message":{"role":"user","parts":[{"kind":"text","text":false},{"kind":"file","data":0,"uri":{}},{"kind":"data","data":null}],"messageId":"msg-011"}}}`),
+	}
+
+	action := p.OnRequest(context.Background(), pctx)
+	if action.Type != pipeline.Continue {
+		t.Fatalf("expected Continue, got %v", action.Type)
+	}
+	ext := pctx.Extensions.A2A
+	if ext == nil {
+		t.Fatal("Extensions.A2A is nil")
+	}
+	if len(ext.Parts) != 3 {
+		t.Fatalf("Parts len = %d, want 3", len(ext.Parts))
+	}
+	if ext.Parts[0].Content != "" {
+		t.Errorf("text part with bool value: Content = %q, want empty", ext.Parts[0].Content)
+	}
+	if ext.Parts[1].Content != "" {
+		t.Errorf("file part with numeric data and object uri: Content = %q, want empty", ext.Parts[1].Content)
+	}
+	if ext.Parts[2].Content != "" {
+		t.Errorf("data part with null data: Content = %q, want empty", ext.Parts[2].Content)
+	}
+}
+
 func TestA2AParser_OnResponse(t *testing.T) {
 	p := NewA2AParser()
 	action := p.OnResponse(context.Background(), &pipeline.Context{})

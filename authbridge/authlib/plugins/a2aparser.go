@@ -89,12 +89,13 @@ func parseA2AParts(rawParts []any) []pipeline.A2APart {
 		case "text":
 			content, _ = partMap["text"].(string)
 		case "file":
+			// TODO: update when A2A spec stabilizes — canonical Part uses mediaType + content field presence, not "kind".
 			content, _ = partMap["data"].(string)
 			if content == "" {
 				content, _ = partMap["uri"].(string)
 			}
 		case "data":
-			if dataVal, ok := partMap["data"]; ok {
+			if dataVal, ok := partMap["data"]; ok && dataVal != nil {
 				if b, err := json.Marshal(dataVal); err == nil {
 					content = string(b)
 				}

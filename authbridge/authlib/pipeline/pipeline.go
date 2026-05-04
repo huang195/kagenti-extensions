@@ -17,6 +17,7 @@ var defaultSlots = map[string]bool{
 	"a2a":        true,
 	"security":   true,
 	"delegation": true,
+	"inference":  true,
 	"custom":     true,
 }
 

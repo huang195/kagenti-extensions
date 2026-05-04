@@ -6,6 +6,7 @@ package forwardproxy
 import (
 	"bytes"
 	"encoding/json"
+	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
@@ -103,6 +104,42 @@ func (s *Server) handleRequest(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer resp.Body.Close()
+
+	// Response phase: populate pctx and run plugins in reverse order.
+	pctx.StatusCode = resp.StatusCode
+	pctx.ResponseHeaders = resp.Header.Clone()
+
+	if s.OutboundPipeline.NeedsResponseBody() && resp.Body != nil {
+		respBody, err := io.ReadAll(io.LimitReader(resp.Body, maxBodySize+1))
+		if err != nil {
+			slog.Warn("forward-proxy: response body read error", "host", r.Host, "error", err)
+			http.Error(w, `{"error":"response body read error"}`, http.StatusBadGateway)
+			return
+		}
+		if len(respBody) > maxBodySize {
+			slog.Warn("forward-proxy: response body too large", "host", r.Host, "len", len(respBody))
+			http.Error(w, `{"error":"response body too large"}`, http.StatusBadGateway)
+			return
+		}
+		pctx.ResponseBody = respBody
+		resp.Body = io.NopCloser(bytes.NewReader(respBody))
+	}
+
+	respAction := s.OutboundPipeline.RunResponse(r.Context(), pctx)
+	if respAction.Type == pipeline.Reject {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(respAction.Status)
+		body, _ := json.Marshal(map[string]string{"error": respAction.Reason})
+		w.Write(body)
+		return
+	}
+
+	// If a plugin mutated ResponseBody, use the mutated version.
+	if s.OutboundPipeline.NeedsResponseBody() && pctx.ResponseBody != nil {
+		resp.Body = io.NopCloser(bytes.NewReader(pctx.ResponseBody))
+		resp.ContentLength = int64(len(pctx.ResponseBody))
+		resp.Header.Set("Content-Length", fmt.Sprintf("%d", len(pctx.ResponseBody)))
+	}
 
 	for key, values := range resp.Header {
 		for _, value := range values {

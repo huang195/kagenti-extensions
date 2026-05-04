@@ -58,6 +58,16 @@ type jsonRPCRequest struct {
 	Params map[string]any `json:"params"`
 }
 
+func (r *jsonRPCRequest) stringParam(key string) string {
+	v, _ := r.Params[key].(string)
+	return v
+}
+
+func (r *jsonRPCRequest) mapParam(key string) map[string]any {
+	v, _ := r.Params[key].(map[string]any)
+	return v
+}
+
 func truncate(s string, max int) string {
 	if len(s) <= max {
 		return s

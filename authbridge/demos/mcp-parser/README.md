@@ -275,7 +275,7 @@ You should see `allow_mode_override: true` for each ext_proc filter.
 With `pctx.Extensions.MCP` populated, future plugins can:
 
 - **tool-policy**: Allow/deny specific tools based on caller identity
-  (`pctx.Claims.Scopes` + `pctx.Extensions.MCP.Tool.Name`)
+  (`pctx.Claims.Scopes` + `pctx.Extensions.MCP.Params["name"]`)
 - **audit**: Log every tool invocation with full caller attribution
 - **guardrails**: Inspect tool arguments for PII or injection patterns
 - **rate-limit**: Per-tool rate limiting based on caller identity

@@ -42,7 +42,7 @@ func (p *MCPParser) OnRequest(_ context.Context, pctx *pipeline.Context) pipelin
 		Params: rpc.Params,
 	}
 
-	slog.Info("mcp-parser", "method", rpc.Method)
+	slog.Info("mcp-parser: request", "method", rpc.Method)
 	slog.Debug("mcp-parser: payload", "method", rpc.Method, "body", truncate(string(pctx.Body), 128))
 
 	return pipeline.Action{Type: pipeline.Continue}

@@ -130,19 +130,9 @@ kubectl patch configmap authbridge-config -n team1 \
 Or toggle at runtime without restart:
 
 ```bash
-# Find the authbridge PID (not PID 1, which is entrypoint.sh in the
-# combined envoy-proxy container):
-ABPID=$(kubectl exec deploy/<agent-name> -n team1 -c envoy-proxy -- \
-  sh -c 'for f in /proc/[0-9]*/cmdline; do
-    if cat "$f" 2>/dev/null | tr "\0" " " | head -c 100 | \
-       cat - /dev/null | sh -c "read x; case \$x in *authbridge*) exit 0;; *) exit 1;; esac"; then
-      echo "${f%/cmdline}" | tr -dc "0-9"; break
-    fi
-  done')
-kubectl exec deploy/<agent-name> -n team1 -c envoy-proxy -- kill -USR1 $ABPID
-
-# Or if you know the PID (typically 14 in the combined image):
-kubectl exec deploy/<agent-name> -n team1 -c envoy-proxy -- kill -USR1 14
+# The container has no standalone kill/grep — use bash builtins to find the PID.
+kubectl exec deploy/<agent-name> -n team1 -c envoy-proxy -- \
+  bash -c 'for f in /proc/[0-9]*/cmdline; do [ -r "$f" ] || continue; c=$(<"$f"); [[ "$c" == /usr/local/bin/authbridge* ]] && kill -USR1 "${f//[!0-9]/}" && break; done'
 ```
 
 ## Step 3: Restart the Agent Pod

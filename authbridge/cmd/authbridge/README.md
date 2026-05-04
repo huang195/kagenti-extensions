@@ -183,7 +183,10 @@ LOG_LEVEL=debug authbridge --config /etc/authbridge/config.yaml
 Send `SIGUSR1` to toggle between `info` and `debug`:
 
 ```bash
-kubectl exec deploy/weather-service -n team1 -c authbridge-proxy -- kill -USR1 1
+# The container has no standalone kill/grep binaries — use bash builtins only.
+# Match on the full binary path to skip the entrypoint script (also at PID 1).
+kubectl exec deploy/weather-service -n team1 -c envoy-proxy -- \
+  bash -c 'for f in /proc/[0-9]*/cmdline; do [ -r "$f" ] || continue; c=$(<"$f"); [[ "$c" == /usr/local/bin/authbridge* ]] && kill -USR1 "${f//[!0-9]/}" && break; done'
 ```
 
 Send again to toggle back. The current level is logged on each toggle.

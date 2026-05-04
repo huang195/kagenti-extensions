@@ -1,8 +1,8 @@
 # MCP Parser Plugin Demo
 
 This guide shows how to enable the `mcp-parser` plugin so AuthBridge
-parses MCP JSON-RPC requests and logs tool calls, resource reads, and
-prompt invocations.
+parses outbound MCP JSON-RPC requests and logs tool calls, resource
+reads, and prompt invocations.
 
 ## Prerequisites
 
@@ -16,7 +16,12 @@ prompt invocations.
 
 ## How It Works
 
-The `mcp-parser` plugin:
+The `mcp-parser` plugin runs on the **outbound** pipeline. Agents use the
+MCP protocol to call tools — these are outbound HTTP requests from the
+agent to tool services. Inbound requests to the agent use A2A protocol,
+not MCP.
+
+The plugin:
 1. Declares `BodyAccess: true`, which triggers body buffering in all
    listener modes
 2. Parses the request body as JSON-RPC 2.0
@@ -25,9 +30,36 @@ The `mcp-parser` plugin:
 4. Returns `Continue` unconditionally (never rejects)
 
 In envoy-sidecar mode, AuthBridge uses ext_proc `ModeOverride` to
-dynamically request the body from Envoy. No Envoy configuration changes
-are needed — the default `request_body_mode: NONE` is overridden
-per-stream when `mcp-parser` is in the pipeline.
+dynamically request the body from Envoy when a POST request has a body.
+GET/HEAD/OPTIONS/DELETE requests skip body buffering entirely (these
+methods have no body).
+
+### Envoy Configuration Requirement
+
+The outbound ext_proc filter **must** have `allow_mode_override: true`
+for dynamic body buffering to work. Without it, Envoy ignores the
+`ModeOverride` and never sends the request body to authbridge.
+
+```yaml
+# In the outbound_listener's ext_proc filter:
+- name: envoy.filters.http.ext_proc
+  typed_config:
+    "@type": type.googleapis.com/envoy.extensions.filters.http.ext_proc.v3.ExternalProcessor
+    grpc_service:
+      envoy_grpc:
+        cluster_name: ext_proc_cluster
+      timeout: 300s
+    allow_mode_override: true          # Required for mcp-parser
+    processing_mode:
+      request_header_mode: SEND
+      response_header_mode: SKIP
+      request_body_mode: NONE
+      response_body_mode: NONE
+```
+
+If you are using the kagenti-operator v0.5.0-alpha.8+, this is already
+set in the default `envoy-config` ConfigMap. For earlier versions, patch
+the ConfigMap manually.
 
 ## Step 1: Patch the Runtime Config
 
@@ -66,6 +98,9 @@ data:
       inbound:
         plugins:
           - jwt-validation
+      outbound:
+        plugins:
+          - token-exchange
           - mcp-parser
 EOF
 ```
@@ -74,11 +109,11 @@ EOF
 > should match your existing `authbridge-runtime-config`. If you use
 > `client-secret` identity type instead of `spiffe`, adjust accordingly.
 
-The `mcp-parser` is placed **after** `jwt-validation` in the inbound
+The `mcp-parser` is placed **after** `token-exchange` in the outbound
 pipeline. This means:
-- Unauthenticated requests are rejected before body buffering occurs
-- Only validated requests have their body parsed (no wasted work)
-- Future policy plugins can read both `pctx.Claims` and
+- Token exchange runs first (injecting credentials for routed hosts)
+- The MCP body is parsed after auth decisions are made
+- Future policy plugins can read both token metadata and
   `pctx.Extensions.MCP`
 
 ## Step 2: Enable Debug Logging (Optional)
@@ -95,8 +130,19 @@ kubectl patch configmap authbridge-config -n team1 \
 Or toggle at runtime without restart:
 
 ```bash
-# Send SIGUSR1 to the authbridge process (PID 1 inside the container)
-kubectl exec deploy/<agent-name> -n team1 -c authbridge-proxy -- kill -USR1 1
+# Find the authbridge PID (not PID 1, which is entrypoint.sh in the
+# combined envoy-proxy container):
+ABPID=$(kubectl exec deploy/<agent-name> -n team1 -c envoy-proxy -- \
+  sh -c 'for f in /proc/[0-9]*/cmdline; do
+    if cat "$f" 2>/dev/null | tr "\0" " " | head -c 100 | \
+       cat - /dev/null | sh -c "read x; case \$x in *authbridge*) exit 0;; *) exit 1;; esac"; then
+      echo "${f%/cmdline}" | tr -dc "0-9"; break
+    fi
+  done')
+kubectl exec deploy/<agent-name> -n team1 -c envoy-proxy -- kill -USR1 $ABPID
+
+# Or if you know the PID (typically 14 in the combined image):
+kubectl exec deploy/<agent-name> -n team1 -c envoy-proxy -- kill -USR1 14
 ```
 
 ## Step 3: Restart the Agent Pod
@@ -116,25 +162,24 @@ kubectl rollout status deploy/<agent-name> -n team1
 ## Step 4: Send a Request Through the Agent
 
 Use the Kagenti UI or curl to trigger a tool call through the agent.
-For the weather agent:
+For the weather agent, simply ask it a weather question — the agent
+will call the weather-tool-mcp service over MCP (outbound):
 
 ```bash
 # Via the Kagenti UI:
-# Navigate to the agent, type "What's the weather in NYC?"
-
-# Or via curl (replace TOKEN with a valid Keycloak access token):
-curl -X POST http://<agent-host>/mcp \
-  -H "Authorization: Bearer $TOKEN" \
-  -H "Content-Type: application/json" \
-  -d '{"jsonrpc":"2.0","method":"tools/call","id":1,"params":{"name":"get_weather","arguments":{"city":"NYC"}}}'
+# Navigate to the weather agent, type "What's the weather in NYC?"
 ```
+
+The agent receives an A2A request (inbound, validated by jwt-validation),
+then makes an outbound MCP `tools/call` to the weather tool. The
+mcp-parser sees this outbound call.
 
 ## Step 5: Verify in Logs
 
-Check the authbridge container logs for MCP parsing output:
+Check the envoy-proxy container logs for MCP parsing output:
 
 ```bash
-kubectl logs deploy/<agent-name> -n team1 -c authbridge-proxy | grep mcp-parser
+kubectl logs deploy/<agent-name> -n team1 -c envoy-proxy | grep mcp-parser
 ```
 
 ### Expected Output (LOG_LEVEL=info)
@@ -153,15 +198,20 @@ level=INFO msg="mcp-parser: parsed resources/read" uri=file:///tmp/data.csv
 
 ### Expected Output (LOG_LEVEL=debug)
 
-With debug enabled, you also see:
+With debug enabled, you also see the body buffering flow:
 
 ```
-level=DEBUG msg="ext_proc: requesting body from Envoy" direction=inbound
-level=DEBUG msg="ext_proc: received request body" direction=inbound bodyLen=87
-level=DEBUG msg="pipeline: plugin completed" plugin=jwt-validation
+level=DEBUG msg="ext_proc: requesting body from Envoy" direction=""
+level=DEBUG msg="ext_proc: received request body" direction="" bodyLen=106
+level=INFO  msg="outbound passthrough" host=weather-tool-mcp:9090 reason="no matching route"
+level=DEBUG msg="pipeline: plugin completed" plugin=token-exchange
 level=INFO  msg="mcp-parser: parsed tools/call" tool=get_weather
 level=DEBUG msg="pipeline: plugin completed" plugin=mcp-parser
 ```
+
+The `direction=""` (empty) indicates outbound — only inbound requests
+have the `x-authbridge-direction: inbound` header set by Envoy's Lua
+filter.
 
 ### Requests That Are NOT MCP
 
@@ -171,7 +221,7 @@ Non-JSON or non-MCP requests pass through silently at debug level:
 level=DEBUG msg="mcp-parser: body is not valid JSON-RPC" error="invalid character..." bodyLen=42
 ```
 
-Or if the body is empty (e.g., GET requests):
+Or if the request has no body (e.g., GET requests skip body buffering):
 
 ```
 level=DEBUG msg="mcp-parser: no body, skipping"
@@ -195,15 +245,40 @@ This fatal error means you configured `mcp-parser` in waypoint mode.
 ext_authz cannot forward request bodies (hard Envoy constraint). Use
 envoy-sidecar or proxy-sidecar mode instead.
 
+### "Spurious response message received on gRPC stream"
+
+This Envoy warning means ext_proc sent a response that Envoy wasn't
+expecting. Two common causes:
+
+1. **Missing `allow_mode_override: true`** — Envoy ignores the
+   `ModeOverride` in the headers response, never sends RequestBody, but
+   authbridge already replied to RequestHeaders. The next request on the
+   same stream then gets a stale response. Fix: add
+   `allow_mode_override: true` to the ext_proc filter config.
+
+2. **Wrong response phase** — If authbridge sends a
+   `ProcessingResponse_RequestHeaders` when Envoy expects a
+   `ProcessingResponse_RequestBody` (because body buffering was
+   requested), Envoy logs this warning. This was fixed in
+   v0.5.0-alpha.9+.
+
 ### Body not reaching the parser
 
 If you see `mcp-parser: no body, skipping` for requests that should
 have a body, check:
-1. The request is POST with a JSON body (GET requests have no body)
-2. The `Content-Length` header is present (some clients omit it for
-   chunked encoding)
+1. The request is POST with a `Content-Length` or `Transfer-Encoding`
+   header (GET/HEAD/OPTIONS/DELETE requests skip body buffering)
+2. The `allow_mode_override: true` is set on the ext_proc filter in the
+   envoy-config ConfigMap (check both outbound and inbound listeners)
 3. Envoy's `per_stream_buffer_limit_bytes` isn't set too low (default
    1MB is fine for MCP)
+
+Verify the envoy config:
+```bash
+kubectl exec deploy/<agent-name> -n team1 -c envoy-proxy -- \
+  cat /etc/envoy/envoy.yaml | grep allow_mode_override
+```
+You should see `allow_mode_override: true` for each ext_proc filter.
 
 ## What This Enables (Future)
 

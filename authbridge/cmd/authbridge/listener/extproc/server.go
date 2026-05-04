@@ -63,7 +63,7 @@ func (s *Server) Process(stream extprocv3.ExternalProcessor_ProcessServer) error
 				p = s.InboundPipeline
 			}
 
-			if p.NeedsBody() {
+			if p.NeedsBody() && requestHasBody(headers) {
 				slog.Debug("ext_proc: requesting body from Envoy", "direction", direction)
 				pendingHeaders = headers
 				pendingDirection = direction
@@ -81,9 +81,9 @@ func (s *Server) Process(stream extprocv3.ExternalProcessor_ProcessServer) error
 				slog.Warn("ext_proc: request body too large", "direction", pendingDirection, "bodyLen", len(body))
 				resp = immediateResponse(http.StatusRequestEntityTooLarge, "request body too large")
 			} else if pendingDirection == "inbound" {
-				resp = s.handleInbound(stream, pendingHeaders, body)
+				resp = s.handleInboundBody(stream, pendingHeaders, body)
 			} else {
-				resp = s.handleOutbound(stream, pendingHeaders, body)
+				resp = s.handleOutboundBody(stream, pendingHeaders, body)
 			}
 			pendingHeaders = nil
 			pendingDirection = ""
@@ -123,6 +123,24 @@ func (s *Server) handleInbound(stream extprocv3.ExternalProcessor_ProcessServer,
 	return allowResponse()
 }
 
+func (s *Server) handleInboundBody(stream extprocv3.ExternalProcessor_ProcessServer, headers *corev3.HeaderMap, body []byte) *extprocv3.ProcessingResponse {
+	ctx := stream.Context()
+	pctx := &pipeline.Context{
+		Direction: pipeline.Inbound,
+		Path:      getHeader(headers, ":path"),
+		Headers:   headerMapToHTTP(headers),
+		Body:      body,
+	}
+
+	action := s.InboundPipeline.Run(ctx, pctx)
+	if action.Type == pipeline.Reject {
+		return denyResponse(typev3.StatusCode(action.Status),
+			jsonError("unauthorized", action.Reason))
+	}
+
+	return allowBodyResponse()
+}
+
 func (s *Server) handleOutbound(stream extprocv3.ExternalProcessor_ProcessServer, headers *corev3.HeaderMap, body []byte) *extprocv3.ProcessingResponse {
 	ctx := stream.Context()
 	pctx := &pipeline.Context{
@@ -147,6 +165,32 @@ func (s *Server) handleOutbound(stream extprocv3.ExternalProcessor_ProcessServer
 		return replaceTokenResponse(extractBearer(newAuth))
 	}
 	return passResponse()
+}
+
+func (s *Server) handleOutboundBody(stream extprocv3.ExternalProcessor_ProcessServer, headers *corev3.HeaderMap, body []byte) *extprocv3.ProcessingResponse {
+	ctx := stream.Context()
+	pctx := &pipeline.Context{
+		Direction: pipeline.Outbound,
+		Host:      getHeader(headers, ":authority"),
+		Headers:   headerMapToHTTP(headers),
+		Body:      body,
+	}
+	if pctx.Host == "" {
+		pctx.Host = getHeader(headers, "host")
+	}
+
+	originalAuth := pctx.Headers.Get("Authorization")
+	action := s.OutboundPipeline.Run(ctx, pctx)
+	if action.Type == pipeline.Reject {
+		return denyResponse(typev3.StatusCode_ServiceUnavailable,
+			jsonError("token_acquisition_failed", action.Reason))
+	}
+
+	newAuth := pctx.Headers.Get("Authorization")
+	if newAuth != originalAuth {
+		return replaceTokenBodyResponse(extractBearer(newAuth))
+	}
+	return passBodyResponse()
 }
 
 func headerMapToHTTP(headers *corev3.HeaderMap) http.Header {
@@ -199,6 +243,49 @@ func passResponse() *extprocv3.ProcessingResponse {
 	}
 }
 
+func passBodyResponse() *extprocv3.ProcessingResponse {
+	return &extprocv3.ProcessingResponse{
+		Response: &extprocv3.ProcessingResponse_RequestBody{
+			RequestBody: &extprocv3.BodyResponse{},
+		},
+	}
+}
+
+func allowBodyResponse() *extprocv3.ProcessingResponse {
+	return &extprocv3.ProcessingResponse{
+		Response: &extprocv3.ProcessingResponse_RequestBody{
+			RequestBody: &extprocv3.BodyResponse{
+				Response: &extprocv3.CommonResponse{
+					HeaderMutation: &extprocv3.HeaderMutation{
+						RemoveHeaders: []string{"x-authbridge-direction"},
+					},
+				},
+			},
+		},
+	}
+}
+
+func replaceTokenBodyResponse(token string) *extprocv3.ProcessingResponse {
+	return &extprocv3.ProcessingResponse{
+		Response: &extprocv3.ProcessingResponse_RequestBody{
+			RequestBody: &extprocv3.BodyResponse{
+				Response: &extprocv3.CommonResponse{
+					HeaderMutation: &extprocv3.HeaderMutation{
+						SetHeaders: []*corev3.HeaderValueOption{
+							{
+								Header: &corev3.HeaderValue{
+									Key:      "authorization",
+									RawValue: []byte("Bearer " + token),
+								},
+							},
+						},
+					},
+				},
+			},
+		},
+	}
+}
+
 func replaceTokenResponse(token string) *extprocv3.ProcessingResponse {
 	return &extprocv3.ProcessingResponse{
 		Response: &extprocv3.ProcessingResponse_RequestHeaders{
@@ -246,6 +333,19 @@ func immediateResponse(httpStatus int, reason string) *extprocv3.ProcessingRespo
 func jsonError(errorCode, message string) string {
 	b, _ := json.Marshal(map[string]string{"error": errorCode, "message": message})
 	return string(b)
+}
+
+func requestHasBody(headers *corev3.HeaderMap) bool {
+	method := getHeader(headers, ":method")
+	if method == "GET" || method == "HEAD" || method == "OPTIONS" || method == "DELETE" {
+		return false
+	}
+	cl := getHeader(headers, "content-length")
+	if cl != "" && cl != "0" {
+		return true
+	}
+	te := getHeader(headers, "transfer-encoding")
+	return te != ""
 }
 
 func getHeader(headers *corev3.HeaderMap, key string) string {

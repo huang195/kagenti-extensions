@@ -14,6 +14,7 @@ var registry = map[string]PluginFactory{
 	"jwt-validation": func(a *auth.Auth) pipeline.Plugin { return NewJWTValidation(a) },
 	"token-exchange": func(a *auth.Auth) pipeline.Plugin { return NewTokenExchange(a) },
 	"mcp-parser":     func(_ *auth.Auth) pipeline.Plugin { return NewMCPParser() },
+	"a2a-parser":     func(_ *auth.Auth) pipeline.Plugin { return NewA2AParser() },
 }
 
 // Build constructs a pipeline from an ordered list of plugin names.

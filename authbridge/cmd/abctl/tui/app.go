@@ -56,8 +56,16 @@ const maxEventsPerSession = 1000
 // confirmation) stays in the footer.
 const flashDuration = 3 * time.Second
 
+// refreshInterval is how often abctl re-fetches /v1/sessions from the
+// server to reconcile its local list. Cheap, and the only mechanism by
+// which rekeys (default → contextId) propagate to the client UI — the
+// server itself doesn't emit a rekey signal on the stream, so short-lived
+// stub sessions would otherwise linger in the TUI.
+const refreshInterval = 2 * time.Second
+
 // Tea messages.
 type tickMsg time.Time
+type refreshTickMsg time.Time
 type sessionsLoadedMsg []session.SessionSummary
 type snapshotLoadedMsg struct {
 	id     string
@@ -144,11 +152,16 @@ func (m *model) Init() tea.Cmd {
 		m.loadSessionsCmd(),
 		streamPump(m.streamCh),
 		tickCmd(),
+		refreshTickCmd(),
 	)
 }
 
 func tickCmd() tea.Cmd {
 	return tea.Tick(time.Second, func(t time.Time) tea.Msg { return tickMsg(t) })
+}
+
+func refreshTickCmd() tea.Cmd {
+	return tea.Tick(refreshInterval, func(t time.Time) tea.Msg { return refreshTickMsg(t) })
 }
 
 // loadSessionsCmd fetches the current session list. Used at startup and after
@@ -212,10 +225,34 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, tickCmd()
 
 	case sessionsLoadedMsg:
+		// Server list is authoritative. Reconcile: drop cached events for
+		// sessions the server no longer knows about (typically the
+		// bootstrap "default" bucket after rekey). If the focused session
+		// disappeared, back out to the sessions pane so the user isn't
+		// stranded on an empty events view.
+		serverIDs := make(map[string]bool, len(msg))
+		for _, s := range msg {
+			serverIDs[s.ID] = true
+		}
+		for id := range m.events {
+			if !serverIDs[id] {
+				delete(m.events, id)
+			}
+		}
+		if m.selectedSess != "" && !serverIDs[m.selectedSess] && m.pane != paneSessions {
+			m.selectedSess = ""
+			m.pane = paneSessions
+		}
 		m.sessions = []session.SessionSummary(msg)
 		m.connState.phase = connOpen
 		m.rebuildSessionsTable()
+		if m.pane == paneEvents {
+			m.rebuildEventsTable()
+		}
 		return m, nil
+
+	case refreshTickMsg:
+		return m, tea.Batch(m.loadSessionsCmd(), refreshTickCmd())
 
 	case snapshotLoadedMsg:
 		// Only update if we're still focused on this session.

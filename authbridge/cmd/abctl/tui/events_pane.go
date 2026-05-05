@@ -24,6 +24,10 @@ func newEventsTable() table.Model {
 		}),
 		table.WithFocused(true),
 	)
+	s := table.DefaultStyles()
+	s.Header = styleTableHeader
+	s.Selected = styleTableSelected
+	t.SetStyles(s)
 	return t
 }
 
@@ -97,14 +101,22 @@ func shortPhase(p pipeline.SessionPhase) string {
 	return "resp"
 }
 
+// shortProto classifies an event by which extension carries meaningful
+// metadata. Inference wins over MCP when both are present: mcp-parser
+// greedily accepts any JSON as JSON-RPC (often with an empty method on
+// LLM request bodies) and sets MCPExtension, so an LLM call shows up
+// with both MCP{method:""} and Inference{model:...}. Picking inference
+// first surfaces the more specific truth.
 func shortProto(e pipeline.SessionEvent) string {
 	switch {
 	case e.A2A != nil:
 		return "a2a"
-	case e.MCP != nil:
-		return "mcp"
 	case e.Inference != nil:
 		return "inf"
+	case e.MCP != nil && e.MCP.Method != "":
+		return "mcp"
+	case e.MCP != nil:
+		return "—" // empty-method MCP = mcp-parser false-positive
 	}
 	return "—"
 }
@@ -113,10 +125,10 @@ func eventMethod(e pipeline.SessionEvent) string {
 	switch {
 	case e.A2A != nil:
 		return truncStr(e.A2A.Method, 22)
-	case e.MCP != nil:
-		return truncStr(e.MCP.Method, 22)
 	case e.Inference != nil:
 		return truncStr(e.Inference.Model, 22)
+	case e.MCP != nil:
+		return truncStr(e.MCP.Method, 22)
 	}
 	return ""
 }

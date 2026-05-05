@@ -20,6 +20,10 @@ func newSessionsTable() table.Model {
 		}),
 		table.WithFocused(true),
 	)
+	s := table.DefaultStyles()
+	s.Header = styleTableHeader
+	s.Selected = styleTableSelected
+	t.SetStyles(s)
 	return t
 }
 

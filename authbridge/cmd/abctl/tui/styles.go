@@ -24,4 +24,19 @@ var (
 	styleError  = lipgloss.NewStyle().Foreground(colorError)
 	styleMuted  = lipgloss.NewStyle().Foreground(colorMuted)
 	styleBorder = lipgloss.NewStyle().Border(lipgloss.RoundedBorder()).BorderForeground(colorMuted)
+
+	// Table cursor row: reverse-video with accent foreground so the selection
+	// is obvious on any terminal. Default bubbles styling is too subtle to
+	// notice at a glance.
+	styleTableSelected = lipgloss.NewStyle().
+				Foreground(lipgloss.Color("229")).
+				Background(colorAccent).
+				Bold(true)
+
+	// Table header: bold with a rule below. Distinguishes columns from rows.
+	styleTableHeader = lipgloss.NewStyle().
+				BorderStyle(lipgloss.NormalBorder()).
+				BorderBottom(true).
+				BorderForeground(colorMuted).
+				Bold(true)
 )

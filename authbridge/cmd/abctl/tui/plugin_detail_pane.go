@@ -14,8 +14,15 @@ func (m *model) showPluginDetail(p *apiclient.PipelinePlugin) {
 	m.detailPlugin = p
 	counts := m.countEventsPerPlugin()
 
+	// Color the plugin name by its protocol so the detail header matches
+	// the color used in the Pipeline table row.
+	name := p.Name
+	if style := pluginStyle(*p); style != nil {
+		name = style.Render(name)
+	}
+
 	var b strings.Builder
-	fmt.Fprintf(&b, "%s %s\n\n", styleTitle.Render("Plugin:"), p.Name)
+	fmt.Fprintf(&b, "%s %s\n\n", styleTitle.Render("Plugin:"), name)
 	fmt.Fprintf(&b, "%s %s\n", styleMuted.Render("Direction:"), p.Direction)
 	fmt.Fprintf(&b, "%s %d\n", styleMuted.Render("Position: "), p.Position)
 	if len(p.Writes) > 0 {

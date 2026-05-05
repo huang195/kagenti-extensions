@@ -28,7 +28,44 @@ var (
 	styleMuted  = lipgloss.NewStyle().Foreground(colorMuted)
 	styleBorder = lipgloss.NewStyle().Border(lipgloss.RoundedBorder()).BorderForeground(colorMuted)
 
+	// Per-protocol foreground colors so an eye can parse the events pane at
+	// a glance: a2a = blue (user-facing inbound), mcp = magenta (tool
+	// invocations), inference = amber (LLM reasoning). Adaptive pairs so
+	// both light and dark terminals get legible contrast.
+	styleProtoA2A = lipgloss.NewStyle().
+			Foreground(lipgloss.AdaptiveColor{Light: "#2563EB", Dark: "#60A5FA"}).
+			Bold(true)
+	styleProtoMCP = lipgloss.NewStyle().
+			Foreground(lipgloss.AdaptiveColor{Light: "#9333EA", Dark: "#C084FC"}).
+			Bold(true)
+	styleProtoInference = lipgloss.NewStyle().
+				Foreground(lipgloss.AdaptiveColor{Light: "#D97706", Dark: "#FBBF24"}).
+				Bold(true)
+	// Reserved for future guardrail/authorization plugins: blocked vs
+	// allowed should get its own distinct coloring so an operator can
+	// immediately see "this turn got redacted" or "this call was denied".
+	styleProtoBlocked = lipgloss.NewStyle().
+				Foreground(colorError).
+				Bold(true)
 )
+
+// protoStyle returns the lipgloss style for a short-proto string. Unknown
+// values (including the placeholder "—" for empty-method MCP false
+// positives) get the muted style so they visually recede.
+func protoStyle(proto string) lipgloss.Style {
+	switch proto {
+	case "a2a":
+		return styleProtoA2A
+	case "mcp":
+		return styleProtoMCP
+	case "inf":
+		return styleProtoInference
+	case "blocked":
+		return styleProtoBlocked
+	default:
+		return styleMuted
+	}
+}
 
 // tableStyles returns the standard abctl table palette — layered on top of
 // bubbles' DefaultStyles so cell padding, borders, and other layout rules

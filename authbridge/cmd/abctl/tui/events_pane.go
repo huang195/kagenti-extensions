@@ -52,11 +52,12 @@ func (m *model) rebuildEventsTable() {
 				phase = "└" + phase
 			}
 		}
+		proto := shortProto(e)
 		rows = append(rows, table.Row{
 			e.At.Format("15:04:05.00"),
 			shortDirection(e.Direction),
 			phase,
-			shortProto(e),
+			protoStyle(proto).Render(proto),
 			eventMethod(e),
 			statusCell(e),
 			durationCell(e),

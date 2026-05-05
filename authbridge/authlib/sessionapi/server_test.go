@@ -269,6 +269,103 @@ func TestHandleStream_SessionFilter_WorksOnOutboundMCP(t *testing.T) {
 	}
 }
 
+// fakePlugin implements pipeline.Plugin for the /v1/pipeline handler tests
+// without pulling in the real plugins package (credential files, etc.).
+type fakePlugin struct {
+	name string
+	caps pipeline.PluginCapabilities
+}
+
+func (f *fakePlugin) Name() string                             { return f.name }
+func (f *fakePlugin) Capabilities() pipeline.PluginCapabilities { return f.caps }
+func (f *fakePlugin) OnRequest(_ context.Context, _ *pipeline.Context) pipeline.Action {
+	return pipeline.Action{Type: pipeline.Continue}
+}
+func (f *fakePlugin) OnResponse(_ context.Context, _ *pipeline.Context) pipeline.Action {
+	return pipeline.Action{Type: pipeline.Continue}
+}
+
+func TestHandlePipeline(t *testing.T) {
+	inbound, err := pipeline.New([]pipeline.Plugin{
+		&fakePlugin{name: "jwt-validation"},
+		&fakePlugin{name: "a2a-parser", caps: pipeline.PluginCapabilities{Writes: []string{"a2a"}, BodyAccess: true}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	outbound, err := pipeline.New([]pipeline.Plugin{
+		&fakePlugin{name: "token-exchange"},
+		&fakePlugin{name: "mcp-parser", caps: pipeline.PluginCapabilities{Writes: []string{"mcp"}, BodyAccess: true}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	store := session.New(5*time.Minute, 100, 0)
+	defer store.Close()
+	srv := New(":0", store, WithPipelines(inbound, outbound))
+	ts := httptest.NewServer(srv.server.Handler)
+	defer ts.Close()
+
+	resp, err := http.Get(ts.URL + "/v1/pipeline")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != 200 {
+		t.Fatalf("status = %d, want 200", resp.StatusCode)
+	}
+
+	var body struct {
+		Inbound  []pipelinePluginView `json:"inbound"`
+		Outbound []pipelinePluginView `json:"outbound"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
+		t.Fatal(err)
+	}
+	if len(body.Inbound) != 2 || len(body.Outbound) != 2 {
+		t.Fatalf("inbound=%d outbound=%d, want 2/2", len(body.Inbound), len(body.Outbound))
+	}
+	if body.Inbound[0].Name != "jwt-validation" || body.Inbound[0].Position != 1 {
+		t.Errorf("inbound[0] = %+v", body.Inbound[0])
+	}
+	if !body.Inbound[1].BodyAccess || len(body.Inbound[1].Writes) == 0 || body.Inbound[1].Writes[0] != "a2a" {
+		t.Errorf("inbound[1] = %+v", body.Inbound[1])
+	}
+	if body.Outbound[1].Direction != "outbound" {
+		t.Errorf("outbound direction = %q, want outbound", body.Outbound[1].Direction)
+	}
+}
+
+func TestHandlePipeline_NilPipelines(t *testing.T) {
+	store := session.New(5*time.Minute, 100, 0)
+	defer store.Close()
+	srv := New(":0", store) // no WithPipelines
+	ts := httptest.NewServer(srv.server.Handler)
+	defer ts.Close()
+
+	resp, err := http.Get(ts.URL + "/v1/pipeline")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+
+	var body struct {
+		Inbound  []pipelinePluginView `json:"inbound"`
+		Outbound []pipelinePluginView `json:"outbound"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
+		t.Fatal(err)
+	}
+	// Empty slices, not null — the UI expects [].
+	if body.Inbound == nil || body.Outbound == nil {
+		t.Errorf("want empty slices, got nil: %+v", body)
+	}
+	if len(body.Inbound) != 0 || len(body.Outbound) != 0 {
+		t.Errorf("want empty, got inbound=%d outbound=%d", len(body.Inbound), len(body.Outbound))
+	}
+}
+
 func TestHandleHealthz(t *testing.T) {
 	ts, _ := newTestServer(t)
 	resp, err := http.Get(ts.URL + "/healthz")

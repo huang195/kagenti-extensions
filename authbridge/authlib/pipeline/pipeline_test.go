@@ -361,3 +361,28 @@ func TestPipelineRun_ContextCancellation(t *testing.T) {
 		t.Error("plugin was called despite cancelled context")
 	}
 }
+
+func TestPipeline_Plugins_ReturnsCopy(t *testing.T) {
+	a := &stubPlugin{name: "a", caps: PluginCapabilities{Writes: []string{"custom"}}}
+	b := &stubPlugin{name: "b", caps: PluginCapabilities{Reads: []string{"custom"}}}
+	p, err := New([]Plugin{a, b})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+
+	got := p.Plugins()
+	if len(got) != 2 {
+		t.Fatalf("Plugins() len = %d, want 2", len(got))
+	}
+	if got[0].Name() != "a" || got[1].Name() != "b" {
+		t.Errorf("Plugins() names = [%s %s], want [a b]", got[0].Name(), got[1].Name())
+	}
+
+	// Mutating the returned slice must not corrupt the pipeline's backing
+	// storage — callers get a decorative accessor, not a handle.
+	got[0] = nil
+	again := p.Plugins()
+	if again[0] == nil || again[0].Name() != "a" {
+		t.Errorf("Plugins() returned aliased slice; backing data was mutated")
+	}
+}

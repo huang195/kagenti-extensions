@@ -17,6 +17,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/kagenti/kagenti-extensions/authbridge/authlib/pipeline"
 	"github.com/kagenti/kagenti-extensions/authbridge/authlib/session"
 )
 
@@ -29,6 +30,8 @@ const defaultHeartbeatInterval = 30 * time.Second
 type Server struct {
 	server    *http.Server
 	store     *session.Store
+	inbound   *pipeline.Pipeline
+	outbound  *pipeline.Pipeline
 	heartbeat time.Duration
 }
 
@@ -39,6 +42,16 @@ type Option func(*Server)
 // tests — production deployments should use the default.
 func WithHeartbeatInterval(d time.Duration) Option {
 	return func(s *Server) { s.heartbeat = d }
+}
+
+// WithPipelines attaches the inbound and outbound pipelines so the server
+// can expose their composition at GET /v1/pipeline. Either may be nil when
+// a mode doesn't configure that direction.
+func WithPipelines(inbound, outbound *pipeline.Pipeline) Option {
+	return func(s *Server) {
+		s.inbound = inbound
+		s.outbound = outbound
+	}
 }
 
 // New constructs an HTTP server serving the session API at addr. store must
@@ -56,6 +69,7 @@ func New(addr string, store *session.Store, opts ...Option) *Server {
 	mux.HandleFunc("GET /v1/sessions", s.handleList)
 	mux.HandleFunc("GET /v1/sessions/{id}", s.handleGet)
 	mux.HandleFunc("GET /v1/events", s.handleStream)
+	mux.HandleFunc("GET /v1/pipeline", s.handlePipeline)
 	mux.HandleFunc("GET /healthz", s.handleHealthz)
 
 	s.server = &http.Server{
@@ -82,6 +96,54 @@ func (s *Server) Shutdown(ctx context.Context) error { return s.server.Shutdown(
 func (s *Server) handleHealthz(w http.ResponseWriter, _ *http.Request) {
 	w.WriteHeader(http.StatusOK)
 	_, _ = w.Write([]byte("ok\n"))
+}
+
+// pipelinePluginView is the wire shape for one plugin in /v1/pipeline.
+type pipelinePluginView struct {
+	Name       string   `json:"name"`
+	Direction  string   `json:"direction"`
+	Position   int      `json:"position"` // 1-based order within its direction
+	BodyAccess bool     `json:"bodyAccess"`
+	Writes     []string `json:"writes,omitempty"`
+	Reads      []string `json:"reads,omitempty"`
+}
+
+// handlePipeline returns the composition of the inbound and outbound
+// pipelines. Empty arrays when a pipeline is unconfigured (mode-dependent).
+func (s *Server) handlePipeline(w http.ResponseWriter, _ *http.Request) {
+	body := struct {
+		Inbound  []pipelinePluginView `json:"inbound"`
+		Outbound []pipelinePluginView `json:"outbound"`
+	}{
+		Inbound:  describePipeline(s.inbound, "inbound"),
+		Outbound: describePipeline(s.outbound, "outbound"),
+	}
+	w.Header().Set("Content-Type", "application/json")
+	if err := json.NewEncoder(w).Encode(body); err != nil {
+		slog.Debug("sessionapi: pipeline encode failed", "error", err)
+	}
+}
+
+// describePipeline turns a *pipeline.Pipeline into its wire form, or an
+// empty slice when nil.
+func describePipeline(p *pipeline.Pipeline, direction string) []pipelinePluginView {
+	if p == nil {
+		return []pipelinePluginView{}
+	}
+	plugins := p.Plugins()
+	out := make([]pipelinePluginView, len(plugins))
+	for i, pl := range plugins {
+		caps := pl.Capabilities()
+		out[i] = pipelinePluginView{
+			Name:       pl.Name(),
+			Direction:  direction,
+			Position:   i + 1,
+			BodyAccess: caps.BodyAccess,
+			Writes:     caps.Writes,
+			Reads:      caps.Reads,
+		}
+	}
+	return out
 }
 
 func (s *Server) handleList(w http.ResponseWriter, _ *http.Request) {

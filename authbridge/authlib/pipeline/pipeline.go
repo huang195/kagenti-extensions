@@ -93,6 +93,18 @@ func (p *Pipeline) RunResponse(ctx context.Context, pctx *Context) Action {
 	return Action{Type: Continue}
 }
 
+// Plugins returns a copy of the pipeline's plugin list in execution order.
+// The copy prevents callers from mutating the backing slice; individual
+// Plugin values are interface types and can be inspected freely.
+//
+// Used by the session events API to expose pipeline composition to
+// off-process tools (abctl) and other observability surfaces.
+func (p *Pipeline) Plugins() []Plugin {
+	out := make([]Plugin, len(p.plugins))
+	copy(out, p.plugins)
+	return out
+}
+
 // NeedsBody returns true if any plugin in the pipeline declares BodyAccess.
 func (p *Pipeline) NeedsBody() bool {
 	for _, plugin := range p.plugins {

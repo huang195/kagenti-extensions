@@ -751,6 +751,69 @@ func TestRecordOutboundResponseSession_MCP(t *testing.T) {
 	}
 }
 
+// Regression: record helpers used to store the live pctx.Extensions.*
+// pointers on SessionEvent. When OnResponse later mutated those same
+// structs (setting Completion/FinishReason/Tokens on Inference, or
+// Result/Err on MCP), the already-appended request event's view was
+// retroactively rewritten to include the eventual response's fields.
+// Snapshot-at-record-time prevents that cross-phase bleed.
+func TestRecordOutboundSession_SnapshotsInferenceAgainstLaterMutation(t *testing.T) {
+	store := session.New(5*time.Minute, 100, 0)
+	defer store.Close()
+	s := &Server{Sessions: store}
+
+	inf := &pipeline.InferenceExtension{
+		Model: "llama3", Messages: []pipeline.InferenceMessage{{Role: "user"}},
+	}
+	pctx := &pipeline.Context{
+		Extensions: pipeline.Extensions{Inference: inf},
+	}
+	s.recordOutboundSession(pctx)
+
+	// Simulate OnResponse mutating the live extension after the request
+	// event was recorded.
+	inf.Completion = "answer"
+	inf.FinishReason = "stop"
+	inf.PromptTokens = 10
+	inf.CompletionTokens = 5
+	inf.TotalTokens = 15
+
+	v := store.View(session.DefaultSessionID)
+	if v == nil || len(v.Events) != 1 {
+		t.Fatalf("expected 1 event, got %+v", v)
+	}
+	got := v.Events[0].Inference
+	if got == nil {
+		t.Fatal("Inference is nil on request event")
+	}
+	if got.Completion != "" || got.FinishReason != "" || got.TotalTokens != 0 {
+		t.Errorf("request event's Inference was mutated by later response-side updates: %+v", got)
+	}
+}
+
+func TestRecordOutboundSession_SnapshotsMCPAgainstLaterMutation(t *testing.T) {
+	store := session.New(5*time.Minute, 100, 0)
+	defer store.Close()
+	s := &Server{Sessions: store}
+
+	mcp := &pipeline.MCPExtension{Method: "tools/call"}
+	pctx := &pipeline.Context{
+		Extensions: pipeline.Extensions{MCP: mcp},
+	}
+	s.recordOutboundSession(pctx)
+
+	// Simulate OnResponse attaching a Result.
+	mcp.Result = map[string]any{"content": "ok"}
+
+	v := store.View(session.DefaultSessionID)
+	if v == nil || len(v.Events) != 1 {
+		t.Fatalf("expected 1 event, got %+v", v)
+	}
+	if v.Events[0].MCP.Result != nil {
+		t.Errorf("request event's MCP.Result was mutated by later response: %+v", v.Events[0].MCP.Result)
+	}
+}
+
 func TestRecordOutboundResponseSession_Inference(t *testing.T) {
 	store := session.New(5*time.Minute, 100, 0)
 	defer store.Close()

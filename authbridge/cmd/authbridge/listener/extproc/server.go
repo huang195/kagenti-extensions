@@ -182,7 +182,7 @@ func (s *Server) recordInboundSession(pctx *pipeline.Context) {
 		At:        time.Now(),
 		Direction: pipeline.Inbound,
 		Phase:     pipeline.SessionRequest,
-		A2A:       pctx.Extensions.A2A,
+		A2A:       snapshotA2A(pctx.Extensions.A2A),
 		Identity:  snapshotIdentity(pctx),
 		Host:      pctx.Host,
 	}
@@ -201,7 +201,7 @@ func (s *Server) recordInboundResponseSession(pctx *pipeline.Context) {
 		At:         time.Now(),
 		Direction:  pipeline.Inbound,
 		Phase:      pipeline.SessionResponse,
-		A2A:        pctx.Extensions.A2A,
+		A2A:        snapshotA2A(pctx.Extensions.A2A),
 		Identity:   snapshotIdentity(pctx),
 		StatusCode: pctx.StatusCode,
 		Error:      deriveError(pctx),
@@ -226,8 +226,8 @@ func (s *Server) recordOutboundResponseSession(pctx *pipeline.Context) {
 		At:             time.Now(),
 		Direction:      pipeline.Outbound,
 		Phase:          pipeline.SessionResponse,
-		MCP:            pctx.Extensions.MCP,
-		Inference:      pctx.Extensions.Inference,
+		MCP:            snapshotMCP(pctx.Extensions.MCP),
+		Inference:      snapshotInference(pctx.Extensions.Inference),
 		Identity:       snapshotIdentity(pctx),
 		StatusCode:     pctx.StatusCode,
 		Error:          deriveError(pctx),
@@ -324,8 +324,8 @@ func (s *Server) recordOutboundSession(pctx *pipeline.Context) {
 		At:             time.Now(),
 		Direction:      pipeline.Outbound,
 		Phase:          pipeline.SessionRequest,
-		MCP:            pctx.Extensions.MCP,
-		Inference:      pctx.Extensions.Inference,
+		MCP:            snapshotMCP(pctx.Extensions.MCP),
+		Inference:      snapshotInference(pctx.Extensions.Inference),
 		Identity:       snapshotIdentity(pctx),
 		Host:           pctx.Host,
 		TargetAudience: routeAudience(pctx),
@@ -333,6 +333,46 @@ func (s *Server) recordOutboundSession(pctx *pipeline.Context) {
 	if ev.MCP != nil || ev.Inference != nil {
 		s.Sessions.Append(sid, ev)
 	}
+}
+
+// snapshotA2A returns a shallow copy of ext. The record helpers attach
+// the snapshot to the SessionEvent rather than the live pointer so
+// response-phase mutations on pctx.Extensions.A2A (e.g. the parser
+// stamping the server-assigned contextId onto SessionID during OnResponse)
+// don't retroactively rewrite request-phase events that were already
+// appended. Slice fields are reused intentionally — they are only
+// assigned, never mutated in place, after the parser completes.
+func snapshotA2A(ext *pipeline.A2AExtension) *pipeline.A2AExtension {
+	if ext == nil {
+		return nil
+	}
+	c := *ext
+	return &c
+}
+
+// snapshotMCP returns a shallow copy of ext. Important for outbound
+// request events: the same pctx.Extensions.MCP pointer receives Result
+// or Err on the response side, so without snapshotting, the
+// already-recorded request event would display the future response's
+// result map.
+func snapshotMCP(ext *pipeline.MCPExtension) *pipeline.MCPExtension {
+	if ext == nil {
+		return nil
+	}
+	c := *ext
+	return &c
+}
+
+// snapshotInference returns a shallow copy of ext. Scalar response
+// fields (Completion, FinishReason, *Tokens) get assigned on the live
+// extension during OnResponse; without snapshotting, the request event's
+// view would contain the eventual response's token counts and completion.
+func snapshotInference(ext *pipeline.InferenceExtension) *pipeline.InferenceExtension {
+	if ext == nil {
+		return nil
+	}
+	c := *ext
+	return &c
 }
 
 func (s *Server) handleOutbound(stream extprocv3.ExternalProcessor_ProcessServer, headers *corev3.HeaderMap, body []byte) (*extprocv3.ProcessingResponse, *pipeline.Context) {

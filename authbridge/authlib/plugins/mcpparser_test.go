@@ -147,6 +147,25 @@ func TestMCPParser_EmptyBody(t *testing.T) {
 	}
 }
 
+// Regression: an OpenAI chat/completions body is valid JSON but not
+// JSON-RPC. Before the fix, mcp-parser ran first in the outbound pipeline,
+// Unmarshal'd the body into a zero-value jsonRPCRequest, and attached an
+// empty MCPExtension{Method:""} to every inference request/response —
+// polluting the session store with a phantom "mcp: {}" on each event.
+func TestMCPParser_SkipsJSONThatIsNotJSONRPC(t *testing.T) {
+	p := NewMCPParser()
+	pctx := &pipeline.Context{
+		Body: []byte(`{"model":"gpt-4","messages":[{"role":"user","content":"hi"}]}`),
+	}
+	action := p.OnRequest(context.Background(), pctx)
+	if action.Type != pipeline.Continue {
+		t.Fatalf("expected Continue, got %v", action.Type)
+	}
+	if pctx.Extensions.MCP != nil {
+		t.Errorf("MCP should remain nil for non-JSON-RPC JSON, got %+v", pctx.Extensions.MCP)
+	}
+}
+
 func TestMCPParser_InvalidJSON(t *testing.T) {
 	p := NewMCPParser()
 	pctx := &pipeline.Context{Body: []byte("not json")}

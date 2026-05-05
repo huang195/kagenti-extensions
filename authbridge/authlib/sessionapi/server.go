@@ -15,7 +15,6 @@ import (
 	"log/slog"
 	"net/http"
 	"strings"
-	"sync/atomic"
 	"time"
 
 	"github.com/kagenti/kagenti-extensions/authbridge/authlib/session"
@@ -151,20 +150,16 @@ func (s *Server) handleStream(w http.ResponseWriter, r *http.Request) {
 				// Store closed or subscription cancelled externally.
 				return
 			}
-			if filter != "" && event.A2A != nil && event.A2A.SessionID != filter {
+			if filter != "" && event.SessionID != filter {
 				continue
 			}
-			// For outbound events there's no direct sessionID; best-effort
-			// filtering happens only when the event carries an A2A extension.
-			// A policy plugin wanting fine-grained per-session outbound filtering
-			// should consume the full stream and filter client-side.
 
 			payload, err := json.Marshal(event)
 			if err != nil {
 				slog.Debug("sessionapi: marshal event failed", "error", err)
 				continue
 			}
-			atomic.AddUint64(&id, 1)
+			id++
 			fmt.Fprintf(w, "event: session-event\nid: %d\ndata: %s\n\n", id, payload)
 			flusher.Flush()
 

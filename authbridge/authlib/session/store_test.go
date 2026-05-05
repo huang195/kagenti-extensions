@@ -550,6 +550,46 @@ func TestStore_Subscribe_CloseStoreUnblocksSubscribers(t *testing.T) {
 	}
 }
 
+func TestStore_Append_StampsSessionID(t *testing.T) {
+	// Consumers (snapshot or stream) need to attribute events — especially
+	// outbound ones with no protocol-native session field — to a bucket.
+	s := New(5*time.Minute, 100, 0)
+	defer s.Close()
+
+	s.Append("bucket-42", pipeline.SessionEvent{MCP: &pipeline.MCPExtension{Method: "tools/call"}})
+
+	v := s.View("bucket-42")
+	if v == nil || len(v.Events) != 1 {
+		t.Fatalf("expected 1 event, got %+v", v)
+	}
+	if v.Events[0].SessionID != "bucket-42" {
+		t.Errorf("SessionID = %q, want %q", v.Events[0].SessionID, "bucket-42")
+	}
+}
+
+func TestStore_Rekey_RewritesExistingEventSessionIDs(t *testing.T) {
+	// After Rekey, snapshot reads of the new key must show the original
+	// events with SessionID updated to the new bucket ID — otherwise
+	// downstream consumers see a mismatch between the session's outer ID
+	// and each event's inner SessionID.
+	s := New(5*time.Minute, 100, 0)
+	defer s.Close()
+
+	s.Append(DefaultSessionID, pipeline.SessionEvent{A2A: &pipeline.A2AExtension{}})
+	s.Append(DefaultSessionID, pipeline.SessionEvent{MCP: &pipeline.MCPExtension{}})
+	s.Rekey(DefaultSessionID, "ctx-abc")
+
+	v := s.View("ctx-abc")
+	if v == nil || len(v.Events) != 2 {
+		t.Fatalf("expected 2 events under new key, got %+v", v)
+	}
+	for i, e := range v.Events {
+		if e.SessionID != "ctx-abc" {
+			t.Errorf("events[%d].SessionID = %q, want %q", i, e.SessionID, "ctx-abc")
+		}
+	}
+}
+
 func waitEvent(t *testing.T, ch <-chan pipeline.SessionEvent, d time.Duration) pipeline.SessionEvent {
 	t.Helper()
 	select {

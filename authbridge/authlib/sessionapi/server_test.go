@@ -205,15 +205,16 @@ func TestHandleStream_SessionFilter(t *testing.T) {
 	}
 	defer resp.Body.Close()
 	sc := bufio.NewScanner(resp.Body)
+	sc.Buffer(make([]byte, 0, 8192), 4<<20)
 	waitForLine(t, sc, ":", "initial", time.Second)
 
 	// Event with a different SessionID — should be filtered out.
 	store.Append("drop", pipeline.SessionEvent{
-		A2A: &pipeline.A2AExtension{SessionID: "drop"},
+		A2A: &pipeline.A2AExtension{Method: "message/stream"},
 	})
 	// Event with matching SessionID — should come through.
 	store.Append("keep", pipeline.SessionEvent{
-		A2A: &pipeline.A2AExtension{SessionID: "keep", Method: "message/stream"},
+		A2A: &pipeline.A2AExtension{Method: "message/stream"},
 	})
 
 	data := scanUntilPrefix(t, sc, "data: ", time.Second)
@@ -221,10 +222,50 @@ func TestHandleStream_SessionFilter(t *testing.T) {
 		t.Fatal("no data frame received")
 	}
 	if !strings.Contains(data, `"sessionId":"keep"`) {
-		t.Errorf("got wrong session in stream: %s", data)
+		t.Errorf("expected keep session in stream, got: %s", data)
 	}
 	if strings.Contains(data, `"sessionId":"drop"`) {
 		t.Errorf("unfiltered drop event leaked: %s", data)
+	}
+}
+
+func TestHandleStream_SessionFilter_WorksOnOutboundMCP(t *testing.T) {
+	// Prior to SessionEvent.SessionID being populated at Append time, this
+	// test would have failed: the outbound MCP event has no A2A extension
+	// and the old filter check bailed when A2A was nil, letting foreign
+	// events through. Guards against regression.
+	ts, store := newTestServer(t)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	req, _ := http.NewRequestWithContext(ctx, "GET", ts.URL+"/v1/events?session=keep", nil)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	sc := bufio.NewScanner(resp.Body)
+	sc.Buffer(make([]byte, 0, 8192), 4<<20)
+	waitForLine(t, sc, ":", "initial", time.Second)
+
+	// Outbound MCP call appended to the wrong bucket — must be filtered.
+	store.Append("drop", pipeline.SessionEvent{
+		MCP: &pipeline.MCPExtension{Method: "tools/call"},
+	})
+	// Outbound MCP call in the target bucket — must pass.
+	store.Append("keep", pipeline.SessionEvent{
+		MCP: &pipeline.MCPExtension{Method: "tools/list"},
+	})
+
+	data := scanUntilPrefix(t, sc, "data: ", time.Second)
+	if data == "" {
+		t.Fatal("no data frame received within deadline")
+	}
+	if !strings.Contains(data, `"sessionId":"keep"`) {
+		t.Errorf("expected sessionId:keep, got: %s", data)
+	}
+	if !strings.Contains(data, `"method":"tools/list"`) {
+		t.Errorf("expected MCP tools/list event, got: %s", data)
 	}
 }
 

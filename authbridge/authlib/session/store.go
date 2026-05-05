@@ -180,6 +180,11 @@ func (s *Store) Append(sessionID string, event pipeline.SessionEvent) {
 		s.sessions[sessionID] = sess
 	}
 
+	// Stamp the bucket ID so downstream consumers can attribute the event
+	// without needing to know which session it was appended to — critical for
+	// outbound events that have no protocol-native session field.
+	event.SessionID = sessionID
+
 	sess.Events = append(sess.Events, event)
 	sess.UpdatedAt = now
 	s.activeID = sessionID
@@ -314,6 +319,11 @@ func (s *Store) Rekey(oldID, newID string) {
 	if s.activeID == oldID {
 		s.activeID = newID
 	}
+	// Retrofit already-recorded events with the new session ID so snapshot
+	// reads stay consistent with live-streamed events after a rekey.
+	for i := range sess.Events {
+		sess.Events[i].SessionID = newID
+	}
 }
 
 // Cleanup removes expired sessions. Safe for concurrent use.
@@ -363,6 +373,12 @@ func (s *Store) isExpired(sess *entry, now time.Time) bool {
 // publishLocked fans out event to every current subscriber. Must be called
 // with s.mu held. Sends are non-blocking — a full channel increments the
 // subscriber's drop counter and discards the event.
+//
+// Performance note: fan-out runs under s.mu, which serializes Append on the
+// subscriber list length. This is fine for the debug API's expected load
+// (O(1) live consumers: one abctl instance + maybe a curl tail). If the
+// store ever needs to support many concurrent subscribers, refactor this
+// to an unlocked broadcast (snapshot the slice under the lock, send outside).
 func (s *Store) publishLocked(event pipeline.SessionEvent) {
 	for _, sub := range s.subscribers {
 		select {

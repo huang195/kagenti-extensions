@@ -27,6 +27,13 @@ func (p SessionPhase) String() string {
 // SessionEvent represents a single pipeline event captured by the session store.
 // Exactly one of A2A, MCP, or Inference is non-nil.
 type SessionEvent struct {
+	// SessionID is the session bucket the event was appended to. Populated by
+	// Store.Append so downstream consumers (particularly the SSE stream
+	// filter) can attribute any event — including outbound MCP/Inference
+	// events that have no protocol-native session concept — to a session
+	// without needing a side-channel lookup.
+	SessionID string
+
 	At        time.Time
 	Direction Direction
 	Phase     SessionPhase
@@ -76,6 +83,7 @@ type SessionEvent struct {
 // — both awkward for CLI / dashboard consumption.
 func (e SessionEvent) MarshalJSON() ([]byte, error) {
 	return json.Marshal(struct {
+		SessionID      string              `json:"sessionId,omitempty"`
 		At             time.Time           `json:"at"`
 		Direction      string              `json:"direction"`
 		Phase          string              `json:"phase"`
@@ -89,6 +97,7 @@ func (e SessionEvent) MarshalJSON() ([]byte, error) {
 		TargetAudience string              `json:"targetAudience,omitempty"`
 		DurationMs     int64               `json:"durationMs,omitempty"`
 	}{
+		SessionID:      e.SessionID,
 		At:             e.At,
 		Direction:      e.Direction.String(),
 		Phase:          e.Phase.String(),
@@ -116,7 +125,7 @@ type EventIdentity struct {
 type EventError struct {
 	Kind    string `json:"kind"`
 	Code    string `json:"code,omitempty"`
-	Message string // human-readable reason; safe to surface in logs/metrics
+	Message string `json:"message,omitempty"` // human-readable reason; safe to surface in logs/metrics
 }
 
 // SessionView is a read-only snapshot of a session, safe to pass to plugins.

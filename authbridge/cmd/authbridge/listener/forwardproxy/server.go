@@ -109,7 +109,7 @@ func (s *Server) handleRequest(w http.ResponseWriter, r *http.Request) {
 	pctx.StatusCode = resp.StatusCode
 	pctx.ResponseHeaders = resp.Header.Clone()
 
-	if s.OutboundPipeline.NeedsResponseBody() && resp.Body != nil {
+	if s.OutboundPipeline.NeedsBody() && resp.Body != nil {
 		respBody, err := io.ReadAll(io.LimitReader(resp.Body, maxBodySize+1))
 		if err != nil {
 			slog.Warn("forward-proxy: response body read error", "host", r.Host, "error", err)
@@ -135,7 +135,7 @@ func (s *Server) handleRequest(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// If a plugin mutated ResponseBody, use the mutated version.
-	if s.OutboundPipeline.NeedsResponseBody() && pctx.ResponseBody != nil {
+	if s.OutboundPipeline.NeedsBody() && pctx.ResponseBody != nil {
 		resp.Body = io.NopCloser(bytes.NewReader(pctx.ResponseBody))
 		resp.ContentLength = int64(len(pctx.ResponseBody))
 		resp.Header.Set("Content-Length", fmt.Sprintf("%d", len(pctx.ResponseBody)))

@@ -19,17 +19,20 @@ type MCPExtension struct {
 	Params map[string]any // raw params from the JSON-RPC request
 }
 
-// A2AExtension carries parsed A2A protocol metadata.
+// A2AExtension carries parsed A2A protocol metadata from inbound requests.
 type A2AExtension struct {
-	TaskID string
-	Method string // "tasks/send", "tasks/get", etc.
-	Parts  []A2APart
+	Method    string // JSON-RPC method: "message/send", "message/stream"
+	RPCID     any    // JSON-RPC id for request-response correlation
+	SessionID string // conversation session (from params.sessionId)
+	MessageID string // unique message ID (from params.message.messageId)
+	Role      string // "user" or "assistant"
+	Parts     []A2APart
 }
 
 // A2APart represents a message part in an A2A request.
 type A2APart struct {
-	Type    string // "text", "file", "data"
-	Content string
+	Kind    string // "text", "file", "data"
+	Content string // text content, file URI, or serialized data
 }
 
 // SecurityExtension carries guardrail output.

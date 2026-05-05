@@ -149,6 +149,47 @@ func (s *Store) ActiveSession() string {
 	return s.activeID
 }
 
+// Rekey renames a session from oldID to newID, preserving all events.
+// Used to merge the bootstrap "default" session into the server-assigned
+// contextId after the backend response reveals it, so events recorded
+// during the request phase (under "default") and subsequent turns (under
+// the real contextId) land in the same bucket.
+//
+// Safe to call when oldID does not exist (no-op) or newID already exists
+// (no-op — preserves the existing newID entry). If oldID was the active
+// session, activeID is updated to newID.
+//
+// Assumes single-tenant, no concurrent conversations per pod. In a
+// multi-tenant deployment two in-flight first-turn requests could both
+// land under "default"; rekeying the first to arrive would strand the
+// second's events. Call sites are expected to guard against that.
+func (s *Store) Rekey(oldID, newID string) {
+	if oldID == newID || oldID == "" || newID == "" {
+		return
+	}
+	if len(newID) > maxSessionIDLen {
+		newID = newID[:maxSessionIDLen]
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	sess, ok := s.sessions[oldID]
+	if !ok {
+		return
+	}
+	if _, exists := s.sessions[newID]; exists {
+		return
+	}
+
+	sess.ID = newID
+	s.sessions[newID] = sess
+	delete(s.sessions, oldID)
+	if s.activeID == oldID {
+		s.activeID = newID
+	}
+}
+
 // Cleanup removes expired sessions. Safe for concurrent use.
 func (s *Store) Cleanup() {
 	s.mu.Lock()

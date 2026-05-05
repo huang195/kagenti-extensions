@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"testing"
+	"time"
 
 	corev3 "github.com/envoyproxy/go-control-plane/envoy/config/core/v3"
 	extprocfilterv3 "github.com/envoyproxy/go-control-plane/envoy/extensions/filters/http/ext_proc/v3"
@@ -20,6 +21,7 @@ import (
 	"github.com/kagenti/kagenti-extensions/authbridge/authlib/pipeline"
 	"github.com/kagenti/kagenti-extensions/authbridge/authlib/plugins"
 	"github.com/kagenti/kagenti-extensions/authbridge/authlib/routing"
+	"github.com/kagenti/kagenti-extensions/authbridge/authlib/session"
 	"github.com/kagenti/kagenti-extensions/authbridge/authlib/validation"
 )
 
@@ -561,4 +563,87 @@ func TestExtProc_NoBodyBuffering_WhenNotNeeded(t *testing.T) {
 	if stream.responses[0].ModeOverride != nil {
 		t.Error("should not request body when pipeline doesn't need it")
 	}
+}
+
+func TestRekeyInboundSession(t *testing.T) {
+	cases := []struct {
+		name         string
+		direction    string
+		a2a          *pipeline.A2AExtension
+		seedDefault  bool
+		wantDefault  bool
+		wantNewID    string
+		wantActiveID string
+	}{
+		{
+			name:         "inbound rekey migrates default to contextId",
+			direction:    "inbound",
+			a2a:          &pipeline.A2AExtension{SessionID: "ctx-abc"},
+			seedDefault:  true,
+			wantDefault:  false,
+			wantNewID:    "ctx-abc",
+			wantActiveID: "ctx-abc",
+		},
+		{
+			name:        "outbound direction is a no-op",
+			direction:   "outbound",
+			a2a:         &pipeline.A2AExtension{SessionID: "ctx-abc"},
+			seedDefault: true,
+			wantDefault: true,
+		},
+		{
+			name:        "nil A2A extension is a no-op",
+			direction:   "inbound",
+			a2a:         nil,
+			seedDefault: true,
+			wantDefault: true,
+		},
+		{
+			name:        "empty SessionID is a no-op",
+			direction:   "inbound",
+			a2a:         &pipeline.A2AExtension{SessionID: ""},
+			seedDefault: true,
+			wantDefault: true,
+		},
+		{
+			name:        "SessionID equal to DefaultSessionID is a no-op",
+			direction:   "inbound",
+			a2a:         &pipeline.A2AExtension{SessionID: session.DefaultSessionID},
+			seedDefault: true,
+			wantDefault: true,
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			store := session.New(5*time.Minute, 100, 0)
+			defer store.Close()
+			if tc.seedDefault {
+				store.Append(session.DefaultSessionID, pipeline.SessionEvent{Direction: pipeline.Inbound})
+			}
+			s := &Server{Sessions: store}
+			pctx := &pipeline.Context{Extensions: pipeline.Extensions{A2A: tc.a2a}}
+
+			s.rekeyInboundSession(pctx, tc.direction)
+
+			hasDefault := store.View(session.DefaultSessionID) != nil
+			if hasDefault != tc.wantDefault {
+				t.Errorf("default session present = %v, want %v", hasDefault, tc.wantDefault)
+			}
+			if tc.wantNewID != "" && store.View(tc.wantNewID) == nil {
+				t.Errorf("expected session under %q after rekey", tc.wantNewID)
+			}
+			if tc.wantActiveID != "" && store.ActiveSession() != tc.wantActiveID {
+				t.Errorf("ActiveSession = %q, want %q", store.ActiveSession(), tc.wantActiveID)
+			}
+		})
+	}
+}
+
+func TestRekeyInboundSession_NilStore(t *testing.T) {
+	// Session tracking disabled — must not panic.
+	s := &Server{Sessions: nil}
+	s.rekeyInboundSession(&pipeline.Context{
+		Extensions: pipeline.Extensions{A2A: &pipeline.A2AExtension{SessionID: "ctx-abc"}},
+	}, "inbound")
 }

@@ -175,6 +175,21 @@ func (s *Server) recordInboundSession(pctx *pipeline.Context) {
 	})
 }
 
+// rekeyInboundSession renames the DefaultSessionID bucket to the
+// server-assigned A2A contextId when the response reveals one, so events
+// from the first turn (recorded under "default" during the request phase)
+// merge with subsequent turns that carry the real contextId.
+func (s *Server) rekeyInboundSession(pctx *pipeline.Context, direction string) {
+	if direction != "inbound" || s.Sessions == nil || pctx.Extensions.A2A == nil {
+		return
+	}
+	sid := pctx.Extensions.A2A.SessionID
+	if sid == "" || sid == session.DefaultSessionID {
+		return
+	}
+	s.Sessions.Rekey(session.DefaultSessionID, sid)
+}
+
 func (s *Server) recordOutboundSession(pctx *pipeline.Context) {
 	if s.Sessions == nil {
 		return
@@ -325,6 +340,12 @@ func (s *Server) handleResponseBody(ctx context.Context, body []byte, pctx *pipe
 		return denyResponse(typev3.StatusCode(action.Status),
 			jsonError("response_blocked", action.Reason))
 	}
+
+	// The server's response may carry the server-assigned A2A contextId. If
+	// the request phase recorded events under DefaultSessionID (because the
+	// client had no contextId yet), migrate them to the real ID so subsequent
+	// turns — which will send that contextId — accumulate into one session.
+	s.rekeyInboundSession(pctx, direction)
 
 	if string(pctx.ResponseBody) != string(body) {
 		return &extprocv3.ProcessingResponse{

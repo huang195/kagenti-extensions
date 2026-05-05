@@ -441,3 +441,122 @@ func TestView_LastError_NoErrors(t *testing.T) {
 		t.Error("FailedEvents should be nil when no errors present")
 	}
 }
+
+func TestStore_Subscribe_ReceivesAppendedEvents(t *testing.T) {
+	s := New(5*time.Minute, 100, 0)
+	defer s.Close()
+
+	sub, cancel := s.Subscribe()
+	defer cancel()
+
+	s.Append("sess", pipeline.SessionEvent{
+		A2A: &pipeline.A2AExtension{Method: "message/send"},
+	})
+
+	select {
+	case e := <-sub.Events():
+		if e.A2A == nil || e.A2A.Method != "message/send" {
+			t.Errorf("received wrong event: %+v", e)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("no event received within 1s")
+	}
+}
+
+func TestStore_Subscribe_CancelStopsDelivery(t *testing.T) {
+	s := New(5*time.Minute, 100, 0)
+	defer s.Close()
+
+	sub, cancel := s.Subscribe()
+	cancel()
+
+	s.Append("sess", pipeline.SessionEvent{A2A: &pipeline.A2AExtension{}})
+
+	// Channel should be closed; receive returns zero value with ok=false.
+	select {
+	case _, ok := <-sub.Events():
+		if ok {
+			t.Error("received event after cancel")
+		}
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("channel never closed after cancel")
+	}
+}
+
+func TestStore_Subscribe_SlowConsumerDropsWithoutBlocking(t *testing.T) {
+	s := New(5*time.Minute, 10000, 0)
+	defer s.Close()
+
+	sub, cancel := s.Subscribe()
+	defer cancel()
+
+	// Flood well beyond buffer capacity without consuming — must not block Append.
+	total := subscriberChanBuf + 50
+	done := make(chan struct{})
+	go func() {
+		for i := 0; i < total; i++ {
+			s.Append("sess", pipeline.SessionEvent{})
+		}
+		close(done)
+	}()
+
+	select {
+	case <-done:
+		// Good — Append did not block.
+	case <-time.After(time.Second):
+		t.Fatal("Append blocked on slow consumer")
+	}
+
+	if drops := sub.Drops(); drops == 0 {
+		t.Errorf("expected some drops, got 0")
+	}
+}
+
+func TestStore_Subscribe_FanOutToMultipleSubscribers(t *testing.T) {
+	s := New(5*time.Minute, 100, 0)
+	defer s.Close()
+
+	a, cancelA := s.Subscribe()
+	defer cancelA()
+	b, cancelB := s.Subscribe()
+	defer cancelB()
+
+	s.Append("sess", pipeline.SessionEvent{A2A: &pipeline.A2AExtension{Method: "ping"}})
+
+	gotA := waitEvent(t, a.Events(), time.Second)
+	gotB := waitEvent(t, b.Events(), time.Second)
+	if gotA.A2A == nil || gotA.A2A.Method != "ping" {
+		t.Errorf("A received wrong event: %+v", gotA)
+	}
+	if gotB.A2A == nil || gotB.A2A.Method != "ping" {
+		t.Errorf("B received wrong event: %+v", gotB)
+	}
+}
+
+func TestStore_Subscribe_CloseStoreUnblocksSubscribers(t *testing.T) {
+	s := New(5*time.Minute, 100, 0)
+	sub, cancel := s.Subscribe()
+	defer cancel()
+
+	s.Close() // must close subscriber channels, not just the cleanup goroutine
+
+	select {
+	case _, ok := <-sub.Events():
+		if ok {
+			t.Error("expected closed channel after Store.Close")
+		}
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("Store.Close did not close subscriber channel")
+	}
+}
+
+func waitEvent(t *testing.T, ch <-chan pipeline.SessionEvent, d time.Duration) pipeline.SessionEvent {
+	t.Helper()
+	select {
+	case e := <-ch:
+		return e
+	case <-time.After(d):
+		t.Fatalf("timeout waiting for event after %v", d)
+		return pipeline.SessionEvent{}
+	}
+}

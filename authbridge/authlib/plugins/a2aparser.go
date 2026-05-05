@@ -1,6 +1,7 @@
 package plugins
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"log/slog"
@@ -43,7 +44,11 @@ func (p *A2AParser) OnRequest(_ context.Context, pctx *pipeline.Context) pipelin
 
 	// Extract message fields generically — any method with params.message
 	// gets full extraction (forward-compatible with future A2A methods).
-	ext.SessionID = rpc.stringParam("sessionId")
+	// A2A spec uses "contextId" (current) or "sessionId" (older drafts).
+	ext.SessionID = rpc.stringParam("contextId")
+	if ext.SessionID == "" {
+		ext.SessionID = rpc.stringParam("sessionId")
+	}
 	if msg := rpc.mapParam("message"); msg != nil {
 		if role, ok := msg["role"].(string); ok {
 			ext.Role = role
@@ -69,8 +74,62 @@ func (p *A2AParser) OnRequest(_ context.Context, pctx *pipeline.Context) pipelin
 	return pipeline.Action{Type: pipeline.Continue}
 }
 
-func (p *A2AParser) OnResponse(_ context.Context, _ *pipeline.Context) pipeline.Action {
+// OnResponse extracts the server-assigned session/context ID from the response body
+// and stores it on the A2A extension. This lets downstream plugins correlate the
+// freshly-assigned session for the next turn of the conversation, since clients
+// typically don't include a contextId on the first message.
+//
+// Handles both JSON-RPC responses (message/send) and SSE event streams (message/stream).
+func (p *A2AParser) OnResponse(_ context.Context, pctx *pipeline.Context) pipeline.Action {
+	if len(pctx.ResponseBody) == 0 || pctx.Extensions.A2A == nil {
+		return pipeline.Action{Type: pipeline.Continue}
+	}
+
+	sid := extractSessionID(pctx.ResponseBody)
+	if sid == "" {
+		slog.Debug("a2a-parser: no sessionId or contextId found in response")
+		return pipeline.Action{Type: pipeline.Continue}
+	}
+
+	pctx.Extensions.A2A.SessionID = sid
+	slog.Debug("a2a-parser: response sessionId", "sessionId", sid)
 	return pipeline.Action{Type: pipeline.Continue}
+}
+
+// extractSessionID finds a contextId (preferred) or sessionId in the response.
+// Supports plain JSON-RPC responses and SSE event streams (message/stream).
+func extractSessionID(body []byte) string {
+	if sid := sessionIDFromJSON(body); sid != "" {
+		return sid
+	}
+	// SSE format: scan "data:" lines for the first event that carries a session ID.
+	for _, line := range bytes.Split(body, []byte("\n")) {
+		line = bytes.TrimSpace(line)
+		if !bytes.HasPrefix(line, []byte("data:")) {
+			continue
+		}
+		data := bytes.TrimSpace(bytes.TrimPrefix(line, []byte("data:")))
+		if sid := sessionIDFromJSON(data); sid != "" {
+			return sid
+		}
+	}
+	return ""
+}
+
+func sessionIDFromJSON(data []byte) string {
+	var resp struct {
+		Result struct {
+			ContextID string `json:"contextId"`
+			SessionID string `json:"sessionId"`
+		} `json:"result"`
+	}
+	if json.Unmarshal(data, &resp) != nil {
+		return ""
+	}
+	if resp.Result.ContextID != "" {
+		return resp.Result.ContextID
+	}
+	return resp.Result.SessionID
 }
 
 func parseA2AParts(rawParts []any) []pipeline.A2APart {

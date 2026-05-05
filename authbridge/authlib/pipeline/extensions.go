@@ -18,6 +18,7 @@ type MCPExtension struct {
 	Method string         // JSON-RPC method (e.g. "tools/call", "resources/read", "initialize")
 	RPCID  any            // JSON-RPC id for request-response correlation
 	Params map[string]any // raw params from the JSON-RPC request
+	Result map[string]any // parsed result from the JSON-RPC response (nil until OnResponse runs)
 }
 
 // A2AExtension carries parsed A2A protocol metadata from inbound requests.

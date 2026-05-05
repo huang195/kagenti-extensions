@@ -161,7 +161,7 @@ data:
                   allow_mode_override: true
                   processing_mode:
                     request_header_mode: SEND
-                    response_header_mode: SKIP
+                    response_header_mode: SEND
                     request_body_mode: NONE
                     response_body_mode: NONE
               - name: envoy.filters.http.router
@@ -213,7 +213,7 @@ data:
                   allow_mode_override: true
                   processing_mode:
                     request_header_mode: SEND
-                    response_header_mode: SKIP
+                    response_header_mode: SEND
                     request_body_mode: NONE
                     response_body_mode: NONE
               - name: envoy.filters.http.router

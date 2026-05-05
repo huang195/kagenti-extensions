@@ -48,8 +48,44 @@ func (p *MCPParser) OnRequest(_ context.Context, pctx *pipeline.Context) pipelin
 	return pipeline.Action{Type: pipeline.Continue}
 }
 
-func (p *MCPParser) OnResponse(_ context.Context, _ *pipeline.Context) pipeline.Action {
+func (p *MCPParser) OnResponse(_ context.Context, pctx *pipeline.Context) pipeline.Action {
+	if len(pctx.ResponseBody) == 0 || pctx.Extensions.MCP == nil {
+		return pipeline.Action{Type: pipeline.Continue}
+	}
+
+	var rpc jsonRPCResponse
+	if err := json.Unmarshal(pctx.ResponseBody, &rpc); err != nil {
+		slog.Debug("mcp-parser: response is not valid JSON-RPC", "error", err, "bodyLen", len(pctx.ResponseBody))
+		return pipeline.Action{Type: pipeline.Continue}
+	}
+
+	if rpc.Error != nil {
+		slog.Info("mcp-parser: response error", "method", pctx.Extensions.MCP.Method, "error", rpc.Error)
+		pctx.Extensions.MCP.Result = rpc.Error
+		return pipeline.Action{Type: pipeline.Continue}
+	}
+
+	if rpc.Result != nil {
+		pctx.Extensions.MCP.Result = rpc.Result
+		slog.Info("mcp-parser: response", "method", pctx.Extensions.MCP.Method, "resultKeys", resultKeys(rpc.Result))
+		slog.Debug("mcp-parser: response detail", "method", pctx.Extensions.MCP.Method, "body", truncate(string(pctx.ResponseBody), 256))
+	}
+
 	return pipeline.Action{Type: pipeline.Continue}
+}
+
+type jsonRPCResponse struct {
+	ID     any            `json:"id"`
+	Result map[string]any `json:"result"`
+	Error  map[string]any `json:"error"`
+}
+
+func resultKeys(m map[string]any) []string {
+	keys := make([]string, 0, len(m))
+	for k := range m {
+		keys = append(keys, k)
+	}
+	return keys
 }
 
 type jsonRPCRequest struct {

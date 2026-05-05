@@ -181,10 +181,110 @@ func TestMCPParser_MissingParams(t *testing.T) {
 	}
 }
 
-func TestMCPParser_OnResponse(t *testing.T) {
+func TestMCPParser_OnResponse_NoRequestContext(t *testing.T) {
+	// If the request phase never ran (no MCP extension populated), OnResponse
+	// should skip — there's nothing to correlate the response to.
 	p := NewMCPParser()
-	action := p.OnResponse(context.Background(), &pipeline.Context{})
+	pctx := &pipeline.Context{
+		ResponseBody: []byte(`{"jsonrpc":"2.0","id":1,"result":{"tools":[]}}`),
+	}
+	action := p.OnResponse(context.Background(), pctx)
 	if action.Type != pipeline.Continue {
-		t.Errorf("OnResponse should return Continue, got %v", action.Type)
+		t.Fatalf("expected Continue, got %v", action.Type)
+	}
+	if pctx.Extensions.MCP != nil {
+		t.Error("MCP extension should remain nil when request was not parsed")
+	}
+}
+
+func TestMCPParser_OnResponse_EmptyBody(t *testing.T) {
+	p := NewMCPParser()
+	pctx := &pipeline.Context{
+		Extensions: pipeline.Extensions{MCP: &pipeline.MCPExtension{Method: "tools/list"}},
+	}
+	action := p.OnResponse(context.Background(), pctx)
+	if action.Type != pipeline.Continue {
+		t.Fatalf("expected Continue, got %v", action.Type)
+	}
+	if pctx.Extensions.MCP.Result != nil {
+		t.Error("Result should remain nil when response body is empty")
+	}
+}
+
+func TestMCPParser_OnResponse_ToolsList(t *testing.T) {
+	p := NewMCPParser()
+	pctx := &pipeline.Context{
+		Extensions:   pipeline.Extensions{MCP: &pipeline.MCPExtension{Method: "tools/list"}},
+		ResponseBody: []byte(`{"jsonrpc":"2.0","id":1,"result":{"tools":[{"name":"get_weather"},{"name":"get_news"}]}}`),
+	}
+
+	action := p.OnResponse(context.Background(), pctx)
+	if action.Type != pipeline.Continue {
+		t.Fatalf("expected Continue, got %v", action.Type)
+	}
+	if pctx.Extensions.MCP.Result == nil {
+		t.Fatal("Result should be populated")
+	}
+	tools, ok := pctx.Extensions.MCP.Result["tools"].([]any)
+	if !ok {
+		t.Fatalf("Result[tools] should be []any, got %T", pctx.Extensions.MCP.Result["tools"])
+	}
+	if len(tools) != 2 {
+		t.Errorf("expected 2 tools, got %d", len(tools))
+	}
+}
+
+func TestMCPParser_OnResponse_ToolsCall(t *testing.T) {
+	p := NewMCPParser()
+	pctx := &pipeline.Context{
+		Extensions:   pipeline.Extensions{MCP: &pipeline.MCPExtension{Method: "tools/call"}},
+		ResponseBody: []byte(`{"jsonrpc":"2.0","id":2,"result":{"content":[{"type":"text","text":"sunny, 72F"}]}}`),
+	}
+
+	action := p.OnResponse(context.Background(), pctx)
+	if action.Type != pipeline.Continue {
+		t.Fatalf("expected Continue, got %v", action.Type)
+	}
+	if pctx.Extensions.MCP.Result == nil {
+		t.Fatal("Result should be populated")
+	}
+	if _, ok := pctx.Extensions.MCP.Result["content"]; !ok {
+		t.Error("Result should contain content key")
+	}
+}
+
+func TestMCPParser_OnResponse_Error(t *testing.T) {
+	p := NewMCPParser()
+	pctx := &pipeline.Context{
+		Extensions:   pipeline.Extensions{MCP: &pipeline.MCPExtension{Method: "tools/call"}},
+		ResponseBody: []byte(`{"jsonrpc":"2.0","id":3,"error":{"code":-32601,"message":"Method not found"}}`),
+	}
+
+	action := p.OnResponse(context.Background(), pctx)
+	if action.Type != pipeline.Continue {
+		t.Fatalf("expected Continue, got %v", action.Type)
+	}
+	// Error payload is stored in Result for downstream inspection.
+	if pctx.Extensions.MCP.Result == nil {
+		t.Fatal("Result should be populated with error payload")
+	}
+	if pctx.Extensions.MCP.Result["message"] != "Method not found" {
+		t.Errorf("Result[message] = %v, want %q", pctx.Extensions.MCP.Result["message"], "Method not found")
+	}
+}
+
+func TestMCPParser_OnResponse_InvalidJSON(t *testing.T) {
+	p := NewMCPParser()
+	pctx := &pipeline.Context{
+		Extensions:   pipeline.Extensions{MCP: &pipeline.MCPExtension{Method: "tools/list"}},
+		ResponseBody: []byte("not json"),
+	}
+
+	action := p.OnResponse(context.Background(), pctx)
+	if action.Type != pipeline.Continue {
+		t.Fatalf("expected Continue, got %v", action.Type)
+	}
+	if pctx.Extensions.MCP.Result != nil {
+		t.Error("Result should remain nil for invalid JSON")
 	}
 }

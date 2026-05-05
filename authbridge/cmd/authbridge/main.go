@@ -29,6 +29,7 @@ import (
 	"github.com/kagenti/kagenti-extensions/authbridge/authlib/pipeline"
 	"github.com/kagenti/kagenti-extensions/authbridge/authlib/plugins"
 	"github.com/kagenti/kagenti-extensions/authbridge/authlib/session"
+	"github.com/kagenti/kagenti-extensions/authbridge/authlib/sessionapi"
 	"github.com/kagenti/kagenti-extensions/authbridge/cmd/authbridge/listener/extauthz"
 	"github.com/kagenti/kagenti-extensions/authbridge/cmd/authbridge/listener/extproc"
 	"github.com/kagenti/kagenti-extensions/authbridge/cmd/authbridge/listener/forwardproxy"
@@ -175,6 +176,18 @@ func main() {
 
 	statSrv := startStatServer(cfg, handler)
 
+	// Session events API (optional; only when session tracking is on).
+	var sessionAPISrv *sessionapi.Server
+	if cfg.Listener.SessionAPIAddr != "" && sessions != nil {
+		sessionAPISrv = sessionapi.New(cfg.Listener.SessionAPIAddr, sessions)
+		go func() {
+			slog.Info("session API listening", "addr", cfg.Listener.SessionAPIAddr)
+			if err := sessionAPISrv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+				log.Fatalf("session API: %v", err)
+			}
+		}()
+	}
+
 	slog.Info("authbridge starting", "mode", cfg.Mode, "logLevel", logLevel.Level().String())
 
 	// Resolve credentials in background — doesn't block the listener.
@@ -219,6 +232,9 @@ func main() {
 		srv.Shutdown(shutdownCtx)
 	}
 	statSrv.Shutdown(shutdownCtx)
+	if sessionAPISrv != nil {
+		sessionAPISrv.Shutdown(shutdownCtx)
+	}
 	if sessions != nil {
 		sessions.Close()
 	}

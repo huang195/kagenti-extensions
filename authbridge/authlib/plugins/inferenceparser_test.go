@@ -72,7 +72,7 @@ func TestInferenceParser_ChatCompletions(t *testing.T) {
 	if ext.Stream {
 		t.Error("Stream should be false")
 	}
-	if len(ext.Tools) != 2 || ext.Tools[0] != "get_weather" || ext.Tools[1] != "get_forecast" {
+	if len(ext.Tools) != 2 || ext.Tools[0].Name != "get_weather" || ext.Tools[1].Name != "get_forecast" {
 		t.Errorf("Tools = %v, want [get_weather get_forecast]", ext.Tools)
 	}
 }
@@ -155,11 +155,99 @@ func TestInferenceParser_WithTools(t *testing.T) {
 	if len(ext.Tools) != 2 {
 		t.Fatalf("Tools len = %d, want 2", len(ext.Tools))
 	}
-	if ext.Tools[0] != "get_weather" {
-		t.Errorf("Tools[0] = %q, want %q", ext.Tools[0], "get_weather")
+	if ext.Tools[0].Name != "get_weather" {
+		t.Errorf("Tools[0].Name = %q, want %q", ext.Tools[0].Name, "get_weather")
 	}
-	if ext.Tools[1] != "search_web" {
-		t.Errorf("Tools[1] = %q, want %q", ext.Tools[1], "search_web")
+	if ext.Tools[1].Name != "search_web" {
+		t.Errorf("Tools[1].Name = %q, want %q", ext.Tools[1].Name, "search_web")
+	}
+}
+
+func TestInferenceParser_CapturesToolDescriptionAndParameters(t *testing.T) {
+	p := NewInferenceParser()
+	pctx := &pipeline.Context{
+		Path: "/v1/chat/completions",
+		Body: []byte(`{
+			"model": "llama3.1",
+			"messages": [{"role":"user","content":"x"}],
+			"tools": [{
+				"type": "function",
+				"function": {
+					"name": "get_weather",
+					"description": "Get weather info for a city",
+					"parameters": {
+						"type": "object",
+						"properties": {"city": {"type":"string"}},
+						"required": ["city"]
+					}
+				}
+			}],
+			"tool_choice": "auto",
+			"top_p": 0.95
+		}`),
+	}
+	if action := p.OnRequest(context.Background(), pctx); action.Type != pipeline.Continue {
+		t.Fatalf("expected Continue, got %v", action.Type)
+	}
+	ext := pctx.Extensions.Inference
+	if ext == nil || len(ext.Tools) != 1 {
+		t.Fatalf("tools not captured: %+v", ext)
+	}
+	tool := ext.Tools[0]
+	if tool.Description != "Get weather info for a city" {
+		t.Errorf("Description = %q", tool.Description)
+	}
+	if tool.Parameters == nil {
+		t.Fatal("Parameters not captured")
+	}
+	if tool.Parameters["type"] != "object" {
+		t.Errorf("Parameters[type] = %v", tool.Parameters["type"])
+	}
+	if ext.ToolChoice != "auto" {
+		t.Errorf("ToolChoice = %v, want \"auto\"", ext.ToolChoice)
+	}
+	if ext.TopP == nil || *ext.TopP != 0.95 {
+		t.Errorf("TopP = %v, want 0.95", ext.TopP)
+	}
+}
+
+func TestInferenceParser_OnResponse_CapturesToolCalls(t *testing.T) {
+	p := NewInferenceParser()
+	pctx := &pipeline.Context{
+		Extensions: pipeline.Extensions{Inference: &pipeline.InferenceExtension{Model: "gpt-4"}},
+		ResponseBody: []byte(`{
+			"choices":[{
+				"message":{
+					"role":"assistant",
+					"content":null,
+					"tool_calls":[
+						{"id":"call_abc","type":"function","function":{"name":"get_weather","arguments":"{\"city\":\"NYC\"}"}},
+						{"id":"call_def","type":"function","function":{"name":"search_web","arguments":"{\"q\":\"hi\"}"}}
+					]
+				},
+				"finish_reason":"tool_calls"
+			}],
+			"usage":{"prompt_tokens":42,"completion_tokens":18,"total_tokens":60}
+		}`),
+	}
+	if action := p.OnResponse(context.Background(), pctx); action.Type != pipeline.Continue {
+		t.Fatalf("expected Continue, got %v", action.Type)
+	}
+	ext := pctx.Extensions.Inference
+	if ext.FinishReason != "tool_calls" {
+		t.Errorf("FinishReason = %q, want tool_calls", ext.FinishReason)
+	}
+	if len(ext.ToolCalls) != 2 {
+		t.Fatalf("ToolCalls len = %d, want 2", len(ext.ToolCalls))
+	}
+	if ext.ToolCalls[0].ID != "call_abc" || ext.ToolCalls[0].Name != "get_weather" {
+		t.Errorf("ToolCalls[0] = %+v", ext.ToolCalls[0])
+	}
+	if ext.ToolCalls[0].Arguments != `{"city":"NYC"}` {
+		t.Errorf("ToolCalls[0].Arguments = %q", ext.ToolCalls[0].Arguments)
+	}
+	if ext.ToolCalls[1].Name != "search_web" {
+		t.Errorf("ToolCalls[1].Name = %q", ext.ToolCalls[1].Name)
 	}
 }
 

@@ -53,21 +53,42 @@ type InferenceExtension struct {
 	Messages    []InferenceMessage `json:"messages,omitempty"`
 	Temperature *float64           `json:"temperature,omitempty"`
 	MaxTokens   *int               `json:"maxTokens,omitempty"`
+	TopP        *float64           `json:"topP,omitempty"`
 	Stream      bool               `json:"stream,omitempty"`
-	Tools       []string           `json:"tools,omitempty"`
+	Tools       []InferenceTool    `json:"tools,omitempty"`
+	ToolChoice  any                `json:"toolChoice,omitempty"` // "auto" | "none" | {type,function:{name}}
 
 	// Response fields (populated after OnResponse runs).
-	Completion       string `json:"completion,omitempty"`
-	FinishReason     string `json:"finishReason,omitempty"`
-	PromptTokens     int    `json:"promptTokens,omitempty"`
-	CompletionTokens int    `json:"completionTokens,omitempty"`
-	TotalTokens      int    `json:"totalTokens,omitempty"`
+	Completion       string              `json:"completion,omitempty"`
+	FinishReason     string              `json:"finishReason,omitempty"`
+	PromptTokens     int                 `json:"promptTokens,omitempty"`
+	CompletionTokens int                 `json:"completionTokens,omitempty"`
+	TotalTokens      int                 `json:"totalTokens,omitempty"`
+	ToolCalls        []InferenceToolCall `json:"toolCalls,omitempty"`
 }
 
 // InferenceMessage represents a single message in the conversation.
 type InferenceMessage struct {
 	Role    string `json:"role"`
 	Content string `json:"content,omitempty"`
+}
+
+// InferenceTool is a function/tool the client declared the model may call.
+// Parameters is the OpenAI-style JSON Schema object describing valid args.
+type InferenceTool struct {
+	Name        string         `json:"name"`
+	Description string         `json:"description,omitempty"`
+	Parameters  map[string]any `json:"parameters,omitempty"`
+}
+
+// InferenceToolCall is a tool invocation the model emitted in its response.
+// Arguments is the raw JSON string as returned by the LLM (often needs
+// json.Unmarshal by the caller) — kept as a string so malformed output
+// from the model doesn't prevent capture.
+type InferenceToolCall struct {
+	ID        string `json:"id,omitempty"`
+	Name      string `json:"name"`
+	Arguments string `json:"arguments,omitempty"`
 }
 
 // SecurityExtension carries guardrail output.

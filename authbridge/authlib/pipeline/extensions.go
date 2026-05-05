@@ -9,6 +9,7 @@ type Extensions struct {
 	A2A        *A2AExtension
 	Security   *SecurityExtension
 	Delegation *DelegationExtension
+	Inference  *InferenceExtension
 	Custom     map[string]any
 }
 
@@ -33,6 +34,22 @@ type A2AExtension struct {
 type A2APart struct {
 	Kind    string // "text", "file", "data"
 	Content string // text content, file URI, or serialized data
+}
+
+// InferenceExtension carries parsed LLM inference request metadata.
+type InferenceExtension struct {
+	Model       string             // model name (e.g., "llama3.1", "gpt-4")
+	Messages    []InferenceMessage // conversation messages
+	Temperature *float64           // sampling temperature (nil if not set)
+	MaxTokens   *int               // max tokens to generate (nil if not set)
+	Stream      bool               // whether streaming is requested
+	Tools       []string           // tool/function names declared
+}
+
+// InferenceMessage represents a single message in the conversation.
+type InferenceMessage struct {
+	Role    string // "system", "user", "assistant", "tool"
+	Content string
 }
 
 // SecurityExtension carries guardrail output.

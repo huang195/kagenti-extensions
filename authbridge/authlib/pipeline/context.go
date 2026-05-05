@@ -30,6 +30,11 @@ type Context struct {
 	Claims *validation.Claims    // nil before jwt-validation runs
 	Route  *routing.ResolvedRoute
 
+	// Response-phase fields (populated by listener before RunResponse).
+	StatusCode      int
+	ResponseHeaders http.Header
+	ResponseBody    []byte // nil unless at least one plugin declares BodyAccess: true
+
 	Extensions Extensions
 }
 

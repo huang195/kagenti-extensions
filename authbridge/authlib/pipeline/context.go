@@ -1,12 +1,14 @@
 package pipeline
 
 import (
+	"encoding/json"
 	"net/http"
 	"time"
 
 	"github.com/kagenti/kagenti-extensions/authbridge/authlib/routing"
 	"github.com/kagenti/kagenti-extensions/authbridge/authlib/validation"
 )
+
 
 // Direction indicates whether a request is inbound (caller → this agent) or
 // outbound (this agent → target service).
@@ -28,6 +30,30 @@ func (d Direction) String() string {
 	default:
 		return "unknown"
 	}
+}
+
+// MarshalJSON emits the string form ("inbound"/"outbound") so the wire
+// format is human-readable without an enum→int lookup.
+func (d Direction) MarshalJSON() ([]byte, error) {
+	return json.Marshal(d.String())
+}
+
+// UnmarshalJSON decodes a Direction from the string form emitted by
+// MarshalJSON. Unknown strings decode to Inbound (zero value) without
+// error so downstream consumers stay tolerant of forward-compatible
+// additions.
+func (d *Direction) UnmarshalJSON(data []byte) error {
+	var s string
+	if err := json.Unmarshal(data, &s); err != nil {
+		return err
+	}
+	switch s {
+	case "outbound":
+		*d = Outbound
+	default:
+		*d = Inbound
+	}
+	return nil
 }
 
 // Context is the shared state passed through the plugin pipeline.

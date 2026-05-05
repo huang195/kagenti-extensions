@@ -24,6 +24,29 @@ func (p SessionPhase) String() string {
 	}
 }
 
+// MarshalJSON emits the string form ("request"/"response") so the wire
+// format stays human-readable.
+func (p SessionPhase) MarshalJSON() ([]byte, error) {
+	return json.Marshal(p.String())
+}
+
+// UnmarshalJSON decodes a SessionPhase from the string form emitted by
+// MarshalJSON. Unknown strings decode to SessionRequest (zero value)
+// without error.
+func (p *SessionPhase) UnmarshalJSON(data []byte) error {
+	var s string
+	if err := json.Unmarshal(data, &s); err != nil {
+		return err
+	}
+	switch s {
+	case "response":
+		*p = SessionResponse
+	default:
+		*p = SessionRequest
+	}
+	return nil
+}
+
 // SessionEvent represents a single pipeline event captured by the session store.
 // Exactly one of A2A, MCP, or Inference is non-nil.
 type SessionEvent struct {
@@ -81,26 +104,31 @@ type SessionEvent struct {
 // is emitted as milliseconds (the field name reflects the unit). The default
 // json marshaler would stringify enums as numbers and duration as nanoseconds
 // — both awkward for CLI / dashboard consumption.
+// sessionEventWire is the on-the-wire shape for SessionEvent. MarshalJSON
+// writes to it directly; UnmarshalJSON reads into it and converts back.
+// Keeping the layout in one place guarantees round-trip symmetry.
+type sessionEventWire struct {
+	SessionID      string              `json:"sessionId,omitempty"`
+	At             time.Time           `json:"at"`
+	Direction      Direction           `json:"direction"`
+	Phase          SessionPhase        `json:"phase"`
+	A2A            *A2AExtension       `json:"a2a,omitempty"`
+	MCP            *MCPExtension       `json:"mcp,omitempty"`
+	Inference      *InferenceExtension `json:"inference,omitempty"`
+	Identity       *EventIdentity      `json:"identity,omitempty"`
+	StatusCode     int                 `json:"statusCode,omitempty"`
+	Error          *EventError         `json:"error,omitempty"`
+	Host           string              `json:"host,omitempty"`
+	TargetAudience string              `json:"targetAudience,omitempty"`
+	DurationMs     int64               `json:"durationMs,omitempty"`
+}
+
 func (e SessionEvent) MarshalJSON() ([]byte, error) {
-	return json.Marshal(struct {
-		SessionID      string              `json:"sessionId,omitempty"`
-		At             time.Time           `json:"at"`
-		Direction      string              `json:"direction"`
-		Phase          string              `json:"phase"`
-		A2A            *A2AExtension       `json:"a2a,omitempty"`
-		MCP            *MCPExtension       `json:"mcp,omitempty"`
-		Inference      *InferenceExtension `json:"inference,omitempty"`
-		Identity       *EventIdentity      `json:"identity,omitempty"`
-		StatusCode     int                 `json:"statusCode,omitempty"`
-		Error          *EventError         `json:"error,omitempty"`
-		Host           string              `json:"host,omitempty"`
-		TargetAudience string              `json:"targetAudience,omitempty"`
-		DurationMs     int64               `json:"durationMs,omitempty"`
-	}{
+	return json.Marshal(sessionEventWire{
 		SessionID:      e.SessionID,
 		At:             e.At,
-		Direction:      e.Direction.String(),
-		Phase:          e.Phase.String(),
+		Direction:      e.Direction,
+		Phase:          e.Phase,
 		A2A:            e.A2A,
 		MCP:            e.MCP,
 		Inference:      e.Inference,
@@ -111,6 +139,32 @@ func (e SessionEvent) MarshalJSON() ([]byte, error) {
 		TargetAudience: e.TargetAudience,
 		DurationMs:     e.Duration.Milliseconds(),
 	})
+}
+
+// UnmarshalJSON accepts the on-the-wire form written by MarshalJSON. This
+// makes SessionEvent round-trippable through JSON so off-process clients
+// (e.g. abctl) can decode straight into the canonical type.
+func (e *SessionEvent) UnmarshalJSON(data []byte) error {
+	var w sessionEventWire
+	if err := json.Unmarshal(data, &w); err != nil {
+		return err
+	}
+	*e = SessionEvent{
+		SessionID:      w.SessionID,
+		At:             w.At,
+		Direction:      w.Direction,
+		Phase:          w.Phase,
+		A2A:            w.A2A,
+		MCP:            w.MCP,
+		Inference:      w.Inference,
+		Identity:       w.Identity,
+		StatusCode:     w.StatusCode,
+		Error:          w.Error,
+		Host:           w.Host,
+		TargetAudience: w.TargetAudience,
+		Duration:       time.Duration(w.DurationMs) * time.Millisecond,
+	}
+	return nil
 }
 
 // EventIdentity carries the "who" for a session event.

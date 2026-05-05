@@ -175,6 +175,51 @@ func (s *Server) recordInboundSession(pctx *pipeline.Context) {
 	})
 }
 
+// recordInboundResponseSession appends a Phase:SessionResponse event for the
+// inbound A2A direction. Called after RunResponse completes so the event
+// carries the updated SessionID (from the response body's contextId).
+func (s *Server) recordInboundResponseSession(pctx *pipeline.Context) {
+	if s.Sessions == nil || pctx.Extensions.A2A == nil {
+		return
+	}
+	sid := pctx.Extensions.A2A.SessionID
+	if sid == "" {
+		sid = s.Sessions.ActiveSession()
+	}
+	if sid == "" {
+		sid = session.DefaultSessionID
+	}
+	s.Sessions.Append(sid, pipeline.SessionEvent{
+		At:        time.Now(),
+		Direction: pipeline.Inbound,
+		Phase:     pipeline.SessionResponse,
+		A2A:       pctx.Extensions.A2A,
+	})
+}
+
+// recordOutboundResponseSession appends a Phase:SessionResponse event for the
+// outbound direction, carrying whichever protocol extension the response
+// populated (MCP tool result, inference completion + token counts).
+func (s *Server) recordOutboundResponseSession(pctx *pipeline.Context) {
+	if s.Sessions == nil {
+		return
+	}
+	sid := s.Sessions.ActiveSession()
+	if sid == "" {
+		sid = session.DefaultSessionID
+	}
+	ev := pipeline.SessionEvent{
+		At:        time.Now(),
+		Direction: pipeline.Outbound,
+		Phase:     pipeline.SessionResponse,
+		MCP:       pctx.Extensions.MCP,
+		Inference: pctx.Extensions.Inference,
+	}
+	if ev.MCP != nil || ev.Inference != nil {
+		s.Sessions.Append(sid, ev)
+	}
+}
+
 // rekeyInboundSession renames the DefaultSessionID bucket to the
 // server-assigned A2A contextId when the response reveals one, so events
 // from the first turn (recorded under "default" during the request phase)
@@ -314,6 +359,16 @@ func (s *Server) handleResponseHeaders(ctx context.Context, headers *corev3.Head
 		return denyResponse(typev3.StatusCode(action.Status),
 			jsonError("response_blocked", action.Reason))
 	}
+
+	// No body phase will run; record the response event here. A2A responses
+	// need the body to extract contextId, so the rekey path is body-only;
+	// skip it on this header-only path.
+	if direction == "inbound" {
+		s.recordInboundResponseSession(pctx)
+	} else {
+		s.recordOutboundResponseSession(pctx)
+	}
+
 	return &extprocv3.ProcessingResponse{
 		Response: &extprocv3.ProcessingResponse_ResponseHeaders{
 			ResponseHeaders: &extprocv3.HeadersResponse{},
@@ -347,7 +402,15 @@ func (s *Server) handleResponseBody(ctx context.Context, body []byte, pctx *pipe
 	// the request phase recorded events under DefaultSessionID (because the
 	// client had no contextId yet), migrate them to the real ID so subsequent
 	// turns — which will send that contextId — accumulate into one session.
+	// Rekey first so the response event we're about to append lands under
+	// the real contextId rather than being orphaned in "default".
 	s.rekeyInboundSession(pctx, direction)
+
+	if direction == "inbound" {
+		s.recordInboundResponseSession(pctx)
+	} else {
+		s.recordOutboundResponseSession(pctx)
+	}
 
 	if string(pctx.ResponseBody) != string(body) {
 		return &extprocv3.ProcessingResponse{

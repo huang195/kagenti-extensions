@@ -647,3 +647,128 @@ func TestRekeyInboundSession_NilStore(t *testing.T) {
 		Extensions: pipeline.Extensions{A2A: &pipeline.A2AExtension{SessionID: "ctx-abc"}},
 	}, "inbound")
 }
+
+func TestRecordInboundResponseSession(t *testing.T) {
+	store := session.New(5*time.Minute, 100, 0)
+	defer store.Close()
+	s := &Server{Sessions: store}
+
+	pctx := &pipeline.Context{
+		Extensions: pipeline.Extensions{
+			A2A: &pipeline.A2AExtension{
+				Method:    "message/stream",
+				SessionID: "ctx-abc",
+			},
+		},
+	}
+	s.recordInboundResponseSession(pctx)
+
+	v := store.View("ctx-abc")
+	if v == nil || len(v.Events) != 1 {
+		t.Fatalf("expected 1 event under ctx-abc, got %v", v)
+	}
+	e := v.Events[0]
+	if e.Direction != pipeline.Inbound || e.Phase != pipeline.SessionResponse {
+		t.Errorf("event fields = (%v, %v), want (Inbound, SessionResponse)", e.Direction, e.Phase)
+	}
+	if e.A2A == nil || e.A2A.SessionID != "ctx-abc" {
+		t.Errorf("A2A extension not attached: %+v", e.A2A)
+	}
+}
+
+func TestRecordInboundResponseSession_NoA2A(t *testing.T) {
+	// No A2A extension — nothing to record.
+	store := session.New(5*time.Minute, 100, 0)
+	defer store.Close()
+	s := &Server{Sessions: store}
+
+	s.recordInboundResponseSession(&pipeline.Context{})
+	if store.View(session.DefaultSessionID) != nil {
+		t.Error("no session should have been created without A2A extension")
+	}
+}
+
+func TestRecordOutboundResponseSession_MCP(t *testing.T) {
+	store := session.New(5*time.Minute, 100, 0)
+	defer store.Close()
+	store.Append(session.DefaultSessionID, pipeline.SessionEvent{Direction: pipeline.Inbound}) // seed active
+	s := &Server{Sessions: store}
+
+	pctx := &pipeline.Context{
+		Extensions: pipeline.Extensions{
+			MCP: &pipeline.MCPExtension{
+				Method: "tools/call",
+				Result: map[string]any{"content": []any{map[string]any{"text": "result"}}},
+			},
+		},
+	}
+	s.recordOutboundResponseSession(pctx)
+
+	v := store.View(session.DefaultSessionID)
+	if v == nil || len(v.Events) != 2 { // 1 seed + 1 response
+		t.Fatalf("expected 2 events, got %v", v)
+	}
+	resp := v.Events[1]
+	if resp.Direction != pipeline.Outbound || resp.Phase != pipeline.SessionResponse {
+		t.Errorf("event fields = (%v, %v), want (Outbound, SessionResponse)", resp.Direction, resp.Phase)
+	}
+	if resp.MCP == nil || resp.MCP.Result["content"] == nil {
+		t.Errorf("MCP Result not attached: %+v", resp.MCP)
+	}
+}
+
+func TestRecordOutboundResponseSession_Inference(t *testing.T) {
+	store := session.New(5*time.Minute, 100, 0)
+	defer store.Close()
+	store.Append(session.DefaultSessionID, pipeline.SessionEvent{})
+	s := &Server{Sessions: store}
+
+	pctx := &pipeline.Context{
+		Extensions: pipeline.Extensions{
+			Inference: &pipeline.InferenceExtension{
+				Model:            "llama3",
+				Completion:       "Hello",
+				FinishReason:     "stop",
+				PromptTokens:     10,
+				CompletionTokens: 5,
+				TotalTokens:      15,
+			},
+		},
+	}
+	s.recordOutboundResponseSession(pctx)
+
+	v := store.View(session.DefaultSessionID)
+	if v == nil || len(v.Events) != 2 {
+		t.Fatalf("expected 2 events, got %v", v)
+	}
+	resp := v.Events[1]
+	if resp.Inference == nil || resp.Inference.Completion != "Hello" {
+		t.Errorf("Inference not attached with response data: %+v", resp.Inference)
+	}
+	if resp.Inference.TotalTokens != 15 {
+		t.Errorf("TotalTokens = %d, want 15", resp.Inference.TotalTokens)
+	}
+}
+
+func TestRecordOutboundResponseSession_NothingToRecord(t *testing.T) {
+	// Neither MCP nor Inference populated — nothing to write.
+	store := session.New(5*time.Minute, 100, 0)
+	defer store.Close()
+	s := &Server{Sessions: store}
+
+	s.recordOutboundResponseSession(&pipeline.Context{})
+	if store.View(session.DefaultSessionID) != nil {
+		t.Error("no session should have been created without MCP/Inference")
+	}
+}
+
+func TestRecordResponseSessions_NilStore(t *testing.T) {
+	// Session tracking disabled — both helpers must be safe to call.
+	s := &Server{Sessions: nil}
+	s.recordInboundResponseSession(&pipeline.Context{
+		Extensions: pipeline.Extensions{A2A: &pipeline.A2AExtension{}},
+	})
+	s.recordOutboundResponseSession(&pipeline.Context{
+		Extensions: pipeline.Extensions{MCP: &pipeline.MCPExtension{}},
+	})
+}

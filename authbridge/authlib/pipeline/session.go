@@ -1,6 +1,9 @@
 package pipeline
 
-import "time"
+import (
+	"encoding/json"
+	"time"
+)
 
 // SessionPhase distinguishes request from response events.
 type SessionPhase int
@@ -66,26 +69,61 @@ type SessionEvent struct {
 	Duration time.Duration
 }
 
+// MarshalJSON emits SessionEvent in a form consumable by off-process clients:
+// Direction and Phase become strings instead of opaque int enums, and Duration
+// is emitted as milliseconds (the field name reflects the unit). The default
+// json marshaler would stringify enums as numbers and duration as nanoseconds
+// — both awkward for CLI / dashboard consumption.
+func (e SessionEvent) MarshalJSON() ([]byte, error) {
+	return json.Marshal(struct {
+		At             time.Time           `json:"at"`
+		Direction      string              `json:"direction"`
+		Phase          string              `json:"phase"`
+		A2A            *A2AExtension       `json:"a2a,omitempty"`
+		MCP            *MCPExtension       `json:"mcp,omitempty"`
+		Inference      *InferenceExtension `json:"inference,omitempty"`
+		Identity       *EventIdentity      `json:"identity,omitempty"`
+		StatusCode     int                 `json:"statusCode,omitempty"`
+		Error          *EventError         `json:"error,omitempty"`
+		Host           string              `json:"host,omitempty"`
+		TargetAudience string              `json:"targetAudience,omitempty"`
+		DurationMs     int64               `json:"durationMs,omitempty"`
+	}{
+		At:             e.At,
+		Direction:      e.Direction.String(),
+		Phase:          e.Phase.String(),
+		A2A:            e.A2A,
+		MCP:            e.MCP,
+		Inference:      e.Inference,
+		Identity:       e.Identity,
+		StatusCode:     e.StatusCode,
+		Error:          e.Error,
+		Host:           e.Host,
+		TargetAudience: e.TargetAudience,
+		DurationMs:     e.Duration.Milliseconds(),
+	})
+}
+
 // EventIdentity carries the "who" for a session event.
 type EventIdentity struct {
-	Subject  string   // end-user subject from JWT (Claims.Subject)
-	Scopes   []string // validated scopes
-	ClientID string   // JWT azp claim (the client that minted the token)
-	AgentID  string   // the sidecar's own workload identity (Agent.WorkloadID)
+	Subject  string   `json:"subject,omitempty"`
+	Scopes   []string `json:"scopes,omitempty"`
+	ClientID string   `json:"clientId,omitempty"`
+	AgentID  string   `json:"agentId,omitempty"`
 }
 
 // EventError describes why a response event represents a failure.
 type EventError struct {
-	Kind    string // "backend_error" | "blocked" | "parser_error" | "timeout"
-	Code    string // protocol-specific error code (HTTP status, JSON-RPC code, etc.)
+	Kind    string `json:"kind"`
+	Code    string `json:"code,omitempty"`
 	Message string // human-readable reason; safe to surface in logs/metrics
 }
 
 // SessionView is a read-only snapshot of a session, safe to pass to plugins.
 // It contains a copy of events — plugins cannot mutate the store.
 type SessionView struct {
-	ID     string
-	Events []SessionEvent
+	ID     string         `json:"id"`
+	Events []SessionEvent `json:"events"`
 }
 
 // Intents returns only inbound A2A request events (user messages).

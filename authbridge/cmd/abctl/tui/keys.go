@@ -130,15 +130,8 @@ func (m *model) handleKey(msg tea.KeyMsg) tea.Cmd {
 		m.sessionsTbl, cmd = m.sessionsTbl.Update(msg)
 		return cmd
 	case paneEvents:
-		prev := m.eventsTbl.Cursor()
 		var cmd tea.Cmd
 		m.eventsTbl, cmd = m.eventsTbl.Update(msg)
-		// Rebuild the table so the ▸ selection indicator in column 0
-		// follows the cursor — we can't rely on bubbles/table's wrapping
-		// Selected style (conflicts with per-cell ANSI colors on METHOD).
-		if m.eventsTbl.Cursor() != prev {
-			m.rebuildEventsTable()
-		}
 		return cmd
 	case paneDetail, panePluginDetail:
 		var cmd tea.Cmd

@@ -5,7 +5,6 @@ import (
 	"strings"
 
 	"github.com/charmbracelet/bubbles/table"
-	"github.com/charmbracelet/lipgloss"
 
 	"github.com/kagenti/kagenti-extensions/authbridge/cmd/abctl/apiclient"
 )
@@ -65,41 +64,18 @@ func pipelineRow(p apiclient.PipelinePlugin, events int) table.Row {
 	if events > 0 {
 		eventsStr = fmt.Sprintf("%d", events)
 	}
-	// Color plugin names by the protocol they parse (or leave unstyled for
-	// non-parser plugins like token-exchange / jwt-validation) so Pipeline
-	// and Events panes share a visual vocabulary.
-	name := p.Name
-	if style := pluginStyle(p); style != nil {
-		name = style.Render(name)
-	}
+	// Plugin names used to be colored by protocol but bubbles v1's
+	// runewidth.Truncate miscounts ANSI escape bytes as visible width,
+	// which truncated the closing \x1b[0m reset for longer names and
+	// bled color into adjacent cells. Blocked on bubbles v2 upgrade.
 	return table.Row{
 		fmt.Sprintf("%d", p.Position),
 		p.Direction,
-		name,
+		p.Name,
 		strings.Join(p.Writes, ","),
 		body,
 		eventsStr,
 	}
-}
-
-// pluginStyle returns the protocol color for a plugin based on its Writes
-// slots. Plugins that don't write a protocol extension (token-exchange,
-// jwt-validation) return nil so they render in the default color.
-func pluginStyle(p apiclient.PipelinePlugin) *lipgloss.Style {
-	for _, w := range p.Writes {
-		switch w {
-		case "a2a":
-			s := styleProtoA2A
-			return &s
-		case "mcp":
-			s := styleProtoMCP
-			return &s
-		case "inference":
-			s := styleProtoInference
-			return &s
-		}
-	}
-	return nil
 }
 
 func isDividerRow(rows []table.Row, i int) bool {

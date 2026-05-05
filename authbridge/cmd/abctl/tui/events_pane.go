@@ -9,19 +9,12 @@ import (
 	"github.com/kagenti/kagenti-extensions/authbridge/authlib/pipeline"
 )
 
-// newEventsTable builds an empty events table.
-//
-// The first column is a 2-char selection indicator (► on the cursor row,
-// blank otherwise) maintained manually at rebuild time. We can't rely on
-// bubbles/table's wrapping Selected style because our per-cell ANSI
-// coloring contains \x1b[0m resets that clobber any outer Selected-Render
-// attempt (reverse, background, foreground — all get wiped at cell
-// boundaries). The indicator column sidesteps the nesting problem
-// entirely.
+// newEventsTable builds an empty events table. Uses the shared tableStyles
+// (including the Reverse-based Selected highlight) like the other panes —
+// now safe because per-cell ANSI coloring was removed from this table.
 func newEventsTable() table.Model {
 	t := table.New(
 		table.WithColumns([]table.Column{
-			{Title: "", Width: 2},
 			{Title: "TIME", Width: 12},
 			{Title: "DIR", Width: 4},
 			{Title: "PHASE", Width: 6},
@@ -33,11 +26,7 @@ func newEventsTable() table.Model {
 		}),
 		table.WithFocused(true),
 	)
-	s := tableStyles()
-	// Disable the wrapping Selected style — indicator column is the sole
-	// selection cue for this table.
-	s.Selected = s.Selected.Foreground(s.Cell.GetForeground()).Background(s.Cell.GetBackground()).Bold(false).Reverse(false)
-	t.SetStyles(s)
+	t.SetStyles(tableStyles())
 	return t
 }
 
@@ -52,11 +41,7 @@ func (m *model) rebuildEventsTable() {
 	// a visual connector back to their request.
 	pairs := pairRequestsAndResponses(events)
 
-	// Cursor is indexed against the rendered rows slice, after filter.
-	cursor := m.eventsTbl.Cursor()
-
 	rows := make([]table.Row, 0, len(events))
-	rowIdx := 0
 	for i, e := range events {
 		if m.filter != "" && !matchEvent(e, m.filter) {
 			continue
@@ -69,31 +54,11 @@ func (m *model) rebuildEventsTable() {
 				phase = "└" + phase
 			}
 		}
-		proto := shortProto(e)
-		// No per-cell ANSI coloring in this table: bubbles v1.0.0's
-		// runewidth.Truncate counts every byte of an ANSI escape as
-		// visible width, so a styled cell whose total runewidth exceeds
-		// the column width gets truncated mid-escape. The trailing
-		// \x1b[0m reset is lost and the color bleeds into every cell and
-		// row that follows until another escape happens by chance. The
-		// Pipeline pane gets away with plugin-name coloring because its
-		// column is wide enough for the short plugin names and there is
-		// nothing else styled in the row; the events pane can't make
-		// the same guarantee for variable-width method names
-		// (message/stream, notifications/initialized, etc.). Bringing
-		// colors back here is blocked on upgrading to bubbles v2, which
-		// uses ANSI-aware truncation.
-		indicator := "  "
-		if rowIdx == cursor {
-			indicator = "▸ "
-		}
-		rowIdx++
 		rows = append(rows, table.Row{
-			indicator,
 			e.At.Format("15:04:05.00"),
 			shortDirection(e.Direction),
 			phase,
-			proto,
+			shortProto(e),
 			eventMethod(e),
 			statusCell(e),
 			durationCell(e),

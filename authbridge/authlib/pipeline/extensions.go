@@ -14,11 +14,20 @@ type Extensions struct {
 }
 
 // MCPExtension carries parsed MCP JSON-RPC metadata.
+// Result and Err are mutually exclusive: a response sets exactly one.
 type MCPExtension struct {
 	Method string         // JSON-RPC method (e.g. "tools/call", "resources/read", "initialize")
 	RPCID  any            // JSON-RPC id for request-response correlation
 	Params map[string]any // raw params from the JSON-RPC request
-	Result map[string]any // parsed result from the JSON-RPC response (nil until OnResponse runs)
+	Result map[string]any // parsed successful result; nil on error or before OnResponse runs
+	Err    *MCPError      // non-nil when the server returned a JSON-RPC error
+}
+
+// MCPError mirrors a JSON-RPC 2.0 error object.
+type MCPError struct {
+	Code    int    // JSON-RPC error code (e.g. -32601 method not found)
+	Message string // human-readable error message
+	Data    any    // optional structured error data (implementation-defined)
 }
 
 // A2AExtension carries parsed A2A protocol metadata from inbound requests.

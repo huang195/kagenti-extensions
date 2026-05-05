@@ -264,12 +264,17 @@ func TestMCPParser_OnResponse_Error(t *testing.T) {
 	if action.Type != pipeline.Continue {
 		t.Fatalf("expected Continue, got %v", action.Type)
 	}
-	// Error payload is stored in Result for downstream inspection.
-	if pctx.Extensions.MCP.Result == nil {
-		t.Fatal("Result should be populated with error payload")
+	if pctx.Extensions.MCP.Result != nil {
+		t.Errorf("Result should be nil on error response, got %v", pctx.Extensions.MCP.Result)
 	}
-	if pctx.Extensions.MCP.Result["message"] != "Method not found" {
-		t.Errorf("Result[message] = %v, want %q", pctx.Extensions.MCP.Result["message"], "Method not found")
+	if pctx.Extensions.MCP.Err == nil {
+		t.Fatal("Err should be populated")
+	}
+	if pctx.Extensions.MCP.Err.Code != -32601 {
+		t.Errorf("Err.Code = %d, want -32601", pctx.Extensions.MCP.Err.Code)
+	}
+	if pctx.Extensions.MCP.Err.Message != "Method not found" {
+		t.Errorf("Err.Message = %q, want %q", pctx.Extensions.MCP.Err.Message, "Method not found")
 	}
 }
 
@@ -321,7 +326,26 @@ func TestMCPParser_OnResponse_SSE_Error(t *testing.T) {
 	}
 
 	_ = p.OnResponse(context.Background(), pctx)
-	if pctx.Extensions.MCP.Result == nil || pctx.Extensions.MCP.Result["message"] != "not found" {
-		t.Errorf("expected error payload in Result, got %v", pctx.Extensions.MCP.Result)
+	if pctx.Extensions.MCP.Err == nil {
+		t.Fatal("expected Err populated from SSE error frame")
+	}
+	if pctx.Extensions.MCP.Err.Message != "not found" {
+		t.Errorf("Err.Message = %q, want %q", pctx.Extensions.MCP.Err.Message, "not found")
+	}
+}
+
+func TestMCPParser_OnResponse_SSE_SkipsMalformedFramesUntilGoodOne(t *testing.T) {
+	// A broken upstream emits a garbage data: line before the valid one.
+	// Malformed frames should be logged at DEBUG, not abort parsing.
+	p := NewMCPParser()
+	body := "data: not-json\n\n" +
+		"data: {\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"ok\":true}}\n\n"
+	pctx := &pipeline.Context{
+		Extensions:   pipeline.Extensions{MCP: &pipeline.MCPExtension{Method: "tools/list"}},
+		ResponseBody: []byte(body),
+	}
+	_ = p.OnResponse(context.Background(), pctx)
+	if pctx.Extensions.MCP.Result == nil || pctx.Extensions.MCP.Result["ok"] != true {
+		t.Errorf("expected result from second SSE frame, got %v", pctx.Extensions.MCP.Result)
 	}
 }

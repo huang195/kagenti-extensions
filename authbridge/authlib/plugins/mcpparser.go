@@ -61,8 +61,12 @@ func (p *MCPParser) OnResponse(_ context.Context, pctx *pipeline.Context) pipeli
 	}
 
 	if rpc.Error != nil {
-		slog.Info("mcp-parser: response error", "method", pctx.Extensions.MCP.Method, "error", rpc.Error)
-		pctx.Extensions.MCP.Result = rpc.Error
+		pctx.Extensions.MCP.Err = &pipeline.MCPError{
+			Code:    rpc.Error.Code,
+			Message: rpc.Error.Message,
+			Data:    rpc.Error.Data,
+		}
+		slog.Info("mcp-parser: response error", "method", pctx.Extensions.MCP.Method, "code", rpc.Error.Code, "message", rpc.Error.Message)
 		return pipeline.Action{Type: pipeline.Continue}
 	}
 
@@ -77,7 +81,8 @@ func (p *MCPParser) OnResponse(_ context.Context, pctx *pipeline.Context) pipeli
 
 // parseMCPResponse handles both plain JSON-RPC responses and SSE event streams
 // (used by MCP's Streamable HTTP transport). For SSE, the first data: line
-// carrying a result or error wins.
+// carrying a result or error wins. Malformed SSE data frames are logged at
+// DEBUG so a broken upstream is observable rather than silently skipped.
 func parseMCPResponse(body []byte) (jsonRPCResponse, bool) {
 	var rpc jsonRPCResponse
 	if json.Unmarshal(body, &rpc) == nil && (rpc.Result != nil || rpc.Error != nil) {
@@ -93,17 +98,27 @@ func parseMCPResponse(body []byte) (jsonRPCResponse, bool) {
 			continue
 		}
 		var r jsonRPCResponse
-		if json.Unmarshal(data, &r) == nil && (r.Result != nil || r.Error != nil) {
+		if err := json.Unmarshal(data, &r); err != nil {
+			slog.Debug("mcp-parser: skipping malformed SSE data frame", "error", err, "data", truncate(string(data), 128))
+			continue
+		}
+		if r.Result != nil || r.Error != nil {
 			return r, true
 		}
 	}
 	return jsonRPCResponse{}, false
 }
 
+type jsonRPCError struct {
+	Code    int    `json:"code"`
+	Message string `json:"message"`
+	Data    any    `json:"data"`
+}
+
 type jsonRPCResponse struct {
 	ID     any            `json:"id"`
 	Result map[string]any `json:"result"`
-	Error  map[string]any `json:"error"`
+	Error  *jsonRPCError  `json:"error"`
 }
 
 func resultKeys(m map[string]any) []string {

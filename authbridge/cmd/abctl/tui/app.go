@@ -1,0 +1,388 @@
+package tui
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"os"
+	"path/filepath"
+	"sort"
+	"strings"
+	"time"
+
+	"github.com/charmbracelet/bubbles/table"
+	"github.com/charmbracelet/bubbles/textinput"
+	"github.com/charmbracelet/bubbles/viewport"
+	tea "github.com/charmbracelet/bubbletea"
+	"github.com/charmbracelet/lipgloss"
+
+	"github.com/kagenti/kagenti-extensions/authbridge/authlib/pipeline"
+	"github.com/kagenti/kagenti-extensions/authbridge/authlib/session"
+	"github.com/kagenti/kagenti-extensions/authbridge/cmd/abctl/apiclient"
+)
+
+// Pane identifiers.
+type paneID int
+
+const (
+	paneSessions paneID = iota
+	paneEvents
+	paneDetail
+)
+
+// Connection state for the SSE stream.
+type connPhase int
+
+const (
+	connConnecting connPhase = iota
+	connOpen
+	connReconnecting
+	connFailed
+)
+
+type connStateInfo struct {
+	phase     connPhase
+	attempt   int
+	nextRetry time.Time
+	err       error
+}
+
+// maxEventsPerSession caps per-session event retention in the TUI. Matches
+// the server's default maxEvents cap so we don't hold more than the server
+// itself does.
+const maxEventsPerSession = 1000
+
+// flashDuration is how long a one-shot status message (e.g. yank
+// confirmation) stays in the footer.
+const flashDuration = 3 * time.Second
+
+// Tea messages.
+type tickMsg time.Time
+type sessionsLoadedMsg []session.SessionSummary
+type snapshotLoadedMsg struct {
+	id     string
+	events []pipeline.SessionEvent
+}
+type streamMsg apiclient.StreamEvent
+type streamClosedMsg struct{}
+type errMsg struct {
+	where string
+	err   error
+}
+
+// Model is the top-level Bubble Tea model.
+type model struct {
+	endpoint string
+	client   *apiclient.Client
+
+	ctx    context.Context
+	cancel context.CancelFunc
+
+	// Data caches.
+	sessions []session.SessionSummary
+	events   map[string][]pipeline.SessionEvent // sessionID → ring buffer
+	eventCt  uint64                             // monotonic counter
+	lastTick time.Time
+	lastCt   uint64
+	rate     float64
+	drops    uint64
+
+	// Connection status.
+	connState connStateInfo
+
+	// UI state.
+	pane          paneID
+	selectedSess  string
+	filter        string
+	filtering     bool
+	paused        bool
+	flash         string
+	flashUntil    time.Time
+	width, height int
+
+	// Panel components.
+	sessionsTbl table.Model
+	eventsTbl   table.Model
+	detailVp    viewport.Model
+	detailEvent *pipeline.SessionEvent
+	filterInput textinput.Model
+
+	// streamCh is the single SSE channel from the apiclient. Opened once
+	// in Init; re-pumped on every streamMsg until it closes.
+	streamCh <-chan apiclient.StreamEvent
+}
+
+// New returns a fresh model pointed at the given client. ctx governs both
+// the HTTP calls and the SSE goroutine; cancelling it shuts everything down.
+func New(ctx context.Context, c *apiclient.Client) tea.Model {
+	ctx, cancel := context.WithCancel(ctx)
+
+	ti := textinput.New()
+	ti.Placeholder = "filter…"
+	ti.Prompt = "/ "
+
+	return &model{
+		endpoint:    c.Endpoint(),
+		client:      c,
+		ctx:         ctx,
+		cancel:      cancel,
+		events:      make(map[string][]pipeline.SessionEvent),
+		pane:        paneSessions,
+		sessionsTbl: newSessionsTable(),
+		eventsTbl:   newEventsTable(),
+		detailVp:    viewport.New(0, 0),
+		filterInput: ti,
+		lastTick:    time.Now(),
+		connState:   connStateInfo{phase: connConnecting},
+	}
+}
+
+// Init fires the initial fetch + starts the SSE pump and the tick.
+func (m *model) Init() tea.Cmd {
+	m.streamCh = m.client.Stream(m.ctx, "")
+	return tea.Batch(
+		m.loadSessionsCmd(),
+		streamPump(m.streamCh),
+		tickCmd(),
+	)
+}
+
+func tickCmd() tea.Cmd {
+	return tea.Tick(time.Second, func(t time.Time) tea.Msg { return tickMsg(t) })
+}
+
+// loadSessionsCmd fetches the current session list. Used at startup and after
+// each successful reconnect so we don't miss new sessions that appeared
+// while the stream was down.
+func (m *model) loadSessionsCmd() tea.Cmd {
+	return func() tea.Msg {
+		summaries, err := m.client.ListSessions(m.ctx)
+		if err != nil {
+			return errMsg{where: "list sessions", err: err}
+		}
+		return sessionsLoadedMsg(summaries)
+	}
+}
+
+// streamPump returns a tea.Cmd that blocks on the stream channel for one
+// message, emits a streamMsg (or streamClosedMsg if the channel closed),
+// and schedules itself again. This keeps all state mutation on the Tea
+// event loop — no concurrent access to m.
+func streamPump(ch <-chan apiclient.StreamEvent) tea.Cmd {
+	return func() tea.Msg {
+		ev, ok := <-ch
+		if !ok {
+			return streamClosedMsg{}
+		}
+		return streamMsg(ev)
+	}
+}
+
+// snapshotCmd fetches a single session's full event list. Used when the
+// user drills into a session the stream hasn't fully populated yet (e.g.
+// events that predate Subscribe).
+func (m *model) snapshotCmd(id string) tea.Cmd {
+	return func() tea.Msg {
+		view, err := m.client.GetSession(m.ctx, id)
+		if err != nil {
+			return errMsg{where: "snapshot " + id, err: err}
+		}
+		return snapshotLoadedMsg{id: id, events: view.Events}
+	}
+}
+
+// Update handles every message + dispatches the next Cmd.
+func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
+	switch msg := msg.(type) {
+
+	case tea.WindowSizeMsg:
+		m.width = msg.Width
+		m.height = msg.Height
+		m.layout()
+		return m, nil
+
+	case tickMsg:
+		now := time.Time(msg)
+		// Rate over the last tick.
+		delta := now.Sub(m.lastTick).Seconds()
+		if delta > 0 {
+			m.rate = float64(m.eventCt-m.lastCt) / delta
+		}
+		m.lastTick, m.lastCt = now, m.eventCt
+		return m, tickCmd()
+
+	case sessionsLoadedMsg:
+		m.sessions = []session.SessionSummary(msg)
+		m.connState.phase = connOpen
+		m.rebuildSessionsTable()
+		return m, nil
+
+	case snapshotLoadedMsg:
+		// Only update if we're still focused on this session.
+		m.events[msg.id] = trim(msg.events, maxEventsPerSession)
+		if m.pane == paneEvents && m.selectedSess == msg.id {
+			m.rebuildEventsTable()
+		}
+		return m, nil
+
+	case streamMsg:
+		ev := apiclient.StreamEvent(msg)
+		m.handleStreamEvent(ev)
+		// Re-pump the same channel for the next message. A single apiclient
+		// goroutine fills the channel for the duration of ctx.
+		return m, streamPump(m.streamCh)
+
+	case streamClosedMsg:
+		m.connState.phase = connReconnecting
+		return m, nil
+
+	case errMsg:
+		m.connState.phase = connFailed
+		m.connState.err = msg.err
+		return m, nil
+
+	case tea.KeyMsg:
+		return m, m.handleKey(msg)
+	}
+
+	// Delegate to the active pane's component.
+	switch m.pane {
+	case paneSessions:
+		var cmd tea.Cmd
+		m.sessionsTbl, cmd = m.sessionsTbl.Update(msg)
+		return m, cmd
+	case paneEvents:
+		var cmd tea.Cmd
+		m.eventsTbl, cmd = m.eventsTbl.Update(msg)
+		return m, cmd
+	case paneDetail:
+		var cmd tea.Cmd
+		m.detailVp, cmd = m.detailVp.Update(msg)
+		return m, cmd
+	}
+	return m, nil
+}
+
+// handleStreamEvent routes a single StreamEvent from the apiclient.
+func (m *model) handleStreamEvent(ev apiclient.StreamEvent) {
+	if ev.Status.Phase != "" {
+		switch ev.Status.Phase {
+		case "open":
+			m.connState.phase = connOpen
+		case "reconnecting":
+			m.connState.phase = connReconnecting
+			m.connState.attempt = ev.Status.Attempt
+			m.connState.nextRetry = time.Now().Add(ev.Status.Wait)
+		}
+		return
+	}
+	if ev.Event == nil {
+		return
+	}
+	if m.paused {
+		return
+	}
+	e := *ev.Event
+	m.eventCt++
+	buf := m.events[e.SessionID]
+	buf = append(buf, e)
+	if len(buf) > maxEventsPerSession {
+		buf = buf[len(buf)-maxEventsPerSession:]
+	}
+	m.events[e.SessionID] = buf
+
+	// Bump updatedAt on the session summary if we already have it.
+	for i := range m.sessions {
+		if m.sessions[i].ID == e.SessionID {
+			m.sessions[i].UpdatedAt = e.At
+			m.sessions[i].EventCount = len(buf)
+			goto sortAndRebuild
+		}
+	}
+	// New session → create a stub summary; next list refresh will replace it.
+	m.sessions = append(m.sessions, session.SessionSummary{
+		ID: e.SessionID, CreatedAt: e.At, UpdatedAt: e.At, EventCount: 1, Active: true,
+	})
+sortAndRebuild:
+	sort.Slice(m.sessions, func(i, j int) bool {
+		return m.sessions[i].UpdatedAt.After(m.sessions[j].UpdatedAt)
+	})
+	m.rebuildSessionsTable()
+	if m.pane == paneEvents && m.selectedSess == e.SessionID {
+		m.rebuildEventsTable()
+	}
+}
+
+// View composes the full screen.
+func (m *model) View() string {
+	if m.width == 0 {
+		return "initializing…"
+	}
+	var title string
+	var body string
+	switch m.pane {
+	case paneSessions:
+		title = fmt.Sprintf("abctl · %s", m.endpoint)
+		body = m.sessionsTbl.View()
+	case paneEvents:
+		title = fmt.Sprintf("abctl · %s", trunc(m.selectedSess, 36))
+		body = m.eventsTbl.View()
+	case paneDetail:
+		title = fmt.Sprintf("abctl · %s · event", trunc(m.selectedSess, 24))
+		body = m.detailVp.View()
+	}
+
+	header := styleTitle.Render(title)
+	if m.filtering {
+		body = m.filterInput.View() + "\n" + body
+	}
+	return lipgloss.JoinVertical(lipgloss.Left,
+		header,
+		body,
+		m.footerView(),
+	)
+}
+
+// trunc clips a string to n runes with an ellipsis. Used for title truncation.
+func trunc(s string, n int) string {
+	if len(s) <= n {
+		return s
+	}
+	return s[:n-1] + "…"
+}
+
+// yankEventToFile writes the currently-focused event to /tmp as pretty
+// JSON and returns the path. Errors bubble up as a flash message.
+func yankEventToFile(e *pipeline.SessionEvent) (string, error) {
+	ts := time.Now().UTC().Format("20060102-150405.000")
+	ts = strings.ReplaceAll(ts, ".", "-")
+	path := filepath.Join(os.TempDir(), "abctl-event-"+ts+".json")
+	data, err := json.MarshalIndent(e, "", "  ")
+	if err != nil {
+		return "", err
+	}
+	if err := os.WriteFile(path, data, 0o644); err != nil {
+		return "", err
+	}
+	return path, nil
+}
+
+// trim bounds a slice to the last n elements (drops oldest on overflow).
+// Used when a snapshot arrives with more events than the TUI caps.
+func trim[T any](s []T, n int) []T {
+	if len(s) <= n {
+		return s
+	}
+	out := make([]T, n)
+	copy(out, s[len(s)-n:])
+	return out
+}
+
+// Run opens the TUI. Blocks until the user quits or ctx is cancelled.
+// Convenience wrapper around tea.Program.Run for main.go.
+func Run(ctx context.Context, endpoint string) error {
+	c := apiclient.New(endpoint)
+	p := tea.NewProgram(New(ctx, c), tea.WithAltScreen())
+	_, err := p.Run()
+	return err
+}

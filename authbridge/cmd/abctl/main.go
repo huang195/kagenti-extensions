@@ -6,11 +6,36 @@
 package main
 
 import (
+	"context"
+	"flag"
 	"fmt"
 	"os"
+	"os/signal"
+	"syscall"
+
+	"github.com/kagenti/kagenti-extensions/authbridge/cmd/abctl/tui"
 )
 
 func main() {
-	fmt.Fprintln(os.Stderr, "abctl: TUI not yet implemented")
-	os.Exit(1)
+	endpoint := flag.String("endpoint", "http://localhost:9094",
+		"AuthBridge session API URL (typically via kubectl port-forward)")
+	flag.Parse()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	// Translate Ctrl-C / SIGTERM into ctx cancellation. The TUI also handles
+	// q / Ctrl+C directly; this covers SIGTERM from a supervisor and is
+	// harmless belt-and-braces for signal delivery.
+	sigs := make(chan os.Signal, 1)
+	signal.Notify(sigs, os.Interrupt, syscall.SIGTERM)
+	go func() {
+		<-sigs
+		cancel()
+	}()
+
+	if err := tui.Run(ctx, *endpoint); err != nil {
+		fmt.Fprintf(os.Stderr, "abctl: %v\n", err)
+		os.Exit(1)
+	}
 }

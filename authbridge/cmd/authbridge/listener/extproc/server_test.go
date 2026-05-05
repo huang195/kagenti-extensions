@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"testing"
+	"time"
 
 	corev3 "github.com/envoyproxy/go-control-plane/envoy/config/core/v3"
 	extprocfilterv3 "github.com/envoyproxy/go-control-plane/envoy/extensions/filters/http/ext_proc/v3"
@@ -20,6 +21,7 @@ import (
 	"github.com/kagenti/kagenti-extensions/authbridge/authlib/pipeline"
 	"github.com/kagenti/kagenti-extensions/authbridge/authlib/plugins"
 	"github.com/kagenti/kagenti-extensions/authbridge/authlib/routing"
+	"github.com/kagenti/kagenti-extensions/authbridge/authlib/session"
 	"github.com/kagenti/kagenti-extensions/authbridge/authlib/validation"
 )
 
@@ -560,5 +562,423 @@ func TestExtProc_NoBodyBuffering_WhenNotNeeded(t *testing.T) {
 	// Should NOT have ModeOverride
 	if stream.responses[0].ModeOverride != nil {
 		t.Error("should not request body when pipeline doesn't need it")
+	}
+}
+
+func TestRekeyInboundSession(t *testing.T) {
+	cases := []struct {
+		name         string
+		direction    string
+		a2a          *pipeline.A2AExtension
+		seedDefault  bool
+		wantDefault  bool
+		wantNewID    string
+		wantActiveID string
+	}{
+		{
+			name:         "inbound rekey migrates default to contextId",
+			direction:    "inbound",
+			a2a:          &pipeline.A2AExtension{SessionID: "ctx-abc"},
+			seedDefault:  true,
+			wantDefault:  false,
+			wantNewID:    "ctx-abc",
+			wantActiveID: "ctx-abc",
+		},
+		{
+			name:        "outbound direction is a no-op",
+			direction:   "outbound",
+			a2a:         &pipeline.A2AExtension{SessionID: "ctx-abc"},
+			seedDefault: true,
+			wantDefault: true,
+		},
+		{
+			name:        "nil A2A extension is a no-op",
+			direction:   "inbound",
+			a2a:         nil,
+			seedDefault: true,
+			wantDefault: true,
+		},
+		{
+			name:        "empty SessionID is a no-op",
+			direction:   "inbound",
+			a2a:         &pipeline.A2AExtension{SessionID: ""},
+			seedDefault: true,
+			wantDefault: true,
+		},
+		{
+			name:        "SessionID equal to DefaultSessionID is a no-op",
+			direction:   "inbound",
+			a2a:         &pipeline.A2AExtension{SessionID: session.DefaultSessionID},
+			seedDefault: true,
+			wantDefault: true,
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			store := session.New(5*time.Minute, 100, 0)
+			defer store.Close()
+			if tc.seedDefault {
+				store.Append(session.DefaultSessionID, pipeline.SessionEvent{Direction: pipeline.Inbound})
+			}
+			s := &Server{Sessions: store}
+			pctx := &pipeline.Context{Extensions: pipeline.Extensions{A2A: tc.a2a}}
+
+			s.rekeyInboundSession(pctx, tc.direction)
+
+			hasDefault := store.View(session.DefaultSessionID) != nil
+			if hasDefault != tc.wantDefault {
+				t.Errorf("default session present = %v, want %v", hasDefault, tc.wantDefault)
+			}
+			if tc.wantNewID != "" && store.View(tc.wantNewID) == nil {
+				t.Errorf("expected session under %q after rekey", tc.wantNewID)
+			}
+			if tc.wantActiveID != "" && store.ActiveSession() != tc.wantActiveID {
+				t.Errorf("ActiveSession = %q, want %q", store.ActiveSession(), tc.wantActiveID)
+			}
+		})
+	}
+}
+
+func TestRekeyInboundSession_NilStore(t *testing.T) {
+	// Session tracking disabled — must not panic.
+	s := &Server{Sessions: nil}
+	s.rekeyInboundSession(&pipeline.Context{
+		Extensions: pipeline.Extensions{A2A: &pipeline.A2AExtension{SessionID: "ctx-abc"}},
+	}, "inbound")
+}
+
+func TestRecordInboundResponseSession(t *testing.T) {
+	store := session.New(5*time.Minute, 100, 0)
+	defer store.Close()
+	s := &Server{Sessions: store}
+
+	pctx := &pipeline.Context{
+		Extensions: pipeline.Extensions{
+			A2A: &pipeline.A2AExtension{
+				Method:    "message/stream",
+				SessionID: "ctx-abc",
+			},
+		},
+	}
+	s.recordInboundResponseSession(pctx)
+
+	v := store.View("ctx-abc")
+	if v == nil || len(v.Events) != 1 {
+		t.Fatalf("expected 1 event under ctx-abc, got %v", v)
+	}
+	e := v.Events[0]
+	if e.Direction != pipeline.Inbound || e.Phase != pipeline.SessionResponse {
+		t.Errorf("event fields = (%v, %v), want (Inbound, SessionResponse)", e.Direction, e.Phase)
+	}
+	if e.A2A == nil || e.A2A.SessionID != "ctx-abc" {
+		t.Errorf("A2A extension not attached: %+v", e.A2A)
+	}
+}
+
+func TestRecordInboundResponseSession_NoA2A(t *testing.T) {
+	// No A2A extension — nothing to record.
+	store := session.New(5*time.Minute, 100, 0)
+	defer store.Close()
+	s := &Server{Sessions: store}
+
+	s.recordInboundResponseSession(&pipeline.Context{})
+	if store.View(session.DefaultSessionID) != nil {
+		t.Error("no session should have been created without A2A extension")
+	}
+}
+
+func TestRecordOutboundResponseSession_MCP(t *testing.T) {
+	store := session.New(5*time.Minute, 100, 0)
+	defer store.Close()
+	store.Append(session.DefaultSessionID, pipeline.SessionEvent{Direction: pipeline.Inbound}) // seed active
+	s := &Server{Sessions: store}
+
+	pctx := &pipeline.Context{
+		Extensions: pipeline.Extensions{
+			MCP: &pipeline.MCPExtension{
+				Method: "tools/call",
+				Result: map[string]any{"content": []any{map[string]any{"text": "result"}}},
+			},
+		},
+	}
+	s.recordOutboundResponseSession(pctx)
+
+	v := store.View(session.DefaultSessionID)
+	if v == nil || len(v.Events) != 2 { // 1 seed + 1 response
+		t.Fatalf("expected 2 events, got %v", v)
+	}
+	resp := v.Events[1]
+	if resp.Direction != pipeline.Outbound || resp.Phase != pipeline.SessionResponse {
+		t.Errorf("event fields = (%v, %v), want (Outbound, SessionResponse)", resp.Direction, resp.Phase)
+	}
+	if resp.MCP == nil || resp.MCP.Result["content"] == nil {
+		t.Errorf("MCP Result not attached: %+v", resp.MCP)
+	}
+}
+
+func TestRecordOutboundResponseSession_Inference(t *testing.T) {
+	store := session.New(5*time.Minute, 100, 0)
+	defer store.Close()
+	store.Append(session.DefaultSessionID, pipeline.SessionEvent{})
+	s := &Server{Sessions: store}
+
+	pctx := &pipeline.Context{
+		Extensions: pipeline.Extensions{
+			Inference: &pipeline.InferenceExtension{
+				Model:            "llama3",
+				Completion:       "Hello",
+				FinishReason:     "stop",
+				PromptTokens:     10,
+				CompletionTokens: 5,
+				TotalTokens:      15,
+			},
+		},
+	}
+	s.recordOutboundResponseSession(pctx)
+
+	v := store.View(session.DefaultSessionID)
+	if v == nil || len(v.Events) != 2 {
+		t.Fatalf("expected 2 events, got %v", v)
+	}
+	resp := v.Events[1]
+	if resp.Inference == nil || resp.Inference.Completion != "Hello" {
+		t.Errorf("Inference not attached with response data: %+v", resp.Inference)
+	}
+	if resp.Inference.TotalTokens != 15 {
+		t.Errorf("TotalTokens = %d, want 15", resp.Inference.TotalTokens)
+	}
+}
+
+func TestRecordOutboundResponseSession_NothingToRecord(t *testing.T) {
+	// Neither MCP nor Inference populated — nothing to write.
+	store := session.New(5*time.Minute, 100, 0)
+	defer store.Close()
+	s := &Server{Sessions: store}
+
+	s.recordOutboundResponseSession(&pipeline.Context{})
+	if store.View(session.DefaultSessionID) != nil {
+		t.Error("no session should have been created without MCP/Inference")
+	}
+}
+
+func TestRecordResponseSessions_NilStore(t *testing.T) {
+	// Session tracking disabled — both helpers must be safe to call.
+	s := &Server{Sessions: nil}
+	s.recordInboundResponseSession(&pipeline.Context{
+		Extensions: pipeline.Extensions{A2A: &pipeline.A2AExtension{}},
+	})
+	s.recordOutboundResponseSession(&pipeline.Context{
+		Extensions: pipeline.Extensions{MCP: &pipeline.MCPExtension{}},
+	})
+}
+
+func TestSnapshotIdentity(t *testing.T) {
+	cases := []struct {
+		name   string
+		claims *validation.Claims
+		agent  *pipeline.AgentIdentity
+		want   *pipeline.EventIdentity
+	}{
+		{
+			name: "claims and agent both set",
+			claims: &validation.Claims{
+				Subject:  "alice",
+				ClientID: "kagenti-ui",
+				Scopes:   []string{"openid", "weather-read"},
+			},
+			agent: &pipeline.AgentIdentity{WorkloadID: "spiffe://localtest.me/ns/team1/sa/weather-agent"},
+			want: &pipeline.EventIdentity{
+				Subject:  "alice",
+				ClientID: "kagenti-ui",
+				Scopes:   []string{"openid", "weather-read"},
+				AgentID:  "spiffe://localtest.me/ns/team1/sa/weather-agent",
+			},
+		},
+		{
+			name:   "only agent (outbound, no JWT validation)",
+			claims: nil,
+			agent:  &pipeline.AgentIdentity{WorkloadID: "spiffe://localtest.me/ns/team1/sa/weather-agent"},
+			want:   &pipeline.EventIdentity{AgentID: "spiffe://localtest.me/ns/team1/sa/weather-agent"},
+		},
+		{
+			name:   "neither set",
+			claims: nil,
+			agent:  nil,
+			want:   nil,
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := snapshotIdentity(&pipeline.Context{Claims: tc.claims, Agent: tc.agent})
+			if tc.want == nil {
+				if got != nil {
+					t.Errorf("got %+v, want nil", got)
+				}
+				return
+			}
+			if got == nil {
+				t.Fatal("got nil, want populated")
+			}
+			if got.Subject != tc.want.Subject || got.ClientID != tc.want.ClientID || got.AgentID != tc.want.AgentID {
+				t.Errorf("identity mismatch: got %+v, want %+v", got, tc.want)
+			}
+			if len(got.Scopes) != len(tc.want.Scopes) {
+				t.Errorf("scopes len: got %d, want %d", len(got.Scopes), len(tc.want.Scopes))
+			}
+		})
+	}
+}
+
+func TestSnapshotIdentity_ScopesDeepCopy(t *testing.T) {
+	// Mutating the claims slice after snapshot must not mutate the event.
+	claims := &validation.Claims{Subject: "alice", Scopes: []string{"a", "b"}}
+	id := snapshotIdentity(&pipeline.Context{Claims: claims})
+	claims.Scopes[0] = "x"
+	if id.Scopes[0] != "a" {
+		t.Errorf("snapshot scopes aliased original: got %v", id.Scopes)
+	}
+}
+
+func TestDeriveError(t *testing.T) {
+	cases := []struct {
+		name     string
+		pctx     *pipeline.Context
+		wantNil  bool
+		wantKind string
+		wantCode string
+	}{
+		{name: "2xx no block", pctx: &pipeline.Context{StatusCode: 200}, wantNil: true},
+		{name: "no status (request phase)", pctx: &pipeline.Context{}, wantNil: true},
+		{name: "404 backend_error", pctx: &pipeline.Context{StatusCode: 404}, wantKind: "backend_error", wantCode: "404"},
+		{name: "500 backend_error", pctx: &pipeline.Context{StatusCode: 500}, wantKind: "backend_error", wantCode: "500"},
+		{
+			name: "guardrail block wins over status",
+			pctx: &pipeline.Context{
+				StatusCode: 200,
+				Extensions: pipeline.Extensions{
+					Security: &pipeline.SecurityExtension{Blocked: true, BlockReason: "pii_detected"},
+				},
+			},
+			wantKind: "blocked",
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := deriveError(tc.pctx)
+			if tc.wantNil {
+				if got != nil {
+					t.Errorf("got %+v, want nil", got)
+				}
+				return
+			}
+			if got == nil {
+				t.Fatal("got nil, want error")
+			}
+			if got.Kind != tc.wantKind {
+				t.Errorf("Kind = %q, want %q", got.Kind, tc.wantKind)
+			}
+			if tc.wantCode != "" && got.Code != tc.wantCode {
+				t.Errorf("Code = %q, want %q", got.Code, tc.wantCode)
+			}
+		})
+	}
+}
+
+func TestRecordOutboundResponseSession_CapturesStatusAndError(t *testing.T) {
+	store := session.New(5*time.Minute, 100, 0)
+	defer store.Close()
+	store.Append(session.DefaultSessionID, pipeline.SessionEvent{})
+	s := &Server{Sessions: store}
+
+	pctx := &pipeline.Context{
+		StatusCode: 503,
+		Claims:     &validation.Claims{Subject: "alice"},
+		Extensions: pipeline.Extensions{
+			MCP: &pipeline.MCPExtension{Method: "tools/call"},
+		},
+	}
+	s.recordOutboundResponseSession(pctx)
+
+	v := store.View(session.DefaultSessionID)
+	if v == nil || len(v.Events) < 2 {
+		t.Fatalf("expected event appended, got %v", v)
+	}
+	resp := v.Events[len(v.Events)-1]
+	if resp.StatusCode != 503 {
+		t.Errorf("StatusCode = %d, want 503", resp.StatusCode)
+	}
+	if resp.Error == nil || resp.Error.Kind != "backend_error" || resp.Error.Code != "503" {
+		t.Errorf("Error = %+v, want backend_error/503", resp.Error)
+	}
+	if resp.Identity == nil || resp.Identity.Subject != "alice" {
+		t.Errorf("Identity not snapshotted: %+v", resp.Identity)
+	}
+}
+
+func TestRouteAudience(t *testing.T) {
+	cases := []struct {
+		name string
+		pctx *pipeline.Context
+		want string
+	}{
+		{"nil route", &pipeline.Context{}, ""},
+		{"unmatched route falls through to passthrough",
+			&pipeline.Context{Route: &routing.ResolvedRoute{Matched: false, Audience: "ignored"}}, ""},
+		{"matched route surfaces audience",
+			&pipeline.Context{Route: &routing.ResolvedRoute{Matched: true, Audience: "github-tool"}}, "github-tool"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := routeAudience(tc.pctx); got != tc.want {
+				t.Errorf("got %q, want %q", got, tc.want)
+			}
+		})
+	}
+}
+
+func TestDurationSince(t *testing.T) {
+	if d := durationSince(time.Time{}); d != 0 {
+		t.Errorf("zero StartedAt should yield 0, got %v", d)
+	}
+	start := time.Now().Add(-50 * time.Millisecond)
+	if d := durationSince(start); d < 50*time.Millisecond {
+		t.Errorf("elapsed = %v, want >= 50ms", d)
+	}
+}
+
+func TestRecordOutboundResponseSession_CapturesHostAndRoute(t *testing.T) {
+	store := session.New(5*time.Minute, 100, 0)
+	defer store.Close()
+	store.Append(session.DefaultSessionID, pipeline.SessionEvent{})
+	s := &Server{Sessions: store}
+
+	start := time.Now().Add(-25 * time.Millisecond)
+	pctx := &pipeline.Context{
+		StartedAt:  start,
+		Host:       "github-tool-mcp",
+		StatusCode: 200,
+		Route: &routing.ResolvedRoute{
+			Matched:  true,
+			Audience: "github-tool",
+		},
+		Extensions: pipeline.Extensions{
+			MCP: &pipeline.MCPExtension{Method: "tools/call"},
+		},
+	}
+	s.recordOutboundResponseSession(pctx)
+
+	v := store.View(session.DefaultSessionID)
+	resp := v.Events[len(v.Events)-1]
+	if resp.Host != "github-tool-mcp" {
+		t.Errorf("Host = %q, want github-tool-mcp", resp.Host)
+	}
+	if resp.TargetAudience != "github-tool" {
+		t.Errorf("TargetAudience = %q, want github-tool", resp.TargetAudience)
+	}
+	if resp.Duration < 25*time.Millisecond {
+		t.Errorf("Duration = %v, want >= 25ms", resp.Duration)
 	}
 }

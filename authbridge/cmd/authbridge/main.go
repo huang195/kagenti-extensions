@@ -122,10 +122,11 @@ func main() {
 		}
 	}
 
-	// Build session store if enabled (nil when disabled — zero overhead)
+	// Build session store if enabled (nil when disabled — zero overhead).
+	// Defaults to on; set session.enabled: false in runtime config to opt out.
 	var sessions *session.Store
-	if cfg.Session.Enabled {
-		ttl := 5 * time.Minute
+	if cfg.Session.SessionEnabled() {
+		ttl := 30 * time.Minute
 		if cfg.Session.TTL != "" {
 			if d, err := time.ParseDuration(cfg.Session.TTL); err == nil {
 				ttl = d
@@ -137,12 +138,14 @@ func main() {
 		if cfg.Session.MaxEvents > 0 {
 			maxEvents = cfg.Session.MaxEvents
 		}
-		maxSessions := 1000
+		maxSessions := 100
 		if cfg.Session.MaxSessions > 0 {
 			maxSessions = cfg.Session.MaxSessions
 		}
 		sessions = session.New(ttl, maxEvents, maxSessions)
 		slog.Info("session tracking enabled", "ttl", ttl, "maxEvents", maxEvents, "maxSessions", maxSessions)
+	} else {
+		slog.Info("session tracking disabled")
 	}
 
 	// Track servers for graceful shutdown

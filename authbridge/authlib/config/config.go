@@ -26,11 +26,26 @@ type Config struct {
 // SessionConfig controls in-memory session tracking for cross-request correlation.
 // When enabled, the framework records inbound intents and outbound tool calls so
 // that guardrail plugins can evaluate sequences across request boundaries.
+//
+// Enabled is a pointer so the loader can distinguish "unset" (apply default)
+// from "explicitly false" (user opted out). Default when unset: enabled.
 type SessionConfig struct {
-	Enabled     bool   `yaml:"enabled" json:"enabled"`
-	TTL         string `yaml:"ttl" json:"ttl"`                   // duration string (e.g., "5m"); default: 5m
+	// Enabled: nil means "unset → default on". Explicit `false` opts out.
+	// Do not change to a plain bool — losing the nil sentinel would collapse
+	// "user didn't say" with "user said false" and silently flip the default.
+	Enabled     *bool  `yaml:"enabled" json:"enabled"`
+	TTL         string `yaml:"ttl" json:"ttl"`                   // duration string; default: 30m
 	MaxEvents   int    `yaml:"max_events" json:"max_events"`     // max events per session; default: 100
-	MaxSessions int    `yaml:"max_sessions" json:"max_sessions"` // max concurrent sessions; default: 1000 (0 = unlimited)
+	MaxSessions int    `yaml:"max_sessions" json:"max_sessions"` // max concurrent sessions; default: 100 (0 = unlimited)
+}
+
+// SessionEnabled returns true when session tracking should run. Defaults to true
+// when Enabled is unset, so operators need to explicitly opt out.
+func (s SessionConfig) SessionEnabled() bool {
+	if s.Enabled == nil {
+		return true
+	}
+	return *s.Enabled
 }
 
 // PipelineConfig holds the plugin pipeline composition.

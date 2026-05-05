@@ -320,3 +320,124 @@ func TestView_InferenceRequests(t *testing.T) {
 		t.Errorf("InferenceRequests()[0].Model = %q, want %q", reqs[0].Inference.Model, "llama3.1")
 	}
 }
+
+func TestStore_Rekey(t *testing.T) {
+	s := New(5*time.Minute, 100, 0)
+
+	ev1 := pipeline.SessionEvent{Direction: pipeline.Inbound, A2A: &pipeline.A2AExtension{Method: "message/send"}}
+	ev2 := pipeline.SessionEvent{Direction: pipeline.Outbound, MCP: &pipeline.MCPExtension{Method: "tools/call"}}
+	s.Append(DefaultSessionID, ev1)
+	s.Append(DefaultSessionID, ev2)
+
+	s.Rekey(DefaultSessionID, "ctx-abc")
+
+	if v := s.View(DefaultSessionID); v != nil {
+		t.Error("old session should be gone after rekey")
+	}
+	v := s.View("ctx-abc")
+	if v == nil {
+		t.Fatal("new session should hold the rekeyed events")
+	}
+	if len(v.Events) != 2 {
+		t.Errorf("events len = %d, want 2", len(v.Events))
+	}
+	if id := s.ActiveSession(); id != "ctx-abc" {
+		t.Errorf("ActiveSession = %q, want %q — activeID should follow rekey", id, "ctx-abc")
+	}
+
+	// Next turn appends to the real contextId and still sees the earlier events.
+	s.Append("ctx-abc", pipeline.SessionEvent{Direction: pipeline.Inbound})
+	if v := s.View("ctx-abc"); v == nil || len(v.Events) != 3 {
+		t.Errorf("expected 3 events after second turn, got %v", v)
+	}
+}
+
+func TestStore_Rekey_NoOpCases(t *testing.T) {
+	s := New(5*time.Minute, 100, 0)
+	s.Append("sess-a", pipeline.SessionEvent{Direction: pipeline.Inbound})
+
+	// oldID absent: no-op.
+	s.Rekey("missing", "sess-b")
+	if v := s.View("sess-b"); v != nil {
+		t.Error("rekey of missing oldID should not create newID")
+	}
+
+	// newID already exists: preserve it, do not clobber.
+	s.Append("sess-b", pipeline.SessionEvent{Direction: pipeline.Outbound})
+	s.Rekey("sess-a", "sess-b")
+	if v := s.View("sess-a"); v == nil {
+		t.Error("sess-a should still exist because sess-b was already taken")
+	}
+	vb := s.View("sess-b")
+	if vb == nil || len(vb.Events) != 1 {
+		t.Errorf("sess-b should be preserved with its own event, got %v", vb)
+	}
+
+	// Empty IDs: no-op, no panic.
+	s.Rekey("", "x")
+	s.Rekey("x", "")
+	s.Rekey("sess-a", "sess-a")
+}
+
+func TestStore_Rekey_ActiveIDUntouchedWhenNotOldID(t *testing.T) {
+	s := New(5*time.Minute, 100, 0)
+	s.Append("sess-a", pipeline.SessionEvent{})
+	s.Append("sess-b", pipeline.SessionEvent{}) // activeID is now sess-b
+
+	s.Rekey("sess-a", "sess-a-renamed")
+
+	if id := s.ActiveSession(); id != "sess-b" {
+		t.Errorf("ActiveSession = %q, want sess-b (unchanged — rekey did not touch active)", id)
+	}
+	if v := s.View("sess-a-renamed"); v == nil {
+		t.Error("sess-a-renamed should exist")
+	}
+}
+
+func TestView_FailedEvents(t *testing.T) {
+	s := New(5*time.Minute, 100, 0)
+	defer s.Close()
+
+	s.Append("sess", pipeline.SessionEvent{Phase: pipeline.SessionRequest, A2A: &pipeline.A2AExtension{}})
+	s.Append("sess", pipeline.SessionEvent{Phase: pipeline.SessionResponse, StatusCode: 200})
+	s.Append("sess", pipeline.SessionEvent{
+		Phase:      pipeline.SessionResponse,
+		StatusCode: 503,
+		Error:      &pipeline.EventError{Kind: "backend_error", Code: "503"},
+	})
+	s.Append("sess", pipeline.SessionEvent{
+		Phase: pipeline.SessionResponse,
+		Error: &pipeline.EventError{Kind: "blocked", Message: "pii"},
+	})
+
+	v := s.View("sess")
+	if v == nil {
+		t.Fatal("View returned nil")
+	}
+
+	failed := v.FailedEvents()
+	if len(failed) != 2 {
+		t.Fatalf("FailedEvents len = %d, want 2", len(failed))
+	}
+	if failed[0].Error.Kind != "backend_error" {
+		t.Errorf("first failed Kind = %q", failed[0].Error.Kind)
+	}
+
+	last := v.LastError()
+	if last == nil || last.Error.Kind != "blocked" {
+		t.Errorf("LastError = %+v, want blocked", last)
+	}
+}
+
+func TestView_LastError_NoErrors(t *testing.T) {
+	s := New(5*time.Minute, 100, 0)
+	defer s.Close()
+	s.Append("sess", pipeline.SessionEvent{Phase: pipeline.SessionResponse, StatusCode: 200})
+	v := s.View("sess")
+	if v.LastError() != nil {
+		t.Error("LastError should be nil when no errors present")
+	}
+	if v.FailedEvents() != nil {
+		t.Error("FailedEvents should be nil when no errors present")
+	}
+}

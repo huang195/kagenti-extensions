@@ -1,6 +1,7 @@
 package plugins
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"log/slog"
@@ -43,13 +44,89 @@ func (p *MCPParser) OnRequest(_ context.Context, pctx *pipeline.Context) pipelin
 	}
 
 	slog.Info("mcp-parser: request", "method", rpc.Method)
-	slog.Debug("mcp-parser: payload", "method", rpc.Method, "body", truncate(string(pctx.Body), 128))
+	slog.Debug("mcp-parser: payload", "method", rpc.Method, "body", truncate(string(pctx.Body), debugBodyMax))
 
 	return pipeline.Action{Type: pipeline.Continue}
 }
 
-func (p *MCPParser) OnResponse(_ context.Context, _ *pipeline.Context) pipeline.Action {
+func (p *MCPParser) OnResponse(_ context.Context, pctx *pipeline.Context) pipeline.Action {
+	if len(pctx.ResponseBody) == 0 || pctx.Extensions.MCP == nil {
+		return pipeline.Action{Type: pipeline.Continue}
+	}
+
+	rpc, ok := parseMCPResponse(pctx.ResponseBody)
+	if !ok {
+		slog.Debug("mcp-parser: response is not valid JSON-RPC or SSE", "bodyLen", len(pctx.ResponseBody))
+		return pipeline.Action{Type: pipeline.Continue}
+	}
+
+	if rpc.Error != nil {
+		pctx.Extensions.MCP.Err = &pipeline.MCPError{
+			Code:    rpc.Error.Code,
+			Message: rpc.Error.Message,
+			Data:    rpc.Error.Data,
+		}
+		slog.Info("mcp-parser: response error", "method", pctx.Extensions.MCP.Method, "code", rpc.Error.Code, "message", rpc.Error.Message)
+		return pipeline.Action{Type: pipeline.Continue}
+	}
+
+	if rpc.Result != nil {
+		pctx.Extensions.MCP.Result = rpc.Result
+		slog.Info("mcp-parser: response", "method", pctx.Extensions.MCP.Method, "resultKeys", resultKeys(rpc.Result))
+		slog.Debug("mcp-parser: response detail", "method", pctx.Extensions.MCP.Method, "body", truncate(string(pctx.ResponseBody), debugBodyMax))
+	}
+
 	return pipeline.Action{Type: pipeline.Continue}
+}
+
+// parseMCPResponse handles both plain JSON-RPC responses and SSE event streams
+// (used by MCP's Streamable HTTP transport). For SSE, the first data: line
+// carrying a result or error wins. Malformed SSE data frames are logged at
+// DEBUG so a broken upstream is observable rather than silently skipped.
+func parseMCPResponse(body []byte) (jsonRPCResponse, bool) {
+	var rpc jsonRPCResponse
+	if json.Unmarshal(body, &rpc) == nil && (rpc.Result != nil || rpc.Error != nil) {
+		return rpc, true
+	}
+	for _, line := range bytes.Split(body, []byte("\n")) {
+		line = bytes.TrimSpace(line)
+		if !bytes.HasPrefix(line, []byte("data:")) {
+			continue
+		}
+		data := bytes.TrimSpace(bytes.TrimPrefix(line, []byte("data:")))
+		if len(data) == 0 {
+			continue
+		}
+		var r jsonRPCResponse
+		if err := json.Unmarshal(data, &r); err != nil {
+			slog.Debug("mcp-parser: skipping malformed SSE data frame", "error", err, "data", truncate(string(data), 128))
+			continue
+		}
+		if r.Result != nil || r.Error != nil {
+			return r, true
+		}
+	}
+	return jsonRPCResponse{}, false
+}
+
+type jsonRPCError struct {
+	Code    int    `json:"code"`
+	Message string `json:"message"`
+	Data    any    `json:"data"`
+}
+
+type jsonRPCResponse struct {
+	ID     any            `json:"id"`
+	Result map[string]any `json:"result"`
+	Error  *jsonRPCError  `json:"error"`
+}
+
+func resultKeys(m map[string]any) []string {
+	keys := make([]string, 0, len(m))
+	for k := range m {
+		keys = append(keys, k)
+	}
+	return keys
 }
 
 type jsonRPCRequest struct {
@@ -69,6 +146,13 @@ func (r *jsonRPCRequest) mapParam(key string) map[string]any {
 	return v
 }
 
+// debugBodyMax caps how many characters of a body/content string a parser
+// writes into debug logs. Large enough to capture a short user message or
+// a tool_call response verbatim, small enough to keep log lines tractable.
+const debugBodyMax = 512
+
+// truncate clips s to max characters, appending "..." when truncated.
+// Shared across parsers for consistent debug-log body formatting.
 func truncate(s string, max int) string {
 	if len(s) <= max {
 		return s

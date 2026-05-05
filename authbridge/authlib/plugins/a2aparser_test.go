@@ -364,10 +364,124 @@ func TestA2AParser_MalformedContentValues(t *testing.T) {
 	}
 }
 
-func TestA2AParser_OnResponse(t *testing.T) {
+func TestA2AParser_OnResponse_NoRequestContext(t *testing.T) {
+	// If OnRequest never ran (no A2A extension on pctx), OnResponse is a no-op.
 	p := NewA2AParser()
-	action := p.OnResponse(context.Background(), &pipeline.Context{})
+	pctx := &pipeline.Context{
+		ResponseBody: []byte(`{"jsonrpc":"2.0","result":{"contextId":"abc-123"}}`),
+	}
+	action := p.OnResponse(context.Background(), pctx)
 	if action.Type != pipeline.Continue {
-		t.Errorf("OnResponse should return Continue, got %v", action.Type)
+		t.Fatalf("expected Continue, got %v", action.Type)
+	}
+	if pctx.Extensions.A2A != nil {
+		t.Error("A2A extension should remain nil when request was not parsed")
+	}
+}
+
+func TestA2AParser_OnResponse_EmptyBody(t *testing.T) {
+	p := NewA2AParser()
+	pctx := &pipeline.Context{
+		Extensions: pipeline.Extensions{A2A: &pipeline.A2AExtension{Method: "message/send"}},
+	}
+	action := p.OnResponse(context.Background(), pctx)
+	if action.Type != pipeline.Continue {
+		t.Fatalf("expected Continue, got %v", action.Type)
+	}
+	if pctx.Extensions.A2A.SessionID != "" {
+		t.Errorf("SessionID should remain empty, got %q", pctx.Extensions.A2A.SessionID)
+	}
+}
+
+func TestA2AParser_OnResponse_JSONRPC_ContextID(t *testing.T) {
+	p := NewA2AParser()
+	pctx := &pipeline.Context{
+		Extensions:   pipeline.Extensions{A2A: &pipeline.A2AExtension{Method: "message/send"}},
+		ResponseBody: []byte(`{"jsonrpc":"2.0","id":1,"result":{"contextId":"ctx-abc","messageId":"m1"}}`),
+	}
+	action := p.OnResponse(context.Background(), pctx)
+	if action.Type != pipeline.Continue {
+		t.Fatalf("expected Continue, got %v", action.Type)
+	}
+	if pctx.Extensions.A2A.SessionID != "ctx-abc" {
+		t.Errorf("SessionID = %q, want %q", pctx.Extensions.A2A.SessionID, "ctx-abc")
+	}
+}
+
+func TestA2AParser_OnResponse_JSONRPC_SessionIDFallback(t *testing.T) {
+	// Older A2A drafts use sessionId — still extract it when contextId is absent.
+	p := NewA2AParser()
+	pctx := &pipeline.Context{
+		Extensions:   pipeline.Extensions{A2A: &pipeline.A2AExtension{Method: "message/send"}},
+		ResponseBody: []byte(`{"jsonrpc":"2.0","id":1,"result":{"sessionId":"sess-legacy"}}`),
+	}
+	action := p.OnResponse(context.Background(), pctx)
+	if action.Type != pipeline.Continue {
+		t.Fatalf("expected Continue, got %v", action.Type)
+	}
+	if pctx.Extensions.A2A.SessionID != "sess-legacy" {
+		t.Errorf("SessionID = %q, want %q", pctx.Extensions.A2A.SessionID, "sess-legacy")
+	}
+}
+
+func TestA2AParser_OnResponse_SSE(t *testing.T) {
+	// message/stream returns SSE events; each "data:" line carries a JSON-RPC event.
+	p := NewA2AParser()
+	body := "data: {\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"contextId\":\"ctx-sse\",\"kind\":\"message\"}}\r\n\r\n" +
+		"data: {\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"contextId\":\"ctx-sse\",\"kind\":\"status-update\"}}\r\n\r\n"
+	pctx := &pipeline.Context{
+		Extensions:   pipeline.Extensions{A2A: &pipeline.A2AExtension{Method: "message/stream"}},
+		ResponseBody: []byte(body),
+	}
+	action := p.OnResponse(context.Background(), pctx)
+	if action.Type != pipeline.Continue {
+		t.Fatalf("expected Continue, got %v", action.Type)
+	}
+	if pctx.Extensions.A2A.SessionID != "ctx-sse" {
+		t.Errorf("SessionID = %q, want %q", pctx.Extensions.A2A.SessionID, "ctx-sse")
+	}
+}
+
+func TestA2AParser_OnResponse_SSE_SkipsEventsWithoutSession(t *testing.T) {
+	// The first "data:" line carries no contextId; the parser should keep scanning
+	// rather than give up on the first event.
+	p := NewA2AParser()
+	body := "data: {\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"kind\":\"status-update\"}}\r\n\r\n" +
+		"data: {\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"contextId\":\"ctx-late\"}}\r\n\r\n"
+	pctx := &pipeline.Context{
+		Extensions:   pipeline.Extensions{A2A: &pipeline.A2AExtension{Method: "message/stream"}},
+		ResponseBody: []byte(body),
+	}
+	_ = p.OnResponse(context.Background(), pctx)
+	if pctx.Extensions.A2A.SessionID != "ctx-late" {
+		t.Errorf("SessionID = %q, want %q", pctx.Extensions.A2A.SessionID, "ctx-late")
+	}
+}
+
+func TestA2AParser_OnResponse_NoSessionFound(t *testing.T) {
+	p := NewA2AParser()
+	pctx := &pipeline.Context{
+		Extensions:   pipeline.Extensions{A2A: &pipeline.A2AExtension{Method: "message/send", SessionID: "preexisting"}},
+		ResponseBody: []byte(`{"jsonrpc":"2.0","id":1,"result":{"kind":"message"}}`),
+	}
+	_ = p.OnResponse(context.Background(), pctx)
+	// Should NOT overwrite the existing value when the response has no session.
+	if pctx.Extensions.A2A.SessionID != "preexisting" {
+		t.Errorf("SessionID = %q, should not be cleared", pctx.Extensions.A2A.SessionID)
+	}
+}
+
+func TestA2AParser_OnRequest_ContextIDPreferred(t *testing.T) {
+	// A client resuming a conversation sends contextId; we should pick it up on the request side too.
+	p := NewA2AParser()
+	pctx := &pipeline.Context{
+		Body: []byte(`{"jsonrpc":"2.0","method":"message/send","id":1,"params":{"contextId":"ctx-resume","message":{"role":"user","messageId":"m2","parts":[{"kind":"text","text":"hi again"}]}}}`),
+	}
+	action := p.OnRequest(context.Background(), pctx)
+	if action.Type != pipeline.Continue {
+		t.Fatalf("expected Continue, got %v", action.Type)
+	}
+	if pctx.Extensions.A2A == nil || pctx.Extensions.A2A.SessionID != "ctx-resume" {
+		t.Errorf("SessionID from contextId: got %+v, want ctx-resume", pctx.Extensions.A2A)
 	}
 }

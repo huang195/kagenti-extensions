@@ -1,9 +1,11 @@
 package plugins
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"log/slog"
+	"strings"
 
 	"github.com/kagenti/kagenti-extensions/authbridge/authlib/pipeline"
 )
@@ -63,12 +65,118 @@ func (p *InferenceParser) OnRequest(_ context.Context, pctx *pipeline.Context) p
 
 	slog.Info("inference-parser", "model", ext.Model)
 	slog.Debug("inference-parser: extracted", "model", ext.Model, "messages", len(ext.Messages), "stream", ext.Stream, "tools", len(ext.Tools))
+	for i, m := range ext.Messages {
+		slog.Debug("inference-parser: message", "index", i, "role", m.Role, "content", truncate(m.Content, debugBodyMax))
+	}
 
 	return pipeline.Action{Type: pipeline.Continue}
 }
 
-func (p *InferenceParser) OnResponse(_ context.Context, _ *pipeline.Context) pipeline.Action {
+// OnResponse populates the response-side fields (Completion, FinishReason,
+// token counts) on pctx.Extensions.Inference. Handles both non-streaming
+// JSON responses and SSE streams from OpenAI-compatible servers.
+func (p *InferenceParser) OnResponse(_ context.Context, pctx *pipeline.Context) pipeline.Action {
+	if len(pctx.ResponseBody) == 0 || pctx.Extensions.Inference == nil {
+		return pipeline.Action{Type: pipeline.Continue}
+	}
+
+	if pctx.Extensions.Inference.Stream {
+		parseInferenceSSE(pctx.ResponseBody, pctx.Extensions.Inference)
+	} else {
+		parseInferenceJSON(pctx.ResponseBody, pctx.Extensions.Inference)
+	}
+
+	ext := pctx.Extensions.Inference
+	slog.Info("inference-parser: response",
+		"model", ext.Model,
+		"finishReason", ext.FinishReason,
+		"promptTokens", ext.PromptTokens,
+		"completionTokens", ext.CompletionTokens,
+	)
+	slog.Debug("inference-parser: completion", "text", truncate(ext.Completion, debugBodyMax))
 	return pipeline.Action{Type: pipeline.Continue}
+}
+
+// parseInferenceJSON parses a non-streaming OpenAI chat/completions response.
+func parseInferenceJSON(body []byte, ext *pipeline.InferenceExtension) {
+	var resp inferenceResponse
+	if err := json.Unmarshal(body, &resp); err != nil {
+		slog.Debug("inference-parser: invalid response JSON", "error", err)
+		return
+	}
+	if len(resp.Choices) > 0 {
+		ext.Completion = resp.Choices[0].Message.Content
+		ext.FinishReason = resp.Choices[0].FinishReason
+	}
+	ext.PromptTokens = resp.Usage.PromptTokens
+	ext.CompletionTokens = resp.Usage.CompletionTokens
+	ext.TotalTokens = resp.Usage.TotalTokens
+}
+
+// parseInferenceSSE concatenates content deltas across SSE events and captures
+// the last finish_reason and usage block (sent when stream_options.include_usage
+// is set). The stream terminates with a "data: [DONE]" marker which is skipped.
+func parseInferenceSSE(body []byte, ext *pipeline.InferenceExtension) {
+	var completion strings.Builder
+	for _, line := range bytes.Split(body, []byte("\n")) {
+		line = bytes.TrimSpace(line)
+		if !bytes.HasPrefix(line, []byte("data:")) {
+			continue
+		}
+		data := bytes.TrimSpace(bytes.TrimPrefix(line, []byte("data:")))
+		if len(data) == 0 || bytes.Equal(data, []byte("[DONE]")) {
+			continue
+		}
+		var chunk inferenceStreamChunk
+		if err := json.Unmarshal(data, &chunk); err != nil {
+			slog.Debug("inference-parser: skipping malformed SSE data frame", "error", err, "data", truncate(string(data), 128))
+			continue
+		}
+		for _, c := range chunk.Choices {
+			if c.Delta.Content != "" {
+				completion.WriteString(c.Delta.Content)
+			}
+			if c.FinishReason != "" {
+				ext.FinishReason = c.FinishReason
+			}
+		}
+		if chunk.Usage.TotalTokens > 0 {
+			ext.PromptTokens = chunk.Usage.PromptTokens
+			ext.CompletionTokens = chunk.Usage.CompletionTokens
+			ext.TotalTokens = chunk.Usage.TotalTokens
+		}
+	}
+	ext.Completion = completion.String()
+}
+
+type inferenceResponse struct {
+	Choices []inferenceChoice `json:"choices"`
+	Usage   inferenceUsage    `json:"usage"`
+}
+
+type inferenceChoice struct {
+	Message      inferenceMessage `json:"message"`
+	FinishReason string           `json:"finish_reason"`
+}
+
+type inferenceStreamChunk struct {
+	Choices []inferenceStreamChoice `json:"choices"`
+	Usage   inferenceUsage          `json:"usage"`
+}
+
+type inferenceStreamChoice struct {
+	Delta        inferenceDelta `json:"delta"`
+	FinishReason string         `json:"finish_reason"`
+}
+
+type inferenceDelta struct {
+	Content string `json:"content"`
+}
+
+type inferenceUsage struct {
+	PromptTokens     int `json:"prompt_tokens"`
+	CompletionTokens int `json:"completion_tokens"`
+	TotalTokens      int `json:"total_tokens"`
 }
 
 type inferenceRequest struct {
@@ -80,9 +188,58 @@ type inferenceRequest struct {
 	Tools       []inferenceTool    `json:"tools"`
 }
 
+// inferenceMessage accepts both OpenAI content shapes:
+//   - "content": "plain string"
+//   - "content": [{"type":"text","text":"..."}, {"type":"image_url",...}, ...]
+//
+// The array form is used for multi-modal input and tool-result messages.
+// Non-text parts (image_url, tool_use objects, etc.) are dropped since the
+// parser only exposes text for downstream policy plugins.
 type inferenceMessage struct {
-	Role    string `json:"role"`
-	Content string `json:"content"`
+	Role    string
+	Content string
+}
+
+func (m *inferenceMessage) UnmarshalJSON(data []byte) error {
+	var raw struct {
+		Role    string          `json:"role"`
+		Content json.RawMessage `json:"content"`
+	}
+	if err := json.Unmarshal(data, &raw); err != nil {
+		return err
+	}
+	m.Role = raw.Role
+	m.Content = flattenContent(raw.Content)
+	return nil
+}
+
+// flattenContent returns the text representation of an OpenAI content value.
+// Returns "" when content is absent, null, or contains no text parts.
+func flattenContent(raw json.RawMessage) string {
+	if len(raw) == 0 || bytes.Equal(raw, []byte("null")) {
+		return ""
+	}
+	var s string
+	if err := json.Unmarshal(raw, &s); err == nil {
+		return s
+	}
+	var parts []struct {
+		Type string `json:"type"`
+		Text string `json:"text"`
+	}
+	if err := json.Unmarshal(raw, &parts); err == nil {
+		var b strings.Builder
+		for _, p := range parts {
+			if p.Type == "text" && p.Text != "" {
+				if b.Len() > 0 {
+					b.WriteByte('\n')
+				}
+				b.WriteString(p.Text)
+			}
+		}
+		return b.String()
+	}
+	return ""
 }
 
 type inferenceTool struct {

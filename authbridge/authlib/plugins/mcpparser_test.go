@@ -181,10 +181,171 @@ func TestMCPParser_MissingParams(t *testing.T) {
 	}
 }
 
-func TestMCPParser_OnResponse(t *testing.T) {
+func TestMCPParser_OnResponse_NoRequestContext(t *testing.T) {
+	// If the request phase never ran (no MCP extension populated), OnResponse
+	// should skip — there's nothing to correlate the response to.
 	p := NewMCPParser()
-	action := p.OnResponse(context.Background(), &pipeline.Context{})
+	pctx := &pipeline.Context{
+		ResponseBody: []byte(`{"jsonrpc":"2.0","id":1,"result":{"tools":[]}}`),
+	}
+	action := p.OnResponse(context.Background(), pctx)
 	if action.Type != pipeline.Continue {
-		t.Errorf("OnResponse should return Continue, got %v", action.Type)
+		t.Fatalf("expected Continue, got %v", action.Type)
+	}
+	if pctx.Extensions.MCP != nil {
+		t.Error("MCP extension should remain nil when request was not parsed")
+	}
+}
+
+func TestMCPParser_OnResponse_EmptyBody(t *testing.T) {
+	p := NewMCPParser()
+	pctx := &pipeline.Context{
+		Extensions: pipeline.Extensions{MCP: &pipeline.MCPExtension{Method: "tools/list"}},
+	}
+	action := p.OnResponse(context.Background(), pctx)
+	if action.Type != pipeline.Continue {
+		t.Fatalf("expected Continue, got %v", action.Type)
+	}
+	if pctx.Extensions.MCP.Result != nil {
+		t.Error("Result should remain nil when response body is empty")
+	}
+}
+
+func TestMCPParser_OnResponse_ToolsList(t *testing.T) {
+	p := NewMCPParser()
+	pctx := &pipeline.Context{
+		Extensions:   pipeline.Extensions{MCP: &pipeline.MCPExtension{Method: "tools/list"}},
+		ResponseBody: []byte(`{"jsonrpc":"2.0","id":1,"result":{"tools":[{"name":"get_weather"},{"name":"get_news"}]}}`),
+	}
+
+	action := p.OnResponse(context.Background(), pctx)
+	if action.Type != pipeline.Continue {
+		t.Fatalf("expected Continue, got %v", action.Type)
+	}
+	if pctx.Extensions.MCP.Result == nil {
+		t.Fatal("Result should be populated")
+	}
+	tools, ok := pctx.Extensions.MCP.Result["tools"].([]any)
+	if !ok {
+		t.Fatalf("Result[tools] should be []any, got %T", pctx.Extensions.MCP.Result["tools"])
+	}
+	if len(tools) != 2 {
+		t.Errorf("expected 2 tools, got %d", len(tools))
+	}
+}
+
+func TestMCPParser_OnResponse_ToolsCall(t *testing.T) {
+	p := NewMCPParser()
+	pctx := &pipeline.Context{
+		Extensions:   pipeline.Extensions{MCP: &pipeline.MCPExtension{Method: "tools/call"}},
+		ResponseBody: []byte(`{"jsonrpc":"2.0","id":2,"result":{"content":[{"type":"text","text":"sunny, 72F"}]}}`),
+	}
+
+	action := p.OnResponse(context.Background(), pctx)
+	if action.Type != pipeline.Continue {
+		t.Fatalf("expected Continue, got %v", action.Type)
+	}
+	if pctx.Extensions.MCP.Result == nil {
+		t.Fatal("Result should be populated")
+	}
+	if _, ok := pctx.Extensions.MCP.Result["content"]; !ok {
+		t.Error("Result should contain content key")
+	}
+}
+
+func TestMCPParser_OnResponse_Error(t *testing.T) {
+	p := NewMCPParser()
+	pctx := &pipeline.Context{
+		Extensions:   pipeline.Extensions{MCP: &pipeline.MCPExtension{Method: "tools/call"}},
+		ResponseBody: []byte(`{"jsonrpc":"2.0","id":3,"error":{"code":-32601,"message":"Method not found"}}`),
+	}
+
+	action := p.OnResponse(context.Background(), pctx)
+	if action.Type != pipeline.Continue {
+		t.Fatalf("expected Continue, got %v", action.Type)
+	}
+	if pctx.Extensions.MCP.Result != nil {
+		t.Errorf("Result should be nil on error response, got %v", pctx.Extensions.MCP.Result)
+	}
+	if pctx.Extensions.MCP.Err == nil {
+		t.Fatal("Err should be populated")
+	}
+	if pctx.Extensions.MCP.Err.Code != -32601 {
+		t.Errorf("Err.Code = %d, want -32601", pctx.Extensions.MCP.Err.Code)
+	}
+	if pctx.Extensions.MCP.Err.Message != "Method not found" {
+		t.Errorf("Err.Message = %q, want %q", pctx.Extensions.MCP.Err.Message, "Method not found")
+	}
+}
+
+func TestMCPParser_OnResponse_InvalidJSON(t *testing.T) {
+	p := NewMCPParser()
+	pctx := &pipeline.Context{
+		Extensions:   pipeline.Extensions{MCP: &pipeline.MCPExtension{Method: "tools/list"}},
+		ResponseBody: []byte("not json"),
+	}
+
+	action := p.OnResponse(context.Background(), pctx)
+	if action.Type != pipeline.Continue {
+		t.Fatalf("expected Continue, got %v", action.Type)
+	}
+	if pctx.Extensions.MCP.Result != nil {
+		t.Error("Result should remain nil for invalid JSON")
+	}
+}
+
+func TestMCPParser_OnResponse_SSE(t *testing.T) {
+	// MCP's Streamable HTTP transport returns SSE (event: / data: lines)
+	// instead of plain JSON-RPC when the client sends Accept: text/event-stream.
+	p := NewMCPParser()
+	body := "event: message\r\n" +
+		"data: {\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"tools\":[{\"name\":\"get_weather\"}]}}\r\n\r\n"
+	pctx := &pipeline.Context{
+		Extensions:   pipeline.Extensions{MCP: &pipeline.MCPExtension{Method: "tools/list"}},
+		ResponseBody: []byte(body),
+	}
+
+	action := p.OnResponse(context.Background(), pctx)
+	if action.Type != pipeline.Continue {
+		t.Fatalf("expected Continue, got %v", action.Type)
+	}
+	if pctx.Extensions.MCP.Result == nil {
+		t.Fatal("Result should be populated from SSE data frame")
+	}
+	if _, ok := pctx.Extensions.MCP.Result["tools"]; !ok {
+		t.Error("Result should contain tools from SSE data")
+	}
+}
+
+func TestMCPParser_OnResponse_SSE_Error(t *testing.T) {
+	p := NewMCPParser()
+	body := "event: message\ndata: {\"jsonrpc\":\"2.0\",\"id\":1,\"error\":{\"code\":-32601,\"message\":\"not found\"}}\n\n"
+	pctx := &pipeline.Context{
+		Extensions:   pipeline.Extensions{MCP: &pipeline.MCPExtension{Method: "tools/call"}},
+		ResponseBody: []byte(body),
+	}
+
+	_ = p.OnResponse(context.Background(), pctx)
+	if pctx.Extensions.MCP.Err == nil {
+		t.Fatal("expected Err populated from SSE error frame")
+	}
+	if pctx.Extensions.MCP.Err.Message != "not found" {
+		t.Errorf("Err.Message = %q, want %q", pctx.Extensions.MCP.Err.Message, "not found")
+	}
+}
+
+func TestMCPParser_OnResponse_SSE_SkipsMalformedFramesUntilGoodOne(t *testing.T) {
+	// A broken upstream emits a garbage data: line before the valid one.
+	// Malformed frames should be logged at DEBUG, not abort parsing.
+	p := NewMCPParser()
+	body := "data: not-json\n\n" +
+		"data: {\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"ok\":true}}\n\n"
+	pctx := &pipeline.Context{
+		Extensions:   pipeline.Extensions{MCP: &pipeline.MCPExtension{Method: "tools/list"}},
+		ResponseBody: []byte(body),
+	}
+	_ = p.OnResponse(context.Background(), pctx)
+	if pctx.Extensions.MCP.Result == nil || pctx.Extensions.MCP.Result["ok"] != true {
+		t.Errorf("expected result from second SSE frame, got %v", pctx.Extensions.MCP.Result)
 	}
 }

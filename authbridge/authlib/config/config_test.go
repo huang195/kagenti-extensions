@@ -336,3 +336,26 @@ func validProxySidecarConfig() *Config {
 		Listener: ListenerConfig{ReverseProxyBackend: "http://localhost:8081"},
 	}
 }
+
+func TestSessionConfig_SessionEnabled(t *testing.T) {
+	t.Run("unset defaults to enabled", func(t *testing.T) {
+		var s SessionConfig
+		if !s.SessionEnabled() {
+			t.Error("unset Enabled should default to true")
+		}
+	})
+	t.Run("explicit true", func(t *testing.T) {
+		b := true
+		s := SessionConfig{Enabled: &b}
+		if !s.SessionEnabled() {
+			t.Error("explicit true should be true")
+		}
+	})
+	t.Run("explicit false disables", func(t *testing.T) {
+		b := false
+		s := SessionConfig{Enabled: &b}
+		if s.SessionEnabled() {
+			t.Error("explicit false should opt out")
+		}
+	})
+}

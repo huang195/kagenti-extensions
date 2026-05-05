@@ -167,12 +167,14 @@ func (s *Server) recordInboundSession(pctx *pipeline.Context) {
 	if sid == "" {
 		sid = session.DefaultSessionID
 	}
-	s.Sessions.Append(sid, pipeline.SessionEvent{
+	ev := pipeline.SessionEvent{
 		At:        time.Now(),
 		Direction: pipeline.Inbound,
 		Phase:     pipeline.SessionRequest,
 		A2A:       pctx.Extensions.A2A,
-	})
+		Identity:  snapshotIdentity(pctx),
+	}
+	s.Sessions.Append(sid, ev)
 }
 
 // recordInboundResponseSession appends a Phase:SessionResponse event for the
@@ -189,12 +191,16 @@ func (s *Server) recordInboundResponseSession(pctx *pipeline.Context) {
 	if sid == "" {
 		sid = session.DefaultSessionID
 	}
-	s.Sessions.Append(sid, pipeline.SessionEvent{
-		At:        time.Now(),
-		Direction: pipeline.Inbound,
-		Phase:     pipeline.SessionResponse,
-		A2A:       pctx.Extensions.A2A,
-	})
+	ev := pipeline.SessionEvent{
+		At:         time.Now(),
+		Direction:  pipeline.Inbound,
+		Phase:      pipeline.SessionResponse,
+		A2A:        pctx.Extensions.A2A,
+		Identity:   snapshotIdentity(pctx),
+		StatusCode: pctx.StatusCode,
+		Error:      deriveError(pctx),
+	}
+	s.Sessions.Append(sid, ev)
 }
 
 // recordOutboundResponseSession appends a Phase:SessionResponse event for the
@@ -209,15 +215,57 @@ func (s *Server) recordOutboundResponseSession(pctx *pipeline.Context) {
 		sid = session.DefaultSessionID
 	}
 	ev := pipeline.SessionEvent{
-		At:        time.Now(),
-		Direction: pipeline.Outbound,
-		Phase:     pipeline.SessionResponse,
-		MCP:       pctx.Extensions.MCP,
-		Inference: pctx.Extensions.Inference,
+		At:         time.Now(),
+		Direction:  pipeline.Outbound,
+		Phase:      pipeline.SessionResponse,
+		MCP:        pctx.Extensions.MCP,
+		Inference:  pctx.Extensions.Inference,
+		Identity:   snapshotIdentity(pctx),
+		StatusCode: pctx.StatusCode,
+		Error:      deriveError(pctx),
 	}
 	if ev.MCP != nil || ev.Inference != nil {
 		s.Sessions.Append(sid, ev)
 	}
+}
+
+// snapshotIdentity copies Claims + Agent identity off pctx so the session event
+// stays valid after pctx is discarded. Returns nil when no identity information
+// is available (e.g., jwt-validation didn't run on this path).
+func snapshotIdentity(pctx *pipeline.Context) *pipeline.EventIdentity {
+	if pctx.Claims == nil && pctx.Agent == nil {
+		return nil
+	}
+	id := &pipeline.EventIdentity{}
+	if pctx.Claims != nil {
+		id.Subject = pctx.Claims.Subject
+		id.ClientID = pctx.Claims.ClientID
+		if len(pctx.Claims.Scopes) > 0 {
+			id.Scopes = append([]string(nil), pctx.Claims.Scopes...)
+		}
+	}
+	if pctx.Agent != nil {
+		id.AgentID = pctx.Agent.WorkloadID
+	}
+	return id
+}
+
+// deriveError constructs an EventError from response-side signals. Returns nil
+// for 2xx / no guardrail block / no parser error.
+func deriveError(pctx *pipeline.Context) *pipeline.EventError {
+	if pctx.Extensions.Security != nil && pctx.Extensions.Security.Blocked {
+		return &pipeline.EventError{
+			Kind:    "blocked",
+			Message: pctx.Extensions.Security.BlockReason,
+		}
+	}
+	if pctx.StatusCode >= 400 {
+		return &pipeline.EventError{
+			Kind: "backend_error",
+			Code: strconv.Itoa(pctx.StatusCode),
+		}
+	}
+	return nil
 }
 
 // rekeyInboundSession renames the DefaultSessionID bucket to the
@@ -249,6 +297,7 @@ func (s *Server) recordOutboundSession(pctx *pipeline.Context) {
 		Phase:     pipeline.SessionRequest,
 		MCP:       pctx.Extensions.MCP,
 		Inference: pctx.Extensions.Inference,
+		Identity:  snapshotIdentity(pctx),
 	}
 	if ev.MCP != nil || ev.Inference != nil {
 		s.Sessions.Append(sid, ev)

@@ -772,3 +772,148 @@ func TestRecordResponseSessions_NilStore(t *testing.T) {
 		Extensions: pipeline.Extensions{MCP: &pipeline.MCPExtension{}},
 	})
 }
+
+func TestSnapshotIdentity(t *testing.T) {
+	cases := []struct {
+		name   string
+		claims *validation.Claims
+		agent  *pipeline.AgentIdentity
+		want   *pipeline.EventIdentity
+	}{
+		{
+			name: "claims and agent both set",
+			claims: &validation.Claims{
+				Subject:  "alice",
+				ClientID: "kagenti-ui",
+				Scopes:   []string{"openid", "weather-read"},
+			},
+			agent: &pipeline.AgentIdentity{WorkloadID: "spiffe://localtest.me/ns/team1/sa/weather-agent"},
+			want: &pipeline.EventIdentity{
+				Subject:  "alice",
+				ClientID: "kagenti-ui",
+				Scopes:   []string{"openid", "weather-read"},
+				AgentID:  "spiffe://localtest.me/ns/team1/sa/weather-agent",
+			},
+		},
+		{
+			name:   "only agent (outbound, no JWT validation)",
+			claims: nil,
+			agent:  &pipeline.AgentIdentity{WorkloadID: "spiffe://localtest.me/ns/team1/sa/weather-agent"},
+			want:   &pipeline.EventIdentity{AgentID: "spiffe://localtest.me/ns/team1/sa/weather-agent"},
+		},
+		{
+			name:   "neither set",
+			claims: nil,
+			agent:  nil,
+			want:   nil,
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := snapshotIdentity(&pipeline.Context{Claims: tc.claims, Agent: tc.agent})
+			if tc.want == nil {
+				if got != nil {
+					t.Errorf("got %+v, want nil", got)
+				}
+				return
+			}
+			if got == nil {
+				t.Fatal("got nil, want populated")
+			}
+			if got.Subject != tc.want.Subject || got.ClientID != tc.want.ClientID || got.AgentID != tc.want.AgentID {
+				t.Errorf("identity mismatch: got %+v, want %+v", got, tc.want)
+			}
+			if len(got.Scopes) != len(tc.want.Scopes) {
+				t.Errorf("scopes len: got %d, want %d", len(got.Scopes), len(tc.want.Scopes))
+			}
+		})
+	}
+}
+
+func TestSnapshotIdentity_ScopesDeepCopy(t *testing.T) {
+	// Mutating the claims slice after snapshot must not mutate the event.
+	claims := &validation.Claims{Subject: "alice", Scopes: []string{"a", "b"}}
+	id := snapshotIdentity(&pipeline.Context{Claims: claims})
+	claims.Scopes[0] = "x"
+	if id.Scopes[0] != "a" {
+		t.Errorf("snapshot scopes aliased original: got %v", id.Scopes)
+	}
+}
+
+func TestDeriveError(t *testing.T) {
+	cases := []struct {
+		name     string
+		pctx     *pipeline.Context
+		wantNil  bool
+		wantKind string
+		wantCode string
+	}{
+		{name: "2xx no block", pctx: &pipeline.Context{StatusCode: 200}, wantNil: true},
+		{name: "no status (request phase)", pctx: &pipeline.Context{}, wantNil: true},
+		{name: "404 backend_error", pctx: &pipeline.Context{StatusCode: 404}, wantKind: "backend_error", wantCode: "404"},
+		{name: "500 backend_error", pctx: &pipeline.Context{StatusCode: 500}, wantKind: "backend_error", wantCode: "500"},
+		{
+			name: "guardrail block wins over status",
+			pctx: &pipeline.Context{
+				StatusCode: 200,
+				Extensions: pipeline.Extensions{
+					Security: &pipeline.SecurityExtension{Blocked: true, BlockReason: "pii_detected"},
+				},
+			},
+			wantKind: "blocked",
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := deriveError(tc.pctx)
+			if tc.wantNil {
+				if got != nil {
+					t.Errorf("got %+v, want nil", got)
+				}
+				return
+			}
+			if got == nil {
+				t.Fatal("got nil, want error")
+			}
+			if got.Kind != tc.wantKind {
+				t.Errorf("Kind = %q, want %q", got.Kind, tc.wantKind)
+			}
+			if tc.wantCode != "" && got.Code != tc.wantCode {
+				t.Errorf("Code = %q, want %q", got.Code, tc.wantCode)
+			}
+		})
+	}
+}
+
+func TestRecordOutboundResponseSession_CapturesStatusAndError(t *testing.T) {
+	store := session.New(5*time.Minute, 100, 0)
+	defer store.Close()
+	store.Append(session.DefaultSessionID, pipeline.SessionEvent{})
+	s := &Server{Sessions: store}
+
+	pctx := &pipeline.Context{
+		StatusCode: 503,
+		Claims:     &validation.Claims{Subject: "alice"},
+		Extensions: pipeline.Extensions{
+			MCP: &pipeline.MCPExtension{Method: "tools/call"},
+		},
+	}
+	s.recordOutboundResponseSession(pctx)
+
+	v := store.View(session.DefaultSessionID)
+	if v == nil || len(v.Events) < 2 {
+		t.Fatalf("expected event appended, got %v", v)
+	}
+	resp := v.Events[len(v.Events)-1]
+	if resp.StatusCode != 503 {
+		t.Errorf("StatusCode = %d, want 503", resp.StatusCode)
+	}
+	if resp.Error == nil || resp.Error.Kind != "backend_error" || resp.Error.Code != "503" {
+		t.Errorf("Error = %+v, want backend_error/503", resp.Error)
+	}
+	if resp.Identity == nil || resp.Identity.Subject != "alice" {
+		t.Errorf("Identity not snapshotted: %+v", resp.Identity)
+	}
+}

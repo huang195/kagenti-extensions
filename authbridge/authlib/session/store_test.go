@@ -393,3 +393,51 @@ func TestStore_Rekey_ActiveIDUntouchedWhenNotOldID(t *testing.T) {
 		t.Error("sess-a-renamed should exist")
 	}
 }
+
+func TestView_FailedEvents(t *testing.T) {
+	s := New(5*time.Minute, 100, 0)
+	defer s.Close()
+
+	s.Append("sess", pipeline.SessionEvent{Phase: pipeline.SessionRequest, A2A: &pipeline.A2AExtension{}})
+	s.Append("sess", pipeline.SessionEvent{Phase: pipeline.SessionResponse, StatusCode: 200})
+	s.Append("sess", pipeline.SessionEvent{
+		Phase:      pipeline.SessionResponse,
+		StatusCode: 503,
+		Error:      &pipeline.EventError{Kind: "backend_error", Code: "503"},
+	})
+	s.Append("sess", pipeline.SessionEvent{
+		Phase: pipeline.SessionResponse,
+		Error: &pipeline.EventError{Kind: "blocked", Message: "pii"},
+	})
+
+	v := s.View("sess")
+	if v == nil {
+		t.Fatal("View returned nil")
+	}
+
+	failed := v.FailedEvents()
+	if len(failed) != 2 {
+		t.Fatalf("FailedEvents len = %d, want 2", len(failed))
+	}
+	if failed[0].Error.Kind != "backend_error" {
+		t.Errorf("first failed Kind = %q", failed[0].Error.Kind)
+	}
+
+	last := v.LastError()
+	if last == nil || last.Error.Kind != "blocked" {
+		t.Errorf("LastError = %+v, want blocked", last)
+	}
+}
+
+func TestView_LastError_NoErrors(t *testing.T) {
+	s := New(5*time.Minute, 100, 0)
+	defer s.Close()
+	s.Append("sess", pipeline.SessionEvent{Phase: pipeline.SessionResponse, StatusCode: 200})
+	v := s.View("sess")
+	if v.LastError() != nil {
+		t.Error("LastError should be nil when no errors present")
+	}
+	if v.FailedEvents() != nil {
+		t.Error("FailedEvents should be nil when no errors present")
+	}
+}

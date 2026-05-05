@@ -69,19 +69,21 @@ func protoStyle(proto string) lipgloss.Style {
 
 // tableStyles returns the standard abctl table palette — layered on top of
 // bubbles' DefaultStyles so cell padding, borders, and other layout rules
-// come through unchanged. Replacing DefaultStyles().Header with a blank
-// lipgloss.Style wiped out the horizontal padding, which caused header
-// cells to butt up against each other while row cells stayed padded —
-// hence the "PROTOMETHOD" run-together in the events pane.
+// come through unchanged.
+//
+// The Selected style is intentionally minimal (Reverse only, no fg/bg) so
+// per-cell protocol coloring survives the nesting: bubbles/table wraps the
+// whole row with Selected.Render, which would otherwise be clobbered by
+// the inner \x1b[0m reset my styled cells emit. Reverse uses a small
+// escape (\x1b[7m) that reappears reliably after full resets in most
+// terminals, giving a clear selection indicator without fighting per-cell
+// color.
 func tableStyles() table.Styles {
 	s := table.DefaultStyles()
 	s.Header = s.Header.
 		Foreground(colorAccent).
 		BorderForeground(colorMuted).
 		Bold(true)
-	s.Selected = s.Selected.
-		Foreground(lipgloss.Color("229")).
-		Background(colorAccent).
-		Bold(true)
+	s.Selected = lipgloss.NewStyle().Reverse(true).Bold(true)
 	return s
 }

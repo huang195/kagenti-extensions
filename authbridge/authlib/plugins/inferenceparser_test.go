@@ -250,10 +250,99 @@ func TestInferenceParser_LegacyCompletions(t *testing.T) {
 	}
 }
 
-func TestInferenceParser_OnResponse(t *testing.T) {
+func TestInferenceParser_OnResponse_NoRequestContext(t *testing.T) {
+	// Without an Inference extension (e.g., path didn't match on the request),
+	// OnResponse should be a no-op.
 	p := NewInferenceParser()
-	action := p.OnResponse(context.Background(), &pipeline.Context{})
+	pctx := &pipeline.Context{
+		ResponseBody: []byte(`{"choices":[{"message":{"content":"hi"}}]}`),
+	}
+	action := p.OnResponse(context.Background(), pctx)
 	if action.Type != pipeline.Continue {
-		t.Errorf("OnResponse should return Continue, got %v", action.Type)
+		t.Fatalf("expected Continue, got %v", action.Type)
+	}
+	if pctx.Extensions.Inference != nil {
+		t.Error("Inference extension should remain nil when request was not parsed")
+	}
+}
+
+func TestInferenceParser_OnResponse_EmptyBody(t *testing.T) {
+	p := NewInferenceParser()
+	pctx := &pipeline.Context{
+		Extensions: pipeline.Extensions{Inference: &pipeline.InferenceExtension{Model: "gpt-4"}},
+	}
+	action := p.OnResponse(context.Background(), pctx)
+	if action.Type != pipeline.Continue {
+		t.Fatalf("expected Continue, got %v", action.Type)
+	}
+	if pctx.Extensions.Inference.Completion != "" {
+		t.Errorf("Completion = %q, want empty", pctx.Extensions.Inference.Completion)
+	}
+}
+
+func TestInferenceParser_OnResponse_NonStreaming(t *testing.T) {
+	p := NewInferenceParser()
+	pctx := &pipeline.Context{
+		Extensions: pipeline.Extensions{Inference: &pipeline.InferenceExtension{Model: "gpt-4"}},
+		ResponseBody: []byte(`{
+			"choices":[{"message":{"role":"assistant","content":"Hello, world!"},"finish_reason":"stop"}],
+			"usage":{"prompt_tokens":12,"completion_tokens":5,"total_tokens":17}
+		}`),
+	}
+	action := p.OnResponse(context.Background(), pctx)
+	if action.Type != pipeline.Continue {
+		t.Fatalf("expected Continue, got %v", action.Type)
+	}
+	ext := pctx.Extensions.Inference
+	if ext.Completion != "Hello, world!" {
+		t.Errorf("Completion = %q, want %q", ext.Completion, "Hello, world!")
+	}
+	if ext.FinishReason != "stop" {
+		t.Errorf("FinishReason = %q, want %q", ext.FinishReason, "stop")
+	}
+	if ext.PromptTokens != 12 || ext.CompletionTokens != 5 || ext.TotalTokens != 17 {
+		t.Errorf("Tokens = (%d, %d, %d), want (12, 5, 17)", ext.PromptTokens, ext.CompletionTokens, ext.TotalTokens)
+	}
+}
+
+func TestInferenceParser_OnResponse_SSE(t *testing.T) {
+	p := NewInferenceParser()
+	body := "data: {\"choices\":[{\"delta\":{\"content\":\"Hello\"}}]}\n\n" +
+		"data: {\"choices\":[{\"delta\":{\"content\":\", \"}}]}\n\n" +
+		"data: {\"choices\":[{\"delta\":{\"content\":\"world!\"},\"finish_reason\":\"stop\"}]}\n\n" +
+		"data: {\"choices\":[],\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":3,\"total_tokens\":13}}\n\n" +
+		"data: [DONE]\n\n"
+	pctx := &pipeline.Context{
+		Extensions: pipeline.Extensions{Inference: &pipeline.InferenceExtension{Model: "gpt-4", Stream: true}},
+		ResponseBody: []byte(body),
+	}
+	action := p.OnResponse(context.Background(), pctx)
+	if action.Type != pipeline.Continue {
+		t.Fatalf("expected Continue, got %v", action.Type)
+	}
+	ext := pctx.Extensions.Inference
+	if ext.Completion != "Hello, world!" {
+		t.Errorf("Completion = %q, want %q", ext.Completion, "Hello, world!")
+	}
+	if ext.FinishReason != "stop" {
+		t.Errorf("FinishReason = %q, want %q", ext.FinishReason, "stop")
+	}
+	if ext.TotalTokens != 13 {
+		t.Errorf("TotalTokens = %d, want 13", ext.TotalTokens)
+	}
+}
+
+func TestInferenceParser_OnResponse_InvalidJSON(t *testing.T) {
+	p := NewInferenceParser()
+	pctx := &pipeline.Context{
+		Extensions:   pipeline.Extensions{Inference: &pipeline.InferenceExtension{Model: "gpt-4"}},
+		ResponseBody: []byte("not json"),
+	}
+	action := p.OnResponse(context.Background(), pctx)
+	if action.Type != pipeline.Continue {
+		t.Fatalf("expected Continue, got %v", action.Type)
+	}
+	if pctx.Extensions.Inference.Completion != "" {
+		t.Error("Completion should remain empty on parse failure")
 	}
 }

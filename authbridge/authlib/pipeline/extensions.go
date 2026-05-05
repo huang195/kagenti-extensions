@@ -37,7 +37,8 @@ type A2APart struct {
 	Content string // text content, file URI, or serialized data
 }
 
-// InferenceExtension carries parsed LLM inference request metadata.
+// InferenceExtension carries parsed LLM inference request and response metadata.
+// Request fields are populated by OnRequest; response fields by OnResponse.
 type InferenceExtension struct {
 	Model       string             // model name (e.g., "llama3.1", "gpt-4")
 	Messages    []InferenceMessage // conversation messages
@@ -45,6 +46,13 @@ type InferenceExtension struct {
 	MaxTokens   *int               // max tokens to generate (nil if not set)
 	Stream      bool               // whether streaming is requested
 	Tools       []string           // tool/function names declared
+
+	// Response fields (populated after OnResponse runs).
+	Completion       string // assistant's response text (concatenated across SSE deltas)
+	FinishReason     string // "stop", "length", "tool_calls", "content_filter", etc.
+	PromptTokens     int    // tokens consumed by the prompt
+	CompletionTokens int    // tokens generated in the response
+	TotalTokens      int    // PromptTokens + CompletionTokens (as reported by the server)
 }
 
 // InferenceMessage represents a single message in the conversation.

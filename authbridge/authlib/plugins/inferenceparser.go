@@ -1,9 +1,11 @@
 package plugins
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"log/slog"
+	"strings"
 
 	"github.com/kagenti/kagenti-extensions/authbridge/authlib/pipeline"
 )
@@ -67,8 +69,109 @@ func (p *InferenceParser) OnRequest(_ context.Context, pctx *pipeline.Context) p
 	return pipeline.Action{Type: pipeline.Continue}
 }
 
-func (p *InferenceParser) OnResponse(_ context.Context, _ *pipeline.Context) pipeline.Action {
+// OnResponse populates the response-side fields (Completion, FinishReason,
+// token counts) on pctx.Extensions.Inference. Handles both non-streaming
+// JSON responses and SSE streams from OpenAI-compatible servers.
+func (p *InferenceParser) OnResponse(_ context.Context, pctx *pipeline.Context) pipeline.Action {
+	if len(pctx.ResponseBody) == 0 || pctx.Extensions.Inference == nil {
+		return pipeline.Action{Type: pipeline.Continue}
+	}
+
+	if pctx.Extensions.Inference.Stream {
+		parseInferenceSSE(pctx.ResponseBody, pctx.Extensions.Inference)
+	} else {
+		parseInferenceJSON(pctx.ResponseBody, pctx.Extensions.Inference)
+	}
+
+	ext := pctx.Extensions.Inference
+	slog.Info("inference-parser: response",
+		"model", ext.Model,
+		"finishReason", ext.FinishReason,
+		"promptTokens", ext.PromptTokens,
+		"completionTokens", ext.CompletionTokens,
+	)
 	return pipeline.Action{Type: pipeline.Continue}
+}
+
+// parseInferenceJSON parses a non-streaming OpenAI chat/completions response.
+func parseInferenceJSON(body []byte, ext *pipeline.InferenceExtension) {
+	var resp inferenceResponse
+	if err := json.Unmarshal(body, &resp); err != nil {
+		slog.Debug("inference-parser: invalid response JSON", "error", err)
+		return
+	}
+	if len(resp.Choices) > 0 {
+		ext.Completion = resp.Choices[0].Message.Content
+		ext.FinishReason = resp.Choices[0].FinishReason
+	}
+	ext.PromptTokens = resp.Usage.PromptTokens
+	ext.CompletionTokens = resp.Usage.CompletionTokens
+	ext.TotalTokens = resp.Usage.TotalTokens
+}
+
+// parseInferenceSSE concatenates content deltas across SSE events and captures
+// the last finish_reason and usage block (sent when stream_options.include_usage
+// is set). The stream terminates with a "data: [DONE]" marker which is skipped.
+func parseInferenceSSE(body []byte, ext *pipeline.InferenceExtension) {
+	var completion strings.Builder
+	for _, line := range bytes.Split(body, []byte("\n")) {
+		line = bytes.TrimSpace(line)
+		if !bytes.HasPrefix(line, []byte("data:")) {
+			continue
+		}
+		data := bytes.TrimSpace(bytes.TrimPrefix(line, []byte("data:")))
+		if len(data) == 0 || bytes.Equal(data, []byte("[DONE]")) {
+			continue
+		}
+		var chunk inferenceStreamChunk
+		if json.Unmarshal(data, &chunk) != nil {
+			continue
+		}
+		for _, c := range chunk.Choices {
+			if c.Delta.Content != "" {
+				completion.WriteString(c.Delta.Content)
+			}
+			if c.FinishReason != "" {
+				ext.FinishReason = c.FinishReason
+			}
+		}
+		if chunk.Usage.TotalTokens > 0 {
+			ext.PromptTokens = chunk.Usage.PromptTokens
+			ext.CompletionTokens = chunk.Usage.CompletionTokens
+			ext.TotalTokens = chunk.Usage.TotalTokens
+		}
+	}
+	ext.Completion = completion.String()
+}
+
+type inferenceResponse struct {
+	Choices []inferenceChoice `json:"choices"`
+	Usage   inferenceUsage    `json:"usage"`
+}
+
+type inferenceChoice struct {
+	Message      inferenceMessage `json:"message"`
+	FinishReason string           `json:"finish_reason"`
+}
+
+type inferenceStreamChunk struct {
+	Choices []inferenceStreamChoice `json:"choices"`
+	Usage   inferenceUsage          `json:"usage"`
+}
+
+type inferenceStreamChoice struct {
+	Delta        inferenceDelta `json:"delta"`
+	FinishReason string         `json:"finish_reason"`
+}
+
+type inferenceDelta struct {
+	Content string `json:"content"`
+}
+
+type inferenceUsage struct {
+	PromptTokens     int `json:"prompt_tokens"`
+	CompletionTokens int `json:"completion_tokens"`
+	TotalTokens      int `json:"total_tokens"`
 }
 
 type inferenceRequest struct {

@@ -4,6 +4,7 @@
 package session
 
 import (
+	"log/slog"
 	"sync"
 	"time"
 
@@ -100,6 +101,8 @@ func (s *Store) Append(sessionID string, event pipeline.SessionEvent) {
 	sess.Events = append(sess.Events, event)
 	sess.UpdatedAt = now
 	s.activeID = sessionID
+
+	logAppended(sessionID, &event)
 
 	if s.maxEvents > 0 && len(sess.Events) > s.maxEvents {
 		excess := len(sess.Events) - s.maxEvents
@@ -232,4 +235,55 @@ func (s *Store) evictOldestLocked() {
 
 func (s *Store) isExpired(sess *entry, now time.Time) bool {
 	return now.Sub(sess.UpdatedAt) > s.ttl
+}
+
+// logAppended emits a structured DEBUG line so operators can observe session
+// state evolution. Fields are chosen to cover the data captured by all four
+// record helpers — extension payloads themselves are intentionally omitted
+// since the parsers already log them.
+func logAppended(sessionID string, e *pipeline.SessionEvent) {
+	attrs := []any{
+		"sessionId", sessionID,
+		"direction", directionName(e.Direction),
+		"phase", e.Phase.String(),
+	}
+	if e.Host != "" {
+		attrs = append(attrs, "host", e.Host)
+	}
+	if e.TargetAudience != "" {
+		attrs = append(attrs, "aud", e.TargetAudience)
+	}
+	if e.StatusCode != 0 {
+		attrs = append(attrs, "status", e.StatusCode)
+	}
+	if e.Duration != 0 {
+		attrs = append(attrs, "durationMs", e.Duration.Milliseconds())
+	}
+	if e.Identity != nil {
+		if e.Identity.Subject != "" {
+			attrs = append(attrs, "subject", e.Identity.Subject)
+		}
+		if e.Identity.AgentID != "" {
+			attrs = append(attrs, "agent", e.Identity.AgentID)
+		}
+	}
+	switch {
+	case e.A2A != nil:
+		attrs = append(attrs, "proto", "a2a", "method", e.A2A.Method)
+	case e.MCP != nil:
+		attrs = append(attrs, "proto", "mcp", "method", e.MCP.Method)
+	case e.Inference != nil:
+		attrs = append(attrs, "proto", "inference", "model", e.Inference.Model)
+	}
+	if e.Error != nil {
+		attrs = append(attrs, "errorKind", e.Error.Kind)
+	}
+	slog.Debug("session: event appended", attrs...)
+}
+
+func directionName(d pipeline.Direction) string {
+	if d == pipeline.Inbound {
+		return "inbound"
+	}
+	return "outbound"
 }

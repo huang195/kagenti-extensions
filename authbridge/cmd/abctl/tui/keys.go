@@ -36,6 +36,18 @@ func (m *model) handleKey(msg tea.KeyMsg) tea.Cmd {
 		m.cancel()
 		return tea.Quit
 
+	case "tab":
+		// Toggle between top-level peers only. Sub-panes (events, detail,
+		// plugin-detail) are addressed by their parent — Esc out first.
+		switch m.pane {
+		case paneSessions:
+			m.pane = panePipeline
+			m.rebuildPipelineTable()
+		case panePipeline:
+			m.pane = paneSessions
+		}
+		return nil
+
 	case "/":
 		m.filtering = true
 		m.filterInput.Focus()
@@ -46,14 +58,14 @@ func (m *model) handleKey(msg tea.KeyMsg) tea.Cmd {
 		return nil
 
 	case "esc", "left", "h":
-		// Back-out: detail → events → sessions.
-		if m.pane == paneDetail {
+		// Back-out: plugin-detail → pipeline; detail → events; events → sessions.
+		switch m.pane {
+		case panePluginDetail:
+			m.pane = panePipeline
+		case paneDetail:
 			m.pane = paneEvents
-			return nil
-		}
-		if m.pane == paneEvents {
+		case paneEvents:
 			m.pane = paneSessions
-			return nil
 		}
 		return nil
 
@@ -76,6 +88,14 @@ func (m *model) handleKey(msg tea.KeyMsg) tea.Cmd {
 			}
 			m.showDetail(ev)
 			m.pane = paneDetail
+			return nil
+		case panePipeline:
+			p := m.selectedPlugin()
+			if p == nil {
+				return nil
+			}
+			m.showPluginDetail(p)
+			m.pane = panePluginDetail
 			return nil
 		}
 		return nil
@@ -113,9 +133,22 @@ func (m *model) handleKey(msg tea.KeyMsg) tea.Cmd {
 		var cmd tea.Cmd
 		m.eventsTbl, cmd = m.eventsTbl.Update(msg)
 		return cmd
-	case paneDetail:
+	case paneDetail, panePluginDetail:
 		var cmd tea.Cmd
 		m.detailVp, cmd = m.detailVp.Update(msg)
+		return cmd
+	case panePipeline:
+		prev := m.pipelineTbl.Cursor()
+		var cmd tea.Cmd
+		m.pipelineTbl, cmd = m.pipelineTbl.Update(msg)
+		// Skip over the divider row when navigating.
+		if isDividerRow(m.pipelineTbl.Rows(), m.pipelineTbl.Cursor()) {
+			if m.pipelineTbl.Cursor() > prev {
+				m.pipelineTbl.SetCursor(m.pipelineTbl.Cursor() + 1)
+			} else {
+				m.pipelineTbl.SetCursor(m.pipelineTbl.Cursor() - 1)
+			}
+		}
 		return cmd
 	}
 	return nil
@@ -128,6 +161,8 @@ func (m *model) refreshActivePane() {
 		m.rebuildSessionsTable()
 	case paneEvents:
 		m.rebuildEventsTable()
+	case panePipeline:
+		m.rebuildPipelineTable()
 	}
 }
 
@@ -137,7 +172,9 @@ func (m *model) goTop() {
 		m.sessionsTbl.SetCursor(0)
 	case paneEvents:
 		m.eventsTbl.SetCursor(0)
-	case paneDetail:
+	case panePipeline:
+		m.pipelineTbl.SetCursor(0)
+	case paneDetail, panePluginDetail:
 		m.detailVp.GotoTop()
 	}
 }
@@ -152,7 +189,11 @@ func (m *model) goBottom() {
 		if n := len(m.eventsTbl.Rows()); n > 0 {
 			m.eventsTbl.SetCursor(n - 1)
 		}
-	case paneDetail:
+	case panePipeline:
+		if n := len(m.pipelineTbl.Rows()); n > 0 {
+			m.pipelineTbl.SetCursor(n - 1)
+		}
+	case paneDetail, panePluginDetail:
 		m.detailVp.GotoBottom()
 	}
 }
@@ -171,11 +212,15 @@ func (m *model) helpView() string {
 	}
 	switch m.pane {
 	case paneSessions:
-		return "[↑↓/jk] nav  [↵] drill  [/] filter  [p] pause  [q] quit"
+		return "[↑↓] nav  [↵] drill  [tab] pipeline  [/] filter  [p] pause  [q] quit"
 	case paneEvents:
-		return "[↑↓/jk] nav  [↵] detail  [esc] back  [/] filter  [p] pause  [q] quit"
+		return "[↑↓] nav  [↵] detail  [esc] back  [/] filter  [p] pause  [q] quit"
 	case paneDetail:
 		return "[↑↓] scroll  [y] yank  [esc] back  [q] quit"
+	case panePipeline:
+		return "[↑↓] nav  [↵] plugin detail  [tab] sessions  [q] quit"
+	case panePluginDetail:
+		return "[↑↓] scroll  [esc] back  [q] quit"
 	}
 	return "[q] quit"
 }
@@ -194,6 +239,7 @@ func (m *model) layout() {
 
 	m.sessionsTbl.SetHeight(bodyH)
 	m.eventsTbl.SetHeight(bodyH)
+	m.pipelineTbl.SetHeight(bodyH)
 	m.detailVp.Width = m.width
 	m.detailVp.Height = bodyH
 

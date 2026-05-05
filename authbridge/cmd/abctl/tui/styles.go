@@ -1,7 +1,10 @@
 // Package tui implements the abctl Bubble Tea interactive terminal UI.
 package tui
 
-import "github.com/charmbracelet/lipgloss"
+import (
+	"github.com/charmbracelet/bubbles/table"
+	"github.com/charmbracelet/lipgloss"
+)
 
 // Palette keeps all colors in one place so recoloring the TUI is a single
 // file edit. Colors are chosen to render legibly on both light and dark
@@ -25,18 +28,23 @@ var (
 	styleMuted  = lipgloss.NewStyle().Foreground(colorMuted)
 	styleBorder = lipgloss.NewStyle().Border(lipgloss.RoundedBorder()).BorderForeground(colorMuted)
 
-	// Table cursor row: reverse-video with accent foreground so the selection
-	// is obvious on any terminal. Default bubbles styling is too subtle to
-	// notice at a glance.
-	styleTableSelected = lipgloss.NewStyle().
-				Foreground(lipgloss.Color("229")).
-				Background(colorAccent).
-				Bold(true)
-
-	// Table header: bold with a rule below. Distinguishes columns from rows.
-	styleTableHeader = lipgloss.NewStyle().
-				BorderStyle(lipgloss.NormalBorder()).
-				BorderBottom(true).
-				BorderForeground(colorMuted).
-				Bold(true)
 )
+
+// tableStyles returns the standard abctl table palette — layered on top of
+// bubbles' DefaultStyles so cell padding, borders, and other layout rules
+// come through unchanged. Replacing DefaultStyles().Header with a blank
+// lipgloss.Style wiped out the horizontal padding, which caused header
+// cells to butt up against each other while row cells stayed padded —
+// hence the "PROTOMETHOD" run-together in the events pane.
+func tableStyles() table.Styles {
+	s := table.DefaultStyles()
+	s.Header = s.Header.
+		Foreground(colorAccent).
+		BorderForeground(colorMuted).
+		Bold(true)
+	s.Selected = s.Selected.
+		Foreground(lipgloss.Color("229")).
+		Background(colorAccent).
+		Bold(true)
+	return s
+}

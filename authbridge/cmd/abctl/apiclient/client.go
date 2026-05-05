@@ -61,6 +61,32 @@ func (c *Client) GetSession(ctx context.Context, id string) (*pipeline.SessionVi
 // ErrNotFound is returned when the server responds 404.
 var ErrNotFound = fmt.Errorf("apiclient: not found")
 
+// PipelineView is the decoded shape of GET /v1/pipeline.
+type PipelineView struct {
+	Inbound  []PipelinePlugin `json:"inbound"`
+	Outbound []PipelinePlugin `json:"outbound"`
+}
+
+// PipelinePlugin describes one plugin's position, direction, and
+// capabilities. Mirrors the server's pipelinePluginView exactly.
+type PipelinePlugin struct {
+	Name       string   `json:"name"`
+	Direction  string   `json:"direction"`
+	Position   int      `json:"position"`
+	BodyAccess bool     `json:"bodyAccess"`
+	Writes     []string `json:"writes"`
+	Reads      []string `json:"reads"`
+}
+
+// GetPipeline fetches /v1/pipeline.
+func (c *Client) GetPipeline(ctx context.Context) (*PipelineView, error) {
+	var view PipelineView
+	if err := c.getJSON(ctx, "/v1/pipeline", &view); err != nil {
+		return nil, err
+	}
+	return &view, nil
+}
+
 func (c *Client) getJSON(ctx context.Context, path string, out any) error {
 	req, err := http.NewRequestWithContext(ctx, "GET", c.endpoint+path, nil)
 	if err != nil {

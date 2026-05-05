@@ -77,3 +77,33 @@ func TestEndpointTrimSlash(t *testing.T) {
 		t.Errorf("trailing slash not trimmed: %q", c.Endpoint())
 	}
 }
+
+func TestGetPipeline(t *testing.T) {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/v1/pipeline" {
+			t.Errorf("wrong path: %q", r.URL.Path)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{
+			"inbound":  [{"name":"jwt-validation","direction":"inbound","position":1,"bodyAccess":false},
+			             {"name":"a2a-parser","direction":"inbound","position":2,"bodyAccess":true,"writes":["a2a"]}],
+			"outbound": [{"name":"token-exchange","direction":"outbound","position":1}]
+		}`))
+	}))
+	defer ts.Close()
+
+	c := New(ts.URL)
+	got, err := c.GetPipeline(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got.Inbound) != 2 || len(got.Outbound) != 1 {
+		t.Fatalf("got %d inbound / %d outbound, want 2/1", len(got.Inbound), len(got.Outbound))
+	}
+	if got.Inbound[1].Name != "a2a-parser" || !got.Inbound[1].BodyAccess {
+		t.Errorf("inbound[1] = %+v", got.Inbound[1])
+	}
+	if len(got.Inbound[1].Writes) != 1 || got.Inbound[1].Writes[0] != "a2a" {
+		t.Errorf("inbound[1].Writes = %v, want [a2a]", got.Inbound[1].Writes)
+	}
+}

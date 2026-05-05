@@ -28,6 +28,8 @@ const (
 	paneSessions paneID = iota
 	paneEvents
 	paneDetail
+	panePipeline
+	panePluginDetail
 )
 
 // Connection state for the SSE stream.
@@ -67,6 +69,7 @@ const refreshInterval = 2 * time.Second
 type tickMsg time.Time
 type refreshTickMsg time.Time
 type sessionsLoadedMsg []session.SessionSummary
+type pipelineLoadedMsg *apiclient.PipelineView
 type snapshotLoadedMsg struct {
 	id     string
 	events []pipeline.SessionEvent
@@ -109,11 +112,18 @@ type model struct {
 	width, height int
 
 	// Panel components.
-	sessionsTbl table.Model
-	eventsTbl   table.Model
-	detailVp    viewport.Model
-	detailEvent *pipeline.SessionEvent
-	filterInput textinput.Model
+	sessionsTbl  table.Model
+	eventsTbl    table.Model
+	pipelineTbl  table.Model
+	detailVp     viewport.Model
+	detailEvent  *pipeline.SessionEvent
+	detailPlugin *apiclient.PipelinePlugin
+	filterInput  textinput.Model
+
+	// pipeline is the fetched plugin composition. nil until the initial
+	// GetPipeline response arrives; the pipeline pane shows "(loading…)"
+	// until then.
+	pipeline *apiclient.PipelineView
 
 	// streamCh is the single SSE channel from the apiclient. Opened once
 	// in Init; re-pumped on every streamMsg until it closes.
@@ -138,6 +148,7 @@ func New(ctx context.Context, c *apiclient.Client) tea.Model {
 		pane:        paneSessions,
 		sessionsTbl: newSessionsTable(),
 		eventsTbl:   newEventsTable(),
+		pipelineTbl: newPipelineTable(),
 		detailVp:    viewport.New(0, 0),
 		filterInput: ti,
 		lastTick:    time.Now(),
@@ -150,10 +161,23 @@ func (m *model) Init() tea.Cmd {
 	m.streamCh = m.client.Stream(m.ctx, "")
 	return tea.Batch(
 		m.loadSessionsCmd(),
+		m.loadPipelineCmd(),
 		streamPump(m.streamCh),
 		tickCmd(),
 		refreshTickCmd(),
 	)
+}
+
+// loadPipelineCmd fetches /v1/pipeline once at startup. The pipeline is
+// static for the duration of a process so there's no periodic refresh.
+func (m *model) loadPipelineCmd() tea.Cmd {
+	return func() tea.Msg {
+		pv, err := m.client.GetPipeline(m.ctx)
+		if err != nil {
+			return errMsg{where: "get pipeline", err: err}
+		}
+		return pipelineLoadedMsg(pv)
+	}
 }
 
 func tickCmd() tea.Cmd {
@@ -253,6 +277,11 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case refreshTickMsg:
 		return m, tea.Batch(m.loadSessionsCmd(), refreshTickCmd())
+
+	case pipelineLoadedMsg:
+		m.pipeline = (*apiclient.PipelineView)(msg)
+		m.rebuildPipelineTable()
+		return m, nil
 
 	case snapshotLoadedMsg:
 		// Only update if we're still focused on this session.
@@ -359,13 +388,27 @@ func (m *model) View() string {
 	var body string
 	switch m.pane {
 	case paneSessions:
-		title = fmt.Sprintf("abctl · %s", m.endpoint)
+		title = fmt.Sprintf("abctl · %s · %s", m.endpoint, viewTabs(paneSessions))
 		body = m.sessionsTbl.View()
 	case paneEvents:
 		title = fmt.Sprintf("abctl · %s", trunc(m.selectedSess, 36))
 		body = m.eventsTbl.View()
 	case paneDetail:
 		title = fmt.Sprintf("abctl · %s · event", trunc(m.selectedSess, 24))
+		body = m.detailVp.View()
+	case panePipeline:
+		title = fmt.Sprintf("abctl · %s · %s", m.endpoint, viewTabs(panePipeline))
+		if m.pipeline == nil {
+			body = styleHint.Render("(loading pipeline…)")
+		} else {
+			body = m.pipelineTbl.View()
+		}
+	case panePluginDetail:
+		name := "plugin"
+		if m.detailPlugin != nil {
+			name = m.detailPlugin.Name
+		}
+		title = fmt.Sprintf("abctl · pipeline · %s", name)
 		body = m.detailVp.View()
 	}
 
@@ -378,6 +421,21 @@ func (m *model) View() string {
 		body,
 		m.footerView(),
 	)
+}
+
+// viewTabs renders the top-level tab strip "[Sessions] Pipeline" with the
+// active pane bracketed. Rendered in the title bar of top-level views.
+func viewTabs(active paneID) string {
+	sess := "Sessions"
+	pipe := "Pipeline"
+	if active == paneSessions {
+		sess = styleTitle.Render("[" + sess + "]")
+		pipe = styleHint.Render(pipe)
+	} else {
+		sess = styleHint.Render(sess)
+		pipe = styleTitle.Render("[" + pipe + "]")
+	}
+	return sess + " " + pipe
 }
 
 // trunc clips a string to n runes with an ellipsis. Used for title truncation.

@@ -15,7 +15,7 @@ func newEventsTable() table.Model {
 		table.WithColumns([]table.Column{
 			{Title: "TIME", Width: 12},
 			{Title: "DIR", Width: 4},
-			{Title: "PHASE", Width: 5},
+			{Title: "PHASE", Width: 6},
 			{Title: "PROTO", Width: 5},
 			{Title: "METHOD", Width: 22},
 			{Title: "STATUS", Width: 7},
@@ -24,10 +24,7 @@ func newEventsTable() table.Model {
 		}),
 		table.WithFocused(true),
 	)
-	s := table.DefaultStyles()
-	s.Header = styleTableHeader
-	s.Selected = styleTableSelected
-	t.SetStyles(s)
+	t.SetStyles(tableStyles())
 	return t
 }
 
@@ -38,15 +35,27 @@ func (m *model) rebuildEventsTable() {
 	prevRow := m.eventsTbl.Cursor()
 	wasAtEnd := prevRow >= len(m.eventsTbl.Rows())-1
 
+	// Compute request↔response pairs up-front so response rows can render
+	// a visual connector back to their request.
+	pairs := pairRequestsAndResponses(events)
+
 	rows := make([]table.Row, 0, len(events))
-	for _, e := range events {
+	for i, e := range events {
 		if m.filter != "" && !matchEvent(e, m.filter) {
 			continue
+		}
+		phase := shortPhase(e.Phase)
+		if e.Phase == pipeline.SessionResponse {
+			if _, paired := pairs[i]; paired {
+				// └ prefix visually connects the response to its request
+				// in the row above (or earlier, if filtered).
+				phase = "└" + phase
+			}
 		}
 		rows = append(rows, table.Row{
 			e.At.Format("15:04:05.00"),
 			shortDirection(e.Direction),
-			shortPhase(e.Phase),
+			phase,
 			shortProto(e),
 			eventMethod(e),
 			statusCell(e),
@@ -187,4 +196,48 @@ func matchEvent(e pipeline.SessionEvent, q string) bool {
 		}
 	}
 	return false
+}
+
+// pairRequestsAndResponses returns a map whose keys are the indexes of
+// events that participate in a request↔response pair. It walks events in
+// order: each SessionRequest is paired with the NEXT SessionResponse that
+// matches on direction + protocol + method, within the same session.
+//
+// Sequential pairing is sufficient for AuthBridge's current traffic
+// patterns (no overlapping same-method outbound calls per turn). Future
+// work: key pairs by MCP.RPCID / A2A.RPCID when available for stricter
+// correlation.
+func pairRequestsAndResponses(events []pipeline.SessionEvent) map[int]int {
+	pairs := make(map[int]int)
+	for i := range events {
+		req := events[i]
+		if req.Phase != pipeline.SessionRequest {
+			continue
+		}
+		if _, already := pairs[i]; already {
+			continue
+		}
+		for j := i + 1; j < len(events); j++ {
+			resp := events[j]
+			if resp.Phase != pipeline.SessionResponse {
+				continue
+			}
+			if _, taken := pairs[j]; taken {
+				continue
+			}
+			if resp.Direction != req.Direction {
+				continue
+			}
+			if shortProto(resp) != shortProto(req) {
+				continue
+			}
+			if eventMethod(resp) != eventMethod(req) {
+				continue
+			}
+			pairs[i] = j
+			pairs[j] = i
+			break
+		}
+	}
+	return pairs
 }

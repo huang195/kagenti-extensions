@@ -215,6 +215,7 @@ func (s *Server) handleOutbound(stream extprocv3.ExternalProcessor_ProcessServer
 	pctx := &pipeline.Context{
 		Direction: pipeline.Outbound,
 		Host:      getHeader(headers, ":authority"),
+		Path:      getHeader(headers, ":path"),
 		Headers:   headerMapToHTTP(headers),
 		Body:      body,
 	}
@@ -249,6 +250,7 @@ func (s *Server) handleOutboundBody(stream extprocv3.ExternalProcessor_ProcessSe
 	pctx := &pipeline.Context{
 		Direction: pipeline.Outbound,
 		Host:      getHeader(headers, ":authority"),
+		Path:      getHeader(headers, ":path"),
 		Headers:   headerMapToHTTP(headers),
 		Body:      body,
 	}

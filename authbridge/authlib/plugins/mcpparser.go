@@ -1,6 +1,7 @@
 package plugins
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"log/slog"
@@ -53,9 +54,9 @@ func (p *MCPParser) OnResponse(_ context.Context, pctx *pipeline.Context) pipeli
 		return pipeline.Action{Type: pipeline.Continue}
 	}
 
-	var rpc jsonRPCResponse
-	if err := json.Unmarshal(pctx.ResponseBody, &rpc); err != nil {
-		slog.Debug("mcp-parser: response is not valid JSON-RPC", "error", err, "bodyLen", len(pctx.ResponseBody))
+	rpc, ok := parseMCPResponse(pctx.ResponseBody)
+	if !ok {
+		slog.Debug("mcp-parser: response is not valid JSON-RPC or SSE", "bodyLen", len(pctx.ResponseBody))
 		return pipeline.Action{Type: pipeline.Continue}
 	}
 
@@ -72,6 +73,31 @@ func (p *MCPParser) OnResponse(_ context.Context, pctx *pipeline.Context) pipeli
 	}
 
 	return pipeline.Action{Type: pipeline.Continue}
+}
+
+// parseMCPResponse handles both plain JSON-RPC responses and SSE event streams
+// (used by MCP's Streamable HTTP transport). For SSE, the first data: line
+// carrying a result or error wins.
+func parseMCPResponse(body []byte) (jsonRPCResponse, bool) {
+	var rpc jsonRPCResponse
+	if json.Unmarshal(body, &rpc) == nil && (rpc.Result != nil || rpc.Error != nil) {
+		return rpc, true
+	}
+	for _, line := range bytes.Split(body, []byte("\n")) {
+		line = bytes.TrimSpace(line)
+		if !bytes.HasPrefix(line, []byte("data:")) {
+			continue
+		}
+		data := bytes.TrimSpace(bytes.TrimPrefix(line, []byte("data:")))
+		if len(data) == 0 {
+			continue
+		}
+		var r jsonRPCResponse
+		if json.Unmarshal(data, &r) == nil && (r.Result != nil || r.Error != nil) {
+			return r, true
+		}
+	}
+	return jsonRPCResponse{}, false
 }
 
 type jsonRPCResponse struct {

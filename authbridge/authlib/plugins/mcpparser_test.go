@@ -288,3 +288,40 @@ func TestMCPParser_OnResponse_InvalidJSON(t *testing.T) {
 		t.Error("Result should remain nil for invalid JSON")
 	}
 }
+
+func TestMCPParser_OnResponse_SSE(t *testing.T) {
+	// MCP's Streamable HTTP transport returns SSE (event: / data: lines)
+	// instead of plain JSON-RPC when the client sends Accept: text/event-stream.
+	p := NewMCPParser()
+	body := "event: message\r\n" +
+		"data: {\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"tools\":[{\"name\":\"get_weather\"}]}}\r\n\r\n"
+	pctx := &pipeline.Context{
+		Extensions:   pipeline.Extensions{MCP: &pipeline.MCPExtension{Method: "tools/list"}},
+		ResponseBody: []byte(body),
+	}
+
+	action := p.OnResponse(context.Background(), pctx)
+	if action.Type != pipeline.Continue {
+		t.Fatalf("expected Continue, got %v", action.Type)
+	}
+	if pctx.Extensions.MCP.Result == nil {
+		t.Fatal("Result should be populated from SSE data frame")
+	}
+	if _, ok := pctx.Extensions.MCP.Result["tools"]; !ok {
+		t.Error("Result should contain tools from SSE data")
+	}
+}
+
+func TestMCPParser_OnResponse_SSE_Error(t *testing.T) {
+	p := NewMCPParser()
+	body := "event: message\ndata: {\"jsonrpc\":\"2.0\",\"id\":1,\"error\":{\"code\":-32601,\"message\":\"not found\"}}\n\n"
+	pctx := &pipeline.Context{
+		Extensions:   pipeline.Extensions{MCP: &pipeline.MCPExtension{Method: "tools/call"}},
+		ResponseBody: []byte(body),
+	}
+
+	_ = p.OnResponse(context.Background(), pctx)
+	if pctx.Extensions.MCP.Result == nil || pctx.Extensions.MCP.Result["message"] != "not found" {
+		t.Errorf("expected error payload in Result, got %v", pctx.Extensions.MCP.Result)
+	}
+}

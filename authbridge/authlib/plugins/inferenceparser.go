@@ -183,9 +183,58 @@ type inferenceRequest struct {
 	Tools       []inferenceTool    `json:"tools"`
 }
 
+// inferenceMessage accepts both OpenAI content shapes:
+//   - "content": "plain string"
+//   - "content": [{"type":"text","text":"..."}, {"type":"image_url",...}, ...]
+//
+// The array form is used for multi-modal input and tool-result messages.
+// Non-text parts (image_url, tool_use objects, etc.) are dropped since the
+// parser only exposes text for downstream policy plugins.
 type inferenceMessage struct {
-	Role    string `json:"role"`
-	Content string `json:"content"`
+	Role    string
+	Content string
+}
+
+func (m *inferenceMessage) UnmarshalJSON(data []byte) error {
+	var raw struct {
+		Role    string          `json:"role"`
+		Content json.RawMessage `json:"content"`
+	}
+	if err := json.Unmarshal(data, &raw); err != nil {
+		return err
+	}
+	m.Role = raw.Role
+	m.Content = flattenContent(raw.Content)
+	return nil
+}
+
+// flattenContent returns the text representation of an OpenAI content value.
+// Returns "" when content is absent, null, or contains no text parts.
+func flattenContent(raw json.RawMessage) string {
+	if len(raw) == 0 || bytes.Equal(raw, []byte("null")) {
+		return ""
+	}
+	var s string
+	if err := json.Unmarshal(raw, &s); err == nil {
+		return s
+	}
+	var parts []struct {
+		Type string `json:"type"`
+		Text string `json:"text"`
+	}
+	if err := json.Unmarshal(raw, &parts); err == nil {
+		var b strings.Builder
+		for _, p := range parts {
+			if p.Type == "text" && p.Text != "" {
+				if b.Len() > 0 {
+					b.WriteByte('\n')
+				}
+				b.WriteString(p.Text)
+			}
+		}
+		return b.String()
+	}
+	return ""
 }
 
 type inferenceTool struct {

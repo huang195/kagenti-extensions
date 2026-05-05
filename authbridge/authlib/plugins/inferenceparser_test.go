@@ -346,3 +346,75 @@ func TestInferenceParser_OnResponse_InvalidJSON(t *testing.T) {
 		t.Error("Completion should remain empty on parse failure")
 	}
 }
+
+func TestInferenceParser_MultipartContent(t *testing.T) {
+	// Follow-up requests after tool calls often carry `content` as an array
+	// of parts. The parser must accept this shape without failing the whole
+	// unmarshal — previously the entire request was silently dropped because
+	// Content was typed as string.
+	p := NewInferenceParser()
+	body := `{
+		"model": "gpt-4",
+		"messages": [
+			{"role": "user", "content": "what's the weather?"},
+			{"role": "tool", "content": [{"type":"text","text":"sunny, 72F"}]},
+			{"role": "user", "content": [
+				{"type":"text","text":"hello"},
+				{"type":"image_url","image_url":{"url":"http://x"}},
+				{"type":"text","text":"there"}
+			]}
+		]
+	}`
+	pctx := &pipeline.Context{
+		Path: "/v1/chat/completions",
+		Body: []byte(body),
+	}
+
+	action := p.OnRequest(context.Background(), pctx)
+	if action.Type != pipeline.Continue {
+		t.Fatalf("expected Continue, got %v", action.Type)
+	}
+	if pctx.Extensions.Inference == nil {
+		t.Fatal("Inference extension should be populated despite array content")
+	}
+	msgs := pctx.Extensions.Inference.Messages
+	if len(msgs) != 3 {
+		t.Fatalf("expected 3 messages, got %d", len(msgs))
+	}
+	if msgs[0].Content != "what's the weather?" {
+		t.Errorf("msg[0].Content = %q, want plain string", msgs[0].Content)
+	}
+	if msgs[1].Content != "sunny, 72F" {
+		t.Errorf("msg[1].Content = %q, want flattened text part", msgs[1].Content)
+	}
+	// Non-text parts dropped, multiple text parts joined with newline.
+	if msgs[2].Content != "hello\nthere" {
+		t.Errorf("msg[2].Content = %q, want %q", msgs[2].Content, "hello\nthere")
+	}
+}
+
+func TestInferenceParser_NullContent(t *testing.T) {
+	// Assistant messages that only carry tool_calls have content: null.
+	p := NewInferenceParser()
+	body := `{
+		"model": "gpt-4",
+		"messages": [
+			{"role": "assistant", "content": null, "tool_calls": []}
+		]
+	}`
+	pctx := &pipeline.Context{
+		Path: "/v1/chat/completions",
+		Body: []byte(body),
+	}
+
+	action := p.OnRequest(context.Background(), pctx)
+	if action.Type != pipeline.Continue {
+		t.Fatalf("expected Continue, got %v", action.Type)
+	}
+	if pctx.Extensions.Inference == nil {
+		t.Fatal("Inference extension should be populated despite null content")
+	}
+	if pctx.Extensions.Inference.Messages[0].Content != "" {
+		t.Errorf("Content = %q, want empty for null", pctx.Extensions.Inference.Messages[0].Content)
+	}
+}

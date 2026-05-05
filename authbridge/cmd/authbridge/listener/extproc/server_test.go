@@ -688,6 +688,40 @@ func TestRecordInboundResponseSession_NoA2A(t *testing.T) {
 	}
 }
 
+// Regression: a fresh inbound request with empty A2A.SessionID must bootstrap
+// to DefaultSessionID, NOT inherit ActiveSession() from a prior conversation.
+// Before the fix this produced cross-conversation contamination — the new
+// conversation's request events landed in the previous conversation's
+// rekeyed bucket, and the response-phase event (which used the new
+// contextId) ended up orphaned in its own 1-event bucket.
+func TestInboundSessionID_DoesNotLeakAcrossConversations(t *testing.T) {
+	store := session.New(5*time.Minute, 100, 0)
+	defer store.Close()
+	// Simulate a prior conversation that finished: rekey "default" to
+	// "prev-ctx". ActiveSession now points at "prev-ctx".
+	store.Append(session.DefaultSessionID, pipeline.SessionEvent{A2A: &pipeline.A2AExtension{}})
+	store.Rekey(session.DefaultSessionID, "prev-ctx")
+	if id := store.ActiveSession(); id != "prev-ctx" {
+		t.Fatalf("precondition: ActiveSession = %q, want prev-ctx", id)
+	}
+
+	s := &Server{Sessions: store}
+
+	// New conversation's first inbound request — empty A2A.SessionID.
+	pctx := &pipeline.Context{
+		Extensions: pipeline.Extensions{A2A: &pipeline.A2AExtension{Method: "message/send"}},
+	}
+	s.recordInboundSession(pctx)
+
+	// Must land in DefaultSessionID, NOT prev-ctx.
+	if v := store.View(session.DefaultSessionID); v == nil || len(v.Events) != 1 {
+		t.Errorf("expected new request under DefaultSessionID, got %v", v)
+	}
+	if v := store.View("prev-ctx"); v == nil || len(v.Events) != 1 {
+		t.Errorf("prev-ctx should be unchanged (1 seed event), got %v", v)
+	}
+}
+
 func TestRecordOutboundResponseSession_MCP(t *testing.T) {
 	store := session.New(5*time.Minute, 100, 0)
 	defer store.Close()

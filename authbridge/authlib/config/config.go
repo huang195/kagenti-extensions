@@ -30,6 +30,9 @@ type Config struct {
 // Enabled is a pointer so the loader can distinguish "unset" (apply default)
 // from "explicitly false" (user opted out). Default when unset: enabled.
 type SessionConfig struct {
+	// Enabled: nil means "unset → default on". Explicit `false` opts out.
+	// Do not change to a plain bool — losing the nil sentinel would collapse
+	// "user didn't say" with "user said false" and silently flip the default.
 	Enabled     *bool  `yaml:"enabled" json:"enabled"`
 	TTL         string `yaml:"ttl" json:"ttl"`                   // duration string; default: 30m
 	MaxEvents   int    `yaml:"max_events" json:"max_events"`     // max events per session; default: 100

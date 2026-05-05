@@ -128,7 +128,8 @@ func parseInferenceSSE(body []byte, ext *pipeline.InferenceExtension) {
 			continue
 		}
 		var chunk inferenceStreamChunk
-		if json.Unmarshal(data, &chunk) != nil {
+		if err := json.Unmarshal(data, &chunk); err != nil {
+			slog.Debug("inference-parser: skipping malformed SSE data frame", "error", err, "data", truncate(string(data), 128))
 			continue
 		}
 		for _, c := range chunk.Choices {

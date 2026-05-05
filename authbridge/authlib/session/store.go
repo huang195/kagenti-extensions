@@ -171,6 +171,9 @@ func (s *Store) Rekey(oldID, newID string) {
 		return
 	}
 	if len(newID) > maxSessionIDLen {
+		// Two long IDs sharing a prefix would collide on the same truncated key,
+		// silently turning the second Rekey into a no-op. Log so that's diagnosable.
+		slog.Warn("session: newID truncated for rekey", "origLen", len(newID), "maxLen", maxSessionIDLen)
 		newID = newID[:maxSessionIDLen]
 	}
 

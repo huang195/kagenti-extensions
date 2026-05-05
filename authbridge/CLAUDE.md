@@ -290,10 +290,53 @@ kubectl apply -f k8s/auth-target-deployment-webhook.yaml     # Target service
 | 15123 | Envoy | TCP | Outbound listener (iptables redirects app traffic here) |
 | 15124 | Envoy | TCP | Inbound listener (iptables redirects incoming traffic here) |
 | 9090 | authbridge | gRPC | Ext-proc server (called by Envoy) |
+| 9093 | authbridge | HTTP | Stats + config inspection (`/stats`, `/config`) |
+| 9094 | authbridge | HTTP | Session events API (JSON snapshots + SSE stream) |
 | 9901 | Envoy | HTTP | Admin interface (bound to 127.0.0.1) |
 | 8080 | auth-proxy | HTTP | Example app (NOT part of sidecar) |
 | 8081 | demo-app | HTTP | Demo target (JWT validation) |
 | 8443 | demo-app | HTTPS | Demo target (TLS echo, no JWT) |
+
+## Session Events API (`:9094`)
+
+When `session.enabled` is true (default) and `listener.session_api_addr` is non-empty (default `:9094`), the authbridge binary exposes the captured session store over HTTP. Intended for operators debugging the plugin pipeline via `kubectl port-forward` and for the `abctl` TUI.
+
+**Trust model:** no authentication. Bind only on in-cluster addresses, never behind ingress. Payloads may contain raw user messages, LLM completions, and tool results.
+
+### Endpoints
+
+| Method & Path | Format | Purpose |
+|---|---|---|
+| `GET /v1/sessions` | `application/json` | List active sessions: `{sessions: [{id, createdAt, updatedAt, eventCount, active}]}`. |
+| `GET /v1/sessions/{id}` | `application/json` | Full snapshot of one session's events. 404 if unknown/expired. |
+| `GET /v1/events` | `text/event-stream` | SSE stream of new events. Optional `?session=<id>` filters to one session. Heartbeat every 30s. |
+| `GET /healthz` | text | Liveness probe. |
+
+### Quick examples
+
+```sh
+# Port-forward to an agent pod
+POD=$(kubectl get pod -n team1 -l app.kubernetes.io/name=weather-agent \
+  -o jsonpath='{.items[0].metadata.name}')
+kubectl port-forward -n team1 $POD 9094:9094 &
+
+# List sessions
+curl -s http://localhost:9094/v1/sessions | jq
+
+# Snapshot the most recently updated session
+SID=$(curl -s http://localhost:9094/v1/sessions | jq -r '.sessions[0].id')
+curl -s "http://localhost:9094/v1/sessions/$SID" | jq
+
+# Live tail every event
+curl -N http://localhost:9094/v1/events
+
+# Live tail a single session
+curl -N "http://localhost:9094/v1/events?session=$SID"
+```
+
+### Disabling
+
+Set `session.enabled: false` in the runtime config to turn off the store (and implicitly the API). Setting `listener.session_api_addr: ""` alone is not currently supported as a selective disable — the preset refills it; if you need store-on-API-off, raise an issue.
 
 ## Code Conventions
 

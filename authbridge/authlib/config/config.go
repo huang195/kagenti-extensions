@@ -94,6 +94,11 @@ type ListenerConfig struct {
 	ForwardProxyAddr    string `yaml:"forward_proxy_addr" json:"forward_proxy_addr"`
 	ReverseProxyAddr    string `yaml:"reverse_proxy_addr" json:"reverse_proxy_addr"`
 	ReverseProxyBackend string `yaml:"reverse_proxy_backend" json:"reverse_proxy_backend"`
+
+	// SessionAPIAddr is the bind address for the session events HTTP server
+	// (JSON snapshots + SSE stream consumed by abctl or curl). Default per
+	// mode preset is ":9094". Set to empty string to disable the endpoint.
+	SessionAPIAddr string `yaml:"session_api_addr" json:"session_api_addr"`
 }
 
 // BypassConfig holds path patterns that skip inbound JWT validation.

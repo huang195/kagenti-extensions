@@ -17,6 +17,19 @@ const (
 	Outbound
 )
 
+// String returns "inbound" / "outbound". Used for structured logs and the
+// wire format of SessionEvent.
+func (d Direction) String() string {
+	switch d {
+	case Inbound:
+		return "inbound"
+	case Outbound:
+		return "outbound"
+	default:
+		return "unknown"
+	}
+}
+
 // Context is the shared state passed through the plugin pipeline.
 // Plugins read and mutate fields directly — there is no separate mutation API.
 type Context struct {

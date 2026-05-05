@@ -158,17 +158,26 @@ func (s *Server) handleInboundBody(stream extprocv3.ExternalProcessor_ProcessSer
 	return allowBodyResponse(), pctx
 }
 
+// inboundSessionID returns the bucket ID for an inbound event. Trusts the
+// client's stated contextId (pctx.Extensions.A2A.SessionID) as authoritative
+// and bootstraps to DefaultSessionID when empty. Does NOT fall back to
+// ActiveSession() — that fallback was a cross-conversation contamination
+// vector: a new conversation's first turn (empty SessionID) would inherit
+// the previous conversation's rekeyed bucket, stranding the current turn's
+// request events in the prior bucket and creating an orphan 1-event session
+// for the response.
+func inboundSessionID(pctx *pipeline.Context) string {
+	if sid := pctx.Extensions.A2A.SessionID; sid != "" {
+		return sid
+	}
+	return session.DefaultSessionID
+}
+
 func (s *Server) recordInboundSession(pctx *pipeline.Context) {
 	if s.Sessions == nil || pctx.Extensions.A2A == nil {
 		return
 	}
-	sid := pctx.Extensions.A2A.SessionID
-	if sid == "" {
-		sid = s.Sessions.ActiveSession()
-	}
-	if sid == "" {
-		sid = session.DefaultSessionID
-	}
+	sid := inboundSessionID(pctx)
 	ev := pipeline.SessionEvent{
 		At:        time.Now(),
 		Direction: pipeline.Inbound,
@@ -187,13 +196,7 @@ func (s *Server) recordInboundResponseSession(pctx *pipeline.Context) {
 	if s.Sessions == nil || pctx.Extensions.A2A == nil {
 		return
 	}
-	sid := pctx.Extensions.A2A.SessionID
-	if sid == "" {
-		sid = s.Sessions.ActiveSession()
-	}
-	if sid == "" {
-		sid = session.DefaultSessionID
-	}
+	sid := inboundSessionID(pctx)
 	ev := pipeline.SessionEvent{
 		At:         time.Now(),
 		Direction:  pipeline.Inbound,

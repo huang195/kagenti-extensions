@@ -28,6 +28,12 @@ func ApplyPreset(cfg *Config) {
 		setDefault(&cfg.Listener.ForwardProxyAddr, ":8081")
 	}
 
+	// Session events API is default-on for every mode. Operators who want
+	// to turn it off can disable session tracking entirely via
+	// session.enabled: false — main.go skips the API server when the store
+	// itself is nil.
+	setDefault(&cfg.Listener.SessionAPIAddr, ":9094")
+
 	// All modes share the same default bypass paths
 	if len(cfg.Bypass.InboundPaths) == 0 {
 		cfg.Bypass.InboundPaths = bypass.DefaultPatterns

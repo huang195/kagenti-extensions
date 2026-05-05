@@ -5,7 +5,9 @@ package session
 
 import (
 	"log/slog"
+	"sort"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/kagenti/kagenti-extensions/authbridge/authlib/pipeline"
@@ -37,6 +39,74 @@ type Store struct {
 	activeID    string
 	stop        chan struct{}
 	closeOnce   sync.Once
+
+	// subscribers is the fan-out list for Subscribe(). Protected by mu.
+	subscribers []*subscriber
+}
+
+// subscriberChanBuf caps each subscriber's channel depth. 64 absorbs short
+// bursts without unbounded memory; slow consumers drop rather than blocking
+// Append.
+const subscriberChanBuf = 64
+
+// subscriber wires one live consumer of session events. Writes on ch are
+// non-blocking — a full channel increments drops and discards the event.
+type subscriber struct {
+	ch        chan pipeline.SessionEvent
+	drops     uint64 // atomic; reads via LoadDrops
+	closeOnce sync.Once
+}
+
+// closeCh closes ch at most once. Called by the cancel func returned from
+// Subscribe and by Store.Close during shutdown; whichever runs first wins.
+func (s *subscriber) closeCh() {
+	s.closeOnce.Do(func() { close(s.ch) })
+}
+
+// LoadDrops returns the total events dropped for this subscriber since Subscribe.
+func (s *subscriber) LoadDrops() uint64 {
+	return atomic.LoadUint64(&s.drops)
+}
+
+// Subscribe registers a listener for session events written after the call.
+// The returned channel is buffered (64). Events are sent non-blockingly; if
+// the consumer falls behind, events are dropped — the caller can observe the
+// drop count via the returned Subscription's Drops method. Always call the
+// cancel func to remove the subscriber and close the channel.
+func (s *Store) Subscribe() (*Subscription, func()) {
+	sub := &subscriber{ch: make(chan pipeline.SessionEvent, subscriberChanBuf)}
+
+	s.mu.Lock()
+	s.subscribers = append(s.subscribers, sub)
+	s.mu.Unlock()
+
+	cancel := func() {
+		s.mu.Lock()
+		for i, existing := range s.subscribers {
+			if existing == sub {
+				s.subscribers = append(s.subscribers[:i], s.subscribers[i+1:]...)
+				break
+			}
+		}
+		s.mu.Unlock()
+		sub.closeCh()
+	}
+	return &Subscription{sub: sub}, cancel
+}
+
+// Subscription is the consumer-facing handle returned by Store.Subscribe.
+type Subscription struct {
+	sub *subscriber
+}
+
+// Events returns the receive-only channel of session events.
+func (s *Subscription) Events() <-chan pipeline.SessionEvent {
+	return s.sub.ch
+}
+
+// Drops returns the cumulative event drops due to a full channel.
+func (s *Subscription) Drops() uint64 {
+	return s.sub.LoadDrops()
 }
 
 // New creates a Store with the given TTL, per-session event limit, and max
@@ -54,9 +124,21 @@ func New(ttl time.Duration, maxEvents int, maxSessions int) *Store {
 	return s
 }
 
-// Close stops the background cleanup goroutine. Safe to call multiple times.
+// Close stops the background cleanup goroutine and closes every subscriber's
+// channel so consumers unblock cleanly on shutdown. Safe to call multiple times.
 func (s *Store) Close() {
-	s.closeOnce.Do(func() { close(s.stop) })
+	s.closeOnce.Do(func() {
+		close(s.stop)
+
+		s.mu.Lock()
+		subs := s.subscribers
+		s.subscribers = nil
+		s.mu.Unlock()
+
+		for _, sub := range subs {
+			sub.closeCh()
+		}
+	})
 }
 
 func (s *Store) backgroundCleanup() {
@@ -98,11 +180,17 @@ func (s *Store) Append(sessionID string, event pipeline.SessionEvent) {
 		s.sessions[sessionID] = sess
 	}
 
+	// Stamp the bucket ID so downstream consumers can attribute the event
+	// without needing to know which session it was appended to — critical for
+	// outbound events that have no protocol-native session field.
+	event.SessionID = sessionID
+
 	sess.Events = append(sess.Events, event)
 	sess.UpdatedAt = now
 	s.activeID = sessionID
 
 	logAppended(sessionID, &event)
+	s.publishLocked(event)
 
 	if s.maxEvents > 0 && len(sess.Events) > s.maxEvents {
 		excess := len(sess.Events) - s.maxEvents
@@ -134,6 +222,43 @@ func (s *Store) View(sessionID string) *pipeline.SessionView {
 	events := make([]pipeline.SessionEvent, len(sess.Events))
 	copy(events, sess.Events)
 	return &pipeline.SessionView{ID: sessionID, Events: events}
+}
+
+// SessionSummary is a metadata-only view of a session, suitable for list
+// endpoints that shouldn't copy the full event backlog.
+type SessionSummary struct {
+	ID         string    `json:"id"`
+	CreatedAt  time.Time `json:"createdAt"`
+	UpdatedAt  time.Time `json:"updatedAt"`
+	EventCount int       `json:"eventCount"`
+	Active     bool      `json:"active"` // true if this is the most recently updated session
+}
+
+// ListSessions returns summaries for every non-expired session. Order is
+// UpdatedAt descending (most recent first). Safe for concurrent use.
+func (s *Store) ListSessions() []SessionSummary {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	now := time.Now()
+	out := make([]SessionSummary, 0, len(s.sessions))
+	for id, sess := range s.sessions {
+		if s.isExpired(sess, now) {
+			continue
+		}
+		out = append(out, SessionSummary{
+			ID:         id,
+			CreatedAt:  sess.CreatedAt,
+			UpdatedAt:  sess.UpdatedAt,
+			EventCount: len(sess.Events),
+			Active:     id == s.activeID,
+		})
+	}
+	// Most recently updated first.
+	sort.Slice(out, func(i, j int) bool {
+		return out[i].UpdatedAt.After(out[j].UpdatedAt)
+	})
+	return out
 }
 
 // ActiveSession returns the most recently updated session ID.
@@ -194,6 +319,11 @@ func (s *Store) Rekey(oldID, newID string) {
 	if s.activeID == oldID {
 		s.activeID = newID
 	}
+	// Retrofit already-recorded events with the new session ID so snapshot
+	// reads stay consistent with live-streamed events after a rekey.
+	for i := range sess.Events {
+		sess.Events[i].SessionID = newID
+	}
 }
 
 // Cleanup removes expired sessions. Safe for concurrent use.
@@ -240,6 +370,25 @@ func (s *Store) isExpired(sess *entry, now time.Time) bool {
 	return now.Sub(sess.UpdatedAt) > s.ttl
 }
 
+// publishLocked fans out event to every current subscriber. Must be called
+// with s.mu held. Sends are non-blocking — a full channel increments the
+// subscriber's drop counter and discards the event.
+//
+// Performance note: fan-out runs under s.mu, which serializes Append on the
+// subscriber list length. This is fine for the debug API's expected load
+// (O(1) live consumers: one abctl instance + maybe a curl tail). If the
+// store ever needs to support many concurrent subscribers, refactor this
+// to an unlocked broadcast (snapshot the slice under the lock, send outside).
+func (s *Store) publishLocked(event pipeline.SessionEvent) {
+	for _, sub := range s.subscribers {
+		select {
+		case sub.ch <- event:
+		default:
+			atomic.AddUint64(&sub.drops, 1)
+		}
+	}
+}
+
 // logAppended emits a structured DEBUG line so operators can observe session
 // state evolution. Fields are chosen to cover the data captured by all four
 // record helpers — extension payloads themselves are intentionally omitted
@@ -247,7 +396,7 @@ func (s *Store) isExpired(sess *entry, now time.Time) bool {
 func logAppended(sessionID string, e *pipeline.SessionEvent) {
 	attrs := []any{
 		"sessionId", sessionID,
-		"direction", directionName(e.Direction),
+		"direction", e.Direction.String(),
 		"phase", e.Phase.String(),
 	}
 	if e.Host != "" {
@@ -290,9 +439,3 @@ func logAppended(sessionID string, e *pipeline.SessionEvent) {
 	slog.Debug("session: event appended", attrs...)
 }
 
-func directionName(d pipeline.Direction) string {
-	if d == pipeline.Inbound {
-		return "inbound"
-	}
-	return "outbound"
-}

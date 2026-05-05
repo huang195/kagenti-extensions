@@ -16,67 +16,67 @@ type Extensions struct {
 // MCPExtension carries parsed MCP JSON-RPC metadata.
 // Result and Err are mutually exclusive: a response sets exactly one.
 type MCPExtension struct {
-	Method string         // JSON-RPC method (e.g. "tools/call", "resources/read", "initialize")
-	RPCID  any            // JSON-RPC id for request-response correlation
-	Params map[string]any // raw params from the JSON-RPC request
-	Result map[string]any // parsed successful result; nil on error or before OnResponse runs
-	Err    *MCPError      // non-nil when the server returned a JSON-RPC error
+	Method string         `json:"method,omitempty"`
+	RPCID  any            `json:"rpcId,omitempty"`
+	Params map[string]any `json:"params,omitempty"`
+	Result map[string]any `json:"result,omitempty"`
+	Err    *MCPError      `json:"error,omitempty"`
 }
 
 // MCPError mirrors a JSON-RPC 2.0 error object.
 type MCPError struct {
-	Code    int    // JSON-RPC error code (e.g. -32601 method not found)
-	Message string // human-readable error message
-	Data    any    // optional structured error data (implementation-defined)
+	Code    int    `json:"code"`
+	Message string `json:"message"`
+	Data    any    `json:"data,omitempty"`
 }
 
 // A2AExtension carries parsed A2A protocol metadata from inbound requests.
 type A2AExtension struct {
-	Method    string // JSON-RPC method: "message/send", "message/stream"
-	RPCID     any    // JSON-RPC id for request-response correlation
-	SessionID string // conversation session (from params.sessionId)
-	MessageID string // unique message ID (from params.message.messageId)
-	Role      string // "user" or "assistant"
-	Parts     []A2APart
+	Method    string    `json:"method,omitempty"`
+	RPCID     any       `json:"rpcId,omitempty"`
+	SessionID string    `json:"sessionId,omitempty"`
+	MessageID string    `json:"messageId,omitempty"`
+	Role      string    `json:"role,omitempty"`
+	Parts     []A2APart `json:"parts,omitempty"`
 }
 
 // A2APart represents a message part in an A2A request.
 type A2APart struct {
-	Kind    string // "text", "file", "data"
-	Content string // text content, file URI, or serialized data
+	Kind    string `json:"kind"`
+	Content string `json:"content,omitempty"`
 }
 
 // InferenceExtension carries parsed LLM inference request and response metadata.
 // Request fields are populated by OnRequest; response fields by OnResponse.
 type InferenceExtension struct {
-	Model       string             // model name (e.g., "llama3.1", "gpt-4")
-	Messages    []InferenceMessage // conversation messages
-	Temperature *float64           // sampling temperature (nil if not set)
-	MaxTokens   *int               // max tokens to generate (nil if not set)
-	Stream      bool               // whether streaming is requested
-	Tools       []string           // tool/function names declared
+	Model       string             `json:"model,omitempty"`
+	Messages    []InferenceMessage `json:"messages,omitempty"`
+	Temperature *float64           `json:"temperature,omitempty"`
+	MaxTokens   *int               `json:"maxTokens,omitempty"`
+	Stream      bool               `json:"stream,omitempty"`
+	Tools       []string           `json:"tools,omitempty"`
 
 	// Response fields (populated after OnResponse runs).
-	Completion       string // assistant's response text (concatenated across SSE deltas)
-	FinishReason     string // "stop", "length", "tool_calls", "content_filter", etc.
-	PromptTokens     int    // tokens consumed by the prompt
-	CompletionTokens int    // tokens generated in the response
-	TotalTokens      int    // PromptTokens + CompletionTokens (as reported by the server)
+	Completion       string `json:"completion,omitempty"`
+	FinishReason     string `json:"finishReason,omitempty"`
+	PromptTokens     int    `json:"promptTokens,omitempty"`
+	CompletionTokens int    `json:"completionTokens,omitempty"`
+	TotalTokens      int    `json:"totalTokens,omitempty"`
 }
 
 // InferenceMessage represents a single message in the conversation.
 type InferenceMessage struct {
-	Role    string // "system", "user", "assistant", "tool"
-	Content string
+	Role    string `json:"role"`
+	Content string `json:"content,omitempty"`
 }
 
 // SecurityExtension carries guardrail output.
 // Caller identity is already in ctx.Agent and ctx.Claims — this slot is only
 // for downstream signals from content-inspection plugins.
 type SecurityExtension struct {
-	Labels      []string
-	Blocked     bool
-	BlockReason string
+	Labels      []string `json:"labels,omitempty"`
+	Blocked     bool     `json:"blocked,omitempty"`
+	BlockReason string   `json:"blockReason,omitempty"`
 }
 
 // DelegationExtension tracks the token delegation chain across hops.

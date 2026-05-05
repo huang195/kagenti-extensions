@@ -65,6 +65,9 @@ func (p *InferenceParser) OnRequest(_ context.Context, pctx *pipeline.Context) p
 
 	slog.Info("inference-parser", "model", ext.Model)
 	slog.Debug("inference-parser: extracted", "model", ext.Model, "messages", len(ext.Messages), "stream", ext.Stream, "tools", len(ext.Tools))
+	for i, m := range ext.Messages {
+		slog.Debug("inference-parser: message", "index", i, "role", m.Role, "content", truncate(m.Content, debugBodyMax))
+	}
 
 	return pipeline.Action{Type: pipeline.Continue}
 }
@@ -90,6 +93,7 @@ func (p *InferenceParser) OnResponse(_ context.Context, pctx *pipeline.Context) 
 		"promptTokens", ext.PromptTokens,
 		"completionTokens", ext.CompletionTokens,
 	)
+	slog.Debug("inference-parser: completion", "text", truncate(ext.Completion, debugBodyMax))
 	return pipeline.Action{Type: pipeline.Continue}
 }
 

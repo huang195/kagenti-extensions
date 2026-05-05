@@ -71,6 +71,9 @@ func (p *A2AParser) OnRequest(_ context.Context, pctx *pipeline.Context) pipelin
 		"messageId", ext.MessageID,
 		"parts", len(ext.Parts),
 	)
+	for i, part := range ext.Parts {
+		slog.Debug("a2a-parser: part", "index", i, "kind", part.Kind, "content", truncate(part.Content, debugBodyMax))
+	}
 	return pipeline.Action{Type: pipeline.Continue}
 }
 
@@ -93,6 +96,7 @@ func (p *A2AParser) OnResponse(_ context.Context, pctx *pipeline.Context) pipeli
 
 	pctx.Extensions.A2A.SessionID = sid
 	slog.Debug("a2a-parser: response sessionId", "sessionId", sid)
+	slog.Debug("a2a-parser: response body", "body", truncate(string(pctx.ResponseBody), debugBodyMax))
 	return pipeline.Action{Type: pipeline.Continue}
 }
 

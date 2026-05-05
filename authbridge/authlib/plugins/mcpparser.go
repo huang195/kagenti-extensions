@@ -44,7 +44,7 @@ func (p *MCPParser) OnRequest(_ context.Context, pctx *pipeline.Context) pipelin
 	}
 
 	slog.Info("mcp-parser: request", "method", rpc.Method)
-	slog.Debug("mcp-parser: payload", "method", rpc.Method, "body", truncate(string(pctx.Body), 128))
+	slog.Debug("mcp-parser: payload", "method", rpc.Method, "body", truncate(string(pctx.Body), debugBodyMax))
 
 	return pipeline.Action{Type: pipeline.Continue}
 }
@@ -69,7 +69,7 @@ func (p *MCPParser) OnResponse(_ context.Context, pctx *pipeline.Context) pipeli
 	if rpc.Result != nil {
 		pctx.Extensions.MCP.Result = rpc.Result
 		slog.Info("mcp-parser: response", "method", pctx.Extensions.MCP.Method, "resultKeys", resultKeys(rpc.Result))
-		slog.Debug("mcp-parser: response detail", "method", pctx.Extensions.MCP.Method, "body", truncate(string(pctx.ResponseBody), 256))
+		slog.Debug("mcp-parser: response detail", "method", pctx.Extensions.MCP.Method, "body", truncate(string(pctx.ResponseBody), debugBodyMax))
 	}
 
 	return pipeline.Action{Type: pipeline.Continue}
@@ -131,6 +131,13 @@ func (r *jsonRPCRequest) mapParam(key string) map[string]any {
 	return v
 }
 
+// debugBodyMax caps how many characters of a body/content string a parser
+// writes into debug logs. Large enough to capture a short user message or
+// a tool_call response verbatim, small enough to keep log lines tractable.
+const debugBodyMax = 512
+
+// truncate clips s to max characters, appending "..." when truncated.
+// Shared across parsers for consistent debug-log body formatting.
 func truncate(s string, max int) string {
 	if len(s) <= max {
 		return s

@@ -2,6 +2,7 @@ package pipeline
 
 import (
 	"net/http"
+	"time"
 
 	"github.com/kagenti/kagenti-extensions/authbridge/authlib/routing"
 	"github.com/kagenti/kagenti-extensions/authbridge/authlib/validation"
@@ -25,6 +26,11 @@ type Context struct {
 	Path      string
 	Headers   http.Header
 	Body      []byte // nil unless at least one plugin declares BodyAccess: true
+
+	// StartedAt is the wall-clock time this context was constructed by the
+	// listener at the start of a request. Used on the response path to
+	// compute SessionEvent.Duration without walking the event history.
+	StartedAt time.Time
 
 	Agent   *AgentIdentity
 	Claims  *validation.Claims    // nil before jwt-validation runs

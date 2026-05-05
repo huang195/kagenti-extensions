@@ -917,3 +917,68 @@ func TestRecordOutboundResponseSession_CapturesStatusAndError(t *testing.T) {
 		t.Errorf("Identity not snapshotted: %+v", resp.Identity)
 	}
 }
+
+func TestRouteAudience(t *testing.T) {
+	cases := []struct {
+		name string
+		pctx *pipeline.Context
+		want string
+	}{
+		{"nil route", &pipeline.Context{}, ""},
+		{"unmatched route falls through to passthrough",
+			&pipeline.Context{Route: &routing.ResolvedRoute{Matched: false, Audience: "ignored"}}, ""},
+		{"matched route surfaces audience",
+			&pipeline.Context{Route: &routing.ResolvedRoute{Matched: true, Audience: "github-tool"}}, "github-tool"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := routeAudience(tc.pctx); got != tc.want {
+				t.Errorf("got %q, want %q", got, tc.want)
+			}
+		})
+	}
+}
+
+func TestDurationSince(t *testing.T) {
+	if d := durationSince(time.Time{}); d != 0 {
+		t.Errorf("zero StartedAt should yield 0, got %v", d)
+	}
+	start := time.Now().Add(-50 * time.Millisecond)
+	if d := durationSince(start); d < 50*time.Millisecond {
+		t.Errorf("elapsed = %v, want >= 50ms", d)
+	}
+}
+
+func TestRecordOutboundResponseSession_CapturesHostAndRoute(t *testing.T) {
+	store := session.New(5*time.Minute, 100, 0)
+	defer store.Close()
+	store.Append(session.DefaultSessionID, pipeline.SessionEvent{})
+	s := &Server{Sessions: store}
+
+	start := time.Now().Add(-25 * time.Millisecond)
+	pctx := &pipeline.Context{
+		StartedAt:  start,
+		Host:       "github-tool-mcp",
+		StatusCode: 200,
+		Route: &routing.ResolvedRoute{
+			Matched:  true,
+			Audience: "github-tool",
+		},
+		Extensions: pipeline.Extensions{
+			MCP: &pipeline.MCPExtension{Method: "tools/call"},
+		},
+	}
+	s.recordOutboundResponseSession(pctx)
+
+	v := store.View(session.DefaultSessionID)
+	resp := v.Events[len(v.Events)-1]
+	if resp.Host != "github-tool-mcp" {
+		t.Errorf("Host = %q, want github-tool-mcp", resp.Host)
+	}
+	if resp.TargetAudience != "github-tool" {
+		t.Errorf("TargetAudience = %q, want github-tool", resp.TargetAudience)
+	}
+	if resp.Duration < 25*time.Millisecond {
+		t.Errorf("Duration = %v, want >= 25ms", resp.Duration)
+	}
+}

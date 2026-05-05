@@ -125,6 +125,7 @@ func (s *Server) handleInbound(stream extprocv3.ExternalProcessor_ProcessServer,
 		Path:      getHeader(headers, ":path"),
 		Headers:   headerMapToHTTP(headers),
 		Body:      body,
+		StartedAt: time.Now(),
 	}
 
 	action := s.InboundPipeline.Run(ctx, pctx)
@@ -144,6 +145,7 @@ func (s *Server) handleInboundBody(stream extprocv3.ExternalProcessor_ProcessSer
 		Path:      getHeader(headers, ":path"),
 		Headers:   headerMapToHTTP(headers),
 		Body:      body,
+		StartedAt: time.Now(),
 	}
 
 	action := s.InboundPipeline.Run(ctx, pctx)
@@ -173,6 +175,7 @@ func (s *Server) recordInboundSession(pctx *pipeline.Context) {
 		Phase:     pipeline.SessionRequest,
 		A2A:       pctx.Extensions.A2A,
 		Identity:  snapshotIdentity(pctx),
+		Host:      pctx.Host,
 	}
 	s.Sessions.Append(sid, ev)
 }
@@ -199,6 +202,8 @@ func (s *Server) recordInboundResponseSession(pctx *pipeline.Context) {
 		Identity:   snapshotIdentity(pctx),
 		StatusCode: pctx.StatusCode,
 		Error:      deriveError(pctx),
+		Host:       pctx.Host,
+		Duration:   durationSince(pctx.StartedAt),
 	}
 	s.Sessions.Append(sid, ev)
 }
@@ -215,14 +220,17 @@ func (s *Server) recordOutboundResponseSession(pctx *pipeline.Context) {
 		sid = session.DefaultSessionID
 	}
 	ev := pipeline.SessionEvent{
-		At:         time.Now(),
-		Direction:  pipeline.Outbound,
-		Phase:      pipeline.SessionResponse,
-		MCP:        pctx.Extensions.MCP,
-		Inference:  pctx.Extensions.Inference,
-		Identity:   snapshotIdentity(pctx),
-		StatusCode: pctx.StatusCode,
-		Error:      deriveError(pctx),
+		At:             time.Now(),
+		Direction:      pipeline.Outbound,
+		Phase:          pipeline.SessionResponse,
+		MCP:            pctx.Extensions.MCP,
+		Inference:      pctx.Extensions.Inference,
+		Identity:       snapshotIdentity(pctx),
+		StatusCode:     pctx.StatusCode,
+		Error:          deriveError(pctx),
+		Host:           pctx.Host,
+		TargetAudience: routeAudience(pctx),
+		Duration:       durationSince(pctx.StartedAt),
 	}
 	if ev.MCP != nil || ev.Inference != nil {
 		s.Sessions.Append(sid, ev)
@@ -248,6 +256,24 @@ func snapshotIdentity(pctx *pipeline.Context) *pipeline.EventIdentity {
 		id.AgentID = pctx.Agent.WorkloadID
 	}
 	return id
+}
+
+// routeAudience returns the resolved OAuth audience for an outbound request,
+// or "" when no route matched (passthrough) or the event is inbound.
+func routeAudience(pctx *pipeline.Context) string {
+	if pctx.Route == nil || !pctx.Route.Matched {
+		return ""
+	}
+	return pctx.Route.Audience
+}
+
+// durationSince returns the elapsed time since StartedAt, or 0 when StartedAt
+// is zero (pctx constructed without wall-clock stamping, e.g. in unit tests).
+func durationSince(start time.Time) time.Duration {
+	if start.IsZero() {
+		return 0
+	}
+	return time.Since(start)
 }
 
 // deriveError constructs an EventError from response-side signals. Returns nil
@@ -292,12 +318,14 @@ func (s *Server) recordOutboundSession(pctx *pipeline.Context) {
 		sid = session.DefaultSessionID
 	}
 	ev := pipeline.SessionEvent{
-		At:        time.Now(),
-		Direction: pipeline.Outbound,
-		Phase:     pipeline.SessionRequest,
-		MCP:       pctx.Extensions.MCP,
-		Inference: pctx.Extensions.Inference,
-		Identity:  snapshotIdentity(pctx),
+		At:             time.Now(),
+		Direction:      pipeline.Outbound,
+		Phase:          pipeline.SessionRequest,
+		MCP:            pctx.Extensions.MCP,
+		Inference:      pctx.Extensions.Inference,
+		Identity:       snapshotIdentity(pctx),
+		Host:           pctx.Host,
+		TargetAudience: routeAudience(pctx),
 	}
 	if ev.MCP != nil || ev.Inference != nil {
 		s.Sessions.Append(sid, ev)
@@ -312,6 +340,7 @@ func (s *Server) handleOutbound(stream extprocv3.ExternalProcessor_ProcessServer
 		Path:      getHeader(headers, ":path"),
 		Headers:   headerMapToHTTP(headers),
 		Body:      body,
+		StartedAt: time.Now(),
 	}
 	if pctx.Host == "" {
 		pctx.Host = getHeader(headers, "host")
@@ -347,6 +376,7 @@ func (s *Server) handleOutboundBody(stream extprocv3.ExternalProcessor_ProcessSe
 		Path:      getHeader(headers, ":path"),
 		Headers:   headerMapToHTTP(headers),
 		Body:      body,
+		StartedAt: time.Now(),
 	}
 	if pctx.Host == "" {
 		pctx.Host = getHeader(headers, "host")

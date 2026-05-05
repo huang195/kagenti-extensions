@@ -46,6 +46,24 @@ type SessionEvent struct {
 	// successful requests and 2xx responses. Populated for non-2xx responses,
 	// guardrail blocks, and parse failures.
 	Error *EventError
+
+	// Host is the HTTP :authority (or Host header) of the event. For inbound
+	// events it's the agent's own address; for outbound events it's the
+	// target service, which is the useful case — a session with many
+	// outbound calls can be attributed to the tool / LLM / target each
+	// landed on. Empty when the listener didn't populate pctx.Host.
+	Host string
+
+	// TargetAudience is the OAuth audience the outbound request was routed
+	// to, or empty when no route matched (passthrough) or the event is
+	// inbound. Useful for policy plugins that care which target scope a
+	// call was made against, independent of host (which can be a glob).
+	TargetAudience string
+
+	// Duration is the wall-clock time from request entry into the listener
+	// to response recording. Zero on request-phase events. On response
+	// events it's computed as now - matching-request.At.
+	Duration time.Duration
 }
 
 // EventIdentity carries the "who" for a session event.

@@ -28,6 +28,7 @@ import (
 	"github.com/kagenti/kagenti-extensions/authbridge/authlib/observe"
 	"github.com/kagenti/kagenti-extensions/authbridge/authlib/pipeline"
 	"github.com/kagenti/kagenti-extensions/authbridge/authlib/plugins"
+	"github.com/kagenti/kagenti-extensions/authbridge/authlib/session"
 	"github.com/kagenti/kagenti-extensions/authbridge/cmd/authbridge/listener/extauthz"
 	"github.com/kagenti/kagenti-extensions/authbridge/cmd/authbridge/listener/extproc"
 	"github.com/kagenti/kagenti-extensions/authbridge/cmd/authbridge/listener/forwardproxy"
@@ -121,6 +122,29 @@ func main() {
 		}
 	}
 
+	// Build session store if enabled (nil when disabled — zero overhead)
+	var sessions *session.Store
+	if cfg.Session.Enabled {
+		ttl := 5 * time.Minute
+		if cfg.Session.TTL != "" {
+			if d, err := time.ParseDuration(cfg.Session.TTL); err == nil {
+				ttl = d
+			} else {
+				slog.Warn("invalid session.ttl, using default", "value", cfg.Session.TTL, "error", err)
+			}
+		}
+		maxEvents := 100
+		if cfg.Session.MaxEvents > 0 {
+			maxEvents = cfg.Session.MaxEvents
+		}
+		maxSessions := 1000
+		if cfg.Session.MaxSessions > 0 {
+			maxSessions = cfg.Session.MaxSessions
+		}
+		sessions = session.New(ttl, maxEvents, maxSessions)
+		slog.Info("session tracking enabled", "ttl", ttl, "maxEvents", maxEvents, "maxSessions", maxSessions)
+	}
+
 	// Track servers for graceful shutdown
 	var grpcServers []*grpc.Server
 	var httpServers []*http.Server
@@ -128,19 +152,19 @@ func main() {
 	// Start listeners FIRST — before credential resolution
 	switch cfg.Mode {
 	case config.ModeEnvoySidecar:
-		grpcServers = append(grpcServers, startGRPCExtProc(inboundPipeline, outboundPipeline, cfg.Listener.ExtProcAddr))
+		grpcServers = append(grpcServers, startGRPCExtProc(inboundPipeline, outboundPipeline, sessions, cfg.Listener.ExtProcAddr))
 
 	case config.ModeWaypoint:
 		grpcServers = append(grpcServers, startGRPCExtAuthz(inboundPipeline, outboundPipeline, cfg.Listener.ExtAuthzAddr))
-		httpServers = append(httpServers, startHTTPServer("forward-proxy", forwardproxy.NewServer(outboundPipeline).Handler(), cfg.Listener.ForwardProxyAddr))
+		httpServers = append(httpServers, startHTTPServer("forward-proxy", forwardproxy.NewServer(outboundPipeline, sessions).Handler(), cfg.Listener.ForwardProxyAddr))
 
 	case config.ModeProxySidecar:
-		rpSrv, err := reverseproxy.NewServer(inboundPipeline, cfg.Listener.ReverseProxyBackend)
+		rpSrv, err := reverseproxy.NewServer(inboundPipeline, sessions, cfg.Listener.ReverseProxyBackend)
 		if err != nil {
 			log.Fatalf("creating reverse proxy: %v", err)
 		}
 		httpServers = append(httpServers, startHTTPServer("reverse-proxy", rpSrv.Handler(), cfg.Listener.ReverseProxyAddr))
-		httpServers = append(httpServers, startHTTPServer("forward-proxy", forwardproxy.NewServer(outboundPipeline).Handler(), cfg.Listener.ForwardProxyAddr))
+		httpServers = append(httpServers, startHTTPServer("forward-proxy", forwardproxy.NewServer(outboundPipeline, sessions).Handler(), cfg.Listener.ForwardProxyAddr))
 
 	default:
 		log.Fatalf("unhandled mode %q", cfg.Mode)
@@ -192,6 +216,9 @@ func main() {
 		srv.Shutdown(shutdownCtx)
 	}
 	statSrv.Shutdown(shutdownCtx)
+	if sessions != nil {
+		sessions.Close()
+	}
 }
 
 func buildInboundPipeline(cfg *config.Config, handler *auth.Auth) (*pipeline.Pipeline, error) {
@@ -211,11 +238,12 @@ func buildOutboundPipeline(cfg *config.Config, handler *auth.Auth) (*pipeline.Pi
 	return plugins.DefaultOutboundPipeline(handler)
 }
 
-func startGRPCExtProc(inbound, outbound *pipeline.Pipeline, addr string) *grpc.Server {
+func startGRPCExtProc(inbound, outbound *pipeline.Pipeline, sessions *session.Store, addr string) *grpc.Server {
 	srv := grpc.NewServer()
 	extprocv3.RegisterExternalProcessorServer(srv, &extproc.Server{
 		InboundPipeline:  inbound,
 		OutboundPipeline: outbound,
+		Sessions:         sessions,
 	})
 	registerHealth(srv)
 	reflection.Register(srv)

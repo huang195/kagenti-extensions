@@ -5,36 +5,55 @@ package reverseproxy
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
 	"net/http/httputil"
 	"net/url"
+	"time"
 
 	"github.com/kagenti/kagenti-extensions/authbridge/authlib/pipeline"
+	"github.com/kagenti/kagenti-extensions/authbridge/authlib/session"
 )
 
 const maxBodySize = 1 << 20 // 1MB — matches Envoy's default per_stream_buffer_limit_bytes
 
+type pctxKey struct{}
+
+type responseRejectedError struct {
+	status int
+	reason string
+}
+
+func (e *responseRejectedError) Error() string { return e.reason }
+
 // Server is an HTTP reverse proxy with inbound JWT validation.
 type Server struct {
 	InboundPipeline *pipeline.Pipeline
+	Sessions        *session.Store // nil when session tracking is disabled
 	proxy           *httputil.ReverseProxy
 	backend         string
 }
 
 // NewServer creates a reverse proxy that forwards to the given backend URL.
-func NewServer(inbound *pipeline.Pipeline, backendURL string) (*Server, error) {
+func NewServer(inbound *pipeline.Pipeline, sessions *session.Store, backendURL string) (*Server, error) {
 	target, err := url.Parse(backendURL)
 	if err != nil {
 		return nil, err
 	}
-	return &Server{
+	proxy := httputil.NewSingleHostReverseProxy(target)
+	s := &Server{
 		InboundPipeline: inbound,
-		proxy:           httputil.NewSingleHostReverseProxy(target),
+		Sessions:        sessions,
+		proxy:           proxy,
 		backend:         backendURL,
-	}, nil
+	}
+	proxy.ModifyResponse = s.modifyResponse
+	proxy.ErrorHandler = s.errorHandler
+	return s, nil
 }
 
 // Handler returns the HTTP handler for the reverse proxy.
@@ -72,5 +91,68 @@ func (s *Server) handleRequest(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	if s.Sessions != nil && pctx.Extensions.A2A != nil {
+		sid := pctx.Extensions.A2A.SessionID
+		if sid == "" {
+			sid = s.Sessions.ActiveSession()
+		}
+		if sid == "" {
+			sid = session.DefaultSessionID
+		}
+		s.Sessions.Append(sid, pipeline.SessionEvent{
+			At:        time.Now(),
+			Direction: pipeline.Inbound,
+			Phase:     pipeline.SessionRequest,
+			A2A:       pctx.Extensions.A2A,
+		})
+	}
+
+	r = r.WithContext(context.WithValue(r.Context(), pctxKey{}, pctx))
 	s.proxy.ServeHTTP(w, r)
+}
+
+func (s *Server) modifyResponse(resp *http.Response) error {
+	pctx, _ := resp.Request.Context().Value(pctxKey{}).(*pipeline.Context)
+	if pctx == nil {
+		return nil
+	}
+
+	pctx.StatusCode = resp.StatusCode
+	pctx.ResponseHeaders = resp.Header.Clone()
+
+	if s.InboundPipeline.NeedsBody() && resp.Body != nil {
+		body, err := io.ReadAll(io.LimitReader(resp.Body, maxBodySize+1))
+		if err != nil {
+			return err
+		}
+		resp.Body.Close()
+		if len(body) > maxBodySize {
+			return fmt.Errorf("response body too large (%d bytes)", len(body))
+		}
+		pctx.ResponseBody = body
+		resp.Body = io.NopCloser(bytes.NewReader(body))
+	}
+
+	action := s.InboundPipeline.RunResponse(resp.Request.Context(), pctx)
+	if action.Type == pipeline.Reject {
+		return &responseRejectedError{status: action.Status, reason: action.Reason}
+	}
+
+	// If a plugin mutated ResponseBody, use the mutated version.
+	if s.InboundPipeline.NeedsBody() && pctx.ResponseBody != nil {
+		resp.Body = io.NopCloser(bytes.NewReader(pctx.ResponseBody))
+		resp.ContentLength = int64(len(pctx.ResponseBody))
+		resp.Header.Set("Content-Length", fmt.Sprintf("%d", len(pctx.ResponseBody)))
+	}
+	return nil
+}
+
+func (s *Server) errorHandler(w http.ResponseWriter, _ *http.Request, err error) {
+	if rErr, ok := err.(*responseRejectedError); ok {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(rErr.status)
+		json.NewEncoder(w).Encode(map[string]string{"error": rErr.reason})
+		return
+	}
+	http.Error(w, `{"error":"bad gateway"}`, http.StatusBadGateway)
 }

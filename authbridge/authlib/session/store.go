@@ -263,8 +263,14 @@ func logAppended(sessionID string, e *pipeline.SessionEvent) {
 		if e.Identity.Subject != "" {
 			attrs = append(attrs, "subject", e.Identity.Subject)
 		}
+		if e.Identity.ClientID != "" {
+			attrs = append(attrs, "clientID", e.Identity.ClientID)
+		}
 		if e.Identity.AgentID != "" {
 			attrs = append(attrs, "agent", e.Identity.AgentID)
+		}
+		if n := len(e.Identity.Scopes); n > 0 {
+			attrs = append(attrs, "scopes", n)
 		}
 	}
 	switch {

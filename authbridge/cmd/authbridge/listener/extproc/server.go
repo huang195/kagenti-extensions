@@ -4,10 +4,13 @@
 package extproc
 
 import (
+	"context"
 	"encoding/json"
 	"log/slog"
 	"net/http"
+	"strconv"
 	"strings"
+	"time"
 
 	corev3 "github.com/envoyproxy/go-control-plane/envoy/config/core/v3"
 	extprocfilterv3 "github.com/envoyproxy/go-control-plane/envoy/extensions/filters/http/ext_proc/v3"
@@ -17,6 +20,7 @@ import (
 	"google.golang.org/grpc/status"
 
 	"github.com/kagenti/kagenti-extensions/authbridge/authlib/pipeline"
+	"github.com/kagenti/kagenti-extensions/authbridge/authlib/session"
 )
 
 const maxBodySize = 1 << 20 // 1MB — matches Envoy's default per_stream_buffer_limit_bytes
@@ -26,6 +30,7 @@ type Server struct {
 	extprocv3.UnimplementedExternalProcessorServer
 	InboundPipeline  *pipeline.Pipeline
 	OutboundPipeline *pipeline.Pipeline
+	Sessions         *session.Store // nil when session tracking is disabled
 }
 
 // Process handles the bidirectional ext_proc stream.
@@ -38,6 +43,11 @@ func (s *Server) Process(stream extprocv3.ExternalProcessor_ProcessServer) error
 	// is a single request — no interleaving or stale state is possible.
 	var pendingHeaders *corev3.HeaderMap
 	var pendingDirection string
+
+	// pctx and requestDirection survive from the request phase to the response
+	// phase so that RunResponse can see the full request+response context.
+	var pctx *pipeline.Context
+	var requestDirection string
 
 	for {
 		select {
@@ -69,9 +79,11 @@ func (s *Server) Process(stream extprocv3.ExternalProcessor_ProcessServer) error
 				pendingDirection = direction
 				resp = requestBodyResponse()
 			} else if direction == "inbound" {
-				resp = s.handleInbound(stream, headers, nil)
+				resp, pctx = s.handleInbound(stream, headers, nil)
+				requestDirection = direction
 			} else {
-				resp = s.handleOutbound(stream, headers, nil)
+				resp, pctx = s.handleOutbound(stream, headers, nil)
+				requestDirection = direction
 			}
 
 		case *extprocv3.ProcessingRequest_RequestBody:
@@ -81,19 +93,20 @@ func (s *Server) Process(stream extprocv3.ExternalProcessor_ProcessServer) error
 				slog.Warn("ext_proc: request body too large", "direction", pendingDirection, "bodyLen", len(body))
 				resp = immediateResponse(http.StatusRequestEntityTooLarge, "request body too large")
 			} else if pendingDirection == "inbound" {
-				resp = s.handleInboundBody(stream, pendingHeaders, body)
+				resp, pctx = s.handleInboundBody(stream, pendingHeaders, body)
+				requestDirection = pendingDirection
 			} else {
-				resp = s.handleOutboundBody(stream, pendingHeaders, body)
+				resp, pctx = s.handleOutboundBody(stream, pendingHeaders, body)
+				requestDirection = pendingDirection
 			}
 			pendingHeaders = nil
 			pendingDirection = ""
 
 		case *extprocv3.ProcessingRequest_ResponseHeaders:
-			resp = &extprocv3.ProcessingResponse{
-				Response: &extprocv3.ProcessingResponse_ResponseHeaders{
-					ResponseHeaders: &extprocv3.HeadersResponse{},
-				},
-			}
+			resp = s.handleResponseHeaders(ctx, r.ResponseHeaders.Headers, pctx, requestDirection)
+
+		case *extprocv3.ProcessingRequest_ResponseBody:
+			resp = s.handleResponseBody(ctx, r.ResponseBody.Body, pctx, requestDirection)
 
 		default:
 			resp = &extprocv3.ProcessingResponse{}
@@ -105,7 +118,7 @@ func (s *Server) Process(stream extprocv3.ExternalProcessor_ProcessServer) error
 	}
 }
 
-func (s *Server) handleInbound(stream extprocv3.ExternalProcessor_ProcessServer, headers *corev3.HeaderMap, body []byte) *extprocv3.ProcessingResponse {
+func (s *Server) handleInbound(stream extprocv3.ExternalProcessor_ProcessServer, headers *corev3.HeaderMap, body []byte) (*extprocv3.ProcessingResponse, *pipeline.Context) {
 	ctx := stream.Context()
 	pctx := &pipeline.Context{
 		Direction: pipeline.Inbound,
@@ -117,13 +130,14 @@ func (s *Server) handleInbound(stream extprocv3.ExternalProcessor_ProcessServer,
 	action := s.InboundPipeline.Run(ctx, pctx)
 	if action.Type == pipeline.Reject {
 		return denyResponse(typev3.StatusCode(action.Status),
-			jsonError("unauthorized", action.Reason))
+			jsonError("unauthorized", action.Reason)), nil
 	}
 
-	return allowResponse()
+	s.recordInboundSession(pctx)
+	return allowResponse(), pctx
 }
 
-func (s *Server) handleInboundBody(stream extprocv3.ExternalProcessor_ProcessServer, headers *corev3.HeaderMap, body []byte) *extprocv3.ProcessingResponse {
+func (s *Server) handleInboundBody(stream extprocv3.ExternalProcessor_ProcessServer, headers *corev3.HeaderMap, body []byte) (*extprocv3.ProcessingResponse, *pipeline.Context) {
 	ctx := stream.Context()
 	pctx := &pipeline.Context{
 		Direction: pipeline.Inbound,
@@ -135,13 +149,53 @@ func (s *Server) handleInboundBody(stream extprocv3.ExternalProcessor_ProcessSer
 	action := s.InboundPipeline.Run(ctx, pctx)
 	if action.Type == pipeline.Reject {
 		return denyResponse(typev3.StatusCode(action.Status),
-			jsonError("unauthorized", action.Reason))
+			jsonError("unauthorized", action.Reason)), nil
 	}
 
-	return allowBodyResponse()
+	s.recordInboundSession(pctx)
+	return allowBodyResponse(), pctx
 }
 
-func (s *Server) handleOutbound(stream extprocv3.ExternalProcessor_ProcessServer, headers *corev3.HeaderMap, body []byte) *extprocv3.ProcessingResponse {
+func (s *Server) recordInboundSession(pctx *pipeline.Context) {
+	if s.Sessions == nil || pctx.Extensions.A2A == nil {
+		return
+	}
+	sid := pctx.Extensions.A2A.SessionID
+	if sid == "" {
+		sid = s.Sessions.ActiveSession()
+	}
+	if sid == "" {
+		sid = session.DefaultSessionID
+	}
+	s.Sessions.Append(sid, pipeline.SessionEvent{
+		At:        time.Now(),
+		Direction: pipeline.Inbound,
+		Phase:     pipeline.SessionRequest,
+		A2A:       pctx.Extensions.A2A,
+	})
+}
+
+func (s *Server) recordOutboundSession(pctx *pipeline.Context) {
+	if s.Sessions == nil {
+		return
+	}
+	sid := s.Sessions.ActiveSession()
+	if sid == "" {
+		sid = session.DefaultSessionID
+	}
+	ev := pipeline.SessionEvent{
+		At:        time.Now(),
+		Direction: pipeline.Outbound,
+		Phase:     pipeline.SessionRequest,
+		MCP:       pctx.Extensions.MCP,
+		Inference: pctx.Extensions.Inference,
+	}
+	if ev.MCP != nil || ev.Inference != nil {
+		s.Sessions.Append(sid, ev)
+	}
+}
+
+func (s *Server) handleOutbound(stream extprocv3.ExternalProcessor_ProcessServer, headers *corev3.HeaderMap, body []byte) (*extprocv3.ProcessingResponse, *pipeline.Context) {
 	ctx := stream.Context()
 	pctx := &pipeline.Context{
 		Direction: pipeline.Outbound,
@@ -153,21 +207,29 @@ func (s *Server) handleOutbound(stream extprocv3.ExternalProcessor_ProcessServer
 		pctx.Host = getHeader(headers, "host")
 	}
 
+	if s.Sessions != nil {
+		if aid := s.Sessions.ActiveSession(); aid != "" {
+			pctx.Session = s.Sessions.View(aid)
+		}
+	}
+
 	originalAuth := pctx.Headers.Get("Authorization")
 	action := s.OutboundPipeline.Run(ctx, pctx)
 	if action.Type == pipeline.Reject {
 		return denyResponse(typev3.StatusCode_ServiceUnavailable,
-			jsonError("token_acquisition_failed", action.Reason))
+			jsonError("token_acquisition_failed", action.Reason)), nil
 	}
+
+	s.recordOutboundSession(pctx)
 
 	newAuth := pctx.Headers.Get("Authorization")
 	if newAuth != originalAuth {
-		return replaceTokenResponse(extractBearer(newAuth))
+		return replaceTokenResponse(extractBearer(newAuth)), pctx
 	}
-	return passResponse()
+	return passResponse(), pctx
 }
 
-func (s *Server) handleOutboundBody(stream extprocv3.ExternalProcessor_ProcessServer, headers *corev3.HeaderMap, body []byte) *extprocv3.ProcessingResponse {
+func (s *Server) handleOutboundBody(stream extprocv3.ExternalProcessor_ProcessServer, headers *corev3.HeaderMap, body []byte) (*extprocv3.ProcessingResponse, *pipeline.Context) {
 	ctx := stream.Context()
 	pctx := &pipeline.Context{
 		Direction: pipeline.Outbound,
@@ -179,18 +241,112 @@ func (s *Server) handleOutboundBody(stream extprocv3.ExternalProcessor_ProcessSe
 		pctx.Host = getHeader(headers, "host")
 	}
 
+	if s.Sessions != nil {
+		if aid := s.Sessions.ActiveSession(); aid != "" {
+			pctx.Session = s.Sessions.View(aid)
+		}
+	}
+
 	originalAuth := pctx.Headers.Get("Authorization")
 	action := s.OutboundPipeline.Run(ctx, pctx)
 	if action.Type == pipeline.Reject {
 		return denyResponse(typev3.StatusCode_ServiceUnavailable,
-			jsonError("token_acquisition_failed", action.Reason))
+			jsonError("token_acquisition_failed", action.Reason)), nil
 	}
+
+	s.recordOutboundSession(pctx)
 
 	newAuth := pctx.Headers.Get("Authorization")
 	if newAuth != originalAuth {
-		return replaceTokenBodyResponse(extractBearer(newAuth))
+		return replaceTokenBodyResponse(extractBearer(newAuth)), pctx
 	}
-	return passBodyResponse()
+	return passBodyResponse(), pctx
+}
+
+func (s *Server) handleResponseHeaders(ctx context.Context, headers *corev3.HeaderMap, pctx *pipeline.Context, direction string) *extprocv3.ProcessingResponse {
+	if pctx == nil {
+		return &extprocv3.ProcessingResponse{
+			Response: &extprocv3.ProcessingResponse_ResponseHeaders{
+				ResponseHeaders: &extprocv3.HeadersResponse{},
+			},
+		}
+	}
+
+	statusStr := getHeader(headers, ":status")
+	pctx.StatusCode, _ = strconv.Atoi(statusStr)
+	pctx.ResponseHeaders = headerMapToHTTP(headers)
+
+	p := s.OutboundPipeline
+	if direction == "inbound" {
+		p = s.InboundPipeline
+	}
+
+	if p.NeedsBody() {
+		return &extprocv3.ProcessingResponse{
+			Response: &extprocv3.ProcessingResponse_ResponseHeaders{
+				ResponseHeaders: &extprocv3.HeadersResponse{},
+			},
+			ModeOverride: &extprocfilterv3.ProcessingMode{
+				ResponseBodyMode: extprocfilterv3.ProcessingMode_BUFFERED,
+			},
+		}
+	}
+
+	action := p.RunResponse(ctx, pctx)
+	if action.Type == pipeline.Reject {
+		return denyResponse(typev3.StatusCode(action.Status),
+			jsonError("response_blocked", action.Reason))
+	}
+	return &extprocv3.ProcessingResponse{
+		Response: &extprocv3.ProcessingResponse_ResponseHeaders{
+			ResponseHeaders: &extprocv3.HeadersResponse{},
+		},
+	}
+}
+
+func (s *Server) handleResponseBody(ctx context.Context, body []byte, pctx *pipeline.Context, direction string) *extprocv3.ProcessingResponse {
+	if pctx == nil {
+		return &extprocv3.ProcessingResponse{
+			Response: &extprocv3.ProcessingResponse_ResponseBody{
+				ResponseBody: &extprocv3.BodyResponse{},
+			},
+		}
+	}
+
+	pctx.ResponseBody = body
+
+	p := s.OutboundPipeline
+	if direction == "inbound" {
+		p = s.InboundPipeline
+	}
+
+	action := p.RunResponse(ctx, pctx)
+	if action.Type == pipeline.Reject {
+		return denyResponse(typev3.StatusCode(action.Status),
+			jsonError("response_blocked", action.Reason))
+	}
+
+	if string(pctx.ResponseBody) != string(body) {
+		return &extprocv3.ProcessingResponse{
+			Response: &extprocv3.ProcessingResponse_ResponseBody{
+				ResponseBody: &extprocv3.BodyResponse{
+					Response: &extprocv3.CommonResponse{
+						BodyMutation: &extprocv3.BodyMutation{
+							Mutation: &extprocv3.BodyMutation_Body{
+								Body: pctx.ResponseBody,
+							},
+						},
+					},
+				},
+			},
+		}
+	}
+
+	return &extprocv3.ProcessingResponse{
+		Response: &extprocv3.ProcessingResponse_ResponseBody{
+			ResponseBody: &extprocv3.BodyResponse{},
+		},
+	}
 }
 
 func headerMapToHTTP(headers *corev3.HeaderMap) http.Header {

@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/kagenti/kagenti-extensions/authbridge/authlib/pipeline"
+	"github.com/kagenti/kagenti-extensions/authbridge/authlib/session"
 )
 
 const maxBodySize = 1 << 20 // 1MB — matches Envoy's default per_stream_buffer_limit_bytes
@@ -21,13 +22,15 @@ const maxBodySize = 1 << 20 // 1MB — matches Envoy's default per_stream_buffer
 // Server is an HTTP forward proxy that performs token exchange on outbound requests.
 type Server struct {
 	OutboundPipeline *pipeline.Pipeline
+	Sessions         *session.Store // nil when session tracking is disabled
 	Client           *http.Client
 }
 
 // NewServer creates a forward proxy server with a default HTTP client.
-func NewServer(outbound *pipeline.Pipeline) *Server {
+func NewServer(outbound *pipeline.Pipeline, sessions *session.Store) *Server {
 	return &Server{
 		OutboundPipeline: outbound,
+		Sessions:         sessions,
 		Client: &http.Client{
 			Timeout: 30 * time.Second,
 			CheckRedirect: func(_ *http.Request, _ []*http.Request) error {
@@ -68,6 +71,12 @@ func (s *Server) handleRequest(w http.ResponseWriter, r *http.Request) {
 		slog.Debug("forward-proxy: buffered request body", "host", r.Host, "bodyLen", len(body))
 	}
 
+	if s.Sessions != nil {
+		if aid := s.Sessions.ActiveSession(); aid != "" {
+			pctx.Session = s.Sessions.View(aid)
+		}
+	}
+
 	originalAuth := pctx.Headers.Get("Authorization")
 	action := s.OutboundPipeline.Run(r.Context(), pctx)
 
@@ -77,6 +86,23 @@ func (s *Server) handleRequest(w http.ResponseWriter, r *http.Request) {
 		body, _ := json.Marshal(map[string]string{"error": action.Reason})
 		w.Write(body)
 		return
+	}
+
+	if s.Sessions != nil {
+		sid := s.Sessions.ActiveSession()
+		if sid == "" {
+			sid = session.DefaultSessionID
+		}
+		ev := pipeline.SessionEvent{
+			At:        time.Now(),
+			Direction: pipeline.Outbound,
+			Phase:     pipeline.SessionRequest,
+			MCP:       pctx.Extensions.MCP,
+			Inference: pctx.Extensions.Inference,
+		}
+		if ev.MCP != nil || ev.Inference != nil {
+			s.Sessions.Append(sid, ev)
+		}
 	}
 
 	newAuth := pctx.Headers.Get("Authorization")
@@ -139,6 +165,23 @@ func (s *Server) handleRequest(w http.ResponseWriter, r *http.Request) {
 		resp.Body = io.NopCloser(bytes.NewReader(pctx.ResponseBody))
 		resp.ContentLength = int64(len(pctx.ResponseBody))
 		resp.Header.Set("Content-Length", fmt.Sprintf("%d", len(pctx.ResponseBody)))
+	}
+
+	if s.Sessions != nil {
+		sid := s.Sessions.ActiveSession()
+		if sid == "" {
+			sid = session.DefaultSessionID
+		}
+		ev := pipeline.SessionEvent{
+			At:        time.Now(),
+			Direction: pipeline.Outbound,
+			Phase:     pipeline.SessionResponse,
+			MCP:       pctx.Extensions.MCP,
+			Inference: pctx.Extensions.Inference,
+		}
+		if ev.MCP != nil || ev.Inference != nil {
+			s.Sessions.Append(sid, ev)
+		}
 	}
 
 	for key, values := range resp.Header {

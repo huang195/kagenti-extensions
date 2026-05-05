@@ -44,7 +44,7 @@ func TestReverseProxy_AllowedRequest(t *testing.T) {
 		Verifier: &mockVerifier{claims: &validation.Claims{Subject: "user"}},
 		Identity: auth.IdentityConfig{Audience: "my-app"},
 	})
-	srv, err := NewServer(inboundPipelineFromAuth(t, a), backend.URL)
+	srv, err := NewServer(inboundPipelineFromAuth(t, a), nil, backend.URL)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -68,7 +68,7 @@ func TestReverseProxy_DeniedRequest(t *testing.T) {
 		Verifier: &mockVerifier{err: fmt.Errorf("invalid token")},
 		Identity: auth.IdentityConfig{Audience: "my-app"},
 	})
-	srv, _ := NewServer(inboundPipelineFromAuth(t, a), "http://localhost:9999")
+	srv, _ := NewServer(inboundPipelineFromAuth(t, a), nil, "http://localhost:9999")
 
 	proxy := httptest.NewServer(srv.Handler())
 	defer proxy.Close()
@@ -93,7 +93,7 @@ func TestReverseProxy_BypassPath(t *testing.T) {
 		Verifier: &mockVerifier{err: fmt.Errorf("should not be called")},
 		Bypass:   matcher,
 	})
-	srv, _ := NewServer(inboundPipelineFromAuth(t, a), backend.URL)
+	srv, _ := NewServer(inboundPipelineFromAuth(t, a), nil, backend.URL)
 
 	proxy := httptest.NewServer(srv.Handler())
 	defer proxy.Close()
@@ -137,7 +137,7 @@ func TestReverseProxy_BodyBuffering(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	srv, err := NewServer(p, backend.URL)
+	srv, err := NewServer(p, nil, backend.URL)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -172,7 +172,7 @@ func TestReverseProxy_BodyTooLarge(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	srv, err := NewServer(p, backend.URL)
+	srv, err := NewServer(p, nil, backend.URL)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -202,7 +202,7 @@ func TestReverseProxy_BodyNotBuffered_WhenNotNeeded(t *testing.T) {
 		Verifier: &mockVerifier{claims: &validation.Claims{Subject: "user"}},
 		Identity: auth.IdentityConfig{Audience: "test"},
 	})
-	srv, err := NewServer(inboundPipelineFromAuth(t, a), backend.URL)
+	srv, err := NewServer(inboundPipelineFromAuth(t, a), nil, backend.URL)
 	if err != nil {
 		t.Fatal(err)
 	}

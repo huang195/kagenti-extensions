@@ -58,6 +58,7 @@ type jsonRPCRequest struct {
 	Params map[string]any `json:"params"`
 }
 
+// stringParam and mapParam are shared helpers used by both mcp-parser and a2a-parser.
 func (r *jsonRPCRequest) stringParam(key string) string {
 	v, _ := r.Params[key].(string)
 	return v

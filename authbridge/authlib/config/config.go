@@ -19,7 +19,18 @@ type Config struct {
 	Bypass   BypassConfig   `yaml:"bypass" json:"bypass"`
 	Routes   RoutesConfig   `yaml:"routes" json:"routes"`
 	Pipeline PipelineConfig `yaml:"pipeline" json:"pipeline"`
+	Session  SessionConfig  `yaml:"session" json:"session"`
 	Stats    StatsConfig    `yaml:"stats" json:"stats"`
+}
+
+// SessionConfig controls in-memory session tracking for cross-request correlation.
+// When enabled, the framework records inbound intents and outbound tool calls so
+// that guardrail plugins can evaluate sequences across request boundaries.
+type SessionConfig struct {
+	Enabled     bool   `yaml:"enabled" json:"enabled"`
+	TTL         string `yaml:"ttl" json:"ttl"`                   // duration string (e.g., "5m"); default: 5m
+	MaxEvents   int    `yaml:"max_events" json:"max_events"`     // max events per session; default: 100
+	MaxSessions int    `yaml:"max_sessions" json:"max_sessions"` // max concurrent sessions; default: 1000 (0 = unlimited)
 }
 
 // PipelineConfig holds the plugin pipeline composition.

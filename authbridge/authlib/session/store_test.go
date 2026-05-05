@@ -1,0 +1,322 @@
+package session
+
+import (
+	"sync"
+	"testing"
+	"time"
+
+	"github.com/kagenti/kagenti-extensions/authbridge/authlib/pipeline"
+)
+
+func TestStore_AppendAndView(t *testing.T) {
+	s := New(5*time.Minute, 100, 0)
+
+	ev := pipeline.SessionEvent{
+		At:        time.Now(),
+		Direction: pipeline.Inbound,
+		Phase:     pipeline.SessionRequest,
+		A2A:       &pipeline.A2AExtension{Method: "message/send"},
+	}
+	s.Append("sess-1", ev)
+
+	v := s.View("sess-1")
+	if v == nil {
+		t.Fatal("View returned nil")
+	}
+	if v.ID != "sess-1" {
+		t.Errorf("View.ID = %q, want %q", v.ID, "sess-1")
+	}
+	if len(v.Events) != 1 {
+		t.Fatalf("View.Events len = %d, want 1", len(v.Events))
+	}
+	if v.Events[0].A2A.Method != "message/send" {
+		t.Errorf("Event.A2A.Method = %q, want %q", v.Events[0].A2A.Method, "message/send")
+	}
+}
+
+func TestStore_ActiveSession(t *testing.T) {
+	s := New(5*time.Minute, 100, 0)
+
+	if id := s.ActiveSession(); id != "" {
+		t.Errorf("ActiveSession() = %q, want empty", id)
+	}
+
+	s.Append("sess-1", pipeline.SessionEvent{At: time.Now(), Direction: pipeline.Inbound, Phase: pipeline.SessionRequest})
+	if id := s.ActiveSession(); id != "sess-1" {
+		t.Errorf("ActiveSession() = %q, want %q", id, "sess-1")
+	}
+
+	s.Append("sess-2", pipeline.SessionEvent{At: time.Now(), Direction: pipeline.Inbound, Phase: pipeline.SessionRequest})
+	if id := s.ActiveSession(); id != "sess-2" {
+		t.Errorf("ActiveSession() = %q, want %q", id, "sess-2")
+	}
+}
+
+func TestStore_MultipleSessions(t *testing.T) {
+	s := New(5*time.Minute, 100, 0)
+
+	s.Append("sess-1", pipeline.SessionEvent{At: time.Now(), Direction: pipeline.Inbound, Phase: pipeline.SessionRequest, A2A: &pipeline.A2AExtension{Method: "m1"}})
+	s.Append("sess-2", pipeline.SessionEvent{At: time.Now(), Direction: pipeline.Inbound, Phase: pipeline.SessionRequest, A2A: &pipeline.A2AExtension{Method: "m2"}})
+
+	v1 := s.View("sess-1")
+	v2 := s.View("sess-2")
+	if v1 == nil || v2 == nil {
+		t.Fatal("expected both sessions to exist")
+	}
+	if len(v1.Events) != 1 || v1.Events[0].A2A.Method != "m1" {
+		t.Errorf("sess-1 unexpected content: %+v", v1.Events)
+	}
+	if len(v2.Events) != 1 || v2.Events[0].A2A.Method != "m2" {
+		t.Errorf("sess-2 unexpected content: %+v", v2.Events)
+	}
+}
+
+func TestStore_TTLExpiry(t *testing.T) {
+	s := New(50*time.Millisecond, 100, 0)
+
+	s.Append("sess-1", pipeline.SessionEvent{At: time.Now(), Direction: pipeline.Inbound, Phase: pipeline.SessionRequest})
+
+	v := s.View("sess-1")
+	if v == nil {
+		t.Fatal("expected View to return session before expiry")
+	}
+
+	time.Sleep(60 * time.Millisecond)
+
+	v = s.View("sess-1")
+	if v != nil {
+		t.Error("expected View to return nil after TTL expiry")
+	}
+
+	if id := s.ActiveSession(); id != "" {
+		t.Errorf("ActiveSession() = %q, want empty after expiry", id)
+	}
+}
+
+func TestStore_MaxEvents(t *testing.T) {
+	s := New(5*time.Minute, 3, 0)
+
+	for i := 0; i < 5; i++ {
+		s.Append("sess-1", pipeline.SessionEvent{
+			At:        time.Now(),
+			Direction: pipeline.Outbound,
+			Phase:     pipeline.SessionRequest,
+			MCP:       &pipeline.MCPExtension{Method: string(rune('a' + i))},
+		})
+	}
+
+	v := s.View("sess-1")
+	if v == nil {
+		t.Fatal("View returned nil")
+	}
+	if len(v.Events) != 3 {
+		t.Fatalf("Events len = %d, want 3 (capped at maxEvents)", len(v.Events))
+	}
+	if v.Events[0].MCP.Method != "c" {
+		t.Errorf("Events[0].MCP.Method = %q, want %q (oldest evicted)", v.Events[0].MCP.Method, "c")
+	}
+}
+
+func TestStore_ConcurrentAccess(t *testing.T) {
+	s := New(5*time.Minute, 1000, 0)
+	var wg sync.WaitGroup
+
+	for i := 0; i < 10; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for j := 0; j < 100; j++ {
+				s.Append("sess-concurrent", pipeline.SessionEvent{
+					At:        time.Now(),
+					Direction: pipeline.Outbound,
+					Phase:     pipeline.SessionRequest,
+					MCP:       &pipeline.MCPExtension{Method: "tools/call"},
+				})
+			}
+		}()
+	}
+
+	for i := 0; i < 5; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for j := 0; j < 100; j++ {
+				s.View("sess-concurrent")
+				s.ActiveSession()
+			}
+		}()
+	}
+
+	wg.Wait()
+
+	v := s.View("sess-concurrent")
+	if v == nil {
+		t.Fatal("expected session to exist after concurrent access")
+	}
+	if len(v.Events) != 1000 {
+		t.Errorf("Events len = %d, want 1000", len(v.Events))
+	}
+}
+
+func TestStore_Cleanup(t *testing.T) {
+	s := New(50*time.Millisecond, 100, 0)
+
+	s.Append("sess-old", pipeline.SessionEvent{At: time.Now(), Direction: pipeline.Inbound, Phase: pipeline.SessionRequest})
+	time.Sleep(60 * time.Millisecond)
+
+	s.Append("sess-new", pipeline.SessionEvent{At: time.Now(), Direction: pipeline.Inbound, Phase: pipeline.SessionRequest})
+
+	if v := s.View("sess-old"); v != nil {
+		t.Error("expected sess-old to be cleaned up")
+	}
+	if v := s.View("sess-new"); v == nil {
+		t.Error("expected sess-new to still exist")
+	}
+}
+
+func TestStore_ViewNonExistent(t *testing.T) {
+	s := New(5*time.Minute, 100, 0)
+	if v := s.View("does-not-exist"); v != nil {
+		t.Error("expected nil for non-existent session")
+	}
+}
+
+func TestView_Intents(t *testing.T) {
+	v := &pipeline.SessionView{
+		ID: "test",
+		Events: []pipeline.SessionEvent{
+			{Direction: pipeline.Inbound, Phase: pipeline.SessionRequest, A2A: &pipeline.A2AExtension{Method: "message/send"}},
+			{Direction: pipeline.Outbound, Phase: pipeline.SessionRequest, MCP: &pipeline.MCPExtension{Method: "tools/call"}},
+			{Direction: pipeline.Inbound, Phase: pipeline.SessionRequest, A2A: &pipeline.A2AExtension{Method: "message/send"}},
+			{Direction: pipeline.Outbound, Phase: pipeline.SessionResponse, MCP: &pipeline.MCPExtension{Method: "tools/call"}},
+		},
+	}
+
+	intents := v.Intents()
+	if len(intents) != 2 {
+		t.Fatalf("Intents() len = %d, want 2", len(intents))
+	}
+	for _, e := range intents {
+		if e.Direction != pipeline.Inbound || e.Phase != pipeline.SessionRequest || e.A2A == nil {
+			t.Errorf("unexpected intent event: %+v", e)
+		}
+	}
+}
+
+func TestView_ToolCalls(t *testing.T) {
+	v := &pipeline.SessionView{
+		ID: "test",
+		Events: []pipeline.SessionEvent{
+			{Direction: pipeline.Inbound, Phase: pipeline.SessionRequest, A2A: &pipeline.A2AExtension{}},
+			{Direction: pipeline.Outbound, Phase: pipeline.SessionRequest, MCP: &pipeline.MCPExtension{Method: "tools/call"}},
+			{Direction: pipeline.Outbound, Phase: pipeline.SessionResponse, MCP: &pipeline.MCPExtension{Method: "tools/call"}},
+			{Direction: pipeline.Outbound, Phase: pipeline.SessionRequest, Inference: &pipeline.InferenceExtension{Model: "llama3.1"}},
+		},
+	}
+
+	calls := v.ToolCalls()
+	if len(calls) != 1 {
+		t.Fatalf("ToolCalls() len = %d, want 1", len(calls))
+	}
+	if calls[0].MCP.Method != "tools/call" {
+		t.Errorf("ToolCalls()[0].MCP.Method = %q, want %q", calls[0].MCP.Method, "tools/call")
+	}
+}
+
+func TestView_ToolResponses(t *testing.T) {
+	v := &pipeline.SessionView{
+		ID: "test",
+		Events: []pipeline.SessionEvent{
+			{Direction: pipeline.Outbound, Phase: pipeline.SessionRequest, MCP: &pipeline.MCPExtension{Method: "tools/call"}},
+			{Direction: pipeline.Outbound, Phase: pipeline.SessionResponse, MCP: &pipeline.MCPExtension{Method: "tools/call"}},
+			{Direction: pipeline.Outbound, Phase: pipeline.SessionResponse, Inference: &pipeline.InferenceExtension{}},
+		},
+	}
+
+	responses := v.ToolResponses()
+	if len(responses) != 1 {
+		t.Fatalf("ToolResponses() len = %d, want 1", len(responses))
+	}
+}
+
+func TestView_LastIntent(t *testing.T) {
+	v := &pipeline.SessionView{
+		ID: "test",
+		Events: []pipeline.SessionEvent{
+			{Direction: pipeline.Inbound, Phase: pipeline.SessionRequest, A2A: &pipeline.A2AExtension{Method: "first"}},
+			{Direction: pipeline.Outbound, Phase: pipeline.SessionRequest, MCP: &pipeline.MCPExtension{}},
+			{Direction: pipeline.Inbound, Phase: pipeline.SessionRequest, A2A: &pipeline.A2AExtension{Method: "second"}},
+		},
+	}
+
+	last := v.LastIntent()
+	if last == nil {
+		t.Fatal("LastIntent() returned nil")
+	}
+	if last.A2A.Method != "second" {
+		t.Errorf("LastIntent().A2A.Method = %q, want %q", last.A2A.Method, "second")
+	}
+}
+
+func TestView_LastIntent_Empty(t *testing.T) {
+	v := &pipeline.SessionView{
+		ID: "test",
+		Events: []pipeline.SessionEvent{
+			{Direction: pipeline.Outbound, Phase: pipeline.SessionRequest, MCP: &pipeline.MCPExtension{}},
+		},
+	}
+
+	if last := v.LastIntent(); last != nil {
+		t.Error("LastIntent() should be nil when no A2A inbound events exist")
+	}
+}
+
+func TestStore_MaxSessionsEviction(t *testing.T) {
+	s := New(5*time.Minute, 100, 2)
+	defer s.Close()
+
+	s.Append("sess-1", pipeline.SessionEvent{At: time.Now(), A2A: &pipeline.A2AExtension{Method: "m1"}})
+	time.Sleep(time.Millisecond)
+	s.Append("sess-2", pipeline.SessionEvent{At: time.Now(), A2A: &pipeline.A2AExtension{Method: "m2"}})
+	time.Sleep(time.Millisecond)
+	s.Append("sess-3", pipeline.SessionEvent{At: time.Now(), A2A: &pipeline.A2AExtension{Method: "m3"}})
+
+	if v := s.View("sess-1"); v != nil {
+		t.Error("sess-1 should have been evicted (oldest)")
+	}
+	if v := s.View("sess-2"); v == nil {
+		t.Error("sess-2 should still exist")
+	}
+	if v := s.View("sess-3"); v == nil {
+		t.Error("sess-3 should still exist")
+	}
+}
+
+func TestStore_Close(t *testing.T) {
+	s := New(50*time.Millisecond, 100, 0)
+	s.Close()
+	// Should not panic after close
+	s.Append("sess", pipeline.SessionEvent{At: time.Now(), A2A: &pipeline.A2AExtension{Method: "m"}})
+	if v := s.View("sess"); v == nil {
+		t.Error("store should still function after Close (only background cleanup stops)")
+	}
+}
+
+func TestView_InferenceRequests(t *testing.T) {
+	v := &pipeline.SessionView{
+		ID: "test",
+		Events: []pipeline.SessionEvent{
+			{Direction: pipeline.Outbound, Phase: pipeline.SessionRequest, Inference: &pipeline.InferenceExtension{Model: "llama3.1"}},
+			{Direction: pipeline.Outbound, Phase: pipeline.SessionResponse, Inference: &pipeline.InferenceExtension{}},
+			{Direction: pipeline.Outbound, Phase: pipeline.SessionRequest, MCP: &pipeline.MCPExtension{}},
+		},
+	}
+
+	reqs := v.InferenceRequests()
+	if len(reqs) != 1 {
+		t.Fatalf("InferenceRequests() len = %d, want 1", len(reqs))
+	}
+	if reqs[0].Inference.Model != "llama3.1" {
+		t.Errorf("InferenceRequests()[0].Model = %q, want %q", reqs[0].Inference.Model, "llama3.1")
+	}
+}

@@ -88,9 +88,17 @@ func (p *A2AParser) OnResponse(_ context.Context, pctx *pipeline.Context) pipeli
 		return pipeline.Action{Type: pipeline.Continue}
 	}
 
-	// Extract session ID (existing behavior)
-	if sid := extractSessionID(pctx.ResponseBody); sid != "" {
-		pctx.Extensions.A2A.SessionID = sid
+	// Capture the server-assigned contextId — but only when the request
+	// didn't already carry one. Overwriting would split the inbound
+	// request and response events into different session buckets (the
+	// agent's A2A SDK may mint a fresh contextId in its response even
+	// when the client supplied one, which is legal per A2A but breaks
+	// telemetry bucketing). The request-side contextId is authoritative
+	// for session attribution.
+	if pctx.Extensions.A2A.SessionID == "" {
+		if sid := extractSessionID(pctx.ResponseBody); sid != "" {
+			pctx.Extensions.A2A.SessionID = sid
+		}
 	}
 
 	// Extract response summary (final status + artifact + error)

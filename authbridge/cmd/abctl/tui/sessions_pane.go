@@ -18,7 +18,7 @@ func newSessionsTable() table.Model {
 			{Title: "ID", Width: 40},
 			{Title: "UPDATED", Width: 14},
 			{Title: "EVENTS", Width: 8},
-			{Title: "TOKENS", Width: 8},
+			{Title: "TOKENS", Width: 10},
 			{Title: "ACTIVE", Width: 8},
 		}),
 		table.WithFocused(true),

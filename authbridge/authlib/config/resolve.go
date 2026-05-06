@@ -118,26 +118,70 @@ func deriveJWKSURL(cfg *Config) {
 	}
 }
 
-// ResolveCredentialFiles waits for and reads credential files when configured.
+// ResolveCredentialFiles polls for credential files and signals readiness.
+// It never gives up: after initialTimeout it switches to exponential backoff.
 // Call this after the server listener starts to avoid blocking startup.
-// This handles the startup race with client-registration and spiffe-helper.
-func ResolveCredentialFiles(cfg *Config) {
-	if cfg.Identity.ClientIDFile != "" {
-		if err := waitAndReadFile(cfg.Identity.ClientIDFile, &cfg.Identity.ClientID, 60*time.Second); err != nil {
-			slog.Warn("client_id_file not available, using client_id from config", "error", err)
+func ResolveCredentialFiles(cfg *Config, initialTimeout time.Duration) <-chan struct{} {
+	ready := make(chan struct{})
+
+	needClientID := cfg.Identity.ClientIDFile != ""
+	needClientSecret := cfg.Identity.ClientSecretFile != ""
+	needSVID := cfg.Identity.Type == "spiffe" && cfg.Identity.JWTSVIDPath != ""
+
+	if !needClientID && !needClientSecret && !needSVID {
+		close(ready)
+		return ready
+	}
+
+	go func() {
+		// Phase 1: fast poll (2s interval) up to initialTimeout
+		if resolveAllCredentials(cfg, needClientID, needClientSecret, needSVID, initialTimeout) {
+			close(ready)
+			return
+		}
+		slog.Warn("credential files not available after initial timeout, continuing in background",
+			"timeout", initialTimeout)
+
+		// Phase 2: exponential backoff, never gives up
+		backoff := 5 * time.Second
+		const maxBackoff = 60 * time.Second
+		for {
+			time.Sleep(backoff)
+			if resolveAllCredentials(cfg, needClientID, needClientSecret, needSVID, 0) {
+				close(ready)
+				slog.Info("credential files loaded after extended wait")
+				return
+			}
+			if backoff < maxBackoff {
+				backoff = min(backoff*2, maxBackoff)
+			}
+		}
+	}()
+	return ready
+}
+
+// resolveAllCredentials attempts to read all needed credential files.
+// With timeout=0 it does a single non-blocking check.
+// Returns true only when ALL needed files have been successfully loaded.
+func resolveAllCredentials(cfg *Config, needClientID, needClientSecret, needSVID bool, timeout time.Duration) bool {
+	allOK := true
+
+	if needClientID {
+		if err := waitAndReadFile(cfg.Identity.ClientIDFile, &cfg.Identity.ClientID, timeout); err != nil {
+			allOK = false
 		}
 	}
-	if cfg.Identity.ClientSecretFile != "" {
-		if err := waitAndReadFile(cfg.Identity.ClientSecretFile, &cfg.Identity.ClientSecret, 60*time.Second); err != nil {
-			slog.Warn("client_secret_file not available, using client_secret from config", "error", err)
+	if needClientSecret {
+		if err := waitAndReadFile(cfg.Identity.ClientSecretFile, &cfg.Identity.ClientSecret, timeout); err != nil {
+			allOK = false
 		}
 	}
-	// Wait for JWT-SVID file if SPIFFE identity is configured
-	if cfg.Identity.Type == "spiffe" && cfg.Identity.JWTSVIDPath != "" {
-		if err := waitForFile(cfg.Identity.JWTSVIDPath, 60*time.Second); err != nil {
-			slog.Warn("jwt_svid_path not available at startup, will be read on each exchange", "error", err)
+	if needSVID {
+		if err := waitForFile(cfg.Identity.JWTSVIDPath, timeout); err != nil {
+			allOK = false
 		}
 	}
+	return allOK
 }
 
 // waitAndReadFile polls for a file to exist, then reads its content into dest.
@@ -155,13 +199,20 @@ func waitAndReadFile(path string, dest *string, timeout time.Duration) error {
 }
 
 // waitForFile polls for a file to exist, returning nil when found or error on timeout.
+// With timeout=0, performs a single non-blocking check.
 func waitForFile(path string, timeout time.Duration) error {
+	if info, err := os.Stat(path); err == nil && info.Size() > 0 {
+		return nil
+	}
+	if timeout <= 0 {
+		return fmt.Errorf("file not ready: %s", path)
+	}
 	deadline := time.Now().Add(timeout)
 	for time.Now().Before(deadline) {
+		time.Sleep(2 * time.Second)
 		if info, err := os.Stat(path); err == nil && info.Size() > 0 {
 			return nil
 		}
-		time.Sleep(2 * time.Second)
 	}
 	return fmt.Errorf("timeout waiting for %s (%v)", path, timeout)
 }

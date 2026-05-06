@@ -77,14 +77,15 @@ type OutboundConfig struct {
 
 // IdentityConfig holds agent identity and credentials.
 type IdentityConfig struct {
-	Type             string   `yaml:"type" json:"type"` // "spiffe", "client-secret", "k8s-sa"
-	ClientID         string   `yaml:"client_id" json:"client_id"`
-	ClientSecret     string   `yaml:"client_secret" json:"client_secret"`
-	ClientIDFile     string   `yaml:"client_id_file" json:"client_id_file"`         // alternative: read client_id from file
-	ClientSecretFile string   `yaml:"client_secret_file" json:"client_secret_file"` // alternative: read client_secret from file
-	SocketPath       string   `yaml:"socket_path" json:"socket_path"`               // SPIFFE Workload API
-	JWTSVIDPath      string   `yaml:"jwt_svid_path" json:"jwt_svid_path"`           // file-based SPIFFE
-	JWTAudience      []string `yaml:"jwt_audience" json:"jwt_audience"`             // SPIFFE JWT audience
+	Type                  string   `yaml:"type" json:"type"`                                     // "spiffe", "client-secret", "k8s-sa"
+	ClientID              string   `yaml:"client_id" json:"client_id"`
+	ClientSecret          string   `yaml:"client_secret" json:"client_secret"`
+	ClientIDFile          string   `yaml:"client_id_file" json:"client_id_file"`                 // alternative: read client_id from file
+	ClientSecretFile      string   `yaml:"client_secret_file" json:"client_secret_file"`         // alternative: read client_secret from file
+	SocketPath            string   `yaml:"socket_path" json:"socket_path"`                       // SPIFFE Workload API
+	JWTSVIDPath           string   `yaml:"jwt_svid_path" json:"jwt_svid_path"`                   // file-based SPIFFE
+	JWTAudience           []string `yaml:"jwt_audience" json:"jwt_audience"`                     // SPIFFE JWT audience
+	CredentialWaitTimeout string   `yaml:"credential_wait_timeout" json:"credential_wait_timeout"` // initial fast-poll duration, e.g. "120s"
 }
 
 // ListenerConfig holds per-mode listener addresses.

@@ -14,6 +14,11 @@ A pure Go library providing reusable building blocks for JWT validation, OAuth 2
 | `routing/` | Host-to-audience router with glob pattern matching |
 | `auth/` | Composition layer: `HandleInbound` + `HandleOutbound` |
 | `config/` | YAML config, mode presets, startup validation, URL derivation |
+| `pipeline/` | Plugin pipeline — see [pipeline/README.md](./pipeline/README.md) for the full interface spec and bridge-plugin integration guide |
+| `session/` | In-memory session store + `SessionSummary` aggregation, backing the `:9094` API |
+| `sessionapi/` | HTTP API (`/v1/sessions`, `/v1/events` SSE, `/v1/pipeline`) exposing the session store |
+| `plugins/` | Built-in protocol parsers: `a2a-parser`, `mcp-parser`, `inference-parser`, `jwt-validation` |
+| `observe/` | OTEL + metrics helpers |
 
 ## Usage
 

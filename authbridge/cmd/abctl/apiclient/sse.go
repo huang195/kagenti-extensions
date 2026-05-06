@@ -34,16 +34,19 @@ type StreamStatus struct {
 	Wait time.Duration
 }
 
+// maxBackoff caps the reconnect wait. Tune here to change the upper bound
+// on how long the TUI sits waiting for a flapping server.
+const maxBackoff = 30 * time.Second
+
 // backoffSchedule returns the wait for the Nth reconnect attempt (1-based).
-// Capped at 30s per plan.
+// Schedule: 1s, 2s, 4s, 8s, 16s, then maxBackoff forever.
 func backoffSchedule(attempt int) time.Duration {
 	if attempt <= 0 {
 		return time.Second
 	}
-	// 1s, 2s, 4s, 8s, 16s, 30s forever.
 	d := time.Second << (attempt - 1)
-	if d <= 0 || d > 30*time.Second {
-		return 30 * time.Second
+	if d <= 0 || d > maxBackoff {
+		return maxBackoff
 	}
 	return d
 }

@@ -4,6 +4,11 @@ go 1.24.2
 
 toolchain go1.24.5
 
+// Workspace-only: this replace is satisfied by authbridge/go.work during
+// local development. Standalone `go get` / `go install` outside the
+// workspace will not resolve this path — if abctl is ever distributed as
+// a standalone binary, drop the replace and version authlib as a proper
+// dependency once it has a tagged release.
 replace github.com/kagenti/kagenti-extensions/authbridge/authlib => ../../authlib
 
 require (

@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
 	"strings"
 	"time"
@@ -136,9 +137,17 @@ func parseSSE(ctx context.Context, r io.Reader, out chan<- StreamEvent) error {
 			return
 		}
 		var ev pipeline.SessionEvent
-		if err := json.Unmarshal([]byte(dataBuf.String()), &ev); err != nil {
-			// Corrupt frame — drop it silently; the TUI doesn't need to
-			// distinguish malformed frames from missed ones.
+		raw := dataBuf.String()
+		if err := json.Unmarshal([]byte(raw), &ev); err != nil {
+			// Corrupt frame — the TUI doesn't need to distinguish malformed
+			// frames from missed ones, but log at debug level so a
+			// server/client schema drift is diagnosable during a live
+			// incident rather than events silently vanishing.
+			preview := raw
+			if len(preview) > 200 {
+				preview = preview[:200] + "…"
+			}
+			slog.Debug("apiclient: dropping malformed SSE frame", "err", err, "preview", preview)
 			return
 		}
 		select {

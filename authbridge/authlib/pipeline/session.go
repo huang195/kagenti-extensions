@@ -2,6 +2,7 @@ package pipeline
 
 import (
 	"encoding/json"
+	"log/slog"
 	"time"
 )
 
@@ -32,16 +33,21 @@ func (p SessionPhase) MarshalJSON() ([]byte, error) {
 
 // UnmarshalJSON decodes a SessionPhase from the string form emitted by
 // MarshalJSON. Unknown strings decode to SessionRequest (zero value)
-// without error.
+// without error — tolerant forward-compat behavior. A Debug-level log
+// fires on unknown input so wire-format drift (e.g., a server emitting a
+// typo) is at least observable in a verbose test run rather than silent.
 func (p *SessionPhase) UnmarshalJSON(data []byte) error {
 	var s string
 	if err := json.Unmarshal(data, &s); err != nil {
 		return err
 	}
 	switch s {
+	case "request":
+		*p = SessionRequest
 	case "response":
 		*p = SessionResponse
 	default:
+		slog.Debug("pipeline: unknown SessionPhase, defaulting to request", "value", s)
 		*p = SessionRequest
 	}
 	return nil

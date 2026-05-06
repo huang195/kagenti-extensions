@@ -130,8 +130,7 @@ func (s *Server) handleInbound(stream extprocv3.ExternalProcessor_ProcessServer,
 
 	action := s.InboundPipeline.Run(ctx, pctx)
 	if action.Type == pipeline.Reject {
-		return denyResponse(typev3.StatusCode(action.Status),
-			jsonError("unauthorized", action.Reason)), nil
+		return rejectFromAction(action), nil
 	}
 
 	s.recordInboundSession(pctx)
@@ -150,8 +149,7 @@ func (s *Server) handleInboundBody(stream extprocv3.ExternalProcessor_ProcessSer
 
 	action := s.InboundPipeline.Run(ctx, pctx)
 	if action.Type == pipeline.Reject {
-		return denyResponse(typev3.StatusCode(action.Status),
-			jsonError("unauthorized", action.Reason)), nil
+		return rejectFromAction(action), nil
 	}
 
 	s.recordInboundSession(pctx)
@@ -398,8 +396,7 @@ func (s *Server) handleOutbound(stream extprocv3.ExternalProcessor_ProcessServer
 	originalAuth := pctx.Headers.Get("Authorization")
 	action := s.OutboundPipeline.Run(ctx, pctx)
 	if action.Type == pipeline.Reject {
-		return denyResponse(typev3.StatusCode_ServiceUnavailable,
-			jsonError("token_acquisition_failed", action.Reason)), nil
+		return rejectFromAction(action), nil
 	}
 
 	s.recordOutboundSession(pctx)
@@ -434,8 +431,7 @@ func (s *Server) handleOutboundBody(stream extprocv3.ExternalProcessor_ProcessSe
 	originalAuth := pctx.Headers.Get("Authorization")
 	action := s.OutboundPipeline.Run(ctx, pctx)
 	if action.Type == pipeline.Reject {
-		return denyResponse(typev3.StatusCode_ServiceUnavailable,
-			jsonError("token_acquisition_failed", action.Reason)), nil
+		return rejectFromAction(action), nil
 	}
 
 	s.recordOutboundSession(pctx)
@@ -478,8 +474,7 @@ func (s *Server) handleResponseHeaders(ctx context.Context, headers *corev3.Head
 
 	action := p.RunResponse(ctx, pctx)
 	if action.Type == pipeline.Reject {
-		return denyResponse(typev3.StatusCode(action.Status),
-			jsonError("response_blocked", action.Reason))
+		return rejectFromAction(action)
 	}
 
 	// No body phase will run; record the response event here. A2A responses
@@ -516,8 +511,7 @@ func (s *Server) handleResponseBody(ctx context.Context, body []byte, pctx *pipe
 
 	action := p.RunResponse(ctx, pctx)
 	if action.Type == pipeline.Reject {
-		return denyResponse(typev3.StatusCode(action.Status),
-			jsonError("response_blocked", action.Reason))
+		return rejectFromAction(action)
 	}
 
 	// The server's response may carry the server-assigned A2A contextId. If
@@ -671,14 +665,29 @@ func replaceTokenResponse(token string) *extprocv3.ProcessingResponse {
 	}
 }
 
-func denyResponse(code typev3.StatusCode, body string) *extprocv3.ProcessingResponse {
+// rejectFromAction turns a pipeline Reject into an Envoy ImmediateResponse,
+// preserving the plugin's status/headers/body. Replaces the old
+// denyResponse helper which hardcoded {"error":...,"message":...} at each
+// call site.
+func rejectFromAction(action pipeline.Action) *extprocv3.ProcessingResponse {
+	status, headers, body := action.Violation.Render()
+	immediate := &extprocv3.ImmediateResponse{
+		Status: &typev3.HttpStatus{Code: typev3.StatusCode(status)},
+		Body:   body,
+	}
+	if len(headers) > 0 {
+		setHeaders := make([]*corev3.HeaderValueOption, 0, len(headers))
+		for k, vs := range headers {
+			for _, v := range vs {
+				setHeaders = append(setHeaders, &corev3.HeaderValueOption{
+					Header: &corev3.HeaderValue{Key: k, RawValue: []byte(v)},
+				})
+			}
+		}
+		immediate.Headers = &extprocv3.HeaderMutation{SetHeaders: setHeaders}
+	}
 	return &extprocv3.ProcessingResponse{
-		Response: &extprocv3.ProcessingResponse_ImmediateResponse{
-			ImmediateResponse: &extprocv3.ImmediateResponse{
-				Status: &typev3.HttpStatus{Code: code},
-				Body:   []byte(body),
-			},
-		},
+		Response: &extprocv3.ProcessingResponse_ImmediateResponse{ImmediateResponse: immediate},
 	}
 }
 
@@ -692,11 +701,6 @@ func immediateResponse(httpStatus int, reason string) *extprocv3.ProcessingRespo
 			},
 		},
 	}
-}
-
-func jsonError(errorCode, message string) string {
-	b, _ := json.Marshal(map[string]string{"error": errorCode, "message": message})
-	return string(b)
 }
 
 func requestHasBody(headers *corev3.HeaderMap) bool {

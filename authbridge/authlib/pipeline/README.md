@@ -241,15 +241,53 @@ Mutability: **always assigned, never mutated in place** after the parser sets th
 
 ```go
 type Action struct {
-    Type   ActionType // Continue | Reject
-    Status int        // HTTP status to return (Reject only)
-    Reason string     // human-readable reason (Reject only)
+    Type      ActionType // Continue | Reject
+    Violation *Violation // populated iff Type == Reject
+}
+
+type Violation struct {
+    // Structured (mirrors CPEX's PluginViolation):
+    Code        string         // machine-readable, e.g. "auth.missing-token"
+    Reason      string         // short human message
+    Description string         // longer explanation; optional
+    Details     map[string]any // plugin-arbitrary structured context; optional
+
+    // HTTP rendering hints — all optional; defaults from Code:
+    Status   int         // when 0, StatusFromCode(Code) is used
+    Body     []byte      // when nil, synthesized JSON
+    BodyType string      // Content-Type for Body; defaults to application/json
+    Headers  http.Header // merged into the response (e.g. WWW-Authenticate, Retry-After)
+
+    // Framework-populated from Plugin.Name(); plugins leave it empty:
+    PluginName string
 }
 ```
 
-Returning `Reject` from `OnRequest` **halts the request pipeline** and makes the listener emit an HTTP response with the declared status + a JSON body: `{"error":"<kind>", "message":"<reason>"}`.
+Returning `Reject` from `OnRequest` halts the request pipeline; from `OnResponse` halts the response pipeline. The listener calls `Violation.Render()` to produce `(status, headers, body)` and emits that as the HTTP response. The default body when `Body` is nil:
 
-Returning `Reject` from `OnResponse` halts the response pipeline — the listener emits the same shape instead of forwarding the upstream's response. Used by guardrails that block specific completions.
+```json
+{
+  "error":       "auth.missing-token",
+  "message":     "Bearer token required",
+  "description": "No Authorization header present",
+  "plugin":      "jwt-validation",
+  "details":     { "realm": "kagenti" }
+}
+```
+
+Helper constructors cover the common cases so the reject site stays one line:
+
+```go
+pipeline.Deny("auth.invalid-token", "token expired")
+pipeline.DenyStatus(451, "policy.forbidden", "unavailable for legal reasons")
+pipeline.DenyWithDetails("policy.rate-limited", "quota hit", map[string]any{
+    "remaining": 0, "window": "1h",
+})
+pipeline.Challenge("kagenti", "Authorization required")   // 401 + WWW-Authenticate
+pipeline.RateLimited(30*time.Second, "", "slow down")     // 429 + Retry-After
+```
+
+The `Code` → HTTP-status mapping for well-known codes lives at `codeToStatus` in `action.go`; unknown codes default to 500. Plugins that need a non-default status set `Violation.Status` explicitly or use `DenyStatus`.
 
 There is no "soft error" channel today — a plugin that wants to fail open logs and returns `Continue`. A future iteration may add a per-plugin `on_error` policy (cf. CPEX: `fail | ignore | disable`).
 
@@ -261,11 +299,93 @@ There is no "soft error" channel today — a plugin that wants to fail open logs
 func New(plugins []Plugin, opts ...Option) (*Pipeline, error)
 func (p *Pipeline) Run(ctx context.Context, pctx *Context) Action           // request phase
 func (p *Pipeline) RunResponse(ctx context.Context, pctx *Context) Action   // response phase (reverse)
+func (p *Pipeline) Start(ctx context.Context) error                          // invoke Init on Initializer plugins
+func (p *Pipeline) Stop(ctx context.Context)                                 // invoke Shutdown on Shutdowner plugins
 func (p *Pipeline) Plugins() []Plugin                                        // defensive copy
 func (p *Pipeline) NeedsBody() bool                                          // OR over all plugins' BodyAccess
 ```
 
 `New` validates capability wiring at startup: every `Read` must be satisfied by some earlier plugin's `Write`.
+
+### Plugin lifecycle (`Start` / `Stop`)
+
+Plugins that need one-time setup (load a model, warm a cache, register metrics, spawn a background goroutine) implement the optional `Initializer` interface:
+
+```go
+type Initializer interface {
+    Init(ctx context.Context) error
+}
+```
+
+Plugins that need graceful cleanup (flush audit events, close a connection, cancel a goroutine) implement `Shutdowner`:
+
+```go
+type Shutdowner interface {
+    Shutdown(ctx context.Context) error
+}
+```
+
+Both are **optional** via Go's type-assertion idiom — a plugin that doesn't need them simply doesn't implement them, and the pipeline skips it. Existing plugins (jwt-validation, a2a-parser, mcp-parser, inference-parser, token-exchange) don't implement these; they keep working unchanged.
+
+The host (e.g. `cmd/authbridge/main.go`) drives the lifecycle:
+
+```go
+// After pipeline.New, before listeners accept traffic:
+initCtx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+defer cancel()
+if err := inboundPipeline.Start(initCtx); err != nil {
+    log.Fatalf("inbound pipeline Start: %v", err) // fail-fast on bad plugin init
+}
+if err := outboundPipeline.Start(initCtx); err != nil {
+    log.Fatalf("outbound pipeline Start: %v", err)
+}
+
+// ... serve traffic ...
+
+// After listeners have drained on SIGTERM:
+outboundPipeline.Stop(shutdownCtx) // reverse order within each pipeline
+inboundPipeline.Stop(shutdownCtx)
+```
+
+Semantics:
+- `Start` — Init runs **in declaration order**, fails fast on the first error. The returned error names the offending plugin. No Shutdown is invoked on plugins whose Init already ran successfully — the intent is hard-fail on startup, not unwind.
+- `Stop` — Shutdown runs **in reverse declaration order (LIFO)** so a plugin that depends on an earlier plugin's resources can still use them while cleaning up. Best-effort: errors from one Shutdown are logged but do not stop the sequence. Bounded by the caller's ctx deadline.
+
+A minimal Init/Shutdown plugin example — a rate-limiter that refreshes its quota store in the background:
+
+```go
+type RateLimiter struct {
+    store  *quotaStore
+    cancel context.CancelFunc
+}
+
+func (p *RateLimiter) Name() string { return "rate-limiter" }
+func (p *RateLimiter) Capabilities() pipeline.PluginCapabilities { return pipeline.PluginCapabilities{} }
+
+func (p *RateLimiter) Init(ctx context.Context) error {
+    p.store = newQuotaStore()
+    bg, cancel := context.WithCancel(context.Background())
+    p.cancel = cancel
+    go p.store.refreshLoop(bg, 10*time.Second) // lives until Shutdown
+    return nil
+}
+
+func (p *RateLimiter) Shutdown(ctx context.Context) error {
+    p.cancel()             // stop the refresh loop
+    return p.store.flush(ctx) // best-effort write-back of pending counters
+}
+
+func (p *RateLimiter) OnRequest(ctx context.Context, pctx *pipeline.Context) pipeline.Action {
+    if !p.store.allow(pctx) {
+        return pipeline.RateLimited(30*time.Second, "", "quota exceeded")
+    }
+    return pipeline.Action{Type: pipeline.Continue}
+}
+
+func (p *RateLimiter) OnResponse(context.Context, *pipeline.Context) pipeline.Action {
+    return pipeline.Action{Type: pipeline.Continue}
+}
+```
 
 ### Extension slots known to the validator
 
@@ -399,12 +519,22 @@ func (p *Counter) OnRequest(_ context.Context, pctx *pipeline.Context) pipeline.
     }
     state.N++
     if state.N > 10 {
-        return pipeline.Action{Type: pipeline.Reject, Status: 429,
-            Reason: "per-session turn limit exceeded"}
+        return pipeline.RateLimited(30*time.Second,
+            "policy.rate-limited", "per-session turn limit exceeded")
     }
     return pipeline.Action{Type: pipeline.Continue}
 }
 ```
+
+Plugins express rejections through a structured `Violation` carrying a
+machine-readable `Code`, a short `Reason`, an optional longer
+`Description`, a `Details` map for plugin-arbitrary context, and HTTP-
+rendering hints (`Status`, `Body`, `BodyType`, `Headers`). Default JSON
+body synthesis covers the 95% case — set the hints only when overriding.
+Helper constructors (`Deny`, `DenyStatus`, `DenyWithDetails`,
+`Challenge`, `RateLimited`) make the common cases one-liners. See
+`action.go` for the full surface and `action_test.go` for worked
+examples.
 
 ---
 
@@ -471,8 +601,8 @@ For each AuthBridge invocation, `runCpexHook` needs to:
 
 | CPEX → AuthBridge |
 |---|
-| `ContinueProcessing: true` → return `Action{Type: Continue}` |
-| `Violation` set → return `Action{Type: Reject, Status: violation.ToHTTPStatus(), Reason: violation.Reason}` |
+| `ContinueProcessing: true` → return `pipeline.Action{Type: pipeline.Continue}` |
+| `Violation` set → return a `pipeline.Action` whose `Violation` carries `Code`, `Reason`, `Description`, `Details`, plus any HTTP hints. The two violation structs are near-isomorphic; most fields copy 1:1. Use `pipeline.DenyWithDetails(v.Code, v.Reason, v.Details)` for the common case and set `Description`/`Status`/`Headers` on the returned `Violation` pointer as needed. |
 | `ModifiedExtensions.security` changed → copy back into `pctx.Extensions.Security` |
 | `ModifiedPayload` set → copy into `pctx.Body` or `pctx.ResponseBody` |
 | `Errors[]` (non-fatal) → log, continue |
@@ -532,6 +662,8 @@ The plugin interface is **not** semver-stable yet (AuthBridge is pre-1.0). Chang
 - Extended `A2AExtension` with response-side fields (TaskID, FinalStatus, Artifact, ErrorMessage).
 - Extended `InferenceExtension` with structured tools + tool calls + TopP / ToolChoice.
 - Added `SessionEvent.MarshalJSON`/`UnmarshalJSON` round-trip contract.
+- **Breaking**: replaced `Action.Status`/`Action.Reason` with `Action.Violation` (see §5). Migration: use `Deny()`, `DenyStatus()`, `Challenge()`, `RateLimited()` helpers.
+- Added optional `Initializer` / `Shutdowner` interfaces + `Pipeline.Start` / `Pipeline.Stop` (see §6). Existing plugins are unaffected because the interfaces are opt-in via type-assertion.
 
 Breaking changes will be announced in `authbridge/CHANGELOG.md` (TBD) before a 1.0 tag.
 
@@ -539,9 +671,9 @@ Breaking changes will be announced in `authbridge/CHANGELOG.md` (TBD) before a 1
 
 ## 13. Cross-references
 
-- `pipeline.go` — `Pipeline` type, `New`, `Run`, `RunResponse`, `Plugins`, `NeedsBody`.
-- `plugin.go` — `Plugin` interface, `PluginCapabilities`.
-- `action.go` — `Action`, `ActionType`.
+- `pipeline.go` — `Pipeline` type, `New`, `Run`, `RunResponse`, `Start`, `Stop`, `Plugins`, `NeedsBody`.
+- `plugin.go` — `Plugin` interface, `PluginCapabilities`, `Initializer`, `Shutdowner`.
+- `action.go` — `Action`, `ActionType`, `Violation`, helper constructors (`Deny`, `DenyStatus`, `DenyWithDetails`, `Challenge`, `RateLimited`), `StatusFromCode`.
 - `context.go` — `Context`, `Direction`, `AgentIdentity`.
 - `extensions.go` — named extension types + `GetState`/`SetState`.
 - `session.go` — `SessionEvent`, `SessionView`, `SessionPhase`, marshalers.

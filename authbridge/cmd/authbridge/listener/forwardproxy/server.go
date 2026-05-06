@@ -5,7 +5,6 @@ package forwardproxy
 
 import (
 	"bytes"
-	"encoding/json"
 	"fmt"
 	"io"
 	"log/slog"
@@ -81,10 +80,7 @@ func (s *Server) handleRequest(w http.ResponseWriter, r *http.Request) {
 	action := s.OutboundPipeline.Run(r.Context(), pctx)
 
 	if action.Type == pipeline.Reject {
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(action.Status)
-		body, _ := json.Marshal(map[string]string{"error": action.Reason})
-		w.Write(body)
+		writeRejection(w, action)
 		return
 	}
 
@@ -153,10 +149,7 @@ func (s *Server) handleRequest(w http.ResponseWriter, r *http.Request) {
 
 	respAction := s.OutboundPipeline.RunResponse(r.Context(), pctx)
 	if respAction.Type == pipeline.Reject {
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(respAction.Status)
-		body, _ := json.Marshal(map[string]string{"error": respAction.Reason})
-		w.Write(body)
+		writeRejection(w, respAction)
 		return
 	}
 
@@ -200,4 +193,19 @@ func extractBearer(authHeader string) string {
 		return authHeader[7:]
 	}
 	return ""
+}
+
+// writeRejection renders a pipeline Reject to the http.ResponseWriter.
+// Preserves the plugin's status, headers, and body — the old flat
+// {"error":reason} is gone; plugins now control the wire shape via
+// action.Violation.
+func writeRejection(w http.ResponseWriter, action pipeline.Action) {
+	status, headers, body := action.Violation.Render()
+	for k, vs := range headers {
+		for _, v := range vs {
+			w.Header().Add(k, v)
+		}
+	}
+	w.WriteHeader(status)
+	_, _ = w.Write(body)
 }

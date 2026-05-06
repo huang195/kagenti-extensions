@@ -123,6 +123,21 @@ func main() {
 		}
 	}
 
+	// Invoke Init on any plugin implementing pipeline.Initializer. Done
+	// before listeners start so a plugin that fails to initialize takes
+	// down the process cleanly rather than serving traffic in a broken
+	// state. Init may do network I/O (register metrics, load a model,
+	// fetch a remote config); we give it the process context so an
+	// abort during init (Ctrl-C) cancels cooperatively.
+	initCtx, initCancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer initCancel()
+	if err := inboundPipeline.Start(initCtx); err != nil {
+		log.Fatalf("inbound pipeline Start: %v", err)
+	}
+	if err := outboundPipeline.Start(initCtx); err != nil {
+		log.Fatalf("outbound pipeline Start: %v", err)
+	}
+
 	// Build session store if enabled (nil when disabled — zero overhead).
 	// Defaults to on; set session.enabled: false in runtime config to opt out.
 	var sessions *session.Store
@@ -244,6 +259,14 @@ func main() {
 	if sessionAPISrv != nil {
 		sessionAPISrv.Shutdown(shutdownCtx)
 	}
+
+	// Invoke plugin Shutdown hooks after listeners have stopped accepting
+	// traffic so in-flight work is allowed to complete before plugins
+	// flush state. Best-effort — individual errors are logged but do
+	// not abort the sequence. Bounded by shutdownCtx's deadline.
+	outboundPipeline.Stop(shutdownCtx)
+	inboundPipeline.Stop(shutdownCtx)
+
 	if sessions != nil {
 		sessions.Close()
 	}

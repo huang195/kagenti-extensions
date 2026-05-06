@@ -6,7 +6,6 @@ package reverseproxy
 import (
 	"bytes"
 	"context"
-	"encoding/json"
 	"fmt"
 	"io"
 	"log/slog"
@@ -23,12 +22,20 @@ const maxBodySize = 1 << 20 // 1MB — matches Envoy's default per_stream_buffer
 
 type pctxKey struct{}
 
+// responseRejectedError carries a pipeline Reject from the roundTripper
+// back to the error handler, where it's rendered into the
+// http.ResponseWriter. The embedded action keeps Violation.Render() and
+// helper constructors available at the render site.
 type responseRejectedError struct {
-	status int
-	reason string
+	action pipeline.Action
 }
 
-func (e *responseRejectedError) Error() string { return e.reason }
+func (e *responseRejectedError) Error() string {
+	if e.action.Violation != nil {
+		return e.action.Violation.Reason
+	}
+	return "response rejected"
+}
 
 // Server is an HTTP reverse proxy with inbound JWT validation.
 type Server struct {
@@ -84,10 +91,7 @@ func (s *Server) handleRequest(w http.ResponseWriter, r *http.Request) {
 
 	action := s.InboundPipeline.Run(r.Context(), pctx)
 	if action.Type == pipeline.Reject {
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(action.Status)
-		body, _ := json.Marshal(map[string]string{"error": action.Reason})
-		w.Write(body)
+		writeRejection(w, action)
 		return
 	}
 
@@ -135,7 +139,7 @@ func (s *Server) modifyResponse(resp *http.Response) error {
 
 	action := s.InboundPipeline.RunResponse(resp.Request.Context(), pctx)
 	if action.Type == pipeline.Reject {
-		return &responseRejectedError{status: action.Status, reason: action.Reason}
+		return &responseRejectedError{action: action}
 	}
 
 	// If a plugin mutated ResponseBody, use the mutated version.
@@ -149,10 +153,21 @@ func (s *Server) modifyResponse(resp *http.Response) error {
 
 func (s *Server) errorHandler(w http.ResponseWriter, _ *http.Request, err error) {
 	if rErr, ok := err.(*responseRejectedError); ok {
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(rErr.status)
-		json.NewEncoder(w).Encode(map[string]string{"error": rErr.reason})
+		writeRejection(w, rErr.action)
 		return
 	}
 	http.Error(w, `{"error":"bad gateway"}`, http.StatusBadGateway)
+}
+
+// writeRejection renders a pipeline Reject to the http.ResponseWriter,
+// preserving the plugin's status, headers, and body.
+func writeRejection(w http.ResponseWriter, action pipeline.Action) {
+	status, headers, body := action.Violation.Render()
+	for k, vs := range headers {
+		for _, v := range vs {
+			w.Header().Add(k, v)
+		}
+	}
+	w.WriteHeader(status)
+	_, _ = w.Write(body)
 }

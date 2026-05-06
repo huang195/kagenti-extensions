@@ -66,8 +66,8 @@ func TestJWTValidation_InvalidToken(t *testing.T) {
 	if action.Type != pipeline.Reject {
 		t.Fatalf("got %v, want Reject", action.Type)
 	}
-	if action.Status != http.StatusUnauthorized {
-		t.Errorf("status = %d, want 401", action.Status)
+	status, _, _ := action.Violation.Render(); if status != http.StatusUnauthorized {
+		t.Errorf("status = %d, want 401", status)
 	}
 }
 
@@ -87,8 +87,8 @@ func TestJWTValidation_MissingHeader(t *testing.T) {
 	if action.Type != pipeline.Reject {
 		t.Fatalf("got %v, want Reject", action.Type)
 	}
-	if action.Status != http.StatusUnauthorized {
-		t.Errorf("status = %d, want 401", action.Status)
+	status, _, _ := action.Violation.Render(); if status != http.StatusUnauthorized {
+		t.Errorf("status = %d, want 401", status)
 	}
 }
 
@@ -201,8 +201,8 @@ func TestTokenExchange_ExchangeFailure(t *testing.T) {
 	if action.Type != pipeline.Reject {
 		t.Fatalf("got %v, want Reject", action.Type)
 	}
-	if action.Status != http.StatusServiceUnavailable {
-		t.Errorf("status = %d, want 503", action.Status)
+	status, _, _ := action.Violation.Render(); if status != http.StatusServiceUnavailable {
+		t.Errorf("status = %d, want 503", status)
 	}
 }
 
@@ -223,8 +223,8 @@ func TestTokenExchange_NoToken_Deny(t *testing.T) {
 	if action.Type != pipeline.Reject {
 		t.Fatalf("got %v, want Reject", action.Type)
 	}
-	if action.Status != http.StatusUnauthorized {
-		t.Errorf("status = %d, want 401", action.Status)
+	status, _, _ := action.Violation.Render(); if status != http.StatusUnauthorized {
+		t.Errorf("status = %d, want 401", status)
 	}
 }
 

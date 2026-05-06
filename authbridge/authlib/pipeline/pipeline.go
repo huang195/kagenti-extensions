@@ -57,17 +57,18 @@ func New(plugins []Plugin, opts ...Option) (*Pipeline, error) {
 }
 
 // Run executes the request phase of the pipeline sequentially.
-// If any plugin returns Reject, the pipeline stops and returns that action.
+// If any plugin returns Reject, the pipeline stops and returns that action
+// with Violation.PluginName populated.
 func (p *Pipeline) Run(ctx context.Context, pctx *Context) Action {
 	for _, plugin := range p.plugins {
 		if ctx.Err() != nil {
 			slog.Info("pipeline: request cancelled", "plugin", plugin.Name())
-			return Action{Type: Reject, Status: 499, Reason: "request cancelled"}
+			return Deny("pipeline.cancelled", "request cancelled")
 		}
 		action := plugin.OnRequest(ctx, pctx)
 		if action.Type == Reject {
-			slog.Info("pipeline: plugin rejected request",
-				"plugin", plugin.Name(), "status", action.Status, "reason", action.Reason)
+			stampPluginName(&action, plugin.Name())
+			logReject(plugin.Name(), action, "pipeline: plugin rejected request")
 			return action
 		}
 		slog.Debug("pipeline: plugin completed", "plugin", plugin.Name())
@@ -81,16 +82,40 @@ func (p *Pipeline) RunResponse(ctx context.Context, pctx *Context) Action {
 	for i := len(p.plugins) - 1; i >= 0; i-- {
 		if ctx.Err() != nil {
 			slog.Info("pipeline: response cancelled", "plugin", p.plugins[i].Name())
-			return Action{Type: Reject, Status: 499, Reason: "request cancelled"}
+			return Deny("pipeline.cancelled", "request cancelled")
 		}
 		action := p.plugins[i].OnResponse(ctx, pctx)
 		if action.Type == Reject {
-			slog.Info("pipeline: plugin rejected response",
-				"plugin", p.plugins[i].Name(), "status", action.Status, "reason", action.Reason)
+			stampPluginName(&action, p.plugins[i].Name())
+			logReject(p.plugins[i].Name(), action, "pipeline: plugin rejected response")
 			return action
 		}
 	}
 	return Action{Type: Continue}
+}
+
+// stampPluginName annotates a reject action with the plugin that produced
+// it, so listeners and clients can attribute the denial without the
+// plugin remembering to set it.
+func stampPluginName(action *Action, name string) {
+	if action.Violation == nil {
+		action.Violation = &Violation{Code: "plugin.unspecified", Reason: "plugin rejected without violation"}
+	}
+	if action.Violation.PluginName == "" {
+		action.Violation.PluginName = name
+	}
+}
+
+// logReject emits a structured log for a rejected request/response, with
+// the violation's code and reason. Keeps the two identical log statements
+// in Run/RunResponse in one place.
+func logReject(pluginName string, action Action, msg string) {
+	status, _, _ := action.Violation.Render()
+	slog.Info(msg,
+		"plugin", pluginName,
+		"status", status,
+		"code", action.Violation.Code,
+		"reason", action.Violation.Reason)
 }
 
 // Plugins returns a copy of the pipeline's plugin list in execution order.
@@ -113,6 +138,51 @@ func (p *Pipeline) NeedsBody() bool {
 		}
 	}
 	return false
+}
+
+// Start invokes Init on every plugin that implements the Initializer
+// interface, in declaration order. Returns the first error encountered;
+// on error, later plugins are not initialized. Plugins without Init are
+// silently skipped.
+//
+// Callers should invoke Start after Pipeline construction (pipeline.New)
+// and before the listener accepts traffic. Safe to call at most once per
+// Pipeline — plugins may assume Init runs exactly once per process.
+func (p *Pipeline) Start(ctx context.Context) error {
+	for _, plugin := range p.plugins {
+		init, ok := plugin.(Initializer)
+		if !ok {
+			continue
+		}
+		slog.Debug("pipeline: initializing plugin", "plugin", plugin.Name())
+		if err := init.Init(ctx); err != nil {
+			return fmt.Errorf("plugin %q Init: %w", plugin.Name(), err)
+		}
+	}
+	return nil
+}
+
+// Stop invokes Shutdown on every plugin that implements the Shutdowner
+// interface, in reverse declaration order (LIFO). Errors are logged but
+// do not stop the sequence — every Shutdowner is given a chance to flush.
+// The caller-supplied ctx carries the shutdown deadline; plugins are
+// expected to respect it.
+//
+// Callers should invoke Stop after the listener has drained / stopped
+// accepting new requests so in-flight work is allowed to complete first.
+// Safe to call at most once per Pipeline.
+func (p *Pipeline) Stop(ctx context.Context) {
+	for i := len(p.plugins) - 1; i >= 0; i-- {
+		sh, ok := p.plugins[i].(Shutdowner)
+		if !ok {
+			continue
+		}
+		slog.Debug("pipeline: shutting down plugin", "plugin", p.plugins[i].Name())
+		if err := sh.Shutdown(ctx); err != nil {
+			slog.Warn("pipeline: plugin Shutdown returned error",
+				"plugin", p.plugins[i].Name(), "error", err)
+		}
+	}
 }
 
 // validateCapabilities checks that every slot a plugin reads has been written

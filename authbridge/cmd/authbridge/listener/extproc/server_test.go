@@ -318,8 +318,13 @@ func TestExtProc_Outbound_Deny(t *testing.T) {
 	if ir == nil {
 		t.Fatal("expected ImmediateResponse (deny)")
 	}
-	if ir.Status.Code != 503 {
-		t.Errorf("status = %d, want 503", ir.Status.Code)
+	// Pre-Violation, the listener used to hardcode 503 here regardless of
+	// what the plugin said. That's now fixed — we pass through whatever
+	// status the plugin (via auth.HandleOutbound) chose. NoTokenPolicyDeny
+	// returns 401 because "no auth credential present" is a caller problem,
+	// not an upstream-unavailable one.
+	if ir.Status.Code != 401 {
+		t.Errorf("status = %d, want 401", ir.Status.Code)
 	}
 }
 

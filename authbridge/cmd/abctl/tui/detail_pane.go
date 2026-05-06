@@ -62,6 +62,10 @@ func filterForDetail(data []byte, phase pipeline.SessionPhase) []byte {
 	if a2a, ok := m["a2a"].(map[string]any); ok {
 		m["a2a"] = filterFields(a2a, a2aKeep)
 	}
+	// Identity is summarized at the session level (events pane banner).
+	// Drop it from per-event detail rows to reduce repetition — the full
+	// value is still in the wire JSON that yank writes out.
+	delete(m, "identity")
 	out, err := json.Marshal(m)
 	if err != nil {
 		return data

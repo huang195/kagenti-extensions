@@ -590,6 +590,81 @@ func TestStore_Rekey_RewritesExistingEventSessionIDs(t *testing.T) {
 	}
 }
 
+// TestSumTokens verifies that SessionSummary.TotalTokens aggregates only
+// over inference response events. Request events, non-inference responses,
+// and events without Inference populated must not contribute.
+func TestSumTokens(t *testing.T) {
+	evs := []pipeline.SessionEvent{
+		// Inference response — counted.
+		{
+			Phase:     pipeline.SessionResponse,
+			Inference: &pipeline.InferenceExtension{TotalTokens: 100},
+		},
+		// Inference request (has tokens field set, unusual, but must be skipped
+		// because request-phase token counts aren't usage).
+		{
+			Phase:     pipeline.SessionRequest,
+			Inference: &pipeline.InferenceExtension{TotalTokens: 99},
+		},
+		// MCP response — no inference, skipped.
+		{
+			Phase: pipeline.SessionResponse,
+			MCP:   &pipeline.MCPExtension{Method: "tools/call"},
+		},
+		// Inference response with zero tokens — contributes zero.
+		{
+			Phase:     pipeline.SessionResponse,
+			Inference: &pipeline.InferenceExtension{TotalTokens: 0},
+		},
+		// Second inference response — counted.
+		{
+			Phase:     pipeline.SessionResponse,
+			Inference: &pipeline.InferenceExtension{TotalTokens: 250},
+		},
+	}
+	got := sumTokens(evs)
+	if got != 350 {
+		t.Errorf("sumTokens = %d, want 350", got)
+	}
+	if sumTokens(nil) != 0 {
+		t.Error("sumTokens(nil) should be 0")
+	}
+	if sumTokens([]pipeline.SessionEvent{}) != 0 {
+		t.Error("sumTokens([]) should be 0")
+	}
+}
+
+// TestListSessions_TotalTokens verifies the aggregate lands on the summary.
+func TestListSessions_TotalTokens(t *testing.T) {
+	s := New(5*time.Minute, 100, 0)
+	s.Append("sess-a", pipeline.SessionEvent{
+		Phase:     pipeline.SessionResponse,
+		Inference: &pipeline.InferenceExtension{TotalTokens: 42},
+	})
+	s.Append("sess-a", pipeline.SessionEvent{
+		Phase: pipeline.SessionResponse,
+		MCP:   &pipeline.MCPExtension{Method: "tools/call"},
+	})
+	s.Append("sess-b", pipeline.SessionEvent{
+		Phase:     pipeline.SessionResponse,
+		Inference: &pipeline.InferenceExtension{TotalTokens: 17},
+	})
+	sums := s.ListSessions()
+	if len(sums) != 2 {
+		t.Fatalf("expected 2 summaries, got %d", len(sums))
+	}
+	byID := map[string]int{}
+	for _, sum := range sums {
+		byID[sum.ID] = sum.TotalTokens
+	}
+	if byID["sess-a"] != 42 {
+		t.Errorf("sess-a TotalTokens = %d, want 42", byID["sess-a"])
+	}
+	if byID["sess-b"] != 17 {
+		t.Errorf("sess-b TotalTokens = %d, want 17", byID["sess-b"])
+	}
+}
+
 func waitEvent(t *testing.T, ch <-chan pipeline.SessionEvent, d time.Duration) pipeline.SessionEvent {
 	t.Helper()
 	select {

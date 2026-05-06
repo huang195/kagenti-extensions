@@ -109,6 +109,10 @@ type model struct {
 	flash         string
 	flashUntil    time.Time
 	width, height int
+	// bodyHeight is the inner height available to panes (terminal height
+	// minus title + footer). Cached by layout() so rebuildEventsTable can
+	// size the events table after accounting for the IDENTITY banner.
+	bodyHeight int
 
 	// Panel components.
 	sessionsTbl  table.Model
@@ -402,6 +406,9 @@ func (m *model) View() string {
 	case paneEvents:
 		title = fmt.Sprintf("abctl · %s", trunc(m.selectedSess, 36))
 		body = m.eventsTbl.View()
+		if banner := identityBanner(m.events[m.selectedSess]); banner != "" {
+			body = banner + "\n" + body
+		}
 	case paneDetail:
 		title = fmt.Sprintf("abctl · %s · event", trunc(m.selectedSess, 24))
 		body = m.detailVp.View()

@@ -6,9 +6,11 @@ import (
 	"time"
 
 	"github.com/charmbracelet/bubbles/table"
+
+	"github.com/kagenti/kagenti-extensions/authbridge/authlib/pipeline"
 )
 
-// newSessionsTable builds an empty sessions table with the four columns.
+// newSessionsTable builds an empty sessions table.
 // Widths are refined later by layout() based on terminal width.
 func newSessionsTable() table.Model {
 	t := table.New(
@@ -16,6 +18,7 @@ func newSessionsTable() table.Model {
 			{Title: "ID", Width: 40},
 			{Title: "UPDATED", Width: 14},
 			{Title: "EVENTS", Width: 8},
+			{Title: "TOKENS", Width: 8},
 			{Title: "ACTIVE", Width: 8},
 		}),
 		table.WithFocused(true),
@@ -46,6 +49,7 @@ func (m *model) rebuildSessionsTable() {
 			s.ID,
 			relTime(now, s.UpdatedAt),
 			fmt.Sprintf("%d", s.EventCount),
+			sessionTokens(s.TotalTokens, m.events[s.ID]),
 			active,
 		})
 	}
@@ -83,6 +87,32 @@ func relTime(now, t time.Time) string {
 	default:
 		return t.Format("Jan 2 15:04")
 	}
+}
+
+// sessionTokens reports the total tokens for a session. Prefers the
+// server-computed count from SessionSummary (authoritative, covers the
+// full event backlog even before we've streamed anything for this
+// session). Falls back to a client-side sum over the cached events when
+// the server returned zero (older authbridge server without token
+// aggregation). Returns "—" when neither source has data.
+func sessionTokens(serverTotal int, cached []pipeline.SessionEvent) string {
+	if serverTotal > 0 {
+		return formatCount(serverTotal)
+	}
+	var total int
+	for i := range cached {
+		if cached[i].Phase != pipeline.SessionResponse {
+			continue
+		}
+		if cached[i].Inference == nil {
+			continue
+		}
+		total += cached[i].Inference.TotalTokens
+	}
+	if total == 0 {
+		return "—"
+	}
+	return formatCount(total)
 }
 
 // selectedSessionID returns the cursor row's session ID, or "".

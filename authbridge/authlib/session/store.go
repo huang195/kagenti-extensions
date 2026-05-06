@@ -227,11 +227,12 @@ func (s *Store) View(sessionID string) *pipeline.SessionView {
 // SessionSummary is a metadata-only view of a session, suitable for list
 // endpoints that shouldn't copy the full event backlog.
 type SessionSummary struct {
-	ID         string    `json:"id"`
-	CreatedAt  time.Time `json:"createdAt"`
-	UpdatedAt  time.Time `json:"updatedAt"`
-	EventCount int       `json:"eventCount"`
-	Active     bool      `json:"active"` // true if this is the most recently updated session
+	ID          string    `json:"id"`
+	CreatedAt   time.Time `json:"createdAt"`
+	UpdatedAt   time.Time `json:"updatedAt"`
+	EventCount  int       `json:"eventCount"`
+	TotalTokens int       `json:"totalTokens,omitempty"` // sum of Inference.TotalTokens across response events
+	Active      bool      `json:"active"`                // true if this is the most recently updated session
 }
 
 // ListSessions returns summaries for every non-expired session. Order is
@@ -247,11 +248,12 @@ func (s *Store) ListSessions() []SessionSummary {
 			continue
 		}
 		out = append(out, SessionSummary{
-			ID:         id,
-			CreatedAt:  sess.CreatedAt,
-			UpdatedAt:  sess.UpdatedAt,
-			EventCount: len(sess.Events),
-			Active:     id == s.activeID,
+			ID:          id,
+			CreatedAt:   sess.CreatedAt,
+			UpdatedAt:   sess.UpdatedAt,
+			EventCount:  len(sess.Events),
+			TotalTokens: sumTokens(sess.Events),
+			Active:      id == s.activeID,
 		})
 	}
 	// Most recently updated first.
@@ -259,6 +261,23 @@ func (s *Store) ListSessions() []SessionSummary {
 		return out[i].UpdatedAt.After(out[j].UpdatedAt)
 	})
 	return out
+}
+
+// sumTokens aggregates Inference.TotalTokens across all response events
+// in a session. Used by ListSessions so the summary endpoint can report a
+// per-session cost without the caller loading every event first.
+func sumTokens(events []pipeline.SessionEvent) int {
+	var total int
+	for i := range events {
+		if events[i].Phase != pipeline.SessionResponse {
+			continue
+		}
+		if events[i].Inference == nil {
+			continue
+		}
+		total += events[i].Inference.TotalTokens
+	}
+	return total
 }
 
 // ActiveSession returns the most recently updated session ID.

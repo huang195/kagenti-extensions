@@ -5,6 +5,7 @@ import (
 	"strings"
 
 	"github.com/charmbracelet/bubbles/table"
+	"github.com/charmbracelet/lipgloss"
 
 	"github.com/kagenti/kagenti-extensions/authbridge/authlib/pipeline"
 )
@@ -22,6 +23,7 @@ func newEventsTable() table.Model {
 			{Title: "METHOD", Width: 22},
 			{Title: "STATUS", Width: 7},
 			{Title: "DURATION", Width: 10},
+			{Title: "TOKENS", Width: 8},
 			{Title: "HOST", Width: 20},
 		}),
 		table.WithFocused(true),
@@ -31,9 +33,25 @@ func newEventsTable() table.Model {
 }
 
 // rebuildEventsTable populates the events table from the cache for the
-// currently selected session, applying filter + preserving cursor.
+// currently selected session, applying filter + preserving cursor. Also
+// resizes the table height to account for the IDENTITY banner — when
+// the session has inbound identity, subtract the banner's rendered
+// height so it doesn't push rows off-screen; otherwise claim the full
+// body height.
 func (m *model) rebuildEventsTable() {
 	events := m.events[m.selectedSess]
+
+	if m.bodyHeight > 0 {
+		h := m.bodyHeight
+		if len(distinctInboundIdentities(events)) > 0 {
+			h -= identityBannerHeight
+		}
+		if h < 3 {
+			h = 3
+		}
+		m.eventsTbl.SetHeight(h)
+	}
+
 	prevRow := m.eventsTbl.Cursor()
 	wasAtEnd := prevRow >= len(m.eventsTbl.Rows())-1
 
@@ -62,6 +80,7 @@ func (m *model) rebuildEventsTable() {
 			eventMethod(e),
 			statusCell(e),
 			durationCell(e),
+			tokensCell(e),
 			truncStr(e.Host, 20),
 		})
 	}
@@ -149,6 +168,17 @@ func statusCell(e pipeline.SessionEvent) string {
 		return ""
 	}
 	return fmt.Sprintf("%d", e.StatusCode)
+}
+
+// tokensCell shows the total token count for inference response rows so
+// operators can spot expensive calls while scrolling. Blank for every
+// other event type (a2a, mcp, inference *request*). Uses the same
+// thousands-separator formatter as the sessions-pane totals.
+func tokensCell(e pipeline.SessionEvent) string {
+	if e.Phase != pipeline.SessionResponse || e.Inference == nil || e.Inference.TotalTokens == 0 {
+		return ""
+	}
+	return formatCount(e.Inference.TotalTokens)
 }
 
 func durationCell(e pipeline.SessionEvent) string {
@@ -243,3 +273,93 @@ func pairRequestsAndResponses(events []pipeline.SessionEvent) map[int]int {
 	}
 	return pairs
 }
+
+// identityBannerStyle renders the small bordered box above the events
+// table. Rounded border matches the outer frame; muted color keeps the
+// banner as context rather than competing with the event rows.
+var identityBannerStyle = lipgloss.NewStyle().
+	Border(lipgloss.RoundedBorder()).
+	BorderForeground(lipgloss.AdaptiveColor{Light: "#94A3B8", Dark: "#475569"}).
+	Padding(0, 1)
+
+// identityBannerHeight is the rendered height of the banner — four lines
+// of content plus two border lines. layout() subtracts this from the
+// events-table height so the banner doesn't push rows off-screen.
+const identityBannerHeight = 6
+
+// identityBanner renders a compact "IDENTITY" box summarizing the caller
+// of this session's inbound events. If callers diverge across the
+// session, it reports the count so the operator knows to check detail
+// rows. Returns an empty string when no inbound identity is present
+// (e.g. outbound-only buckets).
+func identityBanner(events []pipeline.SessionEvent) string {
+	idents := distinctInboundIdentities(events)
+	if len(idents) == 0 {
+		return ""
+	}
+
+	var b strings.Builder
+	b.WriteString(styleTitle.Render("IDENTITY"))
+	b.WriteByte('\n')
+
+	if len(idents) == 1 {
+		id := idents[0]
+		b.WriteString(fmt.Sprintf("subject  %s\n", nonEmpty(id.Subject, "—")))
+		b.WriteString(fmt.Sprintf("client   %s\n", nonEmpty(id.ClientID, "—")))
+		b.WriteString(fmt.Sprintf("scopes   %s", nonEmpty(truncateScopes(id.Scopes, 3), "—")))
+	} else {
+		// Multiple distinct callers — surface the count; detail rows
+		// carry the full identity for drill-down.
+		subjects := make([]string, 0, len(idents))
+		for _, id := range idents {
+			subjects = append(subjects, nonEmpty(id.Subject, "—"))
+		}
+		b.WriteString(fmt.Sprintf("subjects  %d distinct: %s\n", len(idents), strings.Join(subjects, ", ")))
+		b.WriteString("client    (see individual events)\n")
+		b.WriteString("scopes    (see individual events)")
+	}
+	return identityBannerStyle.Render(b.String())
+}
+
+// identityKey is the comparable shape used to dedupe identities in the
+// banner. Using a struct avoids string concatenation (and the theoretical
+// "|" collision) — subject+clientID are the two fields that define a
+// unique caller; scopes can legitimately vary turn-to-turn.
+type identityKey struct {
+	subject  string
+	clientID string
+}
+
+// distinctInboundIdentities returns the unique EventIdentity values seen on
+// inbound events, in first-seen order.
+func distinctInboundIdentities(events []pipeline.SessionEvent) []*pipeline.EventIdentity {
+	var out []*pipeline.EventIdentity
+	seen := map[identityKey]bool{}
+	for i := range events {
+		e := &events[i]
+		if e.Direction != pipeline.Inbound || e.Identity == nil {
+			continue
+		}
+		k := identityKey{subject: e.Identity.Subject, clientID: e.Identity.ClientID}
+		if seen[k] {
+			continue
+		}
+		seen[k] = true
+		out = append(out, e.Identity)
+	}
+	return out
+}
+
+// truncateScopes joins the first n scopes with commas and appends a
+// "+N more" suffix if the list was longer. Keeps the identity banner
+// from overflowing the terminal when a caller has many scopes.
+func truncateScopes(scopes []string, n int) string {
+	if len(scopes) == 0 {
+		return ""
+	}
+	if len(scopes) <= n {
+		return strings.Join(scopes, ", ")
+	}
+	return strings.Join(scopes[:n], ", ") + fmt.Sprintf(" +%d more", len(scopes)-n)
+}
+

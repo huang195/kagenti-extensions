@@ -238,7 +238,12 @@ func (m *model) layout() {
 	}
 
 	m.sessionsTbl.SetHeight(bodyH)
-	m.eventsTbl.SetHeight(bodyH)
+	m.bodyHeight = bodyH
+	// The events table's height depends on whether the IDENTITY banner
+	// is rendered for the selected session. rebuildEventsTable() applies
+	// the banner-aware adjustment; call it so the size is correct after
+	// a window resize too.
+	m.rebuildEventsTable()
 	m.pipelineTbl.SetHeight(bodyH)
 	m.detailVp.Width = m.width
 	m.detailVp.Height = bodyH

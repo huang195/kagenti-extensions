@@ -303,6 +303,16 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 
 	case errMsg:
+		// Per-request failures (snapshot/pipeline) shouldn't flip the whole
+		// connection into a terminal failed state — the stream can still be
+		// healthy. Flash the error and leave connState alone. Only failures
+		// from the initial sessions list (which runs before the stream opens)
+		// mark the connection as failed so the user sees why nothing is
+		// appearing.
+		if strings.HasPrefix(msg.where, "snapshot") || msg.where == "get pipeline" {
+			m.setFlash(msg.where + " failed: " + msg.err.Error())
+			return m, nil
+		}
 		m.connState.phase = connFailed
 		m.connState.err = msg.err
 		return m, nil

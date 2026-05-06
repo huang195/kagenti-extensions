@@ -30,14 +30,22 @@ type MCPError struct {
 	Data    any    `json:"data,omitempty"`
 }
 
-// A2AExtension carries parsed A2A protocol metadata from inbound requests.
+// A2AExtension carries parsed A2A protocol metadata from inbound requests
+// and response summaries for debugging.
 type A2AExtension struct {
+	// Request fields
 	Method    string    `json:"method,omitempty"`
 	RPCID     any       `json:"rpcId,omitempty"`
 	SessionID string    `json:"sessionId,omitempty"`
 	MessageID string    `json:"messageId,omitempty"`
+	TaskID    string    `json:"taskId,omitempty"`
 	Role      string    `json:"role,omitempty"`
 	Parts     []A2APart `json:"parts,omitempty"`
+
+	// Response fields (populated by a2a-parser OnResponse)
+	FinalStatus  string `json:"finalStatus,omitempty"`  // "completed", "failed", "canceled"
+	Artifact     string `json:"artifact,omitempty"`     // final artifact text
+	ErrorMessage string `json:"errorMessage,omitempty"` // failure reason if status is "failed"
 }
 
 // A2APart represents a message part in an A2A request.

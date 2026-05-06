@@ -22,7 +22,11 @@ func (m *model) footerView() string {
 				m.connState.attempt,
 				int(time.Until(m.connState.nextRetry).Round(time.Second).Seconds()))))
 	case connFailed:
-		status.WriteString(styleError.Render("✗ failed"))
+		msg := "✗ failed"
+		if m.connState.err != nil {
+			msg += ": " + m.connState.err.Error()
+		}
+		status.WriteString(styleError.Render(msg))
 	default:
 		status.WriteString(styleMuted.Render("… connecting"))
 	}

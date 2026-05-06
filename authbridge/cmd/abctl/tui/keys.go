@@ -244,4 +244,10 @@ func (m *model) layout() {
 	m.detailVp.Height = bodyH
 
 	m.filterInput.Width = m.width - 4
+
+	// Re-wrap the detail viewport to the new width so long JSON values
+	// continue to fit after a terminal resize.
+	if m.detailEvent != nil {
+		m.showDetail(m.detailEvent)
+	}
 }

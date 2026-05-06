@@ -199,14 +199,21 @@ func main() {
 
 	slog.Info("authbridge starting", "mode", cfg.Mode, "logLevel", logLevel.Level().String())
 
+	// Parse configurable credential wait timeout (default 120s).
+	credentialTimeout := 120 * time.Second
+	if t := cfg.Identity.CredentialWaitTimeout; t != "" {
+		if d, err := time.ParseDuration(t); err == nil {
+			credentialTimeout = d
+		}
+	}
+
 	// Resolve credentials in background — doesn't block the listener.
-	// Once credential files are available, update the handler's identity
-	// and exchanger so token exchange requests use the loaded credentials.
+	// Never gives up: after initialTimeout switches to exponential backoff.
+	credReady := config.ResolveCredentialFiles(cfg, credentialTimeout)
+
+	// Update handler identity once credentials are available.
 	go func() {
-		slog.Info("resolving credentials in background...")
-		config.ResolveCredentialFiles(cfg)
-		// Safe to read cfg.Identity here — ResolveCredentialFiles completed
-		// and this is the only goroutine that writes these fields.
+		<-credReady
 		clientAuth, err := config.ResolveClientAuth(cfg)
 		if err != nil {
 			slog.Warn("failed to resolve client auth after credential load", "error", err)
@@ -216,6 +223,25 @@ func main() {
 			ClientID: cfg.Identity.ClientID,
 			Audience: cfg.Identity.ClientID,
 		}, clientAuth)
+	}()
+
+	// Health/readiness server — reflects credential readiness for K8s probes.
+	go func() {
+		mux := http.NewServeMux()
+		mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
+			w.WriteHeader(http.StatusOK)
+		})
+		mux.HandleFunc("/readyz", func(w http.ResponseWriter, r *http.Request) {
+			if handler.Ready() {
+				w.WriteHeader(http.StatusOK)
+			} else {
+				http.Error(w, "credentials pending", http.StatusServiceUnavailable)
+			}
+		})
+		slog.Info("health server listening", "addr", ":9091")
+		if err := http.ListenAndServe(":9091", mux); err != nil {
+			slog.Warn("health server failed", "error", err)
+		}
 	}()
 
 	// Wait for shutdown signal

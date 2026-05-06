@@ -259,6 +259,12 @@ func (a *Auth) UpdateIdentity(id IdentityConfig, clientAuth exchange.ClientAuth)
 	a.log.Info("identity updated", "client_id", id.ClientID)
 }
 
+// Ready returns true if the identity has been loaded (audience is non-empty).
+func (a *Auth) Ready() bool {
+	id := a.identity.Load()
+	return id != nil && id.Audience != ""
+}
+
 // HandleInbound validates an inbound request's JWT token.
 // audience overrides the default expected audience when non-empty. This supports
 // waypoint mode where audience is derived per-request from the destination host.
@@ -303,6 +309,13 @@ func (a *Auth) HandleInbound(ctx context.Context, authHeader, path, audience str
 	}
 	if audience == "" {
 		audience = a.identity.Load().Audience
+	}
+	if audience == "" {
+		return &InboundResult{
+			Action:     ActionDeny,
+			DenyStatus: http.StatusServiceUnavailable,
+			DenyReason: "identity not yet configured (credentials pending)",
+		}
 	}
 	a.log.Debug("validating inbound JWT", "path", path, "expectedAudience", audience)
 	claims, err := a.verifier.Verify(ctx, token, audience)

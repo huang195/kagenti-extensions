@@ -100,9 +100,9 @@ func (c *Client) streamOnce(ctx context.Context, filter string, out chan<- Strea
 	}
 	req.Header.Set("Accept", "text/event-stream")
 
-	// Dedicated client — no timeout for streaming responses.
-	httpc := &http.Client{}
-	resp, err := httpc.Do(req)
+	// Reuse the shared no-timeout client so the Transport's idle-connection
+	// pool survives across reconnects.
+	resp, err := c.httpStream.Do(req)
 	if err != nil {
 		return err
 	}

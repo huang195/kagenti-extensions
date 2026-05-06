@@ -125,14 +125,14 @@ func extractSendResponse(body []byte, ext *pipeline.A2AExtension) bool {
 				State   string `json:"state"`
 				Message struct {
 					Parts []struct {
-						Type string `json:"type"`
+						Kind string `json:"kind"`
 						Text string `json:"text"`
 					} `json:"parts"`
 				} `json:"message"`
 			} `json:"status"`
 			Artifacts []struct {
 				Parts []struct {
-					Type string `json:"type"`
+					Kind string `json:"kind"`
 					Text string `json:"text"`
 				} `json:"parts"`
 			} `json:"artifacts"`
@@ -151,7 +151,7 @@ func extractSendResponse(body []byte, ext *pipeline.A2AExtension) bool {
 	// Extract artifact text
 	for _, artifact := range resp.Result.Artifacts {
 		for _, part := range artifact.Parts {
-			if part.Type == "text" && part.Text != "" {
+			if part.Kind == "text" && part.Text != "" {
 				ext.Artifact = part.Text
 			}
 		}
@@ -160,7 +160,7 @@ func extractSendResponse(body []byte, ext *pipeline.A2AExtension) bool {
 	// Extract error message from status message on failure
 	if resp.Result.Status.State == "failed" {
 		for _, part := range resp.Result.Status.Message.Parts {
-			if part.Type == "text" && part.Text != "" {
+			if part.Kind == "text" && part.Text != "" {
 				ext.ErrorMessage = part.Text
 				break
 			}
@@ -190,14 +190,14 @@ func extractStreamResponse(body []byte, ext *pipeline.A2AExtension) {
 					State   string `json:"state"`
 					Message struct {
 						Parts []struct {
-							Type string `json:"type"`
+							Kind string `json:"kind"`
 							Text string `json:"text"`
 						} `json:"parts"`
 					} `json:"message"`
 				} `json:"status"`
 				Artifact struct {
 					Parts []struct {
-						Type string `json:"type"`
+						Kind string `json:"kind"`
 						Text string `json:"text"`
 					} `json:"parts"`
 				} `json:"artifact"`
@@ -219,18 +219,21 @@ func extractStreamResponse(body []byte, ext *pipeline.A2AExtension) {
 				// Extract error message on failure
 				if event.Result.Status.State == "failed" {
 					for _, part := range event.Result.Status.Message.Parts {
-						if part.Type == "text" && part.Text != "" {
+						if part.Kind == "text" && part.Text != "" {
 							ext.ErrorMessage = part.Text
 							break
 						}
 					}
 				}
 			}
-		case "artifact":
-			// Keep the last artifact (final answer)
+		case "artifact-update", "artifact":
+			// A2A SDKs emit kind="artifact-update" on the stream; older
+			// samples use "artifact". Accept both. Concatenate text parts
+			// from the frame; repeated frames for the same artifact carry
+			// appended text so we accumulate across frames.
 			for _, part := range event.Result.Artifact.Parts {
-				if part.Type == "text" && part.Text != "" {
-					ext.Artifact = part.Text
+				if part.Kind == "text" && part.Text != "" {
+					ext.Artifact += part.Text
 				}
 			}
 		}

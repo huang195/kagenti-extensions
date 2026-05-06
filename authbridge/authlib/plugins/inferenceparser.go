@@ -64,7 +64,7 @@ func (p *InferenceParser) OnRequest(_ context.Context, pctx *pipeline.Context) p
 		ext.Tools = append(ext.Tools, pipeline.InferenceTool{
 			Name:        tool.Function.Name,
 			Description: tool.Function.Description,
-			Parameters:  tool.Function.Parameters,
+			Parameters:  tool.Function.paramsMap(),
 		})
 	}
 
@@ -286,8 +286,27 @@ type inferenceTool struct {
 	Function inferenceFunction `json:"function"`
 }
 
+// inferenceFunction decodes the function object within an OpenAI tool
+// definition. Parameters is deliberately a json.RawMessage rather than a
+// map[string]any so a non-object value (string / number / null) does not
+// fail the whole request decode — we fall back to nil parameters but still
+// capture the tool name and description.
 type inferenceFunction struct {
-	Name        string         `json:"name"`
-	Description string         `json:"description"`
-	Parameters  map[string]any `json:"parameters"`
+	Name        string          `json:"name"`
+	Description string          `json:"description"`
+	Parameters  json.RawMessage `json:"parameters"`
+}
+
+// paramsMap decodes Parameters into a map. Returns nil if the value is
+// absent or not a JSON object (e.g. a string or number); callers treat nil
+// as "no schema captured" without failing the whole inference parse.
+func (f inferenceFunction) paramsMap() map[string]any {
+	if len(f.Parameters) == 0 {
+		return nil
+	}
+	var m map[string]any
+	if err := json.Unmarshal(f.Parameters, &m); err != nil {
+		return nil
+	}
+	return m
 }

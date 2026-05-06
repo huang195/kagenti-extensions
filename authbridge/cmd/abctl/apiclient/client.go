@@ -17,18 +17,31 @@ import (
 )
 
 // Client is a handle to a session API endpoint. Safe for concurrent use.
+//
+// Two http.Clients share a single Transport: `http` has a 10s timeout for
+// short REST calls, `httpStream` has no timeout for SSE. Sharing the
+// Transport keeps the idle-connection pool warm across reconnects so a
+// long session doesn't leak Transports.
 type Client struct {
-	endpoint string
-	http     *http.Client
+	endpoint   string
+	http       *http.Client
+	httpStream *http.Client
 }
 
 // New returns a Client pointed at endpoint (e.g. "http://localhost:9094").
 // Trailing slash is tolerated.
 func New(endpoint string) *Client {
+	// Clone the default transport rather than reuse it so tests / multiple
+	// Clients don't share connection pools.
+	transport := http.DefaultTransport.(*http.Transport).Clone()
 	return &Client{
 		endpoint: trimSlash(endpoint),
 		http: &http.Client{
-			Timeout: 10 * time.Second,
+			Transport: transport,
+			Timeout:   10 * time.Second,
+		},
+		httpStream: &http.Client{
+			Transport: transport,
 		},
 	}
 }

@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
-	"path/filepath"
 	"sort"
 	"strings"
 	"time"
@@ -449,27 +448,42 @@ func viewTabs(active paneID) string {
 }
 
 // trunc clips a string to n runes with an ellipsis. Used for title truncation.
+// truncStr in events_pane.go is the byte-indexed variant for fixed-width
+// ASCII table cells — if that ever needs to handle multi-byte input, merge
+// the two into a single rune-aware helper.
 func trunc(s string, n int) string {
-	if len(s) <= n {
+	r := []rune(s)
+	if len(r) <= n {
 		return s
 	}
-	return s[:n-1] + "…"
+	if n < 1 {
+		return ""
+	}
+	return string(r[:n-1]) + "…"
 }
 
-// yankEventToFile writes the currently-focused event to /tmp as pretty
-// JSON and returns the path. Errors bubble up as a flash message.
+// yankEventToFile writes the currently-focused event to a fresh tmpfile
+// as pretty JSON and returns the path. Uses os.CreateTemp so the file is
+// created with 0600 perms (session events carry identity subjects, raw
+// LLM completions, and tool arguments — the operator-only default keeps
+// them off shared / CI hosts).
 func yankEventToFile(e *pipeline.SessionEvent) (string, error) {
-	ts := time.Now().UTC().Format("20060102-150405.000")
-	ts = strings.ReplaceAll(ts, ".", "-")
-	path := filepath.Join(os.TempDir(), "abctl-event-"+ts+".json")
-	data, err := json.MarshalIndent(e, "", "  ")
+	ts := time.Now().UTC().Format("20060102-150405")
+	f, err := os.CreateTemp(os.TempDir(), "abctl-event-"+ts+"-*.json")
 	if err != nil {
 		return "", err
 	}
-	if err := os.WriteFile(path, data, 0o644); err != nil {
+	defer f.Close()
+	data, err := json.MarshalIndent(e, "", "  ")
+	if err != nil {
+		os.Remove(f.Name())
 		return "", err
 	}
-	return path, nil
+	if _, err := f.Write(data); err != nil {
+		os.Remove(f.Name())
+		return "", err
+	}
+	return f.Name(), nil
 }
 
 // trim bounds a slice to the last n elements (drops oldest on overflow).

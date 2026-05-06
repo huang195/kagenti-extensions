@@ -211,6 +211,47 @@ func TestInferenceParser_CapturesToolDescriptionAndParameters(t *testing.T) {
 	}
 }
 
+// A malformed `parameters` value (string instead of an object) must not
+// take down the whole inference capture. The tool name and description
+// still land on the extension; parameters are simply nil.
+func TestInferenceParser_ToolParametersNotObject(t *testing.T) {
+	p := NewInferenceParser()
+	pctx := &pipeline.Context{
+		Path: "/v1/chat/completions",
+		Body: []byte(`{
+			"model": "llama3.1",
+			"messages": [{"role":"user","content":"x"}],
+			"tools": [{
+				"type": "function",
+				"function": {
+					"name": "get_weather",
+					"description": "Get weather info",
+					"parameters": "not-an-object"
+				}
+			}]
+		}`),
+	}
+	if action := p.OnRequest(context.Background(), pctx); action.Type != pipeline.Continue {
+		t.Fatalf("expected Continue, got %v", action.Type)
+	}
+	ext := pctx.Extensions.Inference
+	if ext == nil {
+		t.Fatal("Inference extension should be captured even with malformed parameters")
+	}
+	if len(ext.Tools) != 1 {
+		t.Fatalf("Tools len = %d, want 1", len(ext.Tools))
+	}
+	if ext.Tools[0].Name != "get_weather" {
+		t.Errorf("Name = %q, want get_weather", ext.Tools[0].Name)
+	}
+	if ext.Tools[0].Description != "Get weather info" {
+		t.Errorf("Description = %q", ext.Tools[0].Description)
+	}
+	if ext.Tools[0].Parameters != nil {
+		t.Errorf("Parameters should be nil for non-object input, got %+v", ext.Tools[0].Parameters)
+	}
+}
+
 func TestInferenceParser_OnResponse_CapturesToolCalls(t *testing.T) {
 	p := NewInferenceParser()
 	pctx := &pipeline.Context{

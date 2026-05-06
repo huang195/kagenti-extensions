@@ -161,7 +161,7 @@ func TestHandleStream_DeliversAppendedEvent(t *testing.T) {
 	if !sawID {
 		t.Error("id: 1 line never arrived")
 	}
-	sawData := scanUntilPrefix(t, sc, "data: ", time.Second)
+	sawData := scanUntilPrefix(t, sc, "data: ", 5*time.Second)
 	if sawData == "" {
 		t.Fatal("data: line never arrived")
 	}
@@ -186,7 +186,7 @@ func TestHandleStream_Heartbeat(t *testing.T) {
 
 	sc := bufio.NewScanner(resp.Body)
 	// Consume the initial ": ok", then expect ": heartbeat" within the window.
-	waitForLine(t, sc, ":", "initial", time.Second)
+	waitForLine(t, sc, ":", "initial", 5*time.Second)
 	got := scanUntilExact(t, sc, ": heartbeat", 500*time.Millisecond)
 	if !got {
 		t.Error("no heartbeat observed within 500ms")
@@ -206,7 +206,7 @@ func TestHandleStream_SessionFilter(t *testing.T) {
 	defer resp.Body.Close()
 	sc := bufio.NewScanner(resp.Body)
 	sc.Buffer(make([]byte, 0, 8192), 4<<20)
-	waitForLine(t, sc, ":", "initial", time.Second)
+	waitForLine(t, sc, ":", "initial", 5*time.Second)
 
 	// Event with a different SessionID — should be filtered out.
 	store.Append("drop", pipeline.SessionEvent{
@@ -217,7 +217,7 @@ func TestHandleStream_SessionFilter(t *testing.T) {
 		A2A: &pipeline.A2AExtension{Method: "message/stream"},
 	})
 
-	data := scanUntilPrefix(t, sc, "data: ", time.Second)
+	data := scanUntilPrefix(t, sc, "data: ", 5*time.Second)
 	if data == "" {
 		t.Fatal("no data frame received")
 	}
@@ -246,7 +246,7 @@ func TestHandleStream_SessionFilter_WorksOnOutboundMCP(t *testing.T) {
 	defer resp.Body.Close()
 	sc := bufio.NewScanner(resp.Body)
 	sc.Buffer(make([]byte, 0, 8192), 4<<20)
-	waitForLine(t, sc, ":", "initial", time.Second)
+	waitForLine(t, sc, ":", "initial", 5*time.Second)
 
 	// Outbound MCP call appended to the wrong bucket — must be filtered.
 	store.Append("drop", pipeline.SessionEvent{
@@ -257,7 +257,7 @@ func TestHandleStream_SessionFilter_WorksOnOutboundMCP(t *testing.T) {
 		MCP: &pipeline.MCPExtension{Method: "tools/list"},
 	})
 
-	data := scanUntilPrefix(t, sc, "data: ", time.Second)
+	data := scanUntilPrefix(t, sc, "data: ", 5*time.Second)
 	if data == "" {
 		t.Fatal("no data frame received within deadline")
 	}

@@ -11,7 +11,9 @@ that doesn't require token exchange. For a more advanced demo showing outbound
 token exchange and scope-based access control, see the
 [GitHub Issue Agent demo](../github-issue/demo.md). For the same weather images
 with **token exchange and AuthBridge on the tool** (plus a CI-style verify script),
-see [Weather Agent — Advanced](demo-ui-advanced.md).
+see [Weather Agent — Advanced](demo-ui-advanced.md). To observe the
+plugin pipeline in real time while chatting with the agent, see
+[Weather Agent with `abctl`](demo-with-abctl.md).
 
 ## What This Demo Shows
 

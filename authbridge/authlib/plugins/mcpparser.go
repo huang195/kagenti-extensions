@@ -36,6 +36,15 @@ func (p *MCPParser) OnRequest(_ context.Context, pctx *pipeline.Context) pipelin
 		slog.Debug("mcp-parser: body is not valid JSON-RPC", "error", err, "bodyLen", len(pctx.Body))
 		return pipeline.Action{Type: pipeline.Continue}
 	}
+	// Empty method → body parses as JSON but isn't a JSON-RPC request
+	// (e.g. an OpenAI chat/completions body also unmarshals into
+	// jsonRPCRequest with zero-value fields). Don't attach a useless
+	// MCPExtension to non-MCP traffic — downstream consumers shouldn't
+	// see a phantom "mcp: {}" on every inference event.
+	if rpc.Method == "" {
+		slog.Debug("mcp-parser: body is JSON but not JSON-RPC, skipping", "bodyLen", len(pctx.Body))
+		return pipeline.Action{Type: pipeline.Continue}
+	}
 
 	pctx.Extensions.MCP = &pipeline.MCPExtension{
 		Method: rpc.Method,

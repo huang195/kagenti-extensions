@@ -183,7 +183,11 @@ func main() {
 	// disable.
 	var sessionAPISrv *sessionapi.Server
 	if cfg.Listener.SessionAPIAddr != "" && sessions != nil {
-		sessionAPISrv = sessionapi.New(cfg.Listener.SessionAPIAddr, sessions)
+		sessionAPISrv = sessionapi.New(
+			cfg.Listener.SessionAPIAddr,
+			sessions,
+			sessionapi.WithPipelines(inboundPipeline, outboundPipeline),
+		)
 		go func() {
 			slog.Warn("session API listening — UNAUTHENTICATED; contains raw user content; never expose via ingress",
 				"addr", cfg.Listener.SessionAPIAddr)

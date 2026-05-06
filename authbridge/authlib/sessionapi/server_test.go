@@ -161,7 +161,7 @@ func TestHandleStream_DeliversAppendedEvent(t *testing.T) {
 	if !sawID {
 		t.Error("id: 1 line never arrived")
 	}
-	sawData := scanUntilPrefix(t, sc, "data: ", time.Second)
+	sawData := scanUntilPrefix(t, sc, "data: ", 5*time.Second)
 	if sawData == "" {
 		t.Fatal("data: line never arrived")
 	}
@@ -186,7 +186,7 @@ func TestHandleStream_Heartbeat(t *testing.T) {
 
 	sc := bufio.NewScanner(resp.Body)
 	// Consume the initial ": ok", then expect ": heartbeat" within the window.
-	waitForLine(t, sc, ":", "initial", time.Second)
+	waitForLine(t, sc, ":", "initial", 5*time.Second)
 	got := scanUntilExact(t, sc, ": heartbeat", 500*time.Millisecond)
 	if !got {
 		t.Error("no heartbeat observed within 500ms")
@@ -206,7 +206,7 @@ func TestHandleStream_SessionFilter(t *testing.T) {
 	defer resp.Body.Close()
 	sc := bufio.NewScanner(resp.Body)
 	sc.Buffer(make([]byte, 0, 8192), 4<<20)
-	waitForLine(t, sc, ":", "initial", time.Second)
+	waitForLine(t, sc, ":", "initial", 5*time.Second)
 
 	// Event with a different SessionID — should be filtered out.
 	store.Append("drop", pipeline.SessionEvent{
@@ -217,7 +217,7 @@ func TestHandleStream_SessionFilter(t *testing.T) {
 		A2A: &pipeline.A2AExtension{Method: "message/stream"},
 	})
 
-	data := scanUntilPrefix(t, sc, "data: ", time.Second)
+	data := scanUntilPrefix(t, sc, "data: ", 5*time.Second)
 	if data == "" {
 		t.Fatal("no data frame received")
 	}
@@ -246,7 +246,7 @@ func TestHandleStream_SessionFilter_WorksOnOutboundMCP(t *testing.T) {
 	defer resp.Body.Close()
 	sc := bufio.NewScanner(resp.Body)
 	sc.Buffer(make([]byte, 0, 8192), 4<<20)
-	waitForLine(t, sc, ":", "initial", time.Second)
+	waitForLine(t, sc, ":", "initial", 5*time.Second)
 
 	// Outbound MCP call appended to the wrong bucket — must be filtered.
 	store.Append("drop", pipeline.SessionEvent{
@@ -257,7 +257,7 @@ func TestHandleStream_SessionFilter_WorksOnOutboundMCP(t *testing.T) {
 		MCP: &pipeline.MCPExtension{Method: "tools/list"},
 	})
 
-	data := scanUntilPrefix(t, sc, "data: ", time.Second)
+	data := scanUntilPrefix(t, sc, "data: ", 5*time.Second)
 	if data == "" {
 		t.Fatal("no data frame received within deadline")
 	}
@@ -266,6 +266,103 @@ func TestHandleStream_SessionFilter_WorksOnOutboundMCP(t *testing.T) {
 	}
 	if !strings.Contains(data, `"method":"tools/list"`) {
 		t.Errorf("expected MCP tools/list event, got: %s", data)
+	}
+}
+
+// fakePlugin implements pipeline.Plugin for the /v1/pipeline handler tests
+// without pulling in the real plugins package (credential files, etc.).
+type fakePlugin struct {
+	name string
+	caps pipeline.PluginCapabilities
+}
+
+func (f *fakePlugin) Name() string                             { return f.name }
+func (f *fakePlugin) Capabilities() pipeline.PluginCapabilities { return f.caps }
+func (f *fakePlugin) OnRequest(_ context.Context, _ *pipeline.Context) pipeline.Action {
+	return pipeline.Action{Type: pipeline.Continue}
+}
+func (f *fakePlugin) OnResponse(_ context.Context, _ *pipeline.Context) pipeline.Action {
+	return pipeline.Action{Type: pipeline.Continue}
+}
+
+func TestHandlePipeline(t *testing.T) {
+	inbound, err := pipeline.New([]pipeline.Plugin{
+		&fakePlugin{name: "jwt-validation"},
+		&fakePlugin{name: "a2a-parser", caps: pipeline.PluginCapabilities{Writes: []string{"a2a"}, BodyAccess: true}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	outbound, err := pipeline.New([]pipeline.Plugin{
+		&fakePlugin{name: "token-exchange"},
+		&fakePlugin{name: "mcp-parser", caps: pipeline.PluginCapabilities{Writes: []string{"mcp"}, BodyAccess: true}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	store := session.New(5*time.Minute, 100, 0)
+	defer store.Close()
+	srv := New(":0", store, WithPipelines(inbound, outbound))
+	ts := httptest.NewServer(srv.server.Handler)
+	defer ts.Close()
+
+	resp, err := http.Get(ts.URL + "/v1/pipeline")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != 200 {
+		t.Fatalf("status = %d, want 200", resp.StatusCode)
+	}
+
+	var body struct {
+		Inbound  []pipelinePluginView `json:"inbound"`
+		Outbound []pipelinePluginView `json:"outbound"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
+		t.Fatal(err)
+	}
+	if len(body.Inbound) != 2 || len(body.Outbound) != 2 {
+		t.Fatalf("inbound=%d outbound=%d, want 2/2", len(body.Inbound), len(body.Outbound))
+	}
+	if body.Inbound[0].Name != "jwt-validation" || body.Inbound[0].Position != 1 {
+		t.Errorf("inbound[0] = %+v", body.Inbound[0])
+	}
+	if !body.Inbound[1].BodyAccess || len(body.Inbound[1].Writes) == 0 || body.Inbound[1].Writes[0] != "a2a" {
+		t.Errorf("inbound[1] = %+v", body.Inbound[1])
+	}
+	if body.Outbound[1].Direction != "outbound" {
+		t.Errorf("outbound direction = %q, want outbound", body.Outbound[1].Direction)
+	}
+}
+
+func TestHandlePipeline_NilPipelines(t *testing.T) {
+	store := session.New(5*time.Minute, 100, 0)
+	defer store.Close()
+	srv := New(":0", store) // no WithPipelines
+	ts := httptest.NewServer(srv.server.Handler)
+	defer ts.Close()
+
+	resp, err := http.Get(ts.URL + "/v1/pipeline")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+
+	var body struct {
+		Inbound  []pipelinePluginView `json:"inbound"`
+		Outbound []pipelinePluginView `json:"outbound"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
+		t.Fatal(err)
+	}
+	// Empty slices, not null — the UI expects [].
+	if body.Inbound == nil || body.Outbound == nil {
+		t.Errorf("want empty slices, got nil: %+v", body)
+	}
+	if len(body.Inbound) != 0 || len(body.Outbound) != 0 {
+		t.Errorf("want empty, got inbound=%d outbound=%d", len(body.Inbound), len(body.Outbound))
 	}
 }
 

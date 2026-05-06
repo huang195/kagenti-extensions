@@ -45,7 +45,9 @@ func (p *InferenceParser) OnRequest(_ context.Context, pctx *pipeline.Context) p
 		Model:       req.Model,
 		Temperature: req.Temperature,
 		MaxTokens:   req.MaxTokens,
+		TopP:        req.TopP,
 		Stream:      req.Stream,
+		ToolChoice:  req.ToolChoice,
 	}
 
 	for _, msg := range req.Messages {
@@ -56,9 +58,14 @@ func (p *InferenceParser) OnRequest(_ context.Context, pctx *pipeline.Context) p
 	}
 
 	for _, tool := range req.Tools {
-		if tool.Function.Name != "" {
-			ext.Tools = append(ext.Tools, tool.Function.Name)
+		if tool.Function.Name == "" {
+			continue
 		}
+		ext.Tools = append(ext.Tools, pipeline.InferenceTool{
+			Name:        tool.Function.Name,
+			Description: tool.Function.Description,
+			Parameters:  tool.Function.paramsMap(),
+		})
 	}
 
 	pctx.Extensions.Inference = ext
@@ -105,8 +112,16 @@ func parseInferenceJSON(body []byte, ext *pipeline.InferenceExtension) {
 		return
 	}
 	if len(resp.Choices) > 0 {
-		ext.Completion = resp.Choices[0].Message.Content
-		ext.FinishReason = resp.Choices[0].FinishReason
+		c := resp.Choices[0]
+		ext.Completion = c.Message.Content
+		ext.FinishReason = c.FinishReason
+		for _, tc := range c.Message.ToolCalls {
+			ext.ToolCalls = append(ext.ToolCalls, pipeline.InferenceToolCall{
+				ID:        tc.ID,
+				Name:      tc.Function.Name,
+				Arguments: tc.Function.Arguments,
+			})
+		}
 	}
 	ext.PromptTokens = resp.Usage.PromptTokens
 	ext.CompletionTokens = resp.Usage.CompletionTokens
@@ -155,8 +170,30 @@ type inferenceResponse struct {
 }
 
 type inferenceChoice struct {
-	Message      inferenceMessage `json:"message"`
-	FinishReason string           `json:"finish_reason"`
+	Message      inferenceRespMessage `json:"message"`
+	FinishReason string               `json:"finish_reason"`
+}
+
+// inferenceRespMessage is the response-side message shape. Separate from
+// the request-side inferenceMessage (which has the multi-part content
+// Unmarshaler) because responses only carry plain-string content + an
+// optional tool_calls array.
+type inferenceRespMessage struct {
+	Role      string                 `json:"role"`
+	Content   string                 `json:"content"`
+	ToolCalls []inferenceRespToolCall `json:"tool_calls"`
+}
+
+// inferenceRespToolCall matches OpenAI's tool-call shape:
+//
+//	{"id":"call_123","type":"function","function":{"name":"...","arguments":"..."}}
+type inferenceRespToolCall struct {
+	ID       string `json:"id"`
+	Type     string `json:"type"`
+	Function struct {
+		Name      string `json:"name"`
+		Arguments string `json:"arguments"` // raw JSON string
+	} `json:"function"`
 }
 
 type inferenceStreamChunk struct {
@@ -184,8 +221,10 @@ type inferenceRequest struct {
 	Messages    []inferenceMessage `json:"messages"`
 	Temperature *float64           `json:"temperature"`
 	MaxTokens   *int               `json:"max_tokens"`
+	TopP        *float64           `json:"top_p"`
 	Stream      bool               `json:"stream"`
 	Tools       []inferenceTool    `json:"tools"`
+	ToolChoice  any                `json:"tool_choice"` // "auto"/"none" or object
 }
 
 // inferenceMessage accepts both OpenAI content shapes:
@@ -247,6 +286,27 @@ type inferenceTool struct {
 	Function inferenceFunction `json:"function"`
 }
 
+// inferenceFunction decodes the function object within an OpenAI tool
+// definition. Parameters is deliberately a json.RawMessage rather than a
+// map[string]any so a non-object value (string / number / null) does not
+// fail the whole request decode — we fall back to nil parameters but still
+// capture the tool name and description.
 type inferenceFunction struct {
-	Name string `json:"name"`
+	Name        string          `json:"name"`
+	Description string          `json:"description"`
+	Parameters  json.RawMessage `json:"parameters"`
+}
+
+// paramsMap decodes Parameters into a map. Returns nil if the value is
+// absent or not a JSON object (e.g. a string or number); callers treat nil
+// as "no schema captured" without failing the whole inference parse.
+func (f inferenceFunction) paramsMap() map[string]any {
+	if len(f.Parameters) == 0 {
+		return nil
+	}
+	var m map[string]any
+	if err := json.Unmarshal(f.Parameters, &m); err != nil {
+		return nil
+	}
+	return m
 }

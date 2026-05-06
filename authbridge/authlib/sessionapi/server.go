@@ -189,12 +189,17 @@ func (s *Server) handleStream(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Connection", "keep-alive")
 	w.Header().Set("X-Accel-Buffering", "no") // disable proxy buffering if any
 
+	// Subscribe BEFORE the ": ok" comment so any Append that happens between
+	// the client reading ": ok" and returning to scan the stream is captured.
+	// Flushing first and subscribing after opened a race where tests (and
+	// real clients that react quickly on ": ok") could Append events before
+	// the subscriber was registered, losing them.
+	sub, cancel := s.store.Subscribe()
+	defer cancel()
+
 	// Initial comment lets the client know the stream is live before any events.
 	fmt.Fprint(w, ": ok\n\n")
 	flusher.Flush()
-
-	sub, cancel := s.store.Subscribe()
-	defer cancel()
 
 	heartbeat := time.NewTicker(s.heartbeat)
 	defer heartbeat.Stop()

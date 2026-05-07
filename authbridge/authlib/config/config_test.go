@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
@@ -99,14 +100,98 @@ func TestValidate_ProxySidecarRequiresBackend(t *testing.T) {
 }
 
 func TestValidate_ValidConfigs(t *testing.T) {
+	withPipeline := func(c *Config) *Config {
+		c.Pipeline = PipelineConfig{
+			Inbound:  PipelineStageConfig{Plugins: []PluginEntry{{Name: "jwt-validation"}}},
+			Outbound: PipelineStageConfig{Plugins: []PluginEntry{{Name: "token-exchange"}}},
+		}
+		return c
+	}
 	for _, cfg := range []*Config{
-		{Mode: ModeEnvoySidecar},
-		{Mode: ModeWaypoint},
-		{Mode: ModeProxySidecar, Listener: ListenerConfig{ReverseProxyBackend: "http://upstream"}},
+		withPipeline(&Config{Mode: ModeEnvoySidecar}),
+		withPipeline(&Config{Mode: ModeWaypoint}),
+		withPipeline(&Config{Mode: ModeProxySidecar, Listener: ListenerConfig{ReverseProxyBackend: "http://upstream"}}),
 	} {
 		if err := Validate(cfg); err != nil {
 			t.Errorf("unexpected error for mode %s: %v", cfg.Mode, err)
 		}
+	}
+}
+
+// TestValidate_EmptyPipelineRejected guards the "open proxy" failure
+// mode: before this check, an operator who kept the pre-migration
+// top-level schema (inbound:, outbound:, identity:, bypass:, routes:)
+// in their ConfigMap would upgrade the image, land on a config where
+// yaml.v3 silently dropped the unknown top-level keys, end up with an
+// empty Pipeline, and boot successfully. Listeners would then run
+// pipelines with zero plugins — every request would pass through
+// without JWT validation or token exchange.
+//
+// Empty pipelines being a configuration error forces the operator to
+// either migrate to the new shape or leave the old image tagged. The
+// error message names the offending section and points at the new
+// schema.
+func TestValidate_EmptyPipelineRejected(t *testing.T) {
+	cfg := &Config{Mode: ModeEnvoySidecar}
+	err := Validate(cfg)
+	if err == nil {
+		t.Fatal("expected error for empty pipeline")
+	}
+	if !strings.Contains(err.Error(), "pipeline.inbound.plugins is empty") {
+		t.Errorf("error does not name the offending section: %q", err)
+	}
+}
+
+func TestValidate_EmptyOutboundPipelineRejected(t *testing.T) {
+	cfg := &Config{
+		Mode: ModeEnvoySidecar,
+		Pipeline: PipelineConfig{
+			Inbound: PipelineStageConfig{Plugins: []PluginEntry{{Name: "jwt-validation"}}},
+			// Outbound intentionally empty
+		},
+	}
+	err := Validate(cfg)
+	if err == nil {
+		t.Fatal("expected error for empty outbound pipeline")
+	}
+	if !strings.Contains(err.Error(), "pipeline.outbound.plugins is empty") {
+		t.Errorf("error does not name the offending section: %q", err)
+	}
+}
+
+// PluginEntry's UnmarshalYAML treats `config: null` as no config at
+// all. A literal null must not be forwarded to Configurable-gate as
+// four bytes "null" — that would spuriously reject non-Configurable
+// plugins that the operator explicitly authored with a null config
+// (e.g. to emphasize "no settings").
+func TestPluginEntry_NullConfigIsTreatedAsUnset(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.yaml")
+	content := `mode: envoy-sidecar
+pipeline:
+  inbound:
+    plugins:
+      - name: jwt-validation
+      - name: a2a-parser
+        config: null
+  outbound:
+    plugins:
+      - token-exchange
+`
+	if err := os.WriteFile(path, []byte(content), 0600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	entries := cfg.Pipeline.Inbound.Plugins
+	if len(entries) != 2 {
+		t.Fatalf("entries len = %d, want 2", len(entries))
+	}
+	if len(entries[1].Config) != 0 {
+		t.Errorf("a2a-parser Config = %q, want empty after config: null normalization",
+			entries[1].Config)
 	}
 }
 

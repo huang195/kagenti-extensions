@@ -334,6 +334,10 @@ func (p *TokenExchange) Init(_ context.Context) error {
 	if !needID && !needSecret {
 		return nil
 	}
+	// Defensive guard; see JWTValidation.Init for rationale.
+	if p.bgCancel != nil {
+		return nil
+	}
 	bgCtx, cancel := context.WithCancel(context.Background())
 	p.bgCancel = cancel
 	go p.pollCredentials(bgCtx, needID, needSecret)

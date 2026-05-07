@@ -48,6 +48,9 @@ func TestAuthbridgeCombinedYAML_Loads(t *testing.T) {
 	if cfg.Mode != config.ModeEnvoySidecar {
 		t.Errorf("mode = %q, want %q", cfg.Mode, config.ModeEnvoySidecar)
 	}
+	if err := config.Validate(cfg); err != nil {
+		t.Errorf("Validate: %v", err)
+	}
 
 	// Build both pipelines. Any plugin whose Configure rejects the
 	// env-expanded config subtree (e.g. because a default path moved

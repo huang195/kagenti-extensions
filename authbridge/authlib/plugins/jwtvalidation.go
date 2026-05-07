@@ -186,6 +186,13 @@ func (p *JWTValidation) Init(_ context.Context) error {
 	if p.cfg.AudienceFile == "" || p.cfg.Audience != "" || p.inner.Ready() {
 		return nil
 	}
+	// Defensive guard: pipeline.Start contract says Init runs exactly
+	// once per process, but a double-call would otherwise leak the
+	// first goroutine (the first cancel func would be dropped on the
+	// floor when we overwrite bgCancel).
+	if p.bgCancel != nil {
+		return nil
+	}
 	bgCtx, cancel := context.WithCancel(context.Background())
 	p.bgCancel = cancel
 	go func() {

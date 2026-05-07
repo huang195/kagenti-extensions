@@ -390,6 +390,30 @@ func TestWaitForCredentialFile_ContextCancel(t *testing.T) {
 	}
 }
 
+// TestWaitForCredentialFile_HeartbeatFires verifies that the
+// heartbeat log path is reachable while the file is absent. The actual
+// slog output isn't captured (stdlib slog has no test hook without a
+// handler swap) — this test just ensures the heartbeat branch in the
+// select loop is wired up, by lowering the interval and letting ctx
+// time out after a heartbeat has fired.
+func TestWaitForCredentialFile_HeartbeatFires(t *testing.T) {
+	orig := heartbeatInterval
+	heartbeatInterval = 50 * time.Millisecond
+	defer func() { heartbeatInterval = orig }()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+	defer cancel()
+
+	// 200ms is enough for at least one heartbeat tick even under CI
+	// load. The assertion below is indirect: if the heartbeat branch
+	// panicked (missing slog import, nil deref on the ticker, etc.),
+	// the goroutine would crash and the test harness would surface it.
+	_, err := WaitForCredentialFile(ctx, filepath.Join(t.TempDir(), "never"))
+	if err == nil {
+		t.Error("expected error when ctx cancels before file appears")
+	}
+}
+
 // --- SessionConfig tri-state ---
 
 func TestSessionConfig_SessionEnabled(t *testing.T) {

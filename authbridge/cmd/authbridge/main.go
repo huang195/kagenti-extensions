@@ -189,6 +189,12 @@ func main() {
 	// plumbs plugin-local stats through; /config still returns the
 	// parsed runtime config, which is the more useful of the two for
 	// debugging.
+	//
+	// The WARN at startup is the only visible signal an operator sees —
+	// otherwise a curl to /stats returns zeros and looks like a broken
+	// pipeline rather than an intentional stub.
+	slog.Warn("stat server: /stats returns empty counters in this release; " +
+		"per-plugin stats aggregation is a follow-up. /config remains accurate.")
 	statSrv := startStatServer(cfg, auth.NewStats())
 
 	// Session events API (optional; only when session tracking is on).

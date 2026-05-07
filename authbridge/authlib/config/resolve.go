@@ -10,6 +10,7 @@ package config
 import (
 	"context"
 	"fmt"
+	"log/slog"
 	"os"
 	"strings"
 	"time"
@@ -35,6 +36,13 @@ func ReadCredentialFile(path string) (string, error) {
 	return strings.TrimSpace(string(b)), nil
 }
 
+// heartbeatInterval is how often WaitForCredentialFile emits a WARN
+// while still waiting. Chosen so that a misconfigured volume mount
+// (e.g., ConfigMap name typo) is loud enough to notice during an
+// operational incident, but not so spammy that it drowns out real
+// signal. Overridable at package scope for tests.
+var heartbeatInterval = 60 * time.Second
+
 // WaitForCredentialFile blocks until the file is readable with non-zero
 // length, or until ctx is cancelled. Plugins call this from Init (via a
 // goroutine) to wait out the race with client-registration's secret
@@ -42,9 +50,16 @@ func ReadCredentialFile(path string) (string, error) {
 //
 // Polls at 2s intervals — fast enough for human-observable boot times,
 // slow enough that a pod full of plugins isn't hammering the kubelet.
+// Emits a WARN every heartbeatInterval while the file is still absent
+// so operators can spot wrong paths / missing volume mounts in
+// `kubectl logs` during an incident, rather than discovering them
+// after chasing silent 503s from traffic.
 func WaitForCredentialFile(ctx context.Context, path string) (string, error) {
 	ticker := time.NewTicker(2 * time.Second)
 	defer ticker.Stop()
+	heartbeat := time.NewTicker(heartbeatInterval)
+	defer heartbeat.Stop()
+	start := time.Now()
 	for {
 		if v, err := ReadCredentialFile(path); err == nil {
 			return v, nil
@@ -52,6 +67,10 @@ func WaitForCredentialFile(ctx context.Context, path string) (string, error) {
 		select {
 		case <-ctx.Done():
 			return "", ctx.Err()
+		case <-heartbeat.C:
+			slog.Warn("credential file still not available",
+				"path", path,
+				"waited", time.Since(start).Round(time.Second))
 		case <-ticker.C:
 		}
 	}

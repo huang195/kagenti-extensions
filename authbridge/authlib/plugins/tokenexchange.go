@@ -210,12 +210,32 @@ func (p *TokenExchange) Configure(raw json.RawMessage) error {
 			return fmt.Errorf("token-exchange config: %w", err)
 		}
 	}
+	// Track whether NoTokenPolicy arrived explicitly so we can warn
+	// waypoint-ish operators whose pre-migration deployments relied on
+	// the old mode-dependent default (waypoint=allow). applyDefaults
+	// fills in "deny" for everyone; without the explicit-set signal we
+	// can't tell the two cases apart at WARN time.
+	noTokenPolicyExplicit := c.NoTokenPolicy != ""
 	c.applyDefaults()
 	if err := c.validate(); err != nil {
 		return fmt.Errorf("token-exchange config: %w", err)
 	}
-	p.cfg = c
+	// Default-policy "exchange" with no explicit no_token_policy is the
+	// configuration shape where the old waypoint default ("allow")
+	// produced visibly different behavior than the new default ("deny").
+	// Log at boot so operators find out via `kubectl logs` instead of
+	// discovering it through unexpected 401s once traffic starts.
+	if !noTokenPolicyExplicit && c.DefaultPolicy == "exchange" {
+		slog.Warn("token-exchange: no_token_policy defaulted to \"deny\"; " +
+			"prior waypoint deployments defaulted to \"allow\". " +
+			"Set no_token_policy explicitly (allow | deny | client-credentials) to silence this warning and pin the behavior.")
+	}
 
+	// Everything below runs against the local `c`, never `p.cfg`, so a
+	// partially-constructed failure leaves the plugin in its zero
+	// state. The final p.cfg / p.inner assignments happen only after
+	// all fallible construction has succeeded.
+	//
 	// Best-effort synchronous credential load. Missing files are
 	// tolerated; Init will retry. Log a boot-time WARN for each file
 	// that isn't yet readable so operators notice misconfiguration
@@ -223,7 +243,7 @@ func (p *TokenExchange) Configure(raw json.RawMessage) error {
 	// initial pod rather than discovering it later via 503s.
 	if c.Identity.ClientID == "" && c.Identity.ClientIDFile != "" {
 		if v, err := config.ReadCredentialFile(c.Identity.ClientIDFile); err == nil {
-			p.cfg.Identity.ClientID = v
+			c.Identity.ClientID = v
 		} else {
 			slog.Warn("token-exchange: client_id_file not yet readable; Init will poll in background",
 				"path", c.Identity.ClientIDFile, "error", err)
@@ -231,21 +251,22 @@ func (p *TokenExchange) Configure(raw json.RawMessage) error {
 	}
 	if c.Identity.ClientSecret == "" && c.Identity.ClientSecretFile != "" {
 		if v, err := config.ReadCredentialFile(c.Identity.ClientSecretFile); err == nil {
-			p.cfg.Identity.ClientSecret = v
+			c.Identity.ClientSecret = v
 		} else {
 			slog.Warn("token-exchange: client_secret_file not yet readable; Init will poll in background",
 				"path", c.Identity.ClientSecretFile, "error", err)
 		}
 	}
 
-	clientAuth, err := p.buildClientAuth()
+	clientAuth, err := buildClientAuthFrom(c.Identity.Type,
+		c.Identity.ClientID, c.Identity.ClientSecret, c.Identity.JWTSVIDPath)
 	if err != nil {
 		return fmt.Errorf("token-exchange: %w", err)
 	}
 
 	exchanger := exchange.NewClient(c.TokenURL, clientAuth)
 
-	router, err := p.buildRouter()
+	router, err := buildRouterFrom(c.DefaultPolicy, c.Routes)
 	if err != nil {
 		return fmt.Errorf("token-exchange routes: %w", err)
 	}
@@ -255,27 +276,25 @@ func (p *TokenExchange) Configure(raw json.RawMessage) error {
 		Exchanger:     exchanger,
 		Cache:         cache.New(),
 		Router:        router,
-		Identity:      auth.IdentityConfig{ClientID: p.cfg.Identity.ClientID},
+		Identity:      auth.IdentityConfig{ClientID: c.Identity.ClientID},
 		NoTokenPolicy: c.NoTokenPolicy,
 	}
 	if c.AudienceFromHost {
 		authCfg.AudienceDeriver = routing.ServiceNameFromHost
 	}
+	// Commit. p.cfg + p.inner become visible atomically (from the
+	// caller's point of view — Configure itself is serialized by
+	// pipeline.Build).
+	p.cfg = c
 	p.inner = auth.New(authCfg)
 	return nil
 }
 
-func (p *TokenExchange) buildClientAuth() (exchange.ClientAuth, error) {
-	return buildClientAuthFrom(
-		p.cfg.Identity.Type,
-		p.cfg.Identity.ClientID,
-		p.cfg.Identity.ClientSecret,
-		p.cfg.Identity.JWTSVIDPath,
-	)
-}
-
-// buildClientAuthFrom is the pure variant used by pollCredentials, which
-// cannot read p.cfg because cfg is immutable after Configure.
+// buildClientAuthFrom constructs an exchange.ClientAuth from explicit
+// args. Used both by Configure (against the local `c`, before p.cfg is
+// assigned) and by pollCredentials (which reads its credential values
+// from goroutine locals, not from the immutable p.cfg). Pure function
+// — no reads from the receiver.
 func buildClientAuthFrom(identityType, clientID, clientSecret, jwtSVIDPath string) (exchange.ClientAuth, error) {
 	switch identityType {
 	case "spiffe":
@@ -295,16 +314,19 @@ func buildClientAuthFrom(identityType, clientID, clientSecret, jwtSVIDPath strin
 	}
 }
 
-func (p *TokenExchange) buildRouter() (*routing.Router, error) {
+// buildRouterFrom is pure — no reads from the receiver. Used from
+// Configure before p.cfg is assigned, so a build failure leaves the
+// plugin in its zero state.
+func buildRouterFrom(defaultPolicy string, routes tokenExchangeRoutes) (*routing.Router, error) {
 	var rules []routing.Route
-	if p.cfg.Routes.File != "" {
-		fileRoutes, err := routing.LoadRoutes(p.cfg.Routes.File)
+	if routes.File != "" {
+		fileRoutes, err := routing.LoadRoutes(routes.File)
 		if err != nil {
 			return nil, err
 		}
 		rules = append(rules, fileRoutes...)
 	}
-	for _, rc := range p.cfg.Routes.Rules {
+	for _, rc := range routes.Rules {
 		action := rc.Action
 		if action == "" && rc.Passthrough {
 			action = "passthrough"
@@ -317,7 +339,7 @@ func (p *TokenExchange) buildRouter() (*routing.Router, error) {
 			Action:        action,
 		})
 	}
-	return routing.NewRouter(p.cfg.DefaultPolicy, rules)
+	return routing.NewRouter(defaultPolicy, rules)
 }
 
 // Init polls for credential files that weren't available during

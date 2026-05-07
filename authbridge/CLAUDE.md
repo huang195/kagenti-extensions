@@ -395,7 +395,7 @@ Set `session.enabled: false` in the runtime config to turn off the store (and im
 
 ## Gotchas and Known Issues
 
-1. **Credential file race condition**: Authbridge waits up to 60s for `/shared/client-id.txt` and `/shared/client-secret.txt`. If client-registration takes longer (e.g., Keycloak slow to start), authbridge will fall back to env vars which may be empty.
+1. **Credential file race condition**: Each plugin that reads a credential file (jwt-validation's `audience_file`, token-exchange's `client_id_file` / `client_secret_file` / `jwt_svid_path`) tries a synchronous read at Configure time and, on miss, spawns an Init goroutine that polls indefinitely — emitting a WARN every ~60s while the file is still missing. OnRequest returns 503 until the file arrives. If the file never shows up (wrong path, missing volume mount), the pod stays unready for outbound traffic; follow the WARN lines to the misconfigured path.
 
 2. **ISSUER vs TOKEN_URL**: `ISSUER` must be the Keycloak **frontend URL** (what appears in the `iss` claim of tokens), while `TOKEN_URL` is the **internal service URL**. These are often different in Kubernetes (e.g., `http://keycloak.localtest.me:8080` vs `http://keycloak-service.keycloak.svc:8080`).
 

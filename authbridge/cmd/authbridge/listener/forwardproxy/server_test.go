@@ -29,7 +29,7 @@ func (m *mockVerifier) Verify(_ context.Context, _ string, _ string) (*validatio
 
 func outboundPipelineFromAuth(t *testing.T, a *auth.Auth) *pipeline.Pipeline {
 	t.Helper()
-	p, err := plugins.DefaultOutboundPipeline(a)
+	p, err := plugins.BuildForTest([]pipeline.Plugin{plugins.NewTokenExchangeForTest(a)})
 	if err != nil {
 		t.Fatalf("building outbound pipeline: %v", err)
 	}

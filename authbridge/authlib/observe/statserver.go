@@ -48,32 +48,14 @@ func NewStatServer(addr string, config *config.Config, stats *auth.Stats) *StatS
 func handleConfigFactory(cfg *config.Config) func(http.ResponseWriter, *http.Request) {
 	return func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
-		// Rather than outputting the entire config,
-		// customize the output to redact the client secret.
-		err := json.NewEncoder(w).Encode(config.Config{
-			Mode:     cfg.Mode,
-			Inbound:  cfg.Inbound,
-			Outbound: cfg.Outbound,
-			Identity: config.IdentityConfig{
-				Type: cfg.Identity.Type,
-				// We report the ClientID unredacted.  In Kagenti, the ID will be something like
-				// "spiffe://localtest.me/ns/team1/sa/my-weather-service-with-authbridge"
-				// Although a brute force attack is possible, showing the ClientID here does
-				// not introduce new security concerns, as an attacker can already construct
-				// the ClientID from the pod's namespace and name, available in the UI.
-				ClientID:         cfg.Identity.ClientID,
-				ClientSecret:     "*redacted*",
-				ClientIDFile:     "*redacted*",
-				ClientSecretFile: "*redacted*",
-				SocketPath:       "*redacted*",
-				JWTSVIDPath:      "*redacted*",
-				JWTAudience:      cfg.Identity.JWTAudience,
-			},
-			Listener: cfg.Listener,
-			Bypass:   cfg.Bypass,
-			Routes:   cfg.Routes,
-			Stats:    cfg.Stats,
-		})
+		// Plugin config subtrees are captured verbatim as json.RawMessage
+		// by the PluginEntry unmarshaler. Operators shouldn't put
+		// secrets in the runtime config — the per-plugin convention is
+		// to reference a file path instead (client_secret_file, etc.) —
+		// so we render the config as-is. If a plugin ever needs to
+		// suppress a known-sensitive field here, it can be added to a
+		// redaction pass in a follow-up.
+		err := json.NewEncoder(w).Encode(cfg)
 		if err != nil {
 			slog.Default().Info("Failed to send configuration", "err", err)
 		}

@@ -1,6 +1,7 @@
 package config
 
 import (
+	"context"
 	"encoding/json"
 	"os"
 	"path/filepath"
@@ -13,67 +14,44 @@ import (
 func TestApplyPreset_EnvoySidecar(t *testing.T) {
 	cfg := &Config{Mode: ModeEnvoySidecar}
 	ApplyPreset(cfg)
-	if cfg.Identity.Type != "spiffe" {
-		t.Errorf("identity.type = %q, want spiffe", cfg.Identity.Type)
-	}
-	if cfg.Outbound.DefaultPolicy != "passthrough" {
-		t.Errorf("default_policy = %q, want passthrough", cfg.Outbound.DefaultPolicy)
-	}
 	if cfg.Listener.ExtProcAddr != ":9090" {
 		t.Errorf("ext_proc_addr = %q, want :9090", cfg.Listener.ExtProcAddr)
 	}
-	if len(cfg.Bypass.InboundPaths) == 0 {
-		t.Error("expected default bypass paths")
+	if cfg.Listener.SessionAPIAddr != ":9094" {
+		t.Errorf("session_api_addr = %q, want :9094", cfg.Listener.SessionAPIAddr)
 	}
 }
 
 func TestApplyPreset_Waypoint(t *testing.T) {
 	cfg := &Config{Mode: ModeWaypoint}
 	ApplyPreset(cfg)
-	if cfg.Identity.Type != "client-secret" {
-		t.Errorf("identity.type = %q, want client-secret", cfg.Identity.Type)
+	if cfg.Listener.ExtAuthzAddr != ":9090" {
+		t.Errorf("ext_authz_addr = %q, want :9090", cfg.Listener.ExtAuthzAddr)
 	}
-	if cfg.Outbound.DefaultPolicy != "exchange" {
-		t.Errorf("default_policy = %q, want exchange", cfg.Outbound.DefaultPolicy)
+	if cfg.Listener.ForwardProxyAddr != ":8080" {
+		t.Errorf("forward_proxy_addr = %q, want :8080", cfg.Listener.ForwardProxyAddr)
 	}
 }
 
 func TestApplyPreset_ProxySidecar(t *testing.T) {
 	cfg := &Config{Mode: ModeProxySidecar}
 	ApplyPreset(cfg)
-	if cfg.Identity.Type != "spiffe" {
-		t.Errorf("identity.type = %q, want spiffe", cfg.Identity.Type)
-	}
 	if cfg.Listener.ReverseProxyAddr != ":8080" {
 		t.Errorf("reverse_proxy_addr = %q, want :8080", cfg.Listener.ReverseProxyAddr)
+	}
+	if cfg.Listener.ForwardProxyAddr != ":8081" {
+		t.Errorf("forward_proxy_addr = %q, want :8081", cfg.Listener.ForwardProxyAddr)
 	}
 }
 
 func TestApplyPreset_UserOverride(t *testing.T) {
 	cfg := &Config{
-		Mode: ModeEnvoySidecar,
-		Identity: IdentityConfig{Type: "client-secret"}, // user override
+		Mode:     ModeEnvoySidecar,
+		Listener: ListenerConfig{ExtProcAddr: ":19090"}, // user override
 	}
 	ApplyPreset(cfg)
-	if cfg.Identity.Type != "client-secret" {
-		t.Errorf("user override lost: identity.type = %q", cfg.Identity.Type)
-	}
-}
-
-func TestNoTokenPolicyForMode(t *testing.T) {
-	tests := []struct {
-		mode   string
-		want string
-	}{
-		{ModeEnvoySidecar, "client-credentials"},
-		{ModeWaypoint, "allow"},
-		{ModeProxySidecar, "deny"},
-		{"unknown", "deny"},
-	}
-	for _, tt := range tests {
-		if got := NoTokenPolicyForMode(tt.mode); got != tt.want {
-			t.Errorf("NoTokenPolicyForMode(%q) = %q, want %q", tt.mode, got, tt.want)
-		}
+	if cfg.Listener.ExtProcAddr != ":19090" {
+		t.Errorf("user override lost: ext_proc_addr = %q", cfg.Listener.ExtProcAddr)
 	}
 }
 
@@ -93,73 +71,38 @@ func TestValidate_InvalidMode(t *testing.T) {
 	}
 }
 
-func TestValidate_MissingRequired(t *testing.T) {
-	base := Config{
-		Mode:     ModeWaypoint,
-		Identity: IdentityConfig{Type: "client-secret", ClientID: "c", ClientSecret: "s"},
-	}
-
-	// Missing issuer
-	cfg := base
-	cfg.Inbound = InboundConfig{JWKSURL: "http://jwks"}
-	cfg.Outbound = OutboundConfig{TokenURL: "http://token"}
-	if err := Validate(&cfg); err == nil {
-		t.Error("expected error for missing issuer")
-	}
-
-	// Missing jwks_url
-	cfg = base
-	cfg.Inbound = InboundConfig{Issuer: "http://issuer"}
-	cfg.Outbound = OutboundConfig{TokenURL: "http://token"}
-	if err := Validate(&cfg); err == nil {
-		t.Error("expected error for missing jwks_url")
-	}
-
-	// Missing token_url
-	cfg = base
-	cfg.Inbound = InboundConfig{JWKSURL: "http://jwks", Issuer: "http://issuer"}
-	if err := Validate(&cfg); err == nil {
-		t.Error("expected error for missing token_url")
-	}
-}
-
-func TestValidate_SpiffeIdentityRequiresPath(t *testing.T) {
-	cfg := validEnvoySidecarConfig()
-	cfg.Identity = IdentityConfig{Type: "spiffe"}
-	if err := Validate(cfg); err == nil {
-		t.Error("expected error for spiffe without path")
-	}
-}
-
 func TestValidate_InvalidListenerCombo(t *testing.T) {
-	cfg := validEnvoySidecarConfig()
-	cfg.Listener.ReverseProxyAddr = ":8080" // invalid for envoy-sidecar
+	cfg := &Config{
+		Mode:     ModeEnvoySidecar,
+		Listener: ListenerConfig{ReverseProxyAddr: ":8080"}, // invalid for envoy-sidecar
+	}
 	if err := Validate(cfg); err == nil {
 		t.Error("expected error for envoy-sidecar + reverse_proxy_addr")
 	}
 }
 
 func TestValidate_WaypointRejectsExtProc(t *testing.T) {
-	cfg := validWaypointConfig()
-	cfg.Listener.ExtProcAddr = ":9090"
+	cfg := &Config{
+		Mode:     ModeWaypoint,
+		Listener: ListenerConfig{ExtProcAddr: ":9090"},
+	}
 	if err := Validate(cfg); err == nil {
 		t.Error("expected error for waypoint + ext_proc_addr")
 	}
 }
 
 func TestValidate_ProxySidecarRequiresBackend(t *testing.T) {
-	cfg := validProxySidecarConfig()
-	cfg.Listener.ReverseProxyBackend = ""
+	cfg := &Config{Mode: ModeProxySidecar}
 	if err := Validate(cfg); err == nil {
 		t.Error("expected error for proxy-sidecar without backend")
 	}
 }
 
-func TestValidate_ValidConfig(t *testing.T) {
+func TestValidate_ValidConfigs(t *testing.T) {
 	for _, cfg := range []*Config{
-		validEnvoySidecarConfig(),
-		validWaypointConfig(),
-		validProxySidecarConfig(),
+		{Mode: ModeEnvoySidecar},
+		{Mode: ModeWaypoint},
+		{Mode: ModeProxySidecar, Listener: ListenerConfig{ReverseProxyBackend: "http://upstream"}},
 	} {
 		if err := Validate(cfg); err != nil {
 			t.Errorf("unexpected error for mode %s: %v", cfg.Mode, err)
@@ -173,21 +116,14 @@ func TestLoad(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "config.yaml")
 	content := `mode: waypoint
-inbound:
-  jwks_url: "${TEST_JWKS_URL}"
-  issuer: "http://issuer"
-outbound:
-  token_url: "http://token"
-identity:
-  type: client-secret
-  client_id: "svc"
-  client_secret: "secret"
+listener:
+  ext_authz_addr: "${TEST_ADDR}"
 `
 	if err := os.WriteFile(path, []byte(content), 0600); err != nil {
 		t.Fatal(err)
 	}
-	os.Setenv("TEST_JWKS_URL", "http://expanded-jwks")
-	defer os.Unsetenv("TEST_JWKS_URL")
+	os.Setenv("TEST_ADDR", ":19090")
+	defer os.Unsetenv("TEST_ADDR")
 
 	cfg, err := Load(path)
 	if err != nil {
@@ -196,17 +132,17 @@ identity:
 	if cfg.Mode != ModeWaypoint {
 		t.Errorf("mode = %q, want waypoint", cfg.Mode)
 	}
-	if cfg.Inbound.JWKSURL != "http://expanded-jwks" {
-		t.Errorf("jwks_url = %q, want expanded value", cfg.Inbound.JWKSURL)
+	if cfg.Listener.ExtAuthzAddr != ":19090" {
+		t.Errorf("ext_authz_addr = %q, want expanded value", cfg.Listener.ExtAuthzAddr)
 	}
 }
 
 // --- PluginEntry YAML parsing ---
 
-// Existing pipeline configs use bare plugin names. Those must keep
-// parsing to PluginEntry{Name: <name>} with no config, so migrating
-// plugins to Configurable one at a time doesn't force a flag-day edit
-// of every configmap.
+// Pipeline configs continue to accept bare plugin names. Bare names
+// mean "this plugin with no config," which is the right behavior for
+// parsers (a2a-parser / mcp-parser / inference-parser) — they don't
+// implement Configurable and have nothing to configure.
 func TestPluginEntry_BareStringForm(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "config.yaml")
@@ -277,7 +213,6 @@ pipeline:
 	if e.Name != "jwt-validation" || e.ID != "jwt-validation" {
 		t.Errorf("name/id = %q/%q, want jwt-validation/jwt-validation", e.Name, e.ID)
 	}
-	// Decode the captured config back to a map and spot-check fidelity.
 	var decoded map[string]any
 	if err := json.Unmarshal(e.Config, &decoded); err != nil {
 		t.Fatalf("config JSON parse: %v\nbytes: %s", err, e.Config)
@@ -293,9 +228,6 @@ pipeline:
 	if !ok {
 		t.Fatalf("nested lost shape: %v", decoded["nested"])
 	}
-	// YAML int → JSON → Go float64 (json.Unmarshal's default). Checking
-	// the float form keeps the test honest about what plugins actually
-	// receive when they DisallowUnknownFields-decode.
 	if got, want := nested["count"], float64(3); got != want {
 		t.Errorf("nested.count = %v, want 3", got)
 	}
@@ -304,8 +236,8 @@ pipeline:
 	}
 }
 
-// ID defaults to Name if omitted. Build and session telemetry key off
-// ID, so the default must be stable even when operators don't set it.
+// ID defaults to empty string when omitted; callers default to Name
+// themselves (at Build time, which this test does not exercise).
 func TestPluginEntry_IDDefaultsToName(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "config.yaml")
@@ -323,171 +255,75 @@ pipeline:
 		t.Fatalf("Load: %v", err)
 	}
 	e := cfg.Pipeline.Inbound.Plugins[0]
-	// ID comes out as "" when omitted — callers that want "default to
-	// name" must do so themselves. This test pins that behavior so the
-	// convention (applied at the Build layer in a follow-up) is
-	// explicit rather than accidental.
 	if e.ID != "" {
 		t.Errorf("omitted id = %q, want empty (defaulting happens at Build)", e.ID)
 	}
 }
 
-// --- RouteConfig backwards compat ---
+// --- Credential file helpers ---
 
-func TestRouteConfig_LegacyPassthrough(t *testing.T) {
-	rc := RouteConfig{Host: "internal", Passthrough: true}
-	// Simulate what resolve.go does
-	action := rc.Action
-	if action == "" && rc.Passthrough {
-		action = "passthrough"
-	}
-	if action != "passthrough" {
-		t.Errorf("expected passthrough, got %q", action)
-	}
-}
-
-// --- Keycloak URL derivation ---
-
-func TestDeriveKeycloakURLs(t *testing.T) {
-	cfg := &Config{
-		Mode:     ModeWaypoint,
-		Outbound: OutboundConfig{KeycloakURL: "http://keycloak:8080", KeycloakRealm: "kagenti"},
-		Identity: IdentityConfig{Type: "client-secret", ClientID: "svc", ClientSecret: "secret"},
-	}
-	deriveKeycloakURLs(cfg)
-	if cfg.Outbound.TokenURL != "http://keycloak:8080/realms/kagenti/protocol/openid-connect/token" {
-		t.Errorf("token_url = %q", cfg.Outbound.TokenURL)
-	}
-	if cfg.Inbound.Issuer != "http://keycloak:8080/realms/kagenti" {
-		t.Errorf("issuer = %q", cfg.Inbound.Issuer)
-	}
-}
-
-func TestDeriveKeycloakURLs_ExplicitTakesPrecedence(t *testing.T) {
-	cfg := &Config{
-		Inbound:  InboundConfig{Issuer: "http://explicit-issuer"},
-		Outbound: OutboundConfig{TokenURL: "http://explicit-token", KeycloakURL: "http://keycloak:8080", KeycloakRealm: "kagenti"},
-	}
-	deriveKeycloakURLs(cfg)
-	if cfg.Outbound.TokenURL != "http://explicit-token" {
-		t.Errorf("explicit token_url should not be overridden, got %q", cfg.Outbound.TokenURL)
-	}
-	if cfg.Inbound.Issuer != "http://explicit-issuer" {
-		t.Errorf("explicit issuer should not be overridden, got %q", cfg.Inbound.Issuer)
-	}
-}
-
-// --- JWKS URL derivation ---
-
-func TestDeriveJWKSURL(t *testing.T) {
-	cfg := &Config{
-		Outbound: OutboundConfig{TokenURL: "http://keycloak:8080/realms/kagenti/protocol/openid-connect/token"},
-	}
-	deriveJWKSURL(cfg)
-	if cfg.Inbound.JWKSURL != "http://keycloak:8080/realms/kagenti/protocol/openid-connect/certs" {
-		t.Errorf("jwks_url = %q", cfg.Inbound.JWKSURL)
-	}
-}
-
-func TestDeriveJWKSURL_ExplicitTakesPrecedence(t *testing.T) {
-	cfg := &Config{
-		Inbound:  InboundConfig{JWKSURL: "http://explicit-jwks"},
-		Outbound: OutboundConfig{TokenURL: "http://keycloak:8080/realms/kagenti/protocol/openid-connect/token"},
-	}
-	deriveJWKSURL(cfg)
-	if cfg.Inbound.JWKSURL != "http://explicit-jwks" {
-		t.Errorf("explicit jwks_url should not be overridden, got %q", cfg.Inbound.JWKSURL)
-	}
-}
-
-// --- Credential file validation ---
-
-func TestValidate_ClientIDFile(t *testing.T) {
-	cfg := &Config{
-		Mode:     ModeWaypoint,
-		Inbound:  InboundConfig{JWKSURL: "http://jwks", Issuer: "http://issuer"},
-		Outbound: OutboundConfig{TokenURL: "http://token"},
-		Identity: IdentityConfig{Type: "client-secret", ClientIDFile: "/shared/client-id.txt", ClientSecretFile: "/shared/client-secret.txt"},
-	}
-	// Should pass validation — file paths accepted as alternatives
-	if err := Validate(cfg); err != nil {
-		t.Errorf("unexpected error: %v", err)
-	}
-}
-
-// --- Credential file reading ---
-
-func TestWaitAndReadFile(t *testing.T) {
+func TestReadCredentialFile(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "client-id.txt")
-	if err := os.WriteFile(path, []byte("  my-agent  \n"), 0600); err != nil {
+	if err := os.WriteFile(path, []byte("  my-client-id\n"), 0600); err != nil {
 		t.Fatal(err)
 	}
-	var dest string
-	if err := waitAndReadFile(path, &dest, 5*time.Second); err != nil {
-		t.Fatalf("unexpected error: %v", err)
+	v, err := ReadCredentialFile(path)
+	if err != nil {
+		t.Fatalf("ReadCredentialFile: %v", err)
 	}
-	if dest != "my-agent" {
-		t.Errorf("got %q, want trimmed value", dest)
+	if v != "my-client-id" {
+		t.Errorf("got %q, want %q (trimmed)", v, "my-client-id")
 	}
 }
 
-func TestWaitForFile_Timeout(t *testing.T) {
-	err := waitForFile("/nonexistent/file", 1*time.Second)
+func TestReadCredentialFile_Missing(t *testing.T) {
+	_, err := ReadCredentialFile(filepath.Join(t.TempDir(), "does-not-exist"))
 	if err == nil {
-		t.Error("expected timeout error")
+		t.Error("expected error for missing file")
 	}
 }
 
-// --- Helpers ---
-
-func validEnvoySidecarConfig() *Config {
-	return &Config{
-		Mode:     ModeEnvoySidecar,
-		Inbound:  InboundConfig{JWKSURL: "http://jwks", Issuer: "http://issuer"},
-		Outbound: OutboundConfig{TokenURL: "http://token"},
-		Identity: IdentityConfig{Type: "spiffe", JWTSVIDPath: "/opt/svid.token", ClientID: "agent"},
+func TestReadCredentialFile_Empty(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "empty.txt")
+	if err := os.WriteFile(path, []byte{}, 0600); err != nil {
+		t.Fatal(err)
+	}
+	_, err := ReadCredentialFile(path)
+	if err == nil {
+		t.Error("expected error for empty file")
 	}
 }
 
-func validWaypointConfig() *Config {
-	return &Config{
-		Mode:     ModeWaypoint,
-		Inbound:  InboundConfig{JWKSURL: "http://jwks", Issuer: "http://issuer"},
-		Outbound: OutboundConfig{TokenURL: "http://token"},
-		Identity: IdentityConfig{Type: "client-secret", ClientID: "svc", ClientSecret: "secret"},
+func TestWaitForCredentialFile_ContextCancel(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+	_, err := WaitForCredentialFile(ctx, filepath.Join(t.TempDir(), "never"))
+	if err == nil {
+		t.Error("expected error when ctx cancels before file appears")
 	}
 }
 
-func validProxySidecarConfig() *Config {
-	return &Config{
-		Mode:     ModeProxySidecar,
-		Inbound:  InboundConfig{JWKSURL: "http://jwks", Issuer: "http://issuer"},
-		Outbound: OutboundConfig{TokenURL: "http://token"},
-		Identity: IdentityConfig{Type: "spiffe", JWTSVIDPath: "/opt/svid.token", ClientID: "agent"},
-		Listener: ListenerConfig{ReverseProxyBackend: "http://localhost:8081"},
-	}
-}
+// --- SessionConfig tri-state ---
 
 func TestSessionConfig_SessionEnabled(t *testing.T) {
-	t.Run("unset defaults to enabled", func(t *testing.T) {
-		var s SessionConfig
-		if !s.SessionEnabled() {
-			t.Error("unset Enabled should default to true")
-		}
-	})
-	t.Run("explicit true", func(t *testing.T) {
-		b := true
-		s := SessionConfig{Enabled: &b}
-		if !s.SessionEnabled() {
-			t.Error("explicit true should be true")
-		}
-	})
-	t.Run("explicit false disables", func(t *testing.T) {
-		b := false
-		s := SessionConfig{Enabled: &b}
-		if s.SessionEnabled() {
-			t.Error("explicit false should opt out")
-		}
-	})
+	trueP := func(b bool) *bool { return &b }
+
+	tests := []struct {
+		name string
+		cfg  SessionConfig
+		want bool
+	}{
+		{"unset defaults to true", SessionConfig{Enabled: nil}, true},
+		{"explicit true", SessionConfig{Enabled: trueP(true)}, true},
+		{"explicit false", SessionConfig{Enabled: trueP(false)}, false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := tt.cfg.SessionEnabled(); got != tt.want {
+				t.Errorf("got %v, want %v", got, tt.want)
+			}
+		})
+	}
 }

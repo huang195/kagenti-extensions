@@ -5,135 +5,186 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
+	"strings"
 	"testing"
 
-	"github.com/kagenti/kagenti-extensions/authbridge/authlib/auth"
-	"github.com/kagenti/kagenti-extensions/authbridge/authlib/cache"
 	"github.com/kagenti/kagenti-extensions/authbridge/authlib/config"
-	"github.com/kagenti/kagenti-extensions/authbridge/authlib/exchange"
 	"github.com/kagenti/kagenti-extensions/authbridge/authlib/pipeline"
-	"github.com/kagenti/kagenti-extensions/authbridge/authlib/routing"
-	"github.com/kagenti/kagenti-extensions/authbridge/authlib/validation"
 )
 
-type mockVerifier struct {
-	claims *validation.Claims
-	err    error
-}
+// --- JWTValidation: Configure ---
 
-func (m *mockVerifier) Verify(_ context.Context, _ string, _ string) (*validation.Claims, error) {
-	return m.claims, m.err
-}
-
-// --- JWTValidation Tests ---
-
-func TestJWTValidation_ValidToken(t *testing.T) {
-	a := auth.New(auth.Config{
-		Verifier: &mockVerifier{claims: &validation.Claims{Subject: "user-1", ClientID: "agent"}},
-		Identity: auth.IdentityConfig{Audience: "my-agent"},
-	})
-	plugin := NewJWTValidation(a)
-
-	pctx := &pipeline.Context{
-		Direction: pipeline.Inbound,
-		Path:      "/api/test",
-		Headers:   http.Header{"Authorization": []string{"Bearer valid-token"}},
-	}
-	action := plugin.OnRequest(context.Background(), pctx)
-	if action.Type != pipeline.Continue {
-		t.Errorf("got %v, want Continue", action.Type)
-	}
-	if pctx.Claims == nil {
-		t.Fatal("expected pctx.Claims to be populated")
-	}
-	if pctx.Claims.Subject != "user-1" {
-		t.Errorf("subject = %q, want user-1", pctx.Claims.Subject)
+func TestJWTValidation_Configure_MissingIssuer(t *testing.T) {
+	p := NewJWTValidation()
+	err := p.Configure([]byte(`{}`))
+	if err == nil {
+		t.Fatal("expected error for missing issuer")
 	}
 }
 
-func TestJWTValidation_InvalidToken(t *testing.T) {
-	a := auth.New(auth.Config{
-		Verifier: &mockVerifier{err: errorf("token expired")},
-		Identity: auth.IdentityConfig{Audience: "my-agent"},
-	})
-	plugin := NewJWTValidation(a)
-
-	pctx := &pipeline.Context{
-		Direction: pipeline.Inbound,
-		Path:      "/api/test",
-		Headers:   http.Header{"Authorization": []string{"Bearer bad-token"}},
+func TestJWTValidation_Configure_UnknownField(t *testing.T) {
+	p := NewJWTValidation()
+	err := p.Configure([]byte(`{"issuer":"http://ex","audience":"a","not_a_field":"x"}`))
+	if err == nil {
+		t.Fatal("expected error for unknown field; DisallowUnknownFields should reject")
 	}
-	action := plugin.OnRequest(context.Background(), pctx)
+}
+
+func TestJWTValidation_Configure_StaticAudienceRequired(t *testing.T) {
+	p := NewJWTValidation()
+	err := p.Configure([]byte(`{"issuer":"http://ex"}`))
+	if err == nil {
+		t.Fatal("expected error for missing audience in static mode")
+	}
+}
+
+func TestJWTValidation_Configure_PerHost(t *testing.T) {
+	p := NewJWTValidation()
+	// per-host mode does not require an audience field.
+	err := p.Configure([]byte(`{"issuer":"http://ex","audience_mode":"per-host"}`))
+	if err != nil {
+		t.Fatalf("per-host mode should not require audience: %v", err)
+	}
+	if p.audienceDeriver == nil {
+		t.Error("per-host mode should set audienceDeriver")
+	}
+}
+
+func TestJWTValidation_Configure_DefaultsJWKSFromIssuer(t *testing.T) {
+	p := NewJWTValidation()
+	err := p.Configure([]byte(`{"issuer":"http://keycloak/realms/kagenti","audience":"a"}`))
+	if err != nil {
+		t.Fatalf("Configure: %v", err)
+	}
+	// The derived JWKS URL is applied during Configure — we can't
+	// inspect it directly because it's buried inside the verifier, but
+	// if the inner auth handler is nil we know Configure bailed.
+	if p.inner == nil {
+		t.Fatal("Configure produced no inner auth handler")
+	}
+}
+
+func TestJWTValidation_Configure_AudienceFromFile(t *testing.T) {
+	dir := t.TempDir()
+	f := filepath.Join(dir, "aud")
+	if err := os.WriteFile(f, []byte("my-agent"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	p := NewJWTValidation()
+	raw := []byte(`{"issuer":"http://ex","audience_file":"` + f + `"}`)
+	if err := p.Configure(raw); err != nil {
+		t.Fatalf("Configure: %v", err)
+	}
+	if !p.inner.Ready() {
+		t.Error("expected inner.Ready() == true after synchronous audience load")
+	}
+}
+
+// --- JWTValidation: OnRequest ---
+
+func TestJWTValidation_OnRequest_NotConfigured(t *testing.T) {
+	p := NewJWTValidation()
+	action := p.OnRequest(context.Background(), &pipeline.Context{Headers: http.Header{}})
 	if action.Type != pipeline.Reject {
-		t.Fatalf("got %v, want Reject", action.Type)
-	}
-	status, _, _ := action.Violation.Render(); if status != http.StatusUnauthorized {
-		t.Errorf("status = %d, want 401", status)
+		t.Errorf("got %v, want Reject for unconfigured plugin", action.Type)
 	}
 }
 
-func TestJWTValidation_MissingHeader(t *testing.T) {
-	a := auth.New(auth.Config{
-		Verifier: &mockVerifier{claims: &validation.Claims{Subject: "user"}},
-		Identity: auth.IdentityConfig{Audience: "my-agent"},
-	})
-	plugin := NewJWTValidation(a)
+// --- TokenExchange: Configure ---
 
-	pctx := &pipeline.Context{
-		Direction: pipeline.Inbound,
-		Path:      "/api/test",
-		Headers:   http.Header{},
-	}
-	action := plugin.OnRequest(context.Background(), pctx)
-	if action.Type != pipeline.Reject {
-		t.Fatalf("got %v, want Reject", action.Type)
-	}
-	status, _, _ := action.Violation.Render(); if status != http.StatusUnauthorized {
-		t.Errorf("status = %d, want 401", status)
+func TestTokenExchange_Configure_MissingTokenURL(t *testing.T) {
+	p := NewTokenExchange()
+	err := p.Configure([]byte(`{"identity":{"type":"client-secret","client_id":"c","client_secret":"s"}}`))
+	if err == nil {
+		t.Fatal("expected error for missing token_url")
 	}
 }
 
-func TestJWTValidation_WithAudienceDeriver(t *testing.T) {
-	var receivedAudience string
-	verifier := &mockVerifier{claims: &validation.Claims{Subject: "user"}}
-	a := auth.New(auth.Config{
-		Verifier: &captureAudienceVerifier{inner: verifier, captured: &receivedAudience},
-		Identity: auth.IdentityConfig{Audience: "default-aud"},
-	})
-	plugin := NewJWTValidation(a, WithAudienceDeriver(func(host string) string {
-		return "derived-from-" + host
-	}))
-
-	pctx := &pipeline.Context{
-		Direction: pipeline.Inbound,
-		Host:      "target-svc",
-		Path:      "/api",
-		Headers:   http.Header{"Authorization": []string{"Bearer token"}},
+func TestTokenExchange_Configure_DerivesTokenURL(t *testing.T) {
+	p := NewTokenExchange()
+	raw := []byte(`{
+	  "keycloak_url":"http://keycloak:8080",
+	  "keycloak_realm":"kagenti",
+	  "identity":{"type":"client-secret","client_id":"c","client_secret":"s"}
+	}`)
+	if err := p.Configure(raw); err != nil {
+		t.Fatalf("Configure: %v", err)
 	}
-	action := plugin.OnRequest(context.Background(), pctx)
-	if action.Type != pipeline.Continue {
-		t.Fatalf("got %v, want Continue", action.Type)
-	}
-	if receivedAudience != "derived-from-target-svc" {
-		t.Errorf("audience = %q, want derived-from-target-svc", receivedAudience)
+	want := "http://keycloak:8080/realms/kagenti/protocol/openid-connect/token"
+	if p.cfg.TokenURL != want {
+		t.Errorf("token_url = %q, want %q", p.cfg.TokenURL, want)
 	}
 }
 
-// --- TokenExchange Tests ---
+func TestTokenExchange_Configure_DefaultsPassthrough(t *testing.T) {
+	p := NewTokenExchange()
+	raw := []byte(`{
+	  "token_url":"http://token",
+	  "identity":{"type":"client-secret","client_id":"c","client_secret":"s"}
+	}`)
+	if err := p.Configure(raw); err != nil {
+		t.Fatalf("Configure: %v", err)
+	}
+	if p.cfg.DefaultPolicy != "passthrough" {
+		t.Errorf("default_policy = %q, want passthrough", p.cfg.DefaultPolicy)
+	}
+}
+
+func TestTokenExchange_Configure_InvalidDefaultPolicy(t *testing.T) {
+	p := NewTokenExchange()
+	raw := []byte(`{
+	  "token_url":"http://token",
+	  "default_policy":"nope",
+	  "identity":{"type":"client-secret","client_id":"c","client_secret":"s"}
+	}`)
+	if err := p.Configure(raw); err == nil {
+		t.Fatal("expected error for invalid default_policy")
+	}
+}
+
+func TestTokenExchange_Configure_IdentityValidation(t *testing.T) {
+	cases := []struct {
+		name string
+		raw  string
+	}{
+		{"type missing", `{"token_url":"http://t"}`},
+		{"type unknown", `{"token_url":"http://t","identity":{"type":"whatever"}}`},
+		{"spiffe no path", `{"token_url":"http://t","identity":{"type":"spiffe","client_id":"c"}}`},
+		{"client-secret no id", `{"token_url":"http://t","identity":{"type":"client-secret","client_secret":"s"}}`},
+		{"client-secret no secret", `{"token_url":"http://t","identity":{"type":"client-secret","client_id":"c"}}`},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			p := NewTokenExchange()
+			if err := p.Configure([]byte(c.raw)); err == nil {
+				t.Error("expected error, got nil")
+			}
+		})
+	}
+}
+
+// --- TokenExchange: OnRequest (end-to-end through Configure) ---
 
 func TestTokenExchange_Passthrough(t *testing.T) {
-	router, _ := routing.NewRouter("passthrough", []routing.Route{})
-	a := auth.New(auth.Config{Router: router})
-	plugin := NewTokenExchange(a)
-
+	p := NewTokenExchange()
+	raw := []byte(`{
+	  "token_url":"http://unused",
+	  "default_policy":"passthrough",
+	  "identity":{"type":"client-secret","client_id":"c","client_secret":"s"}
+	}`)
+	if err := p.Configure(raw); err != nil {
+		t.Fatalf("Configure: %v", err)
+	}
 	pctx := &pipeline.Context{
 		Direction: pipeline.Outbound,
 		Host:      "some-host",
 		Headers:   http.Header{"Authorization": []string{"Bearer user-token"}},
 	}
-	action := plugin.OnRequest(context.Background(), pctx)
+	action := p.OnRequest(context.Background(), pctx)
 	if action.Type != pipeline.Continue {
-		t.Errorf("got %v, want Continue", action.Type)
+		t.Fatalf("got %v, want Continue", action.Type)
 	}
 	if pctx.Headers.Get("Authorization") != "Bearer user-token" {
 		t.Error("headers should not be modified for passthrough")
@@ -151,23 +202,21 @@ func TestTokenExchange_ExchangeSuccess(t *testing.T) {
 	}))
 	defer exchangeSrv.Close()
 
-	router, _ := routing.NewRouter("exchange", []routing.Route{})
-	exchanger := exchange.NewClient(exchangeSrv.URL, &exchange.ClientSecretAuth{
-		ClientID: "agent", ClientSecret: "secret",
-	})
-	a := auth.New(auth.Config{
-		Router:    router,
-		Exchanger: exchanger,
-		Cache:     cache.New(),
-	})
-	plugin := NewTokenExchange(a)
-
+	p := NewTokenExchange()
+	raw := []byte(`{
+	  "token_url":"` + exchangeSrv.URL + `",
+	  "default_policy":"exchange",
+	  "identity":{"type":"client-secret","client_id":"agent","client_secret":"secret"}
+	}`)
+	if err := p.Configure(raw); err != nil {
+		t.Fatalf("Configure: %v", err)
+	}
 	pctx := &pipeline.Context{
 		Direction: pipeline.Outbound,
 		Host:      "target-svc",
 		Headers:   http.Header{"Authorization": []string{"Bearer user-token"}},
 	}
-	action := plugin.OnRequest(context.Background(), pctx)
+	action := p.OnRequest(context.Background(), pctx)
 	if action.Type != pipeline.Continue {
 		t.Fatalf("got %v, want Continue", action.Type)
 	}
@@ -183,62 +232,65 @@ func TestTokenExchange_ExchangeFailure(t *testing.T) {
 	}))
 	defer exchangeSrv.Close()
 
-	router, _ := routing.NewRouter("exchange", []routing.Route{})
-	exchanger := exchange.NewClient(exchangeSrv.URL, &exchange.ClientSecretAuth{
-		ClientID: "agent", ClientSecret: "secret",
-	})
-	a := auth.New(auth.Config{
-		Router:    router,
-		Exchanger: exchanger,
-	})
-	plugin := NewTokenExchange(a)
-
+	p := NewTokenExchange()
+	raw := []byte(`{
+	  "token_url":"` + exchangeSrv.URL + `",
+	  "default_policy":"exchange",
+	  "identity":{"type":"client-secret","client_id":"agent","client_secret":"secret"}
+	}`)
+	if err := p.Configure(raw); err != nil {
+		t.Fatalf("Configure: %v", err)
+	}
 	pctx := &pipeline.Context{
 		Direction: pipeline.Outbound,
 		Host:      "target-svc",
 		Headers:   http.Header{"Authorization": []string{"Bearer user-token"}},
 	}
-	action := plugin.OnRequest(context.Background(), pctx)
+	action := p.OnRequest(context.Background(), pctx)
 	if action.Type != pipeline.Reject {
 		t.Fatalf("got %v, want Reject", action.Type)
 	}
-	status, _, _ := action.Violation.Render(); if status != http.StatusServiceUnavailable {
+	status, _, _ := action.Violation.Render()
+	if status != http.StatusServiceUnavailable {
 		t.Errorf("status = %d, want 503", status)
 	}
 }
 
 func TestTokenExchange_NoToken_Deny(t *testing.T) {
-	router, _ := routing.NewRouter("exchange", []routing.Route{})
-	a := auth.New(auth.Config{
-		Router:        router,
-		NoTokenPolicy: auth.NoTokenPolicyDeny,
-	})
-	plugin := NewTokenExchange(a)
-
+	p := NewTokenExchange()
+	raw := []byte(`{
+	  "token_url":"http://unused",
+	  "default_policy":"exchange",
+	  "no_token_policy":"deny",
+	  "identity":{"type":"client-secret","client_id":"c","client_secret":"s"}
+	}`)
+	if err := p.Configure(raw); err != nil {
+		t.Fatalf("Configure: %v", err)
+	}
 	pctx := &pipeline.Context{
 		Direction: pipeline.Outbound,
 		Host:      "target-svc",
 		Headers:   http.Header{},
 	}
-	action := plugin.OnRequest(context.Background(), pctx)
+	action := p.OnRequest(context.Background(), pctx)
 	if action.Type != pipeline.Reject {
 		t.Fatalf("got %v, want Reject", action.Type)
 	}
-	status, _, _ := action.Violation.Render(); if status != http.StatusUnauthorized {
+	status, _, _ := action.Violation.Render()
+	if status != http.StatusUnauthorized {
 		t.Errorf("status = %d, want 401", status)
 	}
 }
 
-// --- Registry/Build Tests ---
+// --- Registry / Build ---
 
 func TestBuild_ValidNames(t *testing.T) {
-	a := auth.New(auth.Config{})
 	p, err := Build([]config.PluginEntry{
-		{Name: "jwt-validation"},
-		{Name: "token-exchange"},
-	}, a)
+		{Name: "a2a-parser"},
+		{Name: "mcp-parser"},
+	})
 	if err != nil {
-		t.Fatalf("Build returned error: %v", err)
+		t.Fatalf("Build: %v", err)
 	}
 	if p == nil {
 		t.Fatal("expected non-nil pipeline")
@@ -246,18 +298,16 @@ func TestBuild_ValidNames(t *testing.T) {
 }
 
 func TestBuild_UnknownName(t *testing.T) {
-	a := auth.New(auth.Config{})
-	_, err := Build([]config.PluginEntry{{Name: "nonexistent-plugin"}}, a)
+	_, err := Build([]config.PluginEntry{{Name: "nonexistent-plugin"}})
 	if err == nil {
 		t.Fatal("expected error for unknown plugin name")
 	}
 }
 
 func TestBuild_EmptyList(t *testing.T) {
-	a := auth.New(auth.Config{})
-	p, err := Build([]config.PluginEntry{}, a)
+	p, err := Build([]config.PluginEntry{})
 	if err != nil {
-		t.Fatalf("Build returned error: %v", err)
+		t.Fatalf("Build: %v", err)
 	}
 	action := p.Run(context.Background(), &pipeline.Context{Headers: http.Header{}})
 	if action.Type != pipeline.Continue {
@@ -265,57 +315,29 @@ func TestBuild_EmptyList(t *testing.T) {
 	}
 }
 
-// TestBuild_ConfigForNonConfigurablePlugin ensures that a config: block
-// directed at a plugin which doesn't implement Configurable fails at
-// pipeline construction. Silently accepting it would hide typos and
-// stale config across refactors.
+// A config: block on a plugin that doesn't implement Configurable is a
+// startup error. Silent acceptance would hide typos (wrong plugin name)
+// and stale config across refactors.
 func TestBuild_ConfigForNonConfigurablePlugin(t *testing.T) {
-	a := auth.New(auth.Config{})
 	_, err := Build([]config.PluginEntry{
 		{Name: "a2a-parser", Config: []byte(`{"unused":true}`)},
-	}, a)
+	})
 	if err == nil {
 		t.Fatal("expected error for config on non-Configurable plugin")
 	}
 }
 
-func TestDefaultInboundPipeline(t *testing.T) {
-	a := auth.New(auth.Config{})
-	p, err := DefaultInboundPipeline(a)
-	if err != nil {
-		t.Fatalf("DefaultInboundPipeline returned error: %v", err)
+// Configure errors surface through Build with the offending plugin's
+// name so startup logs identify the broken entry without the operator
+// having to read every plugin's error wording.
+func TestBuild_ConfigureError(t *testing.T) {
+	_, err := Build([]config.PluginEntry{
+		{Name: "jwt-validation", Config: []byte(`{}`)}, // missing issuer
+	})
+	if err == nil {
+		t.Fatal("expected error for invalid jwt-validation config")
 	}
-	if p == nil {
-		t.Fatal("expected non-nil pipeline")
+	if !strings.Contains(err.Error(), "jwt-validation") {
+		t.Errorf("error %q does not name the offending plugin", err)
 	}
-}
-
-func TestDefaultOutboundPipeline(t *testing.T) {
-	a := auth.New(auth.Config{})
-	p, err := DefaultOutboundPipeline(a)
-	if err != nil {
-		t.Fatalf("DefaultOutboundPipeline returned error: %v", err)
-	}
-	if p == nil {
-		t.Fatal("expected non-nil pipeline")
-	}
-}
-
-// --- Helpers ---
-
-type errString string
-
-func errorf(s string) error { return errString(s) }
-
-func (e errString) Error() string { return string(e) }
-
-// captureAudienceVerifier wraps a verifier and captures the audience parameter.
-type captureAudienceVerifier struct {
-	inner    *mockVerifier
-	captured *string
-}
-
-func (v *captureAudienceVerifier) Verify(ctx context.Context, token string, audience string) (*validation.Claims, error) {
-	*v.captured = audience
-	return v.inner.Verify(ctx, token, audience)
 }

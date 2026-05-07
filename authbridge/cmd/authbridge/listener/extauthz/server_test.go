@@ -14,6 +14,7 @@ import (
 	authpkg "github.com/kagenti/kagenti-extensions/authbridge/authlib/auth"
 	"github.com/kagenti/kagenti-extensions/authbridge/authlib/cache"
 	"github.com/kagenti/kagenti-extensions/authbridge/authlib/exchange"
+	"github.com/kagenti/kagenti-extensions/authbridge/authlib/pipeline"
 	"github.com/kagenti/kagenti-extensions/authbridge/authlib/plugins"
 	"github.com/kagenti/kagenti-extensions/authbridge/authlib/routing"
 	"github.com/kagenti/kagenti-extensions/authbridge/authlib/validation"
@@ -33,11 +34,11 @@ func (m *mockVerifier) Verify(_ context.Context, _ string, audience string) (*va
 func serverFromAuth(t *testing.T, a *authpkg.Auth) *Server {
 	t.Helper()
 	// ext_authz is waypoint mode — audience derived from host
-	inbound, err := plugins.WaypointInboundPipeline(a)
+	inbound, err := plugins.BuildForTest([]pipeline.Plugin{plugins.NewJWTValidationForTest(a, true)})
 	if err != nil {
 		t.Fatalf("building inbound pipeline: %v", err)
 	}
-	outbound, err := plugins.DefaultOutboundPipeline(a)
+	outbound, err := plugins.BuildForTest([]pipeline.Plugin{plugins.NewTokenExchangeForTest(a)})
 	if err != nil {
 		t.Fatalf("building outbound pipeline: %v", err)
 	}

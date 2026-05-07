@@ -26,7 +26,7 @@ func (m *mockVerifier) Verify(_ context.Context, _ string, _ string) (*validatio
 
 func inboundPipelineFromAuth(t *testing.T, a *auth.Auth) *pipeline.Pipeline {
 	t.Helper()
-	p, err := plugins.DefaultInboundPipeline(a)
+	p, err := plugins.BuildForTest([]pipeline.Plugin{plugins.NewJWTValidationForTest(a, false)})
 	if err != nil {
 		t.Fatalf("building inbound pipeline: %v", err)
 	}

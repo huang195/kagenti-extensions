@@ -13,7 +13,7 @@ import (
 	"github.com/kagenti/kagenti-extensions/authbridge/authlib/cache"
 	"github.com/kagenti/kagenti-extensions/authbridge/authlib/exchange"
 	"github.com/kagenti/kagenti-extensions/authbridge/authlib/pipeline"
-	"github.com/kagenti/kagenti-extensions/authbridge/authlib/plugins"
+	"github.com/kagenti/kagenti-extensions/authbridge/authlib/plugins/plugintesting"
 	"github.com/kagenti/kagenti-extensions/authbridge/authlib/routing"
 	"github.com/kagenti/kagenti-extensions/authbridge/authlib/validation"
 )
@@ -29,7 +29,7 @@ func (m *mockVerifier) Verify(_ context.Context, _ string, _ string) (*validatio
 
 func outboundPipelineFromAuth(t *testing.T, a *auth.Auth) *pipeline.Pipeline {
 	t.Helper()
-	p, err := plugins.BuildForTest([]pipeline.Plugin{plugins.NewTokenExchangeForTest(a)})
+	p, err := plugintesting.BuildPipeline([]pipeline.Plugin{plugintesting.NewTokenExchange(a)})
 	if err != nil {
 		t.Fatalf("building outbound pipeline: %v", err)
 	}

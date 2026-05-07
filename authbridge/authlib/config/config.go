@@ -50,9 +50,10 @@ func (s SessionConfig) SessionEnabled() bool {
 	return *s.Enabled
 }
 
-// PipelineConfig holds the plugin pipeline composition.
-// If omitted (empty), default pipelines are used:
-// inbound=[jwt-validation], outbound=[token-exchange].
+// PipelineConfig holds the plugin pipeline composition. Required:
+// the runtime YAML must populate both inbound and outbound lists, or
+// plugins.Build will produce empty pipelines and the listener will
+// have nothing to invoke. There are no implicit defaults.
 type PipelineConfig struct {
 	Inbound  PipelineStageConfig `yaml:"inbound" json:"inbound"`
 	Outbound PipelineStageConfig `yaml:"outbound" json:"outbound"`
@@ -108,6 +109,17 @@ func (p *PluginEntry) UnmarshalYAML(node *yaml.Node) error {
 					return fmt.Errorf("plugin entry id: %w", err)
 				}
 			case "config":
+				// Explicit `config: null` (or `config:` with no value)
+				// decodes to a null-tagged scalar node. Normalize to
+				// nil here — otherwise yamlNodeToJSON would emit the
+				// literal bytes "null" and the Build-time "plugin does
+				// not accept configuration" gate would fire
+				// spuriously on non-Configurable plugins that a user
+				// explicitly declared with a null config block.
+				if val.Kind == yaml.ScalarNode && val.Tag == "!!null" {
+					p.Config = nil
+					continue
+				}
 				raw, err := yamlNodeToJSON(val)
 				if err != nil {
 					return fmt.Errorf("plugin %q config: %w", p.Name, err)

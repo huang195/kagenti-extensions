@@ -43,8 +43,9 @@ type tokenExchangeConfig struct {
 	// NoTokenPolicy controls how the plugin handles outbound requests
 	// that arrive without a bearer token: "client-credentials" does an
 	// unprompted client_credentials exchange; "allow" forwards
-	// unchanged; "deny" rejects. Default varies by mode — see
-	// config.NoTokenPolicyForMode.
+	// unchanged; "deny" rejects. Default: "deny" in all modes.
+	// Operators who need a different behavior (e.g. waypoint's historic
+	// "allow" default) must set it explicitly per plugin entry.
 	NoTokenPolicy string `json:"no_token_policy"`
 
 	// Identity carries client credentials used for token exchange.
@@ -157,20 +158,13 @@ func (c *tokenExchangeConfig) validate() error {
 		return fmt.Errorf("no_token_policy must be allow, deny, or client-credentials, got %q", c.NoTokenPolicy)
 	}
 	switch c.Identity.Type {
-	case "spiffe":
-		if c.Identity.JWTSVIDPath == "" {
-			return errors.New("identity.type=spiffe requires identity.jwt_svid_path")
-		}
-		if c.Identity.ClientID == "" && c.Identity.ClientIDFile == "" {
-			return errors.New("identity.type=spiffe requires identity.client_id or identity.client_id_file")
-		}
-	case "client-secret":
-		if c.Identity.ClientID == "" && c.Identity.ClientIDFile == "" {
-			return errors.New("identity.type=client-secret requires identity.client_id or identity.client_id_file")
-		}
-		if c.Identity.ClientSecret == "" && c.Identity.ClientSecretFile == "" {
-			return errors.New("identity.type=client-secret requires identity.client_secret or identity.client_secret_file")
-		}
+	case "spiffe", "client-secret":
+		// applyDefaults fills the identity file paths when the
+		// matching inline values are empty, so no per-field check
+		// here — the Configure path always ends up with a reachable
+		// credential source. Configure's best-effort read logs a
+		// WARN if the file isn't yet readable at boot, and Init's
+		// watcher retries in the background.
 	case "":
 		return errors.New("identity.type is required (spiffe or client-secret)")
 	default:
@@ -183,9 +177,19 @@ func (c *tokenExchangeConfig) validate() error {
 // internal exchanger / router / auth handler; Init polls for credential
 // files that weren't available at Configure time and swaps them in via
 // auth.UpdateIdentity.
+//
+// cfg is immutable after Configure returns. Background goroutines
+// read credential values into locals and feed them through
+// auth.UpdateIdentity rather than mutating cfg, so OnRequest callers
+// can safely read p.cfg without synchronization.
 type TokenExchange struct {
 	cfg   tokenExchangeConfig
 	inner *auth.Auth
+
+	// bgCancel stops the background credential-file poller started by
+	// Init. See JWTValidation.bgCancel for why this can't be tied to
+	// Init's ctx.
+	bgCancel context.CancelFunc
 }
 
 // NewTokenExchange constructs an unconfigured plugin.
@@ -213,15 +217,24 @@ func (p *TokenExchange) Configure(raw json.RawMessage) error {
 	p.cfg = c
 
 	// Best-effort synchronous credential load. Missing files are
-	// tolerated; Init will retry.
+	// tolerated; Init will retry. Log a boot-time WARN for each file
+	// that isn't yet readable so operators notice misconfiguration
+	// (wrong path, missing ConfigMap mount) in `kubectl logs` of the
+	// initial pod rather than discovering it later via 503s.
 	if c.Identity.ClientID == "" && c.Identity.ClientIDFile != "" {
 		if v, err := config.ReadCredentialFile(c.Identity.ClientIDFile); err == nil {
 			p.cfg.Identity.ClientID = v
+		} else {
+			slog.Warn("token-exchange: client_id_file not yet readable; Init will poll in background",
+				"path", c.Identity.ClientIDFile, "error", err)
 		}
 	}
 	if c.Identity.ClientSecret == "" && c.Identity.ClientSecretFile != "" {
 		if v, err := config.ReadCredentialFile(c.Identity.ClientSecretFile); err == nil {
 			p.cfg.Identity.ClientSecret = v
+		} else {
+			slog.Warn("token-exchange: client_secret_file not yet readable; Init will poll in background",
+				"path", c.Identity.ClientSecretFile, "error", err)
 		}
 	}
 
@@ -253,21 +266,32 @@ func (p *TokenExchange) Configure(raw json.RawMessage) error {
 }
 
 func (p *TokenExchange) buildClientAuth() (exchange.ClientAuth, error) {
-	switch p.cfg.Identity.Type {
+	return buildClientAuthFrom(
+		p.cfg.Identity.Type,
+		p.cfg.Identity.ClientID,
+		p.cfg.Identity.ClientSecret,
+		p.cfg.Identity.JWTSVIDPath,
+	)
+}
+
+// buildClientAuthFrom is the pure variant used by pollCredentials, which
+// cannot read p.cfg because cfg is immutable after Configure.
+func buildClientAuthFrom(identityType, clientID, clientSecret, jwtSVIDPath string) (exchange.ClientAuth, error) {
+	switch identityType {
 	case "spiffe":
-		source := spiffe.NewFileJWTSource(p.cfg.Identity.JWTSVIDPath)
+		source := spiffe.NewFileJWTSource(jwtSVIDPath)
 		return &exchange.JWTAssertionAuth{
-			ClientID:      p.cfg.Identity.ClientID,
+			ClientID:      clientID,
 			AssertionType: "urn:ietf:params:oauth:client-assertion-type:jwt-spiffe",
 			TokenSource:   source.FetchToken,
 		}, nil
 	case "client-secret":
 		return &exchange.ClientSecretAuth{
-			ClientID:     p.cfg.Identity.ClientID,
-			ClientSecret: p.cfg.Identity.ClientSecret,
+			ClientID:     clientID,
+			ClientSecret: clientSecret,
 		}, nil
 	default:
-		return nil, fmt.Errorf("unknown identity.type %q", p.cfg.Identity.Type)
+		return nil, fmt.Errorf("unknown identity.type %q", identityType)
 	}
 }
 
@@ -298,47 +322,68 @@ func (p *TokenExchange) buildRouter() (*routing.Router, error) {
 
 // Init polls for credential files that weren't available during
 // Configure. When both client_id and client_secret (or jwt_svid) become
-// available, it reconstructs the client-auth and calls UpdateIdentity
-// so in-flight exchanges pick up the new credentials.
-func (p *TokenExchange) Init(ctx context.Context) error {
+// available, it builds a fresh client-auth and calls UpdateIdentity so
+// in-flight exchanges pick up the new credentials.
+//
+// Init's ctx bounds synchronous init only; the poller runs on a
+// process-lifetime context (see bgCancel) so Pipeline.Start's 60s
+// budget doesn't kill it. Shutdown cancels the poller.
+func (p *TokenExchange) Init(_ context.Context) error {
 	needID := p.cfg.Identity.ClientID == "" && p.cfg.Identity.ClientIDFile != ""
 	needSecret := p.cfg.Identity.ClientSecret == "" && p.cfg.Identity.ClientSecretFile != ""
 	if !needID && !needSecret {
 		return nil
 	}
-	go p.pollCredentials(ctx, needID, needSecret)
+	bgCtx, cancel := context.WithCancel(context.Background())
+	p.bgCancel = cancel
+	go p.pollCredentials(bgCtx, needID, needSecret)
 	return nil
 }
 
+// pollCredentials reads credential files into local variables and
+// applies them via auth.UpdateIdentity. It does not mutate p.cfg —
+// keeping cfg immutable after Configure lets OnRequest and future
+// readers access p.cfg without synchronization.
 func (p *TokenExchange) pollCredentials(ctx context.Context, needID, needSecret bool) {
+	clientID := p.cfg.Identity.ClientID
+	clientSecret := p.cfg.Identity.ClientSecret
 	if needID {
 		v, err := config.WaitForCredentialFile(ctx, p.cfg.Identity.ClientIDFile)
 		if err != nil {
-			slog.Warn("token-exchange: client_id_file never became available",
+			slog.Debug("token-exchange: client_id_file wait stopped",
 				"path", p.cfg.Identity.ClientIDFile, "error", err)
 			return
 		}
-		p.cfg.Identity.ClientID = v
+		clientID = v
 	}
 	if needSecret {
 		v, err := config.WaitForCredentialFile(ctx, p.cfg.Identity.ClientSecretFile)
 		if err != nil {
-			slog.Warn("token-exchange: client_secret_file never became available",
+			slog.Debug("token-exchange: client_secret_file wait stopped",
 				"path", p.cfg.Identity.ClientSecretFile, "error", err)
 			return
 		}
-		p.cfg.Identity.ClientSecret = v
+		clientSecret = v
 	}
-	clientAuth, err := p.buildClientAuth()
+	clientAuth, err := buildClientAuthFrom(p.cfg.Identity.Type, clientID, clientSecret, p.cfg.Identity.JWTSVIDPath)
 	if err != nil {
 		slog.Warn("token-exchange: failed to rebuild client auth after credential load", "error", err)
 		return
 	}
 	p.inner.UpdateIdentity(
-		auth.IdentityConfig{ClientID: p.cfg.Identity.ClientID},
+		auth.IdentityConfig{ClientID: clientID},
 		clientAuth,
 	)
-	slog.Info("token-exchange: credentials loaded", "client_id", p.cfg.Identity.ClientID)
+	slog.Info("token-exchange: credentials loaded", "client_id", clientID)
+}
+
+// Shutdown cancels the background credential-file poller if one was
+// started by Init. Called by Pipeline.Stop during process shutdown.
+func (p *TokenExchange) Shutdown(_ context.Context) error {
+	if p.bgCancel != nil {
+		p.bgCancel()
+	}
+	return nil
 }
 
 func (p *TokenExchange) OnRequest(ctx context.Context, pctx *pipeline.Context) pipeline.Action {
@@ -374,4 +419,5 @@ func (p *TokenExchange) OnResponse(_ context.Context, _ *pipeline.Context) pipel
 var (
 	_ pipeline.Configurable = (*TokenExchange)(nil)
 	_ pipeline.Initializer  = (*TokenExchange)(nil)
+	_ pipeline.Shutdowner   = (*TokenExchange)(nil)
 )

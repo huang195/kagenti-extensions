@@ -14,6 +14,52 @@ import (
 	"github.com/kagenti/kagenti-extensions/authbridge/authlib/pipeline"
 )
 
+// TestAuthbridgeCombinedYAML_Loads asserts that the in-repo default
+// config consumed by the combined sidecar image
+// (authbridge/authproxy/authbridge-combined.yaml) parses, env-expands,
+// and produces working pipelines. Since that YAML leans on per-plugin
+// defaults for file paths and bypass patterns, a future rename of any
+// default constant would silently break the shipped image unless this
+// test fails. It's cheaper to fail in CI than in a running pod.
+func TestAuthbridgeCombinedYAML_Loads(t *testing.T) {
+	// The canonical file path is relative to this test file —
+	// plugins_test.go lives in authlib/plugins/, the YAML in
+	// authproxy/. Go up two directories, across into authproxy/.
+	yamlPath := filepath.Join("..", "..", "authproxy", "authbridge-combined.yaml")
+	if _, err := os.Stat(yamlPath); err != nil {
+		t.Skipf("authbridge-combined.yaml not found (repo layout changed?): %v", err)
+	}
+
+	envs := map[string]string{
+		"ISSUER":                  "http://keycloak.localtest.me:8080/realms/kagenti",
+		"KEYCLOAK_URL":            "http://keycloak-service.keycloak.svc:8080",
+		"KEYCLOAK_REALM":          "kagenti",
+		"DEFAULT_OUTBOUND_POLICY": "passthrough",
+		"TOKEN_URL":               "", // intentionally empty: the plugin should derive from keycloak_url + realm
+	}
+	for k, v := range envs {
+		t.Setenv(k, v)
+	}
+
+	cfg, err := config.Load(yamlPath)
+	if err != nil {
+		t.Fatalf("Load(%s): %v", yamlPath, err)
+	}
+	if cfg.Mode != config.ModeEnvoySidecar {
+		t.Errorf("mode = %q, want %q", cfg.Mode, config.ModeEnvoySidecar)
+	}
+
+	// Build both pipelines. Any plugin whose Configure rejects the
+	// env-expanded config subtree (e.g. because a default path moved
+	// but the YAML still relies on it) fails the build here.
+	if _, err := Build(cfg.Pipeline.Inbound.Plugins); err != nil {
+		t.Errorf("Build inbound: %v", err)
+	}
+	if _, err := Build(cfg.Pipeline.Outbound.Plugins); err != nil {
+		t.Errorf("Build outbound: %v", err)
+	}
+}
+
 // --- JWTValidation: Configure ---
 
 func TestJWTValidation_Configure_MissingIssuer(t *testing.T) {
@@ -430,6 +476,12 @@ func TestBuild_ConfigForNonConfigurablePlugin(t *testing.T) {
 	})
 	if err == nil {
 		t.Fatal("expected error for config on non-Configurable plugin")
+	}
+	// Error text is operator-facing contract — a future refactor that
+	// changes it must update this assertion intentionally.
+	if !strings.Contains(err.Error(), "does not accept configuration") {
+		t.Errorf("error %q does not match the operator-facing contract "+
+			`"%q does not accept configuration"`, err, "a2a-parser")
 	}
 }
 

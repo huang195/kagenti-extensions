@@ -35,9 +35,12 @@ func TestConfigurable_InterfaceIsOptional(t *testing.T) {
 	}
 }
 
-func TestConfigurable_ErrorAborts(t *testing.T) {
-	// A Configure error is surfaced to the caller. Pipeline construction
-	// should not silently continue when a plugin refuses its config.
+func TestConfigurable_ErrorPropagates(t *testing.T) {
+	// A Configure error is surfaced to the caller. Pipeline
+	// construction should not silently continue when a plugin refuses
+	// its config — Build-level coverage that the error actually
+	// aborts a pipeline build lives in
+	// plugins_test.go:TestBuild_ConfigureError.
 	p := &configurablePlugin{
 		stubPlugin: stubPlugin{name: "bad"},
 		returnErr:  errors.New("bad config"),

@@ -86,9 +86,6 @@ func main() {
 		log.Fatal("--config is required")
 	}
 
-	_, cancel := context.WithCancel(context.Background())
-	defer cancel()
-
 	// Load config
 	cfg, err := config.Load(*configPath)
 	if err != nil {

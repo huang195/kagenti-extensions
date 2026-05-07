@@ -236,9 +236,9 @@ pipeline:
 	}
 }
 
-// ID defaults to empty string when omitted; callers default to Name
-// themselves (at Build time, which this test does not exercise).
-func TestPluginEntry_IDDefaultsToName(t *testing.T) {
+// ID stays empty when omitted; callers default to Name themselves (at
+// Build time, which this test does not exercise).
+func TestPluginEntry_IDOmittedStaysEmpty(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "config.yaml")
 	content := `mode: envoy-sidecar

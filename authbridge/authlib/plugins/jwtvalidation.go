@@ -38,6 +38,11 @@ type jwtValidationConfig struct {
 	// together with client-registration's /shared/client-id.txt. The
 	// file may not exist at Configure time; a background poll started
 	// by Init waits for it and updates the plugin when it appears.
+	//
+	// Note: an empty-string value is treated as "unset" — applyDefaults
+	// will fill in /shared/client-id.txt. To opt out of any file poll,
+	// supply an explicit Audience instead; the file default only kicks
+	// in when both Audience and AudienceFile are empty.
 	AudienceFile string `json:"audience_file"`
 
 	// AudienceMode chooses how the expected audience is resolved:
@@ -80,9 +85,10 @@ func (c *jwtValidationConfig) validate() error {
 	}
 	switch c.AudienceMode {
 	case "static":
-		if c.Audience == "" && c.AudienceFile == "" {
-			return errors.New("audience or audience_file is required when audience_mode=static")
-		}
+		// applyDefaults guarantees AudienceFile is set whenever both
+		// Audience and AudienceFile arrived empty, so no check here —
+		// the plugin will always have either a literal audience or a
+		// file path to poll.
 	case "per-host":
 		// Audience derived at request time from pctx.Host — nothing to check.
 	default:
@@ -99,6 +105,13 @@ type JWTValidation struct {
 	cfg             jwtValidationConfig
 	inner           *auth.Auth
 	audienceDeriver func(string) string
+
+	// bgCancel stops the background audience-file poller started by
+	// Init. It's created with context.Background() (not Init's ctx) so
+	// the poller's lifetime is the plugin's lifetime, not Start's
+	// 60-second budget — otherwise a slow client-registration during
+	// pod boot would orphan the plugin after the initCtx deadline.
+	bgCancel context.CancelFunc
 }
 
 // NewJWTValidation constructs an unconfigured plugin. Configure must be
@@ -132,13 +145,19 @@ func (p *JWTValidation) Configure(raw json.RawMessage) error {
 	p.cfg = c
 
 	if c.AudienceMode == "per-host" {
-		p.audienceDeriver = perHostAudienceDeriver
+		p.audienceDeriver = routing.ServiceNameFromHost
 	}
 
 	audience := c.Audience
 	if audience == "" && c.AudienceFile != "" {
 		if v, err := config.ReadCredentialFile(c.AudienceFile); err == nil {
 			audience = v
+		} else {
+			// Boot-time visibility: operators see this in `kubectl logs`
+			// of the initial pod instead of chasing 503s from traffic
+			// that arrived before Init's poll filled the audience in.
+			slog.Warn("jwt-validation: audience_file not yet readable; Init will poll in background",
+				"path", c.AudienceFile, "error", err)
 		}
 	}
 
@@ -156,16 +175,26 @@ func (p *JWTValidation) Configure(raw json.RawMessage) error {
 }
 
 // Init starts a background poll for AudienceFile when the file wasn't
-// readable during Configure. The goroutine runs until the file appears
-// or ctx is cancelled.
-func (p *JWTValidation) Init(ctx context.Context) error {
+// readable during Configure.
+//
+// The ctx passed to Init bounds synchronous initialization — not
+// long-running watchers. The poller is spawned with a process-lifetime
+// context (context.Background() + a cancel func stored in bgCancel)
+// so Pipeline.Start's 60s init budget doesn't kill it. Shutdown
+// cancels the watcher when the process is shutting down.
+func (p *JWTValidation) Init(_ context.Context) error {
 	if p.cfg.AudienceFile == "" || p.cfg.Audience != "" || p.inner.Ready() {
 		return nil
 	}
+	bgCtx, cancel := context.WithCancel(context.Background())
+	p.bgCancel = cancel
 	go func() {
-		v, err := config.WaitForCredentialFile(ctx, p.cfg.AudienceFile)
+		v, err := config.WaitForCredentialFile(bgCtx, p.cfg.AudienceFile)
 		if err != nil {
-			slog.Warn("jwt-validation: audience_file never became available",
+			// Only reached when Shutdown cancels bgCtx — the file-wait
+			// doesn't have a deadline of its own. Log at Debug so clean
+			// shutdowns don't spam the log.
+			slog.Debug("jwt-validation: audience_file wait stopped",
 				"path", p.cfg.AudienceFile, "error", err)
 			return
 		}
@@ -173,6 +202,15 @@ func (p *JWTValidation) Init(ctx context.Context) error {
 		slog.Info("jwt-validation: audience loaded from file",
 			"path", p.cfg.AudienceFile, "audience", v)
 	}()
+	return nil
+}
+
+// Shutdown cancels the background audience-file poller if one was
+// started by Init. Called by Pipeline.Stop during process shutdown.
+func (p *JWTValidation) Shutdown(_ context.Context) error {
+	if p.bgCancel != nil {
+		p.bgCancel()
+	}
 	return nil
 }
 
@@ -212,8 +250,5 @@ func (p *JWTValidation) OnResponse(_ context.Context, _ *pipeline.Context) pipel
 var (
 	_ pipeline.Configurable = (*JWTValidation)(nil)
 	_ pipeline.Initializer  = (*JWTValidation)(nil)
+	_ pipeline.Shutdowner   = (*JWTValidation)(nil)
 )
-
-// perHostAudienceDeriver is a package-local alias so testutil.go can
-// reference the same derivation function the Configure path wires up.
-var perHostAudienceDeriver = routing.ServiceNameFromHost

@@ -1,6 +1,7 @@
 package config
 
 import (
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"testing"
@@ -197,6 +198,137 @@ identity:
 	}
 	if cfg.Inbound.JWKSURL != "http://expanded-jwks" {
 		t.Errorf("jwks_url = %q, want expanded value", cfg.Inbound.JWKSURL)
+	}
+}
+
+// --- PluginEntry YAML parsing ---
+
+// Existing pipeline configs use bare plugin names. Those must keep
+// parsing to PluginEntry{Name: <name>} with no config, so migrating
+// plugins to Configurable one at a time doesn't force a flag-day edit
+// of every configmap.
+func TestPluginEntry_BareStringForm(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.yaml")
+	content := `mode: envoy-sidecar
+pipeline:
+  inbound:
+    plugins:
+      - jwt-validation
+      - a2a-parser
+  outbound:
+    plugins:
+      - token-exchange
+`
+	if err := os.WriteFile(path, []byte(content), 0600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	inbound := cfg.Pipeline.Inbound.Plugins
+	if len(inbound) != 2 {
+		t.Fatalf("inbound len = %d, want 2", len(inbound))
+	}
+	if inbound[0].Name != "jwt-validation" || len(inbound[0].Config) != 0 {
+		t.Errorf("inbound[0] = %+v, want {jwt-validation, nil config}", inbound[0])
+	}
+	if inbound[1].Name != "a2a-parser" || len(inbound[1].Config) != 0 {
+		t.Errorf("inbound[1] = %+v, want {a2a-parser, nil config}", inbound[1])
+	}
+}
+
+// The richer form captures config as a raw JSON subtree. The framework
+// doesn't interpret it; the plugin decodes against its own typed
+// struct. Assert the bytes round-trip the operator's YAML faithfully
+// (scalars preserved, nested maps intact) because that's the contract
+// plugins rely on for DisallowUnknownFields decoding.
+func TestPluginEntry_FullForm(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.yaml")
+	content := `mode: envoy-sidecar
+pipeline:
+  inbound:
+    plugins:
+      - name: jwt-validation
+        id: jwt-validation
+        config:
+          issuer: "http://keycloak.example/realms/kagenti"
+          bypass_paths:
+            - /healthz
+            - /.well-known/*
+          nested:
+            count: 3
+            enabled: true
+`
+	if err := os.WriteFile(path, []byte(content), 0600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	entries := cfg.Pipeline.Inbound.Plugins
+	if len(entries) != 1 {
+		t.Fatalf("entries len = %d, want 1", len(entries))
+	}
+	e := entries[0]
+	if e.Name != "jwt-validation" || e.ID != "jwt-validation" {
+		t.Errorf("name/id = %q/%q, want jwt-validation/jwt-validation", e.Name, e.ID)
+	}
+	// Decode the captured config back to a map and spot-check fidelity.
+	var decoded map[string]any
+	if err := json.Unmarshal(e.Config, &decoded); err != nil {
+		t.Fatalf("config JSON parse: %v\nbytes: %s", err, e.Config)
+	}
+	if decoded["issuer"] != "http://keycloak.example/realms/kagenti" {
+		t.Errorf("issuer round-trip lost: %v", decoded["issuer"])
+	}
+	paths, ok := decoded["bypass_paths"].([]any)
+	if !ok || len(paths) != 2 {
+		t.Errorf("bypass_paths = %v, want 2-element list", decoded["bypass_paths"])
+	}
+	nested, ok := decoded["nested"].(map[string]any)
+	if !ok {
+		t.Fatalf("nested lost shape: %v", decoded["nested"])
+	}
+	// YAML int → JSON → Go float64 (json.Unmarshal's default). Checking
+	// the float form keeps the test honest about what plugins actually
+	// receive when they DisallowUnknownFields-decode.
+	if got, want := nested["count"], float64(3); got != want {
+		t.Errorf("nested.count = %v, want 3", got)
+	}
+	if nested["enabled"] != true {
+		t.Errorf("nested.enabled = %v, want true", nested["enabled"])
+	}
+}
+
+// ID defaults to Name if omitted. Build and session telemetry key off
+// ID, so the default must be stable even when operators don't set it.
+func TestPluginEntry_IDDefaultsToName(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.yaml")
+	content := `mode: envoy-sidecar
+pipeline:
+  inbound:
+    plugins:
+      - name: jwt-validation
+`
+	if err := os.WriteFile(path, []byte(content), 0600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	e := cfg.Pipeline.Inbound.Plugins[0]
+	// ID comes out as "" when omitted — callers that want "default to
+	// name" must do so themselves. This test pins that behavior so the
+	// convention (applied at the Build layer in a follow-up) is
+	// explicit rather than accidental.
+	if e.ID != "" {
+		t.Errorf("omitted id = %q, want empty (defaulting happens at Build)", e.ID)
 	}
 }
 

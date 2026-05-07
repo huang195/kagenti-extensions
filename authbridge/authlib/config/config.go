@@ -3,6 +3,7 @@
 package config
 
 import (
+	"encoding/json"
 	"fmt"
 	"os"
 
@@ -58,7 +59,110 @@ type PipelineConfig struct {
 
 // PipelineStageConfig lists the plugins for a pipeline stage in execution order.
 type PipelineStageConfig struct {
-	Plugins []string `yaml:"plugins" json:"plugins"`
+	Plugins []PluginEntry `yaml:"plugins" json:"plugins"`
+}
+
+// PluginEntry names a plugin and optionally carries per-instance config.
+//
+// The YAML accepts both the bare-name form ("jwt-validation") and the
+// full form ({name, id, config}). The short form keeps existing pipeline
+// configs parsing unchanged; the long form is what plugins that
+// implement pipeline.Configurable actually need. See
+// authbridge/authlib/plugins/CONVENTIONS.md for the convention plugins
+// follow when decoding Config.
+//
+// Config is captured as a raw subtree via json.RawMessage so the plugin
+// can do its own DisallowUnknownFields decode against a typed struct —
+// the framework does not interpret it.
+type PluginEntry struct {
+	Name   string          `yaml:"name" json:"name"`
+	ID     string          `yaml:"id,omitempty" json:"id,omitempty"`
+	Config json.RawMessage `yaml:"-" json:"config,omitempty"`
+}
+
+// UnmarshalYAML accepts either a bare string or a map. The string form
+// is equivalent to {name: <string>} with no config.
+func (p *PluginEntry) UnmarshalYAML(node *yaml.Node) error {
+	switch node.Kind {
+	case yaml.ScalarNode:
+		p.Name = node.Value
+		return nil
+	case yaml.MappingNode:
+		// Walk the mapping's Content pairs directly so we can preserve
+		// the config subtree as raw bytes. yaml.v3's struct decode into
+		// a *yaml.Node field produces nil in this version; iterating
+		// Content is the reliable path.
+		for i := 0; i+1 < len(node.Content); i += 2 {
+			key, val := node.Content[i], node.Content[i+1]
+			if key.Kind != yaml.ScalarNode {
+				return fmt.Errorf("plugin entry: non-scalar key %q", key.Value)
+			}
+			switch key.Value {
+			case "name":
+				if err := val.Decode(&p.Name); err != nil {
+					return fmt.Errorf("plugin entry name: %w", err)
+				}
+			case "id":
+				if err := val.Decode(&p.ID); err != nil {
+					return fmt.Errorf("plugin entry id: %w", err)
+				}
+			case "config":
+				raw, err := yamlNodeToJSON(val)
+				if err != nil {
+					return fmt.Errorf("plugin %q config: %w", p.Name, err)
+				}
+				p.Config = raw
+			default:
+				return fmt.Errorf("plugin entry: unknown field %q", key.Value)
+			}
+		}
+		return nil
+	default:
+		return fmt.Errorf("plugin entry: expected string or map, got kind %d", node.Kind)
+	}
+}
+
+// yamlNodeToJSON converts a YAML node to JSON bytes by round-tripping
+// through a generic Go value. Sufficient for config sub-trees, which
+// only contain scalars, sequences, and maps.
+func yamlNodeToJSON(n *yaml.Node) ([]byte, error) {
+	var v any
+	if err := n.Decode(&v); err != nil {
+		return nil, err
+	}
+	return json.Marshal(normalizeYAMLMaps(v))
+}
+
+// normalizeYAMLMaps converts map[any]any (which yaml.v3 can produce when
+// decoding into an untyped `any`) into map[string]any so json.Marshal
+// accepts it. YAML allows non-string keys but config files never use them.
+func normalizeYAMLMaps(v any) any {
+	switch x := v.(type) {
+	case map[any]any:
+		out := make(map[string]any, len(x))
+		for k, val := range x {
+			ks, ok := k.(string)
+			if !ok {
+				ks = fmt.Sprintf("%v", k)
+			}
+			out[ks] = normalizeYAMLMaps(val)
+		}
+		return out
+	case map[string]any:
+		out := make(map[string]any, len(x))
+		for k, val := range x {
+			out[k] = normalizeYAMLMaps(val)
+		}
+		return out
+	case []any:
+		out := make([]any, len(x))
+		for i, val := range x {
+			out[i] = normalizeYAMLMaps(val)
+		}
+		return out
+	default:
+		return v
+	}
 }
 
 // InboundConfig holds JWT validation settings.

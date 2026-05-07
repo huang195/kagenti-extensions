@@ -1,0 +1,262 @@
+# Plugin Config Conventions
+
+How plugins under `authbridge/authlib/plugins/` receive, validate, and
+apply their configuration. Everything here is convention — the framework
+only requires `pipeline.Configurable` if the plugin has any config at all.
+The rest of this document exists so that the sixth and tenth plugin
+don't each invent their own style.
+
+## Scope
+
+- What the YAML entry for a plugin looks like.
+- How a plugin decodes that YAML into a typed config struct.
+- How a plugin applies defaults and runs validation.
+- What the framework does and doesn't do on your behalf.
+- A template you can copy for a new plugin.
+
+## YAML entry shape
+
+Each plugin appears in the pipeline as either a bare name or a full entry:
+
+```yaml
+pipeline:
+  inbound:
+    plugins:
+      - a2a-parser                       # bare name — no config
+      - name: jwt-validation
+        id: jwt-validation               # optional; defaults to name
+        config:
+          issuer: "http://keycloak..."
+          audience_file: "/shared/client-id.txt"
+          bypass_paths:
+            - "/healthz"
+```
+
+- **`name`** — required. Must match a key in the plugin registry.
+- **`id`** — optional. Defaults to `name`. Lets two instances of the same
+  plugin coexist with different config (not yet exercised, but the shape
+  is reserved).
+- **`config`** — optional. Arbitrary YAML sub-tree owned by the plugin.
+  The framework does not interpret it; it's captured as `json.RawMessage`
+  and handed to `Configure`.
+
+## The Configurable interface
+
+```go
+type Configurable interface {
+    Configure(raw json.RawMessage) error
+}
+```
+
+The framework calls `Configure` exactly once per plugin instance, during
+pipeline construction, before `Start`. Plugins without config don't
+implement this interface — the builder type-asserts and skips them.
+
+If a plugin **does not** implement `Configurable` but the YAML entry
+has a non-empty `config:` block, the builder fails with a clear
+`"plugin %q does not accept configuration"` error. This catches
+misconfigurations (typo in plugin name, leftover config after a
+refactor) at startup.
+
+## The four-step Configure pattern
+
+Every Configurable plugin follows the same shape:
+
+```go
+func (p *Plugin) Configure(raw json.RawMessage) error {
+    var c pluginConfig
+    if len(raw) > 0 {
+        dec := json.NewDecoder(bytes.NewReader(raw))
+        dec.DisallowUnknownFields()             // 1. strict decode
+        if err := dec.Decode(&c); err != nil {
+            return fmt.Errorf("plugin config: %w", err)
+        }
+    }
+    c.applyDefaults()                           // 2. fill in defaults
+    if err := c.validate(); err != nil {        // 3. validate
+        return fmt.Errorf("plugin config: %w", err)
+    }
+    // 4. construct internal state
+    p.verifier = newVerifier(c.Issuer, c.JWKSURL)
+    p.bypass = bypass.New(c.BypassPaths)
+    return nil
+}
+```
+
+### 1. Strict decode (`DisallowUnknownFields`)
+
+Always. A stale or misspelled key is a mistake, not a preference. Loud
+failure at startup beats a silent wrong default at request time.
+
+### 2. `applyDefaults()`
+
+Fills zero-value fields with sensible defaults and derives computed
+fields. Keep it pure — no I/O, no file reads — so it can be unit-tested
+with the config struct alone.
+
+```go
+func (c *pluginConfig) applyDefaults() {
+    if c.DefaultPolicy == "" {
+        c.DefaultPolicy = "passthrough"
+    }
+    if c.JWKSURL == "" && c.Issuer != "" {
+        c.JWKSURL = c.Issuer + "/protocol/openid-connect/certs"
+    }
+}
+```
+
+When you need to distinguish "unset" from "explicitly set to zero" —
+typically for booleans — use `*bool` / `*int` in the struct and convert
+to plain values after `applyDefaults`. `SessionConfig.Enabled` in
+`authlib/config` is the reference pattern.
+
+### 3. `validate()`
+
+Rejects configurations the plugin cannot operate with. Run validation
+**after** `applyDefaults` so derived fields are in place.
+
+```go
+func (c *pluginConfig) validate() error {
+    if c.Issuer == "" {
+        return errors.New("issuer is required")
+    }
+    if c.DefaultPolicy != "passthrough" && c.DefaultPolicy != "exchange" {
+        return fmt.Errorf("default_policy must be passthrough or exchange, got %q", c.DefaultPolicy)
+    }
+    return nil
+}
+```
+
+Return errors phrased for an operator reading a pod log, not a developer
+reading a stack trace.
+
+### 4. Construct internal state
+
+This is the only step allowed to do I/O (read credential files, open
+connections, etc.). Everything the plugin needs at request time should
+be materialized here, not lazily on first `OnRequest` — lazy init
+hides config errors until traffic arrives.
+
+## File-sourced values
+
+Several plugins accept either an inline value or a file path for the
+same datum (e.g. `client_secret` vs `client_secret_file`). The
+convention:
+
+- Both fields live in the config struct; the file variant has the
+  `_file` suffix.
+- `applyDefaults` does not read the file.
+- `validate` requires exactly one to be set.
+- Internal state construction calls the file-read helper from
+  `authlib/config` (not a new one), which tolerates transient absence
+  during pod boot (client-registration may still be writing).
+
+## What Configure MUST NOT do
+
+- **Block forever.** Configure runs before traffic starts; the process
+  is still holding the startup deadline. Use bounded waits with
+  timeouts, not unbounded blocking reads.
+- **Start background goroutines.** Use `Init(ctx)` from the
+  `pipeline.Initializer` interface for that — it runs after Configure
+  and has a process context you can key your goroutine's lifetime to.
+- **Mutate global state.** Plugins run in a single process today, but
+  the config → runtime mapping must stay per-instance. Two instances
+  of the same plugin with different config must not clobber each other.
+- **Persist the raw bytes.** Decode into your typed struct and drop
+  the `json.RawMessage`. Holding it leaks the original YAML, which
+  may contain secrets, into any log that dumps the plugin for
+  debugging.
+
+## Testing
+
+Each Configurable plugin ships three kinds of tests:
+
+1. **Config round-trip.** Given a YAML snippet, does Configure produce
+   the expected internal state? Exercise defaults-applied and defaults-
+   rejected paths explicitly.
+2. **Validation failures.** One test per validation error path — name
+   a missing-required field, a malformed value, a conflicting pair.
+   Assert the error message names the bad field.
+3. **Behavior integration.** The existing `OnRequest` / `OnResponse`
+   tests, but wired through Configure rather than hand-built internal
+   state. This is what keeps the config layer and the plugin behavior
+   honest about each other.
+
+## Template
+
+Copy this into a new plugin file as the starting point. Replace
+`myPlugin` with your plugin's identifier.
+
+```go
+package plugins
+
+import (
+    "bytes"
+    "encoding/json"
+    "errors"
+    "fmt"
+
+    "github.com/kagenti/kagenti-extensions/authbridge/authlib/pipeline"
+)
+
+// myPluginConfig is the plugin's private config schema. Fields are JSON-
+// tagged so Configure can DisallowUnknownFields against operator-supplied
+// YAML (YAML → JSON round-trip preserves key names).
+type myPluginConfig struct {
+    SomeKnob   string   `json:"some_knob"`
+    SomePaths  []string `json:"some_paths"`
+    // ...
+}
+
+func (c *myPluginConfig) applyDefaults() {
+    if c.SomeKnob == "" {
+        c.SomeKnob = "default-value"
+    }
+}
+
+func (c *myPluginConfig) validate() error {
+    if c.SomeKnob == "" {
+        return errors.New("some_knob is required")
+    }
+    return nil
+}
+
+type MyPlugin struct {
+    // internal state populated by Configure
+}
+
+func (p *MyPlugin) Configure(raw json.RawMessage) error {
+    var c myPluginConfig
+    if len(raw) > 0 {
+        dec := json.NewDecoder(bytes.NewReader(raw))
+        dec.DisallowUnknownFields()
+        if err := dec.Decode(&c); err != nil {
+            return fmt.Errorf("my-plugin config: %w", err)
+        }
+    }
+    c.applyDefaults()
+    if err := c.validate(); err != nil {
+        return fmt.Errorf("my-plugin config: %w", err)
+    }
+    // construct internal state from c
+    return nil
+}
+
+func (p *MyPlugin) Name() string                             { return "my-plugin" }
+func (p *MyPlugin) Capabilities() pipeline.PluginCapabilities { return pipeline.PluginCapabilities{} }
+func (p *MyPlugin) OnRequest(_ context.Context, _ *pipeline.Context) pipeline.Action {
+    return pipeline.Action{Type: pipeline.Continue}
+}
+func (p *MyPlugin) OnResponse(_ context.Context, _ *pipeline.Context) pipeline.Action {
+    return pipeline.Action{Type: pipeline.Continue}
+}
+```
+
+## Cross-references
+
+- `authbridge/authlib/pipeline/configurable.go` — the interface.
+- `authbridge/authlib/pipeline/README.md` — how plugins compose and
+  run; Configure's place in the lifecycle.
+- `authbridge/authlib/config/config.go` — `PluginEntry` YAML shape and
+  parsing.
+- `authbridge/authlib/plugins/registry.go` — how Build calls Configure.

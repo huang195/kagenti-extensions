@@ -9,6 +9,7 @@ import (
 
 	"github.com/kagenti/kagenti-extensions/authbridge/authlib/auth"
 	"github.com/kagenti/kagenti-extensions/authbridge/authlib/cache"
+	"github.com/kagenti/kagenti-extensions/authbridge/authlib/config"
 	"github.com/kagenti/kagenti-extensions/authbridge/authlib/exchange"
 	"github.com/kagenti/kagenti-extensions/authbridge/authlib/pipeline"
 	"github.com/kagenti/kagenti-extensions/authbridge/authlib/routing"
@@ -232,7 +233,10 @@ func TestTokenExchange_NoToken_Deny(t *testing.T) {
 
 func TestBuild_ValidNames(t *testing.T) {
 	a := auth.New(auth.Config{})
-	p, err := Build([]string{"jwt-validation", "token-exchange"}, a)
+	p, err := Build([]config.PluginEntry{
+		{Name: "jwt-validation"},
+		{Name: "token-exchange"},
+	}, a)
 	if err != nil {
 		t.Fatalf("Build returned error: %v", err)
 	}
@@ -243,7 +247,7 @@ func TestBuild_ValidNames(t *testing.T) {
 
 func TestBuild_UnknownName(t *testing.T) {
 	a := auth.New(auth.Config{})
-	_, err := Build([]string{"nonexistent-plugin"}, a)
+	_, err := Build([]config.PluginEntry{{Name: "nonexistent-plugin"}}, a)
 	if err == nil {
 		t.Fatal("expected error for unknown plugin name")
 	}
@@ -251,13 +255,27 @@ func TestBuild_UnknownName(t *testing.T) {
 
 func TestBuild_EmptyList(t *testing.T) {
 	a := auth.New(auth.Config{})
-	p, err := Build([]string{}, a)
+	p, err := Build([]config.PluginEntry{}, a)
 	if err != nil {
 		t.Fatalf("Build returned error: %v", err)
 	}
 	action := p.Run(context.Background(), &pipeline.Context{Headers: http.Header{}})
 	if action.Type != pipeline.Continue {
 		t.Errorf("empty pipeline got %v, want Continue", action.Type)
+	}
+}
+
+// TestBuild_ConfigForNonConfigurablePlugin ensures that a config: block
+// directed at a plugin which doesn't implement Configurable fails at
+// pipeline construction. Silently accepting it would hide typos and
+// stale config across refactors.
+func TestBuild_ConfigForNonConfigurablePlugin(t *testing.T) {
+	a := auth.New(auth.Config{})
+	_, err := Build([]config.PluginEntry{
+		{Name: "a2a-parser", Config: []byte(`{"unused":true}`)},
+	}, a)
+	if err == nil {
+		t.Fatal("expected error for config on non-Configurable plugin")
 	}
 }
 

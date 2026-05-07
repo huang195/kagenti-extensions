@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"log/slog"
 	"strings"
+	"sync/atomic"
 
 	"github.com/kagenti/kagenti-extensions/authbridge/authlib/auth"
 	"github.com/kagenti/kagenti-extensions/authbridge/authlib/bypass"
@@ -111,7 +112,13 @@ type JWTValidation struct {
 	// the poller's lifetime is the plugin's lifetime, not Start's
 	// 60-second budget — otherwise a slow client-registration during
 	// pod boot would orphan the plugin after the initCtx deadline.
-	bgCancel context.CancelFunc
+	//
+	// Held in an atomic.Pointer so a future caller can invoke Shutdown
+	// from a goroutine other than the one that ran Init without racing
+	// the Init assignment. Today the pipeline serializes Start / Stop,
+	// so the lock-free guarantee is future-proofing rather than a
+	// correctness fix for current callers.
+	bgCancel atomic.Pointer[context.CancelFunc]
 }
 
 // NewJWTValidation constructs an unconfigured plugin. Configure must be
@@ -138,6 +145,12 @@ func (p *JWTValidation) Configure(raw json.RawMessage) error {
 			return fmt.Errorf("jwt-validation config: %w", err)
 		}
 	}
+	// Capture whether audience_file arrived explicitly so the boot-time
+	// WARN can distinguish "operator pointed at the wrong path" from
+	// "defaulted to the Kagenti convention and you might not have
+	// noticed." applyDefaults fills AudienceFile in when both audience
+	// and audience_file are empty, erasing the signal.
+	audienceFileExplicit := c.AudienceFile != ""
 	c.applyDefaults()
 	if err := c.validate(); err != nil {
 		return fmt.Errorf("jwt-validation config: %w", err)
@@ -156,8 +169,18 @@ func (p *JWTValidation) Configure(raw json.RawMessage) error {
 			// Boot-time visibility: operators see this in `kubectl logs`
 			// of the initial pod instead of chasing 503s from traffic
 			// that arrived before Init's poll filled the audience in.
-			slog.Warn("jwt-validation: audience_file not yet readable; Init will poll in background",
-				"path", c.AudienceFile, "error", err)
+			// When the path was defaulted (not written in the YAML),
+			// spell that out so non-Kagenti deployers don't wonder why
+			// the plugin is asking for /shared/client-id.txt.
+			if audienceFileExplicit {
+				slog.Warn("jwt-validation: audience_file not yet readable; Init will poll in background",
+					"path", c.AudienceFile, "error", err)
+			} else {
+				slog.Warn("jwt-validation: audience_file defaulted to Kagenti convention and not yet readable; "+
+					"Init will poll in background. Set audience (literal value) or audience_file (explicit path) "+
+					"if you are not running under Kagenti.",
+					"path", c.AudienceFile, "error", err)
+			}
 		}
 	}
 
@@ -189,12 +212,12 @@ func (p *JWTValidation) Init(_ context.Context) error {
 	// Defensive guard: pipeline.Start contract says Init runs exactly
 	// once per process, but a double-call would otherwise leak the
 	// first goroutine (the first cancel func would be dropped on the
-	// floor when we overwrite bgCancel).
-	if p.bgCancel != nil {
+	// floor when we replaced bgCancel).
+	if p.bgCancel.Load() != nil {
 		return nil
 	}
 	bgCtx, cancel := context.WithCancel(context.Background())
-	p.bgCancel = cancel
+	p.bgCancel.Store(&cancel)
 	go func() {
 		v, err := config.WaitForCredentialFile(bgCtx, p.cfg.AudienceFile)
 		if err != nil {
@@ -214,9 +237,11 @@ func (p *JWTValidation) Init(_ context.Context) error {
 
 // Shutdown cancels the background audience-file poller if one was
 // started by Init. Called by Pipeline.Stop during process shutdown.
+// Safe to call more than once — the atomic swap makes the second call
+// a no-op.
 func (p *JWTValidation) Shutdown(_ context.Context) error {
-	if p.bgCancel != nil {
-		p.bgCancel()
+	if cancel := p.bgCancel.Swap(nil); cancel != nil {
+		(*cancel)()
 	}
 	return nil
 }

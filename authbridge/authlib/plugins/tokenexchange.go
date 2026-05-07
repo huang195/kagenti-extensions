@@ -9,6 +9,7 @@ import (
 	"log/slog"
 	"net/http"
 	"strings"
+	"sync/atomic"
 
 	"github.com/kagenti/kagenti-extensions/authbridge/authlib/auth"
 	"github.com/kagenti/kagenti-extensions/authbridge/authlib/cache"
@@ -188,8 +189,8 @@ type TokenExchange struct {
 
 	// bgCancel stops the background credential-file poller started by
 	// Init. See JWTValidation.bgCancel for why this can't be tied to
-	// Init's ctx.
-	bgCancel context.CancelFunc
+	// Init's ctx, and for why it lives in an atomic.Pointer.
+	bgCancel atomic.Pointer[context.CancelFunc]
 }
 
 // NewTokenExchange constructs an unconfigured plugin.
@@ -220,14 +221,15 @@ func (p *TokenExchange) Configure(raw json.RawMessage) error {
 	if err := c.validate(); err != nil {
 		return fmt.Errorf("token-exchange config: %w", err)
 	}
-	// Default-policy "exchange" with no explicit no_token_policy is the
-	// configuration shape where the old waypoint default ("allow")
-	// produced visibly different behavior than the new default ("deny").
-	// Log at boot so operators find out via `kubectl logs` instead of
-	// discovering it through unexpected 401s once traffic starts.
-	if !noTokenPolicyExplicit && c.DefaultPolicy == "exchange" {
+	// The old NoTokenPolicyForMode defaulted to "client-credentials" for
+	// envoy-sidecar, "allow" for waypoint, and "deny" for proxy-sidecar.
+	// The new uniform default is "deny". Warn whenever no_token_policy
+	// was defaulted so operators relying on either of the old
+	// mode-specific behaviors find out at boot rather than via a
+	// traffic regression.
+	if !noTokenPolicyExplicit {
 		slog.Warn("token-exchange: no_token_policy defaulted to \"deny\"; " +
-			"prior waypoint deployments defaulted to \"allow\". " +
+			"prior defaults were mode-specific (envoy-sidecar: client-credentials, waypoint: allow, proxy-sidecar: deny). " +
 			"Set no_token_policy explicitly (allow | deny | client-credentials) to silence this warning and pin the behavior.")
 	}
 
@@ -357,11 +359,11 @@ func (p *TokenExchange) Init(_ context.Context) error {
 		return nil
 	}
 	// Defensive guard; see JWTValidation.Init for rationale.
-	if p.bgCancel != nil {
+	if p.bgCancel.Load() != nil {
 		return nil
 	}
 	bgCtx, cancel := context.WithCancel(context.Background())
-	p.bgCancel = cancel
+	p.bgCancel.Store(&cancel)
 	go p.pollCredentials(bgCtx, needID, needSecret)
 	return nil
 }
@@ -400,14 +402,19 @@ func (p *TokenExchange) pollCredentials(ctx context.Context, needID, needSecret 
 		auth.IdentityConfig{ClientID: clientID},
 		clientAuth,
 	)
-	slog.Info("token-exchange: credentials loaded", "client_id", clientID)
+	// Deliberately log no client_id: some operators treat OAuth client
+	// IDs as sensitive (they appear in access logs, JWT sub claims,
+	// etc.). The signal here — credentials have loaded — doesn't need
+	// the identifier.
+	slog.Info("token-exchange: credentials loaded")
 }
 
 // Shutdown cancels the background credential-file poller if one was
 // started by Init. Called by Pipeline.Stop during process shutdown.
+// Safe to call more than once.
 func (p *TokenExchange) Shutdown(_ context.Context) error {
-	if p.bgCancel != nil {
-		p.bgCancel()
+	if cancel := p.bgCancel.Swap(nil); cancel != nil {
+		(*cancel)()
 	}
 	return nil
 }

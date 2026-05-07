@@ -145,21 +145,47 @@ func (p *Pipeline) NeedsBody() bool {
 // on error, later plugins are not initialized. Plugins without Init are
 // silently skipped.
 //
+// If Init fails on plugin N, Start invokes Shutdown on plugins
+// [0..N-1] (those whose Init succeeded) in reverse order before
+// returning the error. This cleans up any background goroutines the
+// earlier plugins spawned, so the plugin chain doesn't leak when a
+// downstream peer rejects its config at boot. Shutdown errors during
+// unwind are logged but do not mask the original Init failure.
+//
 // Callers should invoke Start after Pipeline construction (pipeline.New)
 // and before the listener accepts traffic. Safe to call at most once per
 // Pipeline — plugins may assume Init runs exactly once per process.
 func (p *Pipeline) Start(ctx context.Context) error {
-	for _, plugin := range p.plugins {
+	for i, plugin := range p.plugins {
 		init, ok := plugin.(Initializer)
 		if !ok {
 			continue
 		}
 		slog.Debug("pipeline: initializing plugin", "plugin", plugin.Name())
 		if err := init.Init(ctx); err != nil {
+			p.unwindStart(ctx, i)
 			return fmt.Errorf("plugin %q Init: %w", plugin.Name(), err)
 		}
 	}
 	return nil
+}
+
+// unwindStart invokes Shutdown on plugins [0..failedIdx-1] in reverse
+// order after a Start failure at index failedIdx. Best-effort — errors
+// are logged.
+func (p *Pipeline) unwindStart(ctx context.Context, failedIdx int) {
+	for i := failedIdx - 1; i >= 0; i-- {
+		sh, ok := p.plugins[i].(Shutdowner)
+		if !ok {
+			continue
+		}
+		slog.Debug("pipeline: unwinding plugin after Start failure",
+			"plugin", p.plugins[i].Name())
+		if err := sh.Shutdown(ctx); err != nil {
+			slog.Warn("pipeline: plugin Shutdown during Start unwind returned error",
+				"plugin", p.plugins[i].Name(), "error", err)
+		}
+	}
 }
 
 // Stop invokes Shutdown on every plugin that implements the Shutdowner

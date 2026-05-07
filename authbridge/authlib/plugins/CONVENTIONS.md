@@ -252,6 +252,26 @@ func (p *MyPlugin) OnResponse(_ context.Context, _ *pipeline.Context) pipeline.A
 }
 ```
 
+## Strictness asymmetry: plugin config vs. runtime top-level
+
+The plugin-level config inside each `plugins[].config` subtree is
+**strict** — `DisallowUnknownFields` is part of the Configure
+convention, so a typo or a stale key fails the plugin at boot.
+
+The runtime YAML's **top-level** keys (`mode`, `listener`, `pipeline`,
+`session`, `stats`) are **forgiving**: unknown top-level keys are
+silently ignored by the YAML decoder. This is deliberate forward-
+compat — adding a new top-level section (say, `observability:`) in a
+future release must not break older binaries reading a newer config.
+
+The obvious gap — an operator keeping the pre-migration top-level
+schema (`inbound:`, `outbound:`, `identity:`, `bypass:`, `routes:`)
+would have their config silently accepted with those keys dropped —
+is closed by `config.Validate`, which errors when either pipeline
+list is empty. The error message names the likely cause so the
+operator is pointed at the migration, not left wondering why
+authentication isn't happening.
+
 ## Cross-references
 
 - `authbridge/authlib/pipeline/configurable.go` — the interface.

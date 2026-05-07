@@ -496,6 +496,62 @@ func TestPipelineStart_StopsOnInitError(t *testing.T) {
 	}
 }
 
+// When a plugin's Init fails, plugins earlier in the chain whose Init
+// already succeeded get their Shutdown called in reverse order. This
+// prevents the common failure mode of "plugin A's Init spawns a
+// background goroutine, plugin B's Init rejects its config, process
+// exits via log.Fatalf, plugin A's goroutine is orphaned until the
+// process dies." Not a correctness bug for the production flow (exit
+// cleans up everything), but matters for embedded / multi-tenant
+// callers.
+func TestPipelineStart_UnwindsSuccessfulInitsOnFailure(t *testing.T) {
+	var shutdownOrder []string
+	a := &lifecyclePlugin{
+		stubPlugin: stubPlugin{name: "a"},
+		onShutdown: func(context.Context) { shutdownOrder = append(shutdownOrder, "a") },
+	}
+	b := &lifecyclePlugin{
+		stubPlugin: stubPlugin{name: "b"},
+		onShutdown: func(context.Context) { shutdownOrder = append(shutdownOrder, "b") },
+	}
+	// c fails its Init — a and b should be shut down in reverse order.
+	c := &lifecyclePlugin{
+		stubPlugin: stubPlugin{name: "c"},
+		initErr:    errors.New("config rejected"),
+		onShutdown: func(context.Context) { shutdownOrder = append(shutdownOrder, "c") },
+	}
+	// d is never Init'd, must not be Shutdown either.
+	d := &lifecyclePlugin{
+		stubPlugin: stubPlugin{name: "d"},
+		onShutdown: func(context.Context) { shutdownOrder = append(shutdownOrder, "d") },
+	}
+
+	p, err := New([]Plugin{a, b, c, d})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	if err := p.Start(context.Background()); err == nil {
+		t.Fatal("expected Start to return an error")
+	}
+	// Expect [b, a]: reverse order of [a, b]. c's Init failed, so c is
+	// not unwound (it never succeeded). d was never touched.
+	if got, want := shutdownOrder, []string{"b", "a"}; !equalStrings(got, want) {
+		t.Errorf("shutdown order = %v, want %v", got, want)
+	}
+}
+
+func equalStrings(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
+}
+
 // Shutdown is called in reverse declaration order (LIFO), so plugins
 // that depend on earlier plugins' resources can still use them while
 // cleaning up.

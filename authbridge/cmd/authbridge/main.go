@@ -193,6 +193,11 @@ func main() {
 	// The WARN at startup is the only visible signal an operator sees —
 	// otherwise a curl to /stats returns zeros and looks like a broken
 	// pipeline rather than an intentional stub.
+	//
+	// TODO(follow-up): aggregate per-plugin stats. Sketch: add an
+	// optional `Stats() *auth.Stats` method to Plugin, iterate
+	// pipeline.Plugins() in the stat handler, merge counters into a
+	// single response. ~50 LOC + tests.
 	slog.Warn("stat server: /stats returns empty counters in this release; " +
 		"per-plugin stats aggregation is a follow-up. /config remains accurate.")
 	statSrv := startStatServer(cfg, auth.NewStats())
@@ -227,6 +232,11 @@ func main() {
 	// before serving traffic (token-exchange, jwt-validation with
 	// audience_file) do so in their own Init goroutines — OnRequest
 	// reports 503 if traffic arrives before credentials land.
+	//
+	// TODO(follow-up): plugin-level Ready() for /readyz. Sketch: add
+	// an optional `Ready() bool` interface; /readyz AND-folds each
+	// plugin's Ready(). auth.Auth.Ready() already exists, so each
+	// plugin's method is a one-line delegation.
 	go func() {
 		mux := http.NewServeMux()
 		mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {

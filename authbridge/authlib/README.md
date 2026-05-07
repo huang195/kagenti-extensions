@@ -12,31 +12,38 @@ A pure Go library providing reusable building blocks for JWT validation, OAuth 2
 | `bypass/` | Path pattern matcher for public endpoints (health, agent card) |
 | `spiffe/` | SPIFFE credential sources (file-based JWT-SVID) |
 | `routing/` | Host-to-audience router with glob pattern matching |
-| `auth/` | Composition layer: `HandleInbound` + `HandleOutbound` |
-| `config/` | YAML config, mode presets, startup validation, URL derivation |
-| `pipeline/` | Plugin pipeline — see [pipeline/README.md](./pipeline/README.md) for the full interface spec and bridge-plugin integration guide |
+| `auth/` | Composition layer: `HandleInbound` + `HandleOutbound` — used internally by `jwt-validation` and `token-exchange` plugins |
+| `config/` | YAML config loader, mode presets, credential-file waiters, top-level validation |
+| `pipeline/` | Plugin pipeline + lifecycle (`Configurable`, `Initializer`, `Shutdowner`) — see [pipeline/README.md](./pipeline/README.md) |
 | `session/` | In-memory session store + `SessionSummary` aggregation, backing the `:9094` API |
 | `sessionapi/` | HTTP API (`/v1/sessions`, `/v1/events` SSE, `/v1/pipeline`) exposing the session store |
-| `plugins/` | Built-in protocol parsers: `a2a-parser`, `mcp-parser`, `inference-parser`, `jwt-validation` |
+| `plugins/` | Built-in plugins: `jwt-validation`, `token-exchange`, `a2a-parser`, `mcp-parser`, `inference-parser`. See [plugins/CONVENTIONS.md](./plugins/CONVENTIONS.md) for the per-plugin config convention |
 | `observe/` | OTEL + metrics helpers |
 
 ## Usage
 
+Plugins own their own configuration and construct any `auth.Auth` they need internally from their per-plugin config (see [plugins/CONVENTIONS.md](./plugins/CONVENTIONS.md)). Host processes (cmd/authbridge) just load the YAML, call `plugins.Build`, run the pipelines, and let each plugin handle its own dependencies.
+
 ```go
 import (
-    "github.com/kagenti/kagenti-extensions/authbridge/authlib/auth"
     "github.com/kagenti/kagenti-extensions/authbridge/authlib/config"
+    "github.com/kagenti/kagenti-extensions/authbridge/authlib/plugins"
 )
 
-// Load and resolve config
 cfg, _ := config.Load("config.yaml")
-resolved, _ := config.Resolve(ctx, cfg)
-handler := auth.New(*resolved)
+config.ApplyPreset(cfg)
+_ = config.Validate(cfg) // mode + listener combo only; plugins self-validate
 
-// Handle requests
-inResult := handler.HandleInbound(ctx, authHeader, path, "")
-outResult := handler.HandleOutbound(ctx, authHeader, host)
+inbound,  _ := plugins.Build(cfg.Pipeline.Inbound.Plugins)
+outbound, _ := plugins.Build(cfg.Pipeline.Outbound.Plugins)
+
+_ = inbound.Start(ctx)   // invokes Init on plugins that implement pipeline.Initializer
+_ = outbound.Start(ctx)
+
+// Listeners drive the pipelines — see cmd/authbridge/listener/*
 ```
+
+For direct use of the `auth/` composition layer (outside of plugins), see `auth/auth.go` — `auth.New(cfg)` takes an `auth.Config` containing the specific building blocks a caller needs.
 
 ## Go Module
 

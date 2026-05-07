@@ -111,25 +111,24 @@ with protocol-specific listeners in `cmd/authbridge/listener/`:
 - Routes file is loaded once at startup; restart the pod to pick up changes
 
 **Configuration loading:**
-- YAML config with `${ENV_VAR}` expansion, mode presets, and startup validation
-- Supports `keycloak_url` + `keycloak_realm` derivation for operator compatibility
-- Waits up to 60s for credential files from client-registration
-- Reads `CLIENT_ID` from `/shared/client-id.txt` (file) or `CLIENT_ID` env var (fallback)
-- Reads `CLIENT_SECRET` from `/shared/client-secret.txt` (file) or `CLIENT_SECRET` env var (fallback)
-- `TOKEN_URL`: explicit env var, or auto-derived from `KEYCLOAK_URL` + `KEYCLOAK_REALM` (i.e. `{KEYCLOAK_URL}/realms/{KEYCLOAK_REALM}/protocol/openid-connect/token`)
-- `ISSUER`: explicit env var, or auto-derived from `KEYCLOAK_URL` + `KEYCLOAK_REALM` (i.e. `{KEYCLOAK_URL}/realms/{KEYCLOAK_REALM}`)
-- Inbound audience validation uses `CLIENT_ID` (from `/shared/client-id.txt` or `CLIENT_ID` env var) -- automatic, per-agent
-- Outbound route config from `/etc/authproxy/routes.yaml` (default; override with `ROUTES_CONFIG_PATH` env var in standalone deployments). Target audience and scopes are configured per-route only.
-- Default outbound policy from `DEFAULT_OUTBOUND_POLICY` env var: `"passthrough"` (default) or `"exchange"`
-- JWKS URL is derived from TOKEN_URL: replaces `/token` suffix with `/certs`
+- YAML config with `${ENV_VAR}` expansion, mode presets, and startup validation.
+- Plugin settings are local to each plugin under `pipeline.*.plugins[].config`; the runtime YAML itself only carries `mode`, `listener`, `session`, `stats`, and the pipeline composition. See [`cmd/authbridge/README.md`](cmd/authbridge/README.md) for the per-mode YAML shape and [`authlib/plugins/CONVENTIONS.md`](authlib/plugins/CONVENTIONS.md) for the per-plugin decode pattern.
+- The operator-supplied env vars (`KEYCLOAK_URL`, `KEYCLOAK_REALM`, `TOKEN_URL`, `ISSUER`, `DEFAULT_OUTBOUND_POLICY`, `CLIENT_ID`) are consumed by the default `authbridge-combined.yaml` via `${VAR}` expansion — they land inside the appropriate plugin's `config:` block rather than a top-level section.
+- `jwt-validation` derives `jwks_url` from `issuer` when omitted (appends `/protocol/openid-connect/certs`).
+- `token-exchange` derives `token_url` from `keycloak_url + keycloak_realm` when omitted (Keycloak convention).
+- Credential files: `client-registration` writes `/shared/client-id.txt` and `/shared/client-secret.txt`; `spiffe-helper` writes `/opt/jwt_svid.token`. `jwt-validation` reads the audience from `/shared/client-id.txt` via `audience_file`; `token-exchange` reads client credentials via `client_id_file` / `client_secret_file` / `jwt_svid_path`. Each plugin attempts a synchronous read at Configure time and falls back to a background poll from its `Init` goroutine if the file isn't yet readable.
+- Outbound route config: `token-exchange` reads `/etc/authproxy/routes.yaml` by default (path is per-plugin, configured via `routes.file` in its config block); inline rules can be declared under `routes.rules`.
+- Outbound `default_policy`: `passthrough` (default) or `exchange`, configured per-plugin (no top-level `DEFAULT_OUTBOUND_POLICY` field anymore; the env var is still expanded into the plugin config by `authbridge-combined.yaml`).
 
 **Key library packages (authlib/):**
-- `authlib/validation/` -- JWKS-backed JWT verifier
-- `authlib/exchange/` -- RFC 8693 token exchange client
+- `authlib/validation/` -- JWKS-backed JWT verifier (used internally by `jwt-validation` plugin)
+- `authlib/exchange/` -- RFC 8693 token exchange client (used internally by `token-exchange` plugin)
 - `authlib/cache/` -- SHA-256 keyed token cache
-- `authlib/routing/` -- Host-to-audience route resolver
-- `authlib/auth/` -- `HandleInbound` + `HandleOutbound` composition
-- `authlib/config/` -- Mode presets, YAML config, validation
+- `authlib/routing/` -- Host-to-audience route resolver (used internally by `token-exchange` plugin)
+- `authlib/auth/` -- `HandleInbound` + `HandleOutbound` composition; each plugin instance constructs its own `auth.Auth` from its own local config
+- `authlib/config/` -- Mode presets, YAML config loader, credential-file waiters, top-level (mode + listener + session) validation
+- `authlib/pipeline/` -- Plugin interface + lifecycle (`Configurable`, `Initializer`, `Shutdowner`); see [`authlib/pipeline/README.md`](authlib/pipeline/README.md)
+- `authlib/plugins/` -- The concrete plugins + registry; see [`authlib/plugins/CONVENTIONS.md`](authlib/plugins/CONVENTIONS.md) for the per-plugin config convention
 
 ### init-iptables.sh
 

@@ -521,6 +521,41 @@ func NewStats() *Stats {
 	}
 }
 
+// MergeStats returns a new Stats whose counters are the sum of all
+// srcs. Each src's mutex is taken independently; the returned Stats
+// has its own storage and no relationship to the sources. Safe to
+// call concurrently — sources are only read under their own locks.
+//
+// Used by the /stats aggregator to fold per-plugin counters into a
+// single response per HTTP request without leaking plugin-local
+// Stats instances into the presentation layer.
+func MergeStats(srcs ...*Stats) *Stats {
+	out := NewStats()
+	for _, s := range srcs {
+		if s == nil {
+			continue
+		}
+		s.mu.Lock()
+		for k, v := range s.inboundApprovals {
+			out.inboundApprovals[k] += v
+		}
+		for k, v := range s.inboundDenials {
+			out.inboundDenials[k] += v
+		}
+		for k, v := range s.outboundApprovals {
+			out.outboundApprovals[k] += v
+		}
+		for k, v := range s.outboundDenials {
+			out.outboundDenials[k] += v
+		}
+		for k, v := range s.outboundReplaceTokens {
+			out.outboundReplaceTokens[k] += v
+		}
+		s.mu.Unlock()
+	}
+	return out
+}
+
 // IncInboundApprove records a new approval (for statistics)
 func (a *Auth) IncInboundApprove(reason InboundApprovalReason) {
 	a.Stats.mu.Lock()

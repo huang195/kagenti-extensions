@@ -130,6 +130,39 @@ func (p *Pipeline) Plugins() []Plugin {
 	return out
 }
 
+// Ready reports whether every plugin implementing pipeline.Readier
+// currently reports ready. Plugins without Readier are considered
+// always-ready (no deferred state). Called per /readyz probe, so the
+// implementation is one cheap type-assert + bool read per plugin.
+func (p *Pipeline) Ready() bool {
+	for _, plugin := range p.plugins {
+		r, ok := plugin.(Readier)
+		if !ok {
+			continue
+		}
+		if !r.Ready() {
+			return false
+		}
+	}
+	return true
+}
+
+// NotReadyPlugin returns the first plugin whose Ready() returned
+// false, or "" when the pipeline is ready. Used by /readyz to
+// produce a helpful error body.
+func (p *Pipeline) NotReadyPlugin() string {
+	for _, plugin := range p.plugins {
+		r, ok := plugin.(Readier)
+		if !ok {
+			continue
+		}
+		if !r.Ready() {
+			return plugin.Name()
+		}
+	}
+	return ""
+}
+
 // NeedsBody returns true if any plugin in the pipeline declares BodyAccess.
 func (p *Pipeline) NeedsBody() bool {
 	for _, plugin := range p.plugins {

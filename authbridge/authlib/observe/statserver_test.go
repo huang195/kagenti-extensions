@@ -27,7 +27,11 @@ func newTestConfig() *config.Config {
 }
 
 func serveMux(cfg *config.Config, stats *auth.Stats) http.Handler {
-	s := NewStatServer(":0", cfg, stats)
+	// Provider closes over a fixed Stats so the tests can control
+	// what /stats returns. Production callers pass a provider that
+	// merges per-plugin Stats at request time; see main.go's
+	// statsProvider closure.
+	s := NewStatServer(":0", cfg, func() *auth.Stats { return stats })
 	return s.server.Handler
 }
 
@@ -130,14 +134,14 @@ func TestStatsEndpointValidJSON(t *testing.T) {
 }
 
 func TestNewStatServerSetsAddr(t *testing.T) {
-	s := NewStatServer(":9093", newTestConfig(), auth.NewStats())
+	s := NewStatServer(":9093", newTestConfig(), func() *auth.Stats { return auth.NewStats() })
 	if s.server.Addr != ":9093" {
 		t.Errorf("server.Addr = %q, want :9093", s.server.Addr)
 	}
 }
 
 func TestNewStatServerCustomAddr(t *testing.T) {
-	s := NewStatServer("127.0.0.1:8888", newTestConfig(), auth.NewStats())
+	s := NewStatServer("127.0.0.1:8888", newTestConfig(), func() *auth.Stats { return auth.NewStats() })
 	if s.server.Addr != "127.0.0.1:8888" {
 		t.Errorf("server.Addr = %q, want 127.0.0.1:8888", s.server.Addr)
 	}

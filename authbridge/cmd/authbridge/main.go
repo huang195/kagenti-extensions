@@ -184,23 +184,17 @@ func main() {
 		log.Fatalf("unhandled mode %q", cfg.Mode)
 	}
 
-	// Stats are per-plugin under the new config shape. The /stats
-	// endpoint reports an aggregate that's empty until a follow-up
-	// plumbs plugin-local stats through; /config still returns the
-	// parsed runtime config, which is the more useful of the two for
-	// debugging.
-	//
-	// The WARN at startup is the only visible signal an operator sees —
-	// otherwise a curl to /stats returns zeros and looks like a broken
-	// pipeline rather than an intentional stub.
-	//
-	// TODO(follow-up): aggregate per-plugin stats. Sketch: add an
-	// optional `Stats() *auth.Stats` method to Plugin, iterate
-	// pipeline.Plugins() in the stat handler, merge counters into a
-	// single response. ~50 LOC + tests.
-	slog.Warn("stat server: /stats returns empty counters in this release; " +
-		"per-plugin stats aggregation is a follow-up. /config remains accurate.")
-	statSrv := startStatServer(cfg, auth.NewStats())
+	// /stats aggregates per-plugin counters at request time. Each
+	// plugin that implements plugins.StatsSource contributes its own
+	// *auth.Stats; the provider merges them into a single response
+	// per HTTP request. Freshly-computed every call, so the numbers
+	// reflect traffic up to the moment of the curl.
+	statsProvider := func() *auth.Stats {
+		sources := plugins.CollectStats(inboundPipeline)
+		sources = append(sources, plugins.CollectStats(outboundPipeline)...)
+		return auth.MergeStats(sources...)
+	}
+	statSrv := startStatServer(cfg, statsProvider)
 
 	// Session events API (optional; only when session tracking is on).
 	// The API has no authentication — bind only on in-cluster addresses and
@@ -225,24 +219,30 @@ func main() {
 
 	slog.Info("authbridge starting", "mode", cfg.Mode, "logLevel", logLevel.Level().String())
 
-	// Health/readiness endpoints. Per-plugin readiness reporting is a
-	// follow-up; /readyz is unconditional OK once Start() has
-	// succeeded, which is sufficient for the kubelet to stop killing
-	// the pod. Individual plugins that need their credentials loaded
-	// before serving traffic (token-exchange, jwt-validation with
-	// audience_file) do so in their own Init goroutines — OnRequest
-	// reports 503 if traffic arrives before credentials land.
-	//
-	// TODO(follow-up): plugin-level Ready() for /readyz. Sketch: add
-	// an optional `Ready() bool` interface; /readyz AND-folds each
-	// plugin's Ready(). auth.Auth.Ready() already exists, so each
-	// plugin's method is a one-line delegation.
+	// Health/readiness endpoints. /healthz is liveness (always OK);
+	// /readyz ANDs pipeline.Ready() across inbound and outbound. A
+	// plugin implementing pipeline.Readier — currently jwt-validation
+	// and token-exchange — can return false while its deferred Init
+	// goroutine is still waiting on credential files. The kubelet
+	// holds traffic off the pod until all plugins are ready, so the
+	// 503-from-OnRequest window at pod boot is closed.
 	go func() {
 		mux := http.NewServeMux()
 		mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
 			w.WriteHeader(http.StatusOK)
 		})
 		mux.HandleFunc("/readyz", func(w http.ResponseWriter, r *http.Request) {
+			// Report the first not-ready plugin by name so operators
+			// can diagnose from `kubectl describe pod` without
+			// tailing container logs.
+			if name := inboundPipeline.NotReadyPlugin(); name != "" {
+				http.Error(w, "inbound plugin not ready: "+name, http.StatusServiceUnavailable)
+				return
+			}
+			if name := outboundPipeline.NotReadyPlugin(); name != "" {
+				http.Error(w, "outbound plugin not ready: "+name, http.StatusServiceUnavailable)
+				return
+			}
 			w.WriteHeader(http.StatusOK)
 		})
 		slog.Info("health server listening", "addr", ":9091")
@@ -350,8 +350,8 @@ func startHTTPServer(name string, handler http.Handler, addr string) *http.Serve
 	return srv
 }
 
-func startStatServer(config *config.Config, stats *auth.Stats) *observe.StatServer {
-	srv := observe.NewStatServer(config.Stats.StatsAddress, config, stats)
+func startStatServer(config *config.Config, provider observe.StatsProvider) *observe.StatServer {
+	srv := observe.NewStatServer(config.Stats.StatsAddress, config, provider)
 	go func() {
 		slog.Info("stat server listening", "addr", config.Stats.StatsAddress)
 		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {

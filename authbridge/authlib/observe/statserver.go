@@ -16,11 +16,21 @@ type StatServer struct {
 	server *http.Server
 }
 
-func NewStatServer(addr string, config *config.Config, stats *auth.Stats) *StatServer {
+// StatsProvider returns a fresh *auth.Stats per /stats request. The
+// host typically implements this by calling auth.MergeStats over the
+// per-plugin stats collected from each pipeline — see
+// plugins.CollectStats. Called per HTTP request, so implementations
+// should be cheap (a few map copies).
+type StatsProvider func() *auth.Stats
+
+// NewStatServer builds the stat HTTP server. The statsProvider is
+// invoked per /stats request so per-plugin counters can be aggregated
+// live rather than captured at process start.
+func NewStatServer(addr string, config *config.Config, statsProvider StatsProvider) *StatServer {
 	mux := http.NewServeMux()
 
 	mux.HandleFunc("/config", handleConfigFactory(config))
-	mux.HandleFunc("/stats", handleStatsFactory(stats))
+	mux.HandleFunc("/stats", handleStatsFactory(statsProvider))
 
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/html; charset=utf-8")
@@ -62,9 +72,17 @@ func handleConfigFactory(cfg *config.Config) func(http.ResponseWriter, *http.Req
 	}
 }
 
-func handleStatsFactory(stats *auth.Stats) func(http.ResponseWriter, *http.Request) {
+func handleStatsFactory(provider StatsProvider) func(http.ResponseWriter, *http.Request) {
 	return func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
+		// Provider returns a freshly-merged *auth.Stats. Nil means
+		// "no source plugins" — render an empty object rather than
+		// failing, so the endpoint shape is stable even on pipelines
+		// that register no stats sources.
+		stats := provider()
+		if stats == nil {
+			stats = auth.NewStats()
+		}
 		err := json.NewEncoder(w).Encode(stats)
 		if err != nil {
 			slog.Default().Info("Failed to send stats", "err", err)

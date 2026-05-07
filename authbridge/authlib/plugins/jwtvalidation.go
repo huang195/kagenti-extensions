@@ -278,9 +278,37 @@ func (p *JWTValidation) OnResponse(_ context.Context, _ *pipeline.Context) pipel
 	return pipeline.Action{Type: pipeline.Continue}
 }
 
+// Ready reports whether the plugin can validate traffic. auth.Auth's
+// Ready() returns true once Identity.Audience is non-empty, which the
+// plugin's synchronous-load path in Configure or the async poll in
+// Init (via auth.UpdateIdentity) arranges. Per-host mode skips the
+// audience check because the audience is derived from pctx.Host per
+// request rather than loaded up front.
+func (p *JWTValidation) Ready() bool {
+	if p.inner == nil {
+		return false
+	}
+	if p.cfg.AudienceMode == "per-host" {
+		return true
+	}
+	return p.inner.Ready()
+}
+
+// Stats returns the plugin's counter store for the /stats aggregator
+// (see plugins.CollectStats). Returns nil when Configure hasn't run
+// yet — aggregation code tolerates nils.
+func (p *JWTValidation) Stats() *auth.Stats {
+	if p.inner == nil {
+		return nil
+	}
+	return p.inner.Stats
+}
+
 // Compile-time interface checks.
 var (
 	_ pipeline.Configurable = (*JWTValidation)(nil)
 	_ pipeline.Initializer  = (*JWTValidation)(nil)
 	_ pipeline.Shutdowner   = (*JWTValidation)(nil)
+	_ pipeline.Readier      = (*JWTValidation)(nil)
+	_ StatsSource           = (*JWTValidation)(nil)
 )

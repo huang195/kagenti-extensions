@@ -191,6 +191,13 @@ type TokenExchange struct {
 	// Init. See JWTValidation.bgCancel for why this can't be tied to
 	// Init's ctx, and for why it lives in an atomic.Pointer.
 	bgCancel atomic.Pointer[context.CancelFunc]
+
+	// ready flips true when credentials are available — either because
+	// the synchronous read in Configure succeeded, because the operator
+	// supplied inline credentials, or because pollCredentials finished.
+	// auth.Auth.Ready() checks Identity.Audience which token-exchange
+	// doesn't set (it uses ClientID), so we track readiness locally.
+	ready atomic.Bool
 }
 
 // NewTokenExchange constructs an unconfigured plugin.
@@ -289,7 +296,35 @@ func (p *TokenExchange) Configure(raw json.RawMessage) error {
 	// pipeline.Build).
 	p.cfg = c
 	p.inner = auth.New(authCfg)
+
+	// Readiness: the synchronous credential load in Configure may have
+	// populated ClientID already. For SPIFFE identity we also need the
+	// SVID path to exist on disk (spiffe-helper has to have written it);
+	// the jwt-svid source re-reads on each exchange, so existence at
+	// this moment is a reasonable proxy. If the poll path is going to
+	// run, ready stays false until pollCredentials flips it.
+	if credentialsAreReady(c.Identity) {
+		p.ready.Store(true)
+	}
 	return nil
+}
+
+// credentialsAreReady returns true iff the identity has everything it
+// needs to do an exchange right now. Keeping this as a pure function
+// lets pollCredentials and Configure share the predicate.
+func credentialsAreReady(id tokenExchangeIdentity) bool {
+	if id.ClientID == "" {
+		return false
+	}
+	switch id.Type {
+	case "client-secret":
+		return id.ClientSecret != ""
+	case "spiffe":
+		// JWT-SVID source reads the file lazily; existence of ClientID
+		// is the signal that client-registration has completed.
+		return true
+	}
+	return false
 }
 
 // buildClientAuthFrom constructs an exchange.ClientAuth from explicit
@@ -402,6 +437,7 @@ func (p *TokenExchange) pollCredentials(ctx context.Context, needID, needSecret 
 		auth.IdentityConfig{ClientID: clientID},
 		clientAuth,
 	)
+	p.ready.Store(true)
 	// Deliberately log no client_id: some operators treat OAuth client
 	// IDs as sensitive (they appear in access logs, JWT sub claims,
 	// etc.). The signal here — credentials have loaded — doesn't need
@@ -448,9 +484,31 @@ func (p *TokenExchange) OnResponse(_ context.Context, _ *pipeline.Context) pipel
 	return pipeline.Action{Type: pipeline.Continue}
 }
 
+// Ready reports whether client credentials are available for
+// exchange. Flips true either at Configure time (if the synchronous
+// credential read succeeded or the operator supplied inline values)
+// or at pollCredentials success. Used by the pipeline-level /readyz
+// aggregator so the kubelet holds traffic off the pod until
+// credentials land.
+func (p *TokenExchange) Ready() bool {
+	return p.ready.Load()
+}
+
+// Stats returns the plugin's counter store for the /stats aggregator
+// (see plugins.CollectStats). Returns nil when Configure hasn't run
+// yet — aggregation code tolerates nils.
+func (p *TokenExchange) Stats() *auth.Stats {
+	if p.inner == nil {
+		return nil
+	}
+	return p.inner.Stats
+}
+
 // Compile-time interface checks.
 var (
 	_ pipeline.Configurable = (*TokenExchange)(nil)
 	_ pipeline.Initializer  = (*TokenExchange)(nil)
 	_ pipeline.Shutdowner   = (*TokenExchange)(nil)
+	_ pipeline.Readier      = (*TokenExchange)(nil)
+	_ StatsSource           = (*TokenExchange)(nil)
 )

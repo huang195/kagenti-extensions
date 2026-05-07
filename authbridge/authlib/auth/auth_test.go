@@ -453,6 +453,56 @@ func TestIncOutboundReplaceToken(t *testing.T) {
 	}
 }
 
+// MergeStats sums counters from multiple Stats objects into a fresh
+// one. Each source's mutex is taken independently — no deadlock even
+// if sources are being mutated concurrently.
+func TestMergeStats_SumsCounters(t *testing.T) {
+	a := New(Config{})
+	a.IncInboundApprove(APPROVE_AUTHORIZED)
+	a.IncInboundApprove(APPROVE_AUTHORIZED)
+	a.IncInboundDeny(DENY_NO_HEADER)
+
+	b := New(Config{})
+	b.IncInboundApprove(APPROVE_AUTHORIZED) // +1, total 3
+	b.IncInboundApprove(APPROVE_PASSTHROUGH)
+	b.IncOutboundApprove(OUTBOUND_PASSTHROUGH)
+
+	merged := MergeStats(a.Stats, b.Stats)
+	if got, want := merged.inboundApprovals[APPROVE_AUTHORIZED], 3; got != want {
+		t.Errorf("APPROVE_AUTHORIZED = %d, want %d", got, want)
+	}
+	if got, want := merged.inboundApprovals[APPROVE_PASSTHROUGH], 1; got != want {
+		t.Errorf("APPROVE_PASSTHROUGH = %d, want %d", got, want)
+	}
+	if got, want := merged.inboundDenials[DENY_NO_HEADER], 1; got != want {
+		t.Errorf("DENY_NO_HEADER = %d, want %d", got, want)
+	}
+	if got, want := merged.outboundApprovals[OUTBOUND_PASSTHROUGH], 1; got != want {
+		t.Errorf("OUTBOUND_PASSTHROUGH = %d, want %d", got, want)
+	}
+
+	// Merging must not mutate source counters — the aggregator runs
+	// on every /stats probe, and we can't have each probe double-
+	// counting.
+	if got, want := a.Stats.inboundApprovals[APPROVE_AUTHORIZED], 2; got != want {
+		t.Errorf("source a mutated: APPROVE_AUTHORIZED = %d, want %d", got, want)
+	}
+}
+
+func TestMergeStats_TolerantOfNilSources(t *testing.T) {
+	merged := MergeStats(nil, nil)
+	if merged == nil {
+		t.Fatal("MergeStats(nil, nil) returned nil")
+	}
+}
+
+func TestMergeStats_Empty(t *testing.T) {
+	merged := MergeStats()
+	if merged == nil {
+		t.Fatal("MergeStats() returned nil")
+	}
+}
+
 func TestStatsMarshalJSON_Empty(t *testing.T) {
 	s := NewStats()
 	data, err := json.Marshal(s)

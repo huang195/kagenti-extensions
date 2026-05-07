@@ -540,6 +540,66 @@ func TestPipelineStart_UnwindsSuccessfulInitsOnFailure(t *testing.T) {
 	}
 }
 
+// readyPlugin implements Readier so Pipeline.Ready / NotReadyPlugin
+// can be exercised directly. Plugins without Readier are treated as
+// always-ready, and this fixture proves both paths.
+type readyPlugin struct {
+	stubPlugin
+	ready bool
+}
+
+func (p *readyPlugin) Ready() bool { return p.ready }
+
+func TestPipelineReady_AllReadiersTrue(t *testing.T) {
+	p, err := New([]Plugin{
+		&readyPlugin{stubPlugin: stubPlugin{name: "a"}, ready: true},
+		&stubPlugin{name: "no-opinion"},
+		&readyPlugin{stubPlugin: stubPlugin{name: "b"}, ready: true},
+	})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	if !p.Ready() {
+		t.Error("expected pipeline to be ready when all Readiers return true")
+	}
+	if name := p.NotReadyPlugin(); name != "" {
+		t.Errorf("NotReadyPlugin() = %q, want empty", name)
+	}
+}
+
+func TestPipelineReady_OneFalseBlocks(t *testing.T) {
+	p, err := New([]Plugin{
+		&readyPlugin{stubPlugin: stubPlugin{name: "a"}, ready: true},
+		&readyPlugin{stubPlugin: stubPlugin{name: "b"}, ready: false},
+		&readyPlugin{stubPlugin: stubPlugin{name: "c"}, ready: true},
+	})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	if p.Ready() {
+		t.Error("expected pipeline to be not-ready when one Readier returns false")
+	}
+	if got, want := p.NotReadyPlugin(), "b"; got != want {
+		t.Errorf("NotReadyPlugin() = %q, want %q", got, want)
+	}
+}
+
+// Pipelines containing only non-Readier plugins (parsers, stubs) are
+// always-ready. This is the behavior Ready()-free plugins rely on —
+// they must not block the pipeline's /readyz.
+func TestPipelineReady_NoReadiersMeansReady(t *testing.T) {
+	p, err := New([]Plugin{
+		&stubPlugin{name: "a"},
+		&stubPlugin{name: "b"},
+	})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	if !p.Ready() {
+		t.Error("pipeline with no Readiers should be ready")
+	}
+}
+
 func equalStrings(a, b []string) bool {
 	if len(a) != len(b) {
 		return false

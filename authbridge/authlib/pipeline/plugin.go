@@ -50,3 +50,21 @@ type Initializer interface {
 type Shutdowner interface {
 	Shutdown(ctx context.Context) error
 }
+
+// Readier is an optional interface a plugin may implement when it has
+// deferred initialization that matters to a /readyz probe. The host
+// ANDs Ready() across all implementers to decide whether the pipeline
+// is ready to serve traffic. A plugin whose Configure succeeded but
+// whose Init is still waiting (e.g. for a credential file to be
+// written by client-registration) returns false — the kubelet keeps
+// traffic off the pod until Init completes.
+//
+// Plugins without deferred state don't implement this interface and
+// are treated as always-ready. Pipeline.Ready() returns true when
+// every Readier-implementing plugin returns true.
+//
+// Ready is expected to be cheap (pointer read / atomic load). The
+// /readyz handler calls it on every probe (~10s cadence from kubelet).
+type Readier interface {
+	Ready() bool
+}

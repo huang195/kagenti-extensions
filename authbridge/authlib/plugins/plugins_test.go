@@ -167,6 +167,50 @@ func TestJWTValidation_Configure_AudienceFromFile(t *testing.T) {
 	}
 }
 
+// --- JWTValidation: Ready ---
+
+// Synchronous audience load → plugin reports ready immediately after
+// Configure. The /readyz probe sees this on the kubelet's first check.
+func TestJWTValidation_Ready_AfterSyncLoad(t *testing.T) {
+	dir := t.TempDir()
+	f := filepath.Join(dir, "aud")
+	if err := os.WriteFile(f, []byte("my-agent"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	p := NewJWTValidation()
+	if err := p.Configure([]byte(`{"issuer":"http://ex","audience_file":"` + f + `"}`)); err != nil {
+		t.Fatalf("Configure: %v", err)
+	}
+	if !p.Ready() {
+		t.Error("expected Ready() == true after synchronous audience_file load")
+	}
+}
+
+// Missing audience_file → plugin not ready until Init's poller flips
+// it. Without per-plugin Ready(), /readyz would return 200 and the
+// pod would get traffic that immediately 503s.
+func TestJWTValidation_Ready_PendingWithoutFile(t *testing.T) {
+	p := NewJWTValidation()
+	if err := p.Configure([]byte(`{"issuer":"http://ex","audience_file":"/does/not/exist"}`)); err != nil {
+		t.Fatalf("Configure: %v", err)
+	}
+	if p.Ready() {
+		t.Error("expected Ready() == false when audience_file is missing")
+	}
+}
+
+// Per-host mode derives audience per request; no deferred state.
+// Must be always-ready so waypoint deployments don't stay unready.
+func TestJWTValidation_Ready_PerHostAlwaysReady(t *testing.T) {
+	p := NewJWTValidation()
+	if err := p.Configure([]byte(`{"issuer":"http://ex","audience_mode":"per-host"}`)); err != nil {
+		t.Fatalf("Configure: %v", err)
+	}
+	if !p.Ready() {
+		t.Error("expected Ready() == true in per-host mode")
+	}
+}
+
 // --- JWTValidation: OnRequest ---
 
 func TestJWTValidation_OnRequest_NotConfigured(t *testing.T) {
@@ -320,6 +364,39 @@ func TestTokenExchange_Configure_IdentityValidation(t *testing.T) {
 	}
 }
 
+// --- TokenExchange: Ready ---
+
+func TestTokenExchange_Ready_InlineCredentials(t *testing.T) {
+	p := NewTokenExchange()
+	raw := []byte(`{
+	  "token_url":"http://t",
+	  "identity":{"type":"client-secret","client_id":"c","client_secret":"s"}
+	}`)
+	if err := p.Configure(raw); err != nil {
+		t.Fatalf("Configure: %v", err)
+	}
+	if !p.Ready() {
+		t.Error("expected Ready() == true with inline credentials")
+	}
+}
+
+// Default /shared/* paths don't exist in the test environment, so
+// Configure's sync load fails and Ready stays false. pollCredentials
+// would flip it later; this test doesn't call Init.
+func TestTokenExchange_Ready_PendingWithoutCredentials(t *testing.T) {
+	p := NewTokenExchange()
+	raw := []byte(`{
+	  "token_url":"http://t",
+	  "identity":{"type":"client-secret"}
+	}`)
+	if err := p.Configure(raw); err != nil {
+		t.Fatalf("Configure: %v", err)
+	}
+	if p.Ready() {
+		t.Error("expected Ready() == false when defaulted credential files don't exist")
+	}
+}
+
 // --- TokenExchange: OnRequest (end-to-end through Configure) ---
 
 func TestTokenExchange_Passthrough(t *testing.T) {
@@ -434,6 +511,41 @@ func TestTokenExchange_NoToken_Deny(t *testing.T) {
 	status, _, _ := action.Violation.Render()
 	if status != http.StatusUnauthorized {
 		t.Errorf("status = %d, want 401", status)
+	}
+}
+
+// --- Stats aggregation ---
+
+// CollectStats walks a pipeline and returns *auth.Stats from each
+// plugin implementing StatsSource. Non-Configurable plugins (parsers)
+// don't implement StatsSource, so they're skipped; the slice length
+// reflects only plugins with observable counters.
+func TestCollectStats_CollectsOnlyStatsSources(t *testing.T) {
+	jwt := NewJWTValidation()
+	if err := jwt.Configure([]byte(`{"issuer":"http://ex","audience":"a"}`)); err != nil {
+		t.Fatalf("jwt Configure: %v", err)
+	}
+	tok := NewTokenExchange()
+	if err := tok.Configure([]byte(`{"token_url":"http://t","identity":{"type":"client-secret","client_id":"c","client_secret":"s"}}`)); err != nil {
+		t.Fatalf("tok Configure: %v", err)
+	}
+	// a2a-parser does not implement StatsSource.
+	p, err := pipeline.New([]pipeline.Plugin{jwt, NewA2AParser(), tok})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	got := CollectStats(p)
+	if len(got) != 2 {
+		t.Errorf("len(CollectStats) = %d, want 2 (jwt + tok, parser skipped)", len(got))
+	}
+}
+
+// Nil pipeline must not panic — callers often cons up a statsProvider
+// closure that references both inbound and outbound pipelines, and
+// one could legitimately be nil in a degenerate config.
+func TestCollectStats_NilPipeline(t *testing.T) {
+	if got := CollectStats(nil); got != nil {
+		t.Errorf("CollectStats(nil) = %v, want nil", got)
 	}
 }
 

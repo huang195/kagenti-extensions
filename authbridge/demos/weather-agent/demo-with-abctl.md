@@ -15,6 +15,28 @@ Before starting, complete these in order:
 
 Verify by sending one chat message and getting a weather response. Once that works, you're ready for this walkthrough.
 
+3. **Enable the protocol parser plugins** on the weather-service's AuthBridge. The default pipeline runs only `jwt-validation` (inbound) and `token-exchange` (outbound), which leaves abctl's Events pane without the `a2a` / `mcp` / `inf` protocol labels and without token counts. Patch the agent's runtime config to add the parsers, then restart the pod:
+
+   ```sh
+   kubectl patch configmap authbridge-runtime-config -n team1 --type merge -p '
+   data:
+     config.yaml: |
+       pipeline:
+         inbound:
+           plugins:
+             - jwt-validation
+             - a2a-parser
+         outbound:
+           plugins:
+             - token-exchange
+             - mcp-parser
+             - inference-parser
+   '
+   kubectl rollout restart deployment/weather-service -n team1
+   ```
+
+   Merging only the `pipeline:` key into the existing YAML is brittle across operator versions. If the patch above doesn't take effect, `kubectl edit configmap authbridge-runtime-config -n team1` and add the `pipeline:` section to the existing `config.yaml` by hand. See [mcp-parser demo](../mcp-parser/README.md) for the full config format and rationale.
+
 ## 1. Build `abctl`
 
 `abctl` lives in the `kagenti-extensions` repo. Build it once:
@@ -192,27 +214,27 @@ From any top-level pane, press `Tab` to switch between **Sessions** and **Pipeli
 ```
 ╭─ abctl · http://localhost:9094 · Sessions [Pipeline] ─────────────────────────╮
 │  #  DIRECTION  PLUGIN            WRITES          BODY  EVENTS                 │
-│  1  inbound    jwt-validation                                                  │
-│  2  inbound    a2a-parser        a2a             ✓     2                       │
-│  3  inbound    session-recorder                                                │
-│  ─────────────────────────────────────────────────────────────────────────     │
-│  4  outbound   route-resolver                                                  │
-│  5  outbound   token-exchange                                                  │
-│  6  outbound   mcp-parser        mcp             ✓     10                      │
-│  7  outbound   inference-parser  inference       ✓     4                       │
+│  1  inbound    jwt-validation                    no                            │
+│  2  inbound    a2a-parser        a2a             yes   2                       │
+│  ── (app) ──                                                                   │
+│  1  outbound   token-exchange                    no                            │
+│  2  outbound   mcp-parser        mcp             yes   10                      │
+│  3  outbound   inference-parser  inference       yes   4                       │
 │                                                                                │
 │  [↑↓] nav  [↵] plugin detail  [tab] sessions  [q] quit                         │
 ╰────────────────────────────────────────────────────────────────────────────────╯
 ```
 
-This view shows the plugin chain for both inbound and outbound directions, separated by a divider. Columns:
+This view shows the plugin chain for both inbound and outbound directions, separated by a `── (app) ──` divider that represents the agent process sitting between them. Columns:
 
-- **#** — execution order within direction.
+- **#** — execution order within the direction (restarts at 1 for outbound).
 - **DIRECTION** — which chain the plugin lives in.
 - **PLUGIN** — name (as returned by `Plugin.Name()`).
 - **WRITES** — extension slots the plugin populates on `pctx.Extensions`.
-- **BODY** — whether the plugin requested body buffering (drives Envoy `ProcessingMode: BUFFERED`).
-- **EVENTS** — number of events this plugin contributed to the currently-selected session (useful to see *which* plugins were active in this conversation).
+- **BODY** — `yes` if the plugin buffers bodies (drives Envoy `ProcessingMode: BUFFERED`), `no` otherwise.
+- **EVENTS** — number of events in the currently-selected session whose data was populated by this plugin (empty when zero). Use this to see *which* plugins were active in this conversation.
+
+Session recording itself isn't a plugin — the listener (ext_proc / ext_authz / proxy) snapshots `pctx` after each phase and appends to `session.Store` directly, so it doesn't appear in this table.
 
 Select any plugin and press `Enter` for a plugin-detail pane with its declared reads / writes / body-access flag.
 

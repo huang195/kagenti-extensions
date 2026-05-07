@@ -2,11 +2,10 @@
 
 The `pipeline` package defines AuthBridge's plugin contract: how plugins are written, how they communicate through shared state, how they compose into ordered chains, and how those chains run inside each of the three listener modes (ext_proc, ext_authz, forward/reverse proxy).
 
-This document is both an **internal reference** for AuthBridge contributors and an **external integration spec** for teams building plugin frameworks that want to run alongside or inside AuthBridge — e.g. a **cpex-bridge** plugin that hosts a CPEX sub-pipeline as a single AuthBridge plugin.
+This document is the reference for AuthBridge's plugin contract. It covers the interface plugins implement, the shared state they communicate through, how the pipeline composes them, and how the listener renders their decisions.
 
 **Audience:**
 - Go developers adding plugins to AuthBridge's native chain.
-- Platform teams integrating an external plugin runtime with AuthBridge.
 - Anyone debugging the plugin flow via `abctl` or the `:9094` session API.
 
 **Scope:**
@@ -246,7 +245,7 @@ type Action struct {
 }
 
 type Violation struct {
-    // Structured (mirrors CPEX's PluginViolation):
+    // Structured machine-readable error:
     Code        string         // machine-readable, e.g. "auth.missing-token"
     Reason      string         // short human message
     Description string         // longer explanation; optional
@@ -289,7 +288,7 @@ pipeline.RateLimited(30*time.Second, "", "slow down")     // 429 + Retry-After
 
 The `Code` → HTTP-status mapping for well-known codes lives at `codeToStatus` in `action.go`; unknown codes default to 500. Plugins that need a non-default status set `Violation.Status` explicitly or use `DenyStatus`.
 
-There is no "soft error" channel today — a plugin that wants to fail open logs and returns `Continue`. A future iteration may add a per-plugin `on_error` policy (cf. CPEX: `fail | ignore | disable`).
+There is no "soft error" channel today — a plugin that wants to fail open logs and returns `Continue`. A future iteration may add a per-plugin `on_error` policy.
 
 ---
 
@@ -391,14 +390,14 @@ func (p *RateLimiter) OnResponse(context.Context, *pipeline.Context) pipeline.Ac
 
 Built-in: `mcp`, `a2a`, `security`, `delegation`, `inference`, `custom`.
 
-**For bridge plugins that write new slot names:** use the `WithSlots` option:
+**For plugins that write new slot names:** use the `WithSlots` option:
 
 ```go
 pipeline, err := pipeline.New(plugins,
-    pipeline.WithSlots("cpex-meta", "cpex-framework", "cpex-provenance"))
+    pipeline.WithSlots("provenance", "risk-score"))
 ```
 
-This tells the validator those slot names are legal, so a downstream native plugin can `Capabilities.Reads = []string{"cpex-meta"}` without being rejected as "unknown slot".
+This tells the validator those slot names are legal, so a downstream plugin can `Capabilities.Reads = []string{"provenance"}` without being rejected as "unknown slot".
 
 ### Execution order
 - Request phase: `plugins[0].OnRequest → plugins[1].OnRequest → …`
@@ -407,7 +406,7 @@ This tells the validator those slot names are legal, so a downstream native plug
 - `ctx.Err() != nil` between plugins also halts with `Reject{Status: 499}`.
 
 ### Concurrency model
-Always sequential. No priority / mode / fire-and-forget semantics yet. This is the 80% case for auth-and-parse pipelines; richer modes would come with a CPEX-style executor if introduced.
+Always sequential. No priority / mode / fire-and-forget semantics yet. This is the 80% case for auth-and-parse pipelines; richer modes would require an executor layer above the current loop.
 
 ---
 
@@ -538,122 +537,15 @@ examples.
 
 ---
 
-## 10. Integration spec for bridge plugins (e.g. cpex-bridge)
+## 10. Open questions
 
-A **bridge plugin** is a single AuthBridge plugin that hosts a foreign runtime (CPEX, WASM, gRPC-dispatched, etc.) and delegates its work to plugins written in that runtime. From AuthBridge's perspective, the bridge is one plugin; internally it runs its own sub-pipeline.
-
-### What the bridge plugin must implement
-
-The standard `Plugin` interface. Specifically:
-
-```go
-func (b *CpexBridge) Name() string {
-    return "cpex-bridge" // or a more specific name per instance
-}
-
-func (b *CpexBridge) Capabilities() pipeline.PluginCapabilities {
-    return pipeline.PluginCapabilities{
-        // Union of what the hosted CPEX plugins want:
-        Reads:      []string{"a2a", "mcp", "inference"}, // everything we want to pass in
-        Writes:     []string{"security", "cpex-meta"},   // what CPEX plugins produce
-        BodyAccess: true,                                 // if any hosted plugin needs body
-    }
-}
-
-func (b *CpexBridge) OnRequest(ctx context.Context, pctx *pipeline.Context) pipeline.Action {
-    return b.runCpexHook(ctx, pctx, "on_request") // or tool_pre_invoke, prompt_pre_fetch, etc.
-}
-
-func (b *CpexBridge) OnResponse(ctx context.Context, pctx *pipeline.Context) pipeline.Action {
-    return b.runCpexHook(ctx, pctx, "on_response")
-}
-```
-
-### The data marshaling contract
-
-For each AuthBridge invocation, `runCpexHook` needs to:
-
-1. **Serialize `pctx` into the CPEX `Extensions`** (MessagePack per CPEX spec). The mapping is straightforward because the extension slot names overlap:
-
-| AuthBridge slot | CPEX slot | Notes |
-|---|---|---|
-| `pctx.Extensions.MCP` | `mcp` | Same shape (method, rpcId, params, result, err) |
-| `pctx.Extensions.A2A` | `agent` or `framework` | Not an exact match — the A2A-specific fields (contextId, taskId, artifact) need a CPEX equivalent |
-| `pctx.Extensions.Inference` | `llm` / `completion` | Split across two CPEX slots per their conventions |
-| `pctx.Extensions.Security` | `security` | Same shape |
-| `pctx.Extensions.Delegation` | `delegation` | Same shape |
-| `pctx.Headers`, `pctx.Path`, `pctx.Host`, `pctx.Method` | `http` | CPEX's http slot |
-| `pctx.Claims`, `pctx.Agent` | `meta` / `identity` | Caller identity |
-| `pctx.Body`, `pctx.ResponseBody` | `request.body` / payload arg | Raw bytes |
-
-2. **Pick a hook name** based on AuthBridge's (direction, phase) pair. Because CPEX doesn't model direction, encode it in the hook name:
-
-| AuthBridge | CPEX hook name |
-|---|---|
-| Inbound request | `inbound_request` |
-| Inbound response | `inbound_response` |
-| Outbound request | `outbound_request` (or `tool_pre_invoke` when MCP is set) |
-| Outbound response | `outbound_response` (or `tool_post_invoke` when MCP is set, `cmf.llm_output` when Inference is set) |
-
-3. **Invoke `manager.InvokeByName(hook, payloadType, payload, extensions, contextTable)`**. Thread `contextTable` across the lifetime of one `pctx` — suggested wiring: store it under `pipeline.SetState(pctx, "cpex-bridge", &cpexState{Table: table})` so the response phase picks it up.
-
-4. **Deserialize the returned `PipelineResult`** back onto pctx:
-
-| CPEX → AuthBridge |
-|---|
-| `ContinueProcessing: true` → return `pipeline.Action{Type: pipeline.Continue}` |
-| `Violation` set → return a `pipeline.Action` whose `Violation` carries `Code`, `Reason`, `Description`, `Details`, plus any HTTP hints. The two violation structs are near-isomorphic; most fields copy 1:1. Use `pipeline.DenyWithDetails(v.Code, v.Reason, v.Details)` for the common case and set `Description`/`Status`/`Headers` on the returned `Violation` pointer as needed. |
-| `ModifiedExtensions.security` changed → copy back into `pctx.Extensions.Security` |
-| `ModifiedPayload` set → copy into `pctx.Body` or `pctx.ResponseBody` |
-| `Errors[]` (non-fatal) → log, continue |
-
-### Declaring new extension slots
-
-If CPEX plugins produce typed output that other native AuthBridge plugins want to consume (e.g. a classifier's labels), the bridge writes them into `pctx.Extensions.Custom["cpex-<slotname>"]` or adds them via `WithSlots`:
-
-```go
-pipeline.New(plugins, pipeline.WithSlots("cpex-framework", "cpex-provenance"))
-```
-
-Downstream plugins then declare `Capabilities.Reads: []string{"cpex-framework"}` and the validator is happy.
-
-### Capability declaration strategy
-
-Two viable approaches:
-
-**(a) Union-declared capabilities.** The bridge declares `Reads`/`Writes` as the union of what all its hosted plugins need. Simple, but loses per-hosted-plugin granularity in AuthBridge's validator.
-
-**(b) Single-plugin-per-bridge-instance.** Each hosted CPEX plugin gets its own `CpexBridge` instance, with precise capabilities matching that one plugin. AuthBridge pipeline ordering is then granular, at cost of multiple bridge instances.
-
-Recommended for v1: **(a)**. Fold many CPEX plugins into one bridge instance; trust the CPEX manager for internal ordering. Moves the ordering problem to CPEX's `priority`/`mode` config — its strength.
-
-### Observability
-
-The bridge should populate `pctx.Extensions.Security` (or any named slot) when its hosted plugins emit labels/decisions — those fields propagate to `SessionEvent` and show up in `abctl` automatically.
-
-For CPEX-private metadata that shouldn't appear in named slots, either:
-- Put it on `pctx.Extensions.Custom["cpex-<name>"]` — not surfaced by default in `abctl` but captured in snapshot.
-- Or propose a new named slot (and add it to `Extensions`) if it's valuable to multiple bridge consumers.
-
-### What the bridge MUST NOT do
-
-- **Mutate `pctx` fields it didn't declare in `Capabilities.Writes`.** The validator doesn't enforce at runtime, but downstream plugins will malfunction if invariants are broken.
-- **Block the goroutine forever.** `OnRequest`/`OnResponse` are in the request-handling hot path. CPEX `mode: fire_and_forget` needs to be scheduled onto a background goroutine by the bridge, not kept inline.
-- **Assume a persistent `pctx` across requests.** Each HTTP transaction gets a fresh pctx. Cross-request state lives in `pctx.Session` (read-only) or in the bridge's own storage keyed by session ID.
+- **Priority / on-error policies.** Plugins don't declare these today. If fail-open / fail-closed behavior becomes important to express per plugin, it would be added to `PluginCapabilities` (or a sibling metadata struct) and interpreted by `Pipeline`.
+- **Body mutation semantics.** Today plugins generally don't rewrite `pctx.Body` or `pctx.ResponseBody`. If a plugin needs to modify the payload, we'd need a clear contract about whether downstream plugins see the modified or original bytes.
+- **Execution modes.** The pipeline is sequential-only. Concurrent or fire-and-forget modes would require an executor layer; no concrete use case yet.
 
 ---
 
-## 11. Open questions
-
-- **Directional hook mapping.** `inbound_request` / `outbound_response` are proposals; final naming should be agreed with the CPEX team.
-- **Execution modes.** AuthBridge is sequential-only today; hosting CPEX's concurrent / fire-and-forget modes inside the bridge requires the bridge to schedule them off-thread and discard their results for response-shaping purposes. Workable; needs contract clarity.
-- **Multi-bridge instances.** Running two bridges (e.g. `cpex-bridge-inbound-guardrails` + `cpex-bridge-outbound-observability`) with distinct config is supported by the interface but hasn't been exercised.
-- **Priority / on-error policies.** Native AuthBridge plugins don't have these; if they become important, they'd be added to `PluginCapabilities` (or a sibling metadata struct) and interpreted by `Pipeline` — not deferred to the bridge.
-- **Body mutation semantics.** Today plugins generally don't rewrite `pctx.Body` or `pctx.ResponseBody`. CPEX's `modify_payload` would need a clear contract about whether downstream native plugins see the modified or original bytes.
-
----
-
-## 12. Versioning
+## 11. Versioning
 
 The plugin interface is **not** semver-stable yet (AuthBridge is pre-1.0). Changes since the initial release:
 - Added `BodyAccess` to `PluginCapabilities`.
@@ -669,7 +561,7 @@ Breaking changes will be announced in `authbridge/CHANGELOG.md` (TBD) before a 1
 
 ---
 
-## 13. Cross-references
+## 12. Cross-references
 
 - `pipeline.go` — `Pipeline` type, `New`, `Run`, `RunResponse`, `Start`, `Stop`, `Plugins`, `NeedsBody`.
 - `plugin.go` — `Plugin` interface, `PluginCapabilities`, `Initializer`, `Shutdowner`.

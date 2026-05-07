@@ -48,7 +48,16 @@ func (p *JWTValidation) OnRequest(ctx context.Context, pctx *pipeline.Context) p
 
 	result := p.auth.HandleInbound(ctx, authHeader, path, audience)
 	if result.Action == auth.ActionDeny {
-		return pipeline.Action{Type: pipeline.Reject, Status: result.DenyStatus, Reason: result.DenyReason}
+		// result.DenyReason carries the specific failure (missing header,
+		// audience mismatch, expired, etc.). Pick a code whose default
+		// HTTP status matches what auth returned, so the fallback body is
+		// meaningful even before auth.HandleInbound grows a structured
+		// code of its own.
+		code := "auth.unauthorized"
+		if result.DenyStatus == 503 {
+			code = "upstream.unreachable"
+		}
+		return pipeline.DenyStatus(result.DenyStatus, code, result.DenyReason)
 	}
 	pctx.Claims = result.Claims
 	return pipeline.Action{Type: pipeline.Continue}

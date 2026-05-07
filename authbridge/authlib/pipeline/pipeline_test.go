@@ -2,6 +2,8 @@ package pipeline
 
 import (
 	"context"
+	"errors"
+	"strings"
 	"testing"
 )
 
@@ -82,7 +84,7 @@ func TestPipelineRun_Reject(t *testing.T) {
 	p1 := &stubPlugin{
 		name: "rejecter",
 		onReq: func(_ context.Context, _ *Context) Action {
-			return Action{Type: Reject, Status: 403, Reason: "forbidden"}
+			return Deny("policy.forbidden", "forbidden")
 		},
 	}
 	p2 := &stubPlugin{
@@ -101,11 +103,21 @@ func TestPipelineRun_Reject(t *testing.T) {
 	if action.Type != Reject {
 		t.Errorf("got %v, want Reject", action.Type)
 	}
-	if action.Status != 403 {
-		t.Errorf("status = %d, want 403", action.Status)
+	if action.Violation == nil {
+		t.Fatal("violation not populated")
 	}
-	if action.Reason != "forbidden" {
-		t.Errorf("reason = %q, want %q", action.Reason, "forbidden")
+	if action.Violation.Code != "policy.forbidden" {
+		t.Errorf("code = %q, want policy.forbidden", action.Violation.Code)
+	}
+	if action.Violation.Reason != "forbidden" {
+		t.Errorf("reason = %q, want forbidden", action.Violation.Reason)
+	}
+	if action.Violation.PluginName != "rejecter" {
+		t.Errorf("PluginName = %q, want rejecter (auto-stamped by pipeline)", action.Violation.PluginName)
+	}
+	status, _, _ := action.Violation.Render()
+	if status != 403 {
+		t.Errorf("status = %d, want 403", status)
 	}
 	if called {
 		t.Error("second plugin was called after first rejected")
@@ -154,7 +166,7 @@ func TestPipelineRunResponse_Reject(t *testing.T) {
 	p2 := &stubPlugin{
 		name: "rejecter",
 		onResp: func(_ context.Context, _ *Context) Action {
-			return Action{Type: Reject, Status: 500, Reason: "response blocked"}
+			return DenyStatus(500, "policy.content-blocked", "response blocked")
 		},
 	}
 	pipe, err := New([]Plugin{p1, p2})
@@ -354,8 +366,12 @@ func TestPipelineRun_ContextCancellation(t *testing.T) {
 	if action.Type != Reject {
 		t.Errorf("got %v, want Reject for cancelled context", action.Type)
 	}
-	if action.Status != 499 {
-		t.Errorf("status = %d, want 499", action.Status)
+	status, _, _ := action.Violation.Render()
+	if status != 499 {
+		t.Errorf("status = %d, want 499", status)
+	}
+	if action.Violation.Code != "pipeline.cancelled" {
+		t.Errorf("code = %q, want pipeline.cancelled", action.Violation.Code)
 	}
 	if called {
 		t.Error("plugin was called despite cancelled context")
@@ -385,4 +401,160 @@ func TestPipeline_Plugins_ReturnsCopy(t *testing.T) {
 	if again[0] == nil || again[0].Name() != "a" {
 		t.Errorf("Plugins() returned aliased slice; backing data was mutated")
 	}
+}
+
+// ----------------------------------------------------------------------------
+// Lifecycle (Initializer / Shutdowner)
+// ----------------------------------------------------------------------------
+
+// lifecyclePlugin implements Initializer and Shutdowner so tests can
+// verify the order and error handling of Pipeline.Start / Pipeline.Stop.
+type lifecyclePlugin struct {
+	stubPlugin
+	initErr     error
+	shutdownErr error
+	onInit      func(ctx context.Context) // runs before returning initErr
+	onShutdown  func(ctx context.Context)
+}
+
+func (l *lifecyclePlugin) Init(ctx context.Context) error {
+	if l.onInit != nil {
+		l.onInit(ctx)
+	}
+	return l.initErr
+}
+func (l *lifecyclePlugin) Shutdown(ctx context.Context) error {
+	if l.onShutdown != nil {
+		l.onShutdown(ctx)
+	}
+	return l.shutdownErr
+}
+
+// Init is called in declaration order, once per plugin. Plugins without
+// Init are silently skipped.
+func TestPipelineStart_InvokesInitInOrder(t *testing.T) {
+	var order []string
+	a := &lifecyclePlugin{
+		stubPlugin: stubPlugin{name: "a"},
+		onInit:     func(context.Context) { order = append(order, "a") },
+	}
+	// b has no Init — should be skipped, not cause a panic.
+	b := &stubPlugin{name: "b"}
+	c := &lifecyclePlugin{
+		stubPlugin: stubPlugin{name: "c"},
+		onInit:     func(context.Context) { order = append(order, "c") },
+	}
+
+	p, err := New([]Plugin{a, b, c})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	if err := p.Start(context.Background()); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	if len(order) != 2 || order[0] != "a" || order[1] != "c" {
+		t.Errorf("Init order = %v, want [a c]", order)
+	}
+}
+
+// An Init error halts the sequence and the subsequent plugin's Init is
+// never called. The returned error names the offending plugin so
+// operators can debug a failed startup without reading the plugin's
+// wrapped error message.
+func TestPipelineStart_StopsOnInitError(t *testing.T) {
+	aInitCalled := false
+	cInitCalled := false
+	a := &lifecyclePlugin{
+		stubPlugin: stubPlugin{name: "a"},
+		onInit:     func(context.Context) { aInitCalled = true },
+	}
+	b := &lifecyclePlugin{
+		stubPlugin: stubPlugin{name: "b"},
+		initErr:    errors.New("boom"),
+	}
+	c := &lifecyclePlugin{
+		stubPlugin: stubPlugin{name: "c"},
+		onInit:     func(context.Context) { cInitCalled = true },
+	}
+
+	p, err := New([]Plugin{a, b, c})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	err = p.Start(context.Background())
+	if err == nil {
+		t.Fatal("expected Start to return an error")
+	}
+	if !aInitCalled {
+		t.Error("plugin a's Init should have been called before b failed")
+	}
+	if cInitCalled {
+		t.Error("plugin c's Init should NOT have been called after b failed")
+	}
+	if !strings.Contains(err.Error(), `plugin "b"`) {
+		t.Errorf("error = %q; expected it to name plugin b", err)
+	}
+}
+
+// Shutdown is called in reverse declaration order (LIFO), so plugins
+// that depend on earlier plugins' resources can still use them while
+// cleaning up.
+func TestPipelineStop_InvokesShutdownInReverseOrder(t *testing.T) {
+	var order []string
+	a := &lifecyclePlugin{
+		stubPlugin: stubPlugin{name: "a"},
+		onShutdown: func(context.Context) { order = append(order, "a") },
+	}
+	b := &stubPlugin{name: "b"} // no Shutdown, skipped
+	c := &lifecyclePlugin{
+		stubPlugin: stubPlugin{name: "c"},
+		onShutdown: func(context.Context) { order = append(order, "c") },
+	}
+
+	p, err := New([]Plugin{a, b, c})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	p.Stop(context.Background())
+	if len(order) != 2 || order[0] != "c" || order[1] != "a" {
+		t.Errorf("Shutdown order = %v, want [c a] (reverse)", order)
+	}
+}
+
+// Shutdown is best-effort: an error from one plugin must not prevent
+// the rest from being shut down. Otherwise a buggy plugin could strand
+// in-flight work in a later plugin.
+func TestPipelineStop_ContinuesOnShutdownError(t *testing.T) {
+	var calls []string
+	a := &lifecyclePlugin{
+		stubPlugin: stubPlugin{name: "a"},
+		onShutdown: func(context.Context) { calls = append(calls, "a") },
+	}
+	b := &lifecyclePlugin{
+		stubPlugin:  stubPlugin{name: "b"},
+		shutdownErr: errors.New("b failed"),
+		onShutdown:  func(context.Context) { calls = append(calls, "b") },
+	}
+
+	p, err := New([]Plugin{a, b})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	p.Stop(context.Background()) // must not panic / abort
+	// Reverse order: b runs first (and errors), a must still run.
+	if len(calls) != 2 || calls[0] != "b" || calls[1] != "a" {
+		t.Errorf("calls = %v, want [b a] — a must run even after b errored", calls)
+	}
+}
+
+// Shutdown with no Shutdowner-implementing plugins is a no-op (not a
+// panic). Important for default pipelines that don't declare
+// background state.
+func TestPipelineStop_NoShutdownersIsNoop(t *testing.T) {
+	a := &stubPlugin{name: "a"}
+	p, err := New([]Plugin{a})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	p.Stop(context.Background()) // must not panic
 }

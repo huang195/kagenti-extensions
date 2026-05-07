@@ -2,6 +2,7 @@ package plugins
 
 import (
 	"context"
+	"net/http"
 
 	"github.com/kagenti/kagenti-extensions/authbridge/authlib/auth"
 	"github.com/kagenti/kagenti-extensions/authbridge/authlib/pipeline"
@@ -30,7 +31,15 @@ func (p *TokenExchange) OnRequest(ctx context.Context, pctx *pipeline.Context) p
 	result := p.auth.HandleOutbound(ctx, authHeader, host)
 	switch result.Action {
 	case auth.ActionDeny:
-		return pipeline.Action{Type: pipeline.Reject, Status: result.DenyStatus, Reason: result.DenyReason}
+		// Outbound denials almost always come from failed token exchange
+		// at the IdP (upstream unreachable, bad credentials, audience
+		// refused). The auth layer returns the HTTP status it wants to
+		// expose; pick the closest well-known code for the body.
+		code := "upstream.token-exchange-failed"
+		if result.DenyStatus == http.StatusForbidden {
+			code = "policy.forbidden"
+		}
+		return pipeline.DenyStatus(result.DenyStatus, code, result.DenyReason)
 	case auth.ActionReplaceToken:
 		pctx.Headers.Set("Authorization", "Bearer "+result.Token)
 	}

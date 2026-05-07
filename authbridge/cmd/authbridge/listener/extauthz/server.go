@@ -5,7 +5,6 @@ package extauthz
 
 import (
 	"context"
-	"encoding/json"
 	"net/http"
 	"strings"
 
@@ -30,7 +29,8 @@ type Server struct {
 func (s *Server) Check(ctx context.Context, req *authv3.CheckRequest) (*authv3.CheckResponse, error) {
 	httpReq := req.GetAttributes().GetRequest().GetHttp()
 	if httpReq == nil {
-		return denied(codes.InvalidArgument, 400, "missing HTTP request attributes"), nil
+		return deniedFromAction(codes.InvalidArgument,
+			pipeline.DenyStatus(400, "auth.invalid-request", "missing HTTP request attributes")), nil
 	}
 
 	headers := httpReq.GetHeaders()
@@ -49,7 +49,7 @@ func (s *Server) Check(ctx context.Context, req *authv3.CheckRequest) (*authv3.C
 	}
 	inAction := s.InboundPipeline.Run(ctx, inPctx)
 	if inAction.Type == pipeline.Reject {
-		return denied(codes.Unauthenticated, inAction.Status, inAction.Reason), nil
+		return deniedFromAction(codes.Unauthenticated, inAction), nil
 	}
 
 	// Outbound exchange via pipeline
@@ -62,7 +62,7 @@ func (s *Server) Check(ctx context.Context, req *authv3.CheckRequest) (*authv3.C
 	originalAuth := outPctx.Headers.Get("Authorization")
 	outAction := s.OutboundPipeline.Run(ctx, outPctx)
 	if outAction.Type == pipeline.Reject {
-		return denied(codes.PermissionDenied, outAction.Status, outAction.Reason), nil
+		return deniedFromAction(codes.PermissionDenied, outAction), nil
 	}
 
 	newAuth := outPctx.Headers.Get("Authorization")
@@ -87,27 +87,31 @@ func extractBearer(authHeader string) string {
 	return ""
 }
 
-func denied(code codes.Code, httpStatus int, msg string) *authv3.CheckResponse {
-	body, _ := json.Marshal(map[string]string{"error": msg})
+// deniedFromAction renders a pipeline Reject as an ext_authz CheckResponse
+// preserving the plugin's status, headers, and body. The flat
+// {"error":reason} body of the old denied() is gone — plugins can now
+// supply structured bodies, Content-Type overrides, WWW-Authenticate
+// challenges, Retry-After, etc., via action.Violation.
+func deniedFromAction(code codes.Code, action pipeline.Action) *authv3.CheckResponse {
+	status, headers, body := action.Violation.Render()
+	setHeaders := make([]*corev3.HeaderValueOption, 0, len(headers))
+	for k, vs := range headers {
+		for _, v := range vs {
+			setHeaders = append(setHeaders, &corev3.HeaderValueOption{
+				Header: &corev3.HeaderValue{Key: k, Value: v},
+			})
+		}
+	}
 	return &authv3.CheckResponse{
 		Status: &rpcstatus.Status{
 			Code:    int32(code),
-			Message: msg,
+			Message: action.Violation.Reason,
 		},
 		HttpResponse: &authv3.CheckResponse_DeniedResponse{
 			DeniedResponse: &authv3.DeniedHttpResponse{
-				Status: &typev3.HttpStatus{
-					Code: typev3.StatusCode(httpStatus),
-				},
-				Body: string(body),
-				Headers: []*corev3.HeaderValueOption{
-					{
-						Header: &corev3.HeaderValue{
-							Key:   "Content-Type",
-							Value: "application/json",
-						},
-					},
-				},
+				Status:  &typev3.HttpStatus{Code: typev3.StatusCode(status)},
+				Body:    string(body),
+				Headers: setHeaders,
 			},
 		},
 	}

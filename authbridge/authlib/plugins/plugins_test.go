@@ -32,13 +32,10 @@ func TestJWTValidation_Configure_UnknownField(t *testing.T) {
 	}
 }
 
-func TestJWTValidation_Configure_StaticAudienceRequired(t *testing.T) {
-	p := NewJWTValidation()
-	err := p.Configure([]byte(`{"issuer":"http://ex"}`))
-	if err == nil {
-		t.Fatal("expected error for missing audience in static mode")
-	}
-}
+// Legacy test obsolete: applyDefaults now sets audience_file to
+// /shared/client-id.txt when neither audience nor audience_file is
+// supplied, so this scenario no longer reaches validate(). The
+// replacement test is TestJWTValidation_Configure_DefaultAudienceFile.
 
 func TestJWTValidation_Configure_PerHost(t *testing.T) {
 	p := NewJWTValidation()
@@ -49,6 +46,45 @@ func TestJWTValidation_Configure_PerHost(t *testing.T) {
 	}
 	if p.audienceDeriver == nil {
 		t.Error("per-host mode should set audienceDeriver")
+	}
+}
+
+// When neither audience nor audience_file is supplied, the plugin
+// defaults audience_file to /shared/client-id.txt (the Kagenti
+// client-registration convention). Omitting both in the YAML must not
+// fail validation — the file read is best-effort with a background
+// fallback poll.
+func TestJWTValidation_Configure_DefaultAudienceFile(t *testing.T) {
+	p := NewJWTValidation()
+	if err := p.Configure([]byte(`{"issuer":"http://ex"}`)); err != nil {
+		t.Fatalf("Configure with defaults: %v", err)
+	}
+	if p.cfg.AudienceFile != "/shared/client-id.txt" {
+		t.Errorf("AudienceFile = %q, want /shared/client-id.txt", p.cfg.AudienceFile)
+	}
+}
+
+// bypass_paths defaults to bypass.DefaultPatterns so health / .well-known
+// endpoints don't reject every JWT-less probe from kubelet.
+func TestJWTValidation_Configure_DefaultBypassPaths(t *testing.T) {
+	p := NewJWTValidation()
+	if err := p.Configure([]byte(`{"issuer":"http://ex","audience":"a"}`)); err != nil {
+		t.Fatalf("Configure: %v", err)
+	}
+	if len(p.cfg.BypassPaths) == 0 {
+		t.Fatal("expected default bypass paths")
+	}
+}
+
+// Inline audience suppresses the audience_file default: operators who
+// supply a literal audience must not also get a surprise file read.
+func TestJWTValidation_Configure_InlineAudienceSuppressesFileDefault(t *testing.T) {
+	p := NewJWTValidation()
+	if err := p.Configure([]byte(`{"issuer":"http://ex","audience":"literal"}`)); err != nil {
+		t.Fatalf("Configure: %v", err)
+	}
+	if p.cfg.AudienceFile != "" {
+		t.Errorf("AudienceFile = %q, want empty (inline audience should suppress default)", p.cfg.AudienceFile)
 	}
 }
 
@@ -118,6 +154,76 @@ func TestTokenExchange_Configure_DerivesTokenURL(t *testing.T) {
 	}
 }
 
+// Identity file paths default to Kagenti conventions when the operator
+// doesn't supply them. Inline values suppress the default.
+func TestTokenExchange_Configure_DefaultIdentityPaths_SPIFFE(t *testing.T) {
+	p := NewTokenExchange()
+	raw := []byte(`{
+	  "token_url":"http://t",
+	  "identity":{"type":"spiffe"}
+	}`)
+	if err := p.Configure(raw); err != nil {
+		t.Fatalf("Configure: %v", err)
+	}
+	if p.cfg.Identity.ClientIDFile != "/shared/client-id.txt" {
+		t.Errorf("ClientIDFile = %q, want /shared/client-id.txt", p.cfg.Identity.ClientIDFile)
+	}
+	if p.cfg.Identity.JWTSVIDPath != "/opt/jwt_svid.token" {
+		t.Errorf("JWTSVIDPath = %q, want /opt/jwt_svid.token", p.cfg.Identity.JWTSVIDPath)
+	}
+}
+
+func TestTokenExchange_Configure_DefaultIdentityPaths_ClientSecret(t *testing.T) {
+	p := NewTokenExchange()
+	raw := []byte(`{
+	  "token_url":"http://t",
+	  "identity":{"type":"client-secret"}
+	}`)
+	if err := p.Configure(raw); err != nil {
+		t.Fatalf("Configure: %v", err)
+	}
+	if p.cfg.Identity.ClientIDFile != "/shared/client-id.txt" {
+		t.Errorf("ClientIDFile = %q, want /shared/client-id.txt", p.cfg.Identity.ClientIDFile)
+	}
+	if p.cfg.Identity.ClientSecretFile != "/shared/client-secret.txt" {
+		t.Errorf("ClientSecretFile = %q, want /shared/client-secret.txt", p.cfg.Identity.ClientSecretFile)
+	}
+}
+
+// Inline identity values must suppress the file defaults, otherwise an
+// operator who writes inline credentials could be silently overridden
+// by a pre-existing file on the mount point.
+func TestTokenExchange_Configure_InlineIdentitySuppressesFileDefaults(t *testing.T) {
+	p := NewTokenExchange()
+	raw := []byte(`{
+	  "token_url":"http://t",
+	  "identity":{"type":"client-secret","client_id":"c","client_secret":"s"}
+	}`)
+	if err := p.Configure(raw); err != nil {
+		t.Fatalf("Configure: %v", err)
+	}
+	if p.cfg.Identity.ClientIDFile != "" {
+		t.Errorf("ClientIDFile = %q, want empty", p.cfg.Identity.ClientIDFile)
+	}
+	if p.cfg.Identity.ClientSecretFile != "" {
+		t.Errorf("ClientSecretFile = %q, want empty", p.cfg.Identity.ClientSecretFile)
+	}
+}
+
+func TestTokenExchange_Configure_DefaultRoutesFile(t *testing.T) {
+	p := NewTokenExchange()
+	raw := []byte(`{
+	  "token_url":"http://t",
+	  "identity":{"type":"client-secret","client_id":"c","client_secret":"s"}
+	}`)
+	if err := p.Configure(raw); err != nil {
+		t.Fatalf("Configure: %v", err)
+	}
+	if p.cfg.Routes.File != "/etc/authproxy/routes.yaml" {
+		t.Errorf("Routes.File = %q, want /etc/authproxy/routes.yaml", p.cfg.Routes.File)
+	}
+}
+
 func TestTokenExchange_Configure_DefaultsPassthrough(t *testing.T) {
 	p := NewTokenExchange()
 	raw := []byte(`{
@@ -144,6 +250,9 @@ func TestTokenExchange_Configure_InvalidDefaultPolicy(t *testing.T) {
 	}
 }
 
+// Identity type is still required — defaulting covers the *paths* to
+// credential files, not the choice between SPIFFE and client-secret.
+// Unknown types fall through to the default error branch.
 func TestTokenExchange_Configure_IdentityValidation(t *testing.T) {
 	cases := []struct {
 		name string
@@ -151,9 +260,6 @@ func TestTokenExchange_Configure_IdentityValidation(t *testing.T) {
 	}{
 		{"type missing", `{"token_url":"http://t"}`},
 		{"type unknown", `{"token_url":"http://t","identity":{"type":"whatever"}}`},
-		{"spiffe no path", `{"token_url":"http://t","identity":{"type":"spiffe","client_id":"c"}}`},
-		{"client-secret no id", `{"token_url":"http://t","identity":{"type":"client-secret","client_secret":"s"}}`},
-		{"client-secret no secret", `{"token_url":"http://t","identity":{"type":"client-secret","client_id":"c"}}`},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {

@@ -112,6 +112,34 @@ func (c *tokenExchangeConfig) applyDefaults() {
 	if c.NoTokenPolicy == "" {
 		c.NoTokenPolicy = auth.NoTokenPolicyDeny
 	}
+	// Kagenti file-system conventions for credential sources. Each
+	// default kicks in only when the matching inline value is also
+	// empty, so operators who supply inline credentials are never
+	// surprised by a file read.
+	//
+	// The route file default is safe because routing.LoadRoutes
+	// returns (nil, nil) when the file doesn't exist — missing routes
+	// means "no inline rules," which is the correct behavior for
+	// deployments without a mounted authproxy-routes ConfigMap.
+	if c.Routes.File == "" {
+		c.Routes.File = "/etc/authproxy/routes.yaml"
+	}
+	switch c.Identity.Type {
+	case "spiffe":
+		if c.Identity.ClientID == "" && c.Identity.ClientIDFile == "" {
+			c.Identity.ClientIDFile = "/shared/client-id.txt"
+		}
+		if c.Identity.JWTSVIDPath == "" {
+			c.Identity.JWTSVIDPath = "/opt/jwt_svid.token"
+		}
+	case "client-secret":
+		if c.Identity.ClientID == "" && c.Identity.ClientIDFile == "" {
+			c.Identity.ClientIDFile = "/shared/client-id.txt"
+		}
+		if c.Identity.ClientSecret == "" && c.Identity.ClientSecretFile == "" {
+			c.Identity.ClientSecretFile = "/shared/client-secret.txt"
+		}
+	}
 }
 
 func (c *tokenExchangeConfig) validate() error {

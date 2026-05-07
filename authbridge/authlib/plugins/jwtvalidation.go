@@ -57,6 +57,18 @@ func (c *jwtValidationConfig) applyDefaults() {
 	if c.AudienceMode == "" {
 		c.AudienceMode = "static"
 	}
+	// When neither Audience nor AudienceFile is set, fall back to the
+	// Kagenti convention: client-registration writes the agent's client
+	// ID (which doubles as the inbound audience) to this path.
+	// Deployments that don't run client-registration should set
+	// Audience explicitly — the Configure-time read is best-effort and
+	// Init's poll will give up silently if ctx is cancelled.
+	if c.AudienceMode == "static" && c.Audience == "" && c.AudienceFile == "" {
+		c.AudienceFile = "/shared/client-id.txt"
+	}
+	if len(c.BypassPaths) == 0 {
+		c.BypassPaths = bypass.DefaultPatterns
+	}
 }
 
 func (c *jwtValidationConfig) validate() error {

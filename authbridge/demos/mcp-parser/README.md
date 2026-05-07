@@ -83,32 +83,27 @@ data:
           - name: jwt-validation
             config:
               issuer: "http://keycloak.localtest.me:8080/realms/kagenti"
-              audience_file: "/shared/client-id.txt"
-              bypass_paths:
-                - "/.well-known/*"
-                - "/healthz"
-                - "/readyz"
-                - "/livez"
       outbound:
         plugins:
           - name: token-exchange
             config:
               keycloak_url: "http://keycloak-service.keycloak.svc:8080"
               keycloak_realm: "kagenti"
-              default_policy: "passthrough"
               identity:
                 type: "spiffe"
-                client_id_file: "/shared/client-id.txt"
-                client_secret_file: "/shared/client-secret.txt"
-                jwt_svid_path: "/opt/jwt_svid.token"
           - mcp-parser
 EOF
 ```
 
 > **Note**: Per-plugin config is the only supported shape. Top-level
 > `inbound:` / `outbound:` / `identity:` / `bypass:` blocks are no
-> longer accepted. If you use `client-secret` identity type instead of
-> `spiffe`, adjust the `identity` block under `token-exchange` accordingly.
+> longer accepted. Defaults (`audience_file=/shared/client-id.txt`,
+> `bypass_paths`=common probes, `jwt_svid_path=/opt/jwt_svid.token`,
+> `client_id_file=/shared/client-id.txt`, `default_policy=passthrough`,
+> `routes.file=/etc/authproxy/routes.yaml`) kick in for anything you
+> omit. For `client-secret` identity type, swap `type: spiffe` to
+> `type: client-secret` — the `client_secret_file` default activates
+> automatically.
 
 The `mcp-parser` is placed **after** `token-exchange` in the outbound
 pipeline. This means:

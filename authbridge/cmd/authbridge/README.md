@@ -83,6 +83,8 @@ The runtime config is intentionally thin — it covers the mode, the listener ad
 
 Drop-in replacement for `envoy-with-processor`. Used as a sidecar alongside Envoy in each agent pod.
 
+Minimum viable config — every Kagenti-convention default applies:
+
 ```yaml
 mode: envoy-sidecar
 
@@ -91,8 +93,46 @@ pipeline:
     plugins:
       - name: jwt-validation
         config:
-          issuer: "${ISSUER}"                      # or derived from keycloak_url + keycloak_realm
-          jwks_url: "${JWKS_URL}"                  # optional; derived from issuer when empty
+          issuer: "${ISSUER}"
+
+  outbound:
+    plugins:
+      - name: token-exchange
+        config:
+          keycloak_url: "${KEYCLOAK_URL}"
+          keycloak_realm: "${KEYCLOAK_REALM}"
+          identity:
+            type: spiffe                           # spiffe or client-secret
+```
+
+Defaults filled in by the plugins (override any by setting them explicitly):
+
+| Plugin | Default | Value |
+|---|---|---|
+| jwt-validation | `jwks_url` | `<issuer>/protocol/openid-connect/certs` |
+| jwt-validation | `audience_file` | `/shared/client-id.txt` (client-registration convention) |
+| jwt-validation | `bypass_paths` | `/.well-known/*`, `/healthz`, `/readyz`, `/livez` |
+| jwt-validation | `audience_mode` | `static` |
+| token-exchange | `token_url` | `<keycloak_url>/realms/<realm>/protocol/openid-connect/token` |
+| token-exchange | `default_policy` | `passthrough` |
+| token-exchange | `no_token_policy` | `deny` |
+| token-exchange | `routes.file` | `/etc/authproxy/routes.yaml` |
+| token-exchange | `identity.client_id_file` | `/shared/client-id.txt` (both types) |
+| token-exchange | `identity.client_secret_file` | `/shared/client-secret.txt` (client-secret type) |
+| token-exchange | `identity.jwt_svid_path` | `/opt/jwt_svid.token` (spiffe type) |
+
+Full form — every field spelled out, for deployments that diverge from defaults:
+
+```yaml
+mode: envoy-sidecar
+
+pipeline:
+  inbound:
+    plugins:
+      - name: jwt-validation
+        config:
+          issuer: "${ISSUER}"
+          jwks_url: "${JWKS_URL}"                  # optional; derived from issuer
           audience_file: "/shared/client-id.txt"   # audience written by client-registration
           bypass_paths:
             - "/.well-known/*"
@@ -105,17 +145,18 @@ pipeline:
       - name: token-exchange
         config:
           token_url: "${TOKEN_URL}"                # or derived from keycloak_url + keycloak_realm
-          keycloak_url: "${KEYCLOAK_URL}"          # alternative to explicit token_url
+          keycloak_url: "${KEYCLOAK_URL}"
           keycloak_realm: "${KEYCLOAK_REALM}"
           default_policy: "passthrough"            # passthrough (default) or exchange
+          no_token_policy: "deny"                  # deny (default), allow, or client-credentials
           identity:
             type: spiffe                           # spiffe or client-secret
             client_id_file: "/shared/client-id.txt"
             client_secret_file: "/shared/client-secret.txt"
-            jwt_svid_path: "/opt/jwt_svid.token"   # required for type=spiffe
+            jwt_svid_path: "/opt/jwt_svid.token"
           routes:
-            file: "/etc/authproxy/routes.yaml"     # load routes from file
-            rules:                                 # or inline, merged with file
+            file: "/etc/authproxy/routes.yaml"     # loaded when present, ignored when absent
+            rules:                                 # inline; merged with file
               - host: "target-service.**"
                 target_audience: "target"
                 token_scopes: "openid target-aud"

@@ -30,7 +30,7 @@ Watch an AI agent's traffic — its model, tool, and agent-to-agent calls — de
 
    ```sh
    HTTPS_PROXY=http://localhost:47600 \
-     NODE_EXTRA_CA_CERTS="$PWD/cortex-ca/ca.crt" \
+     NODE_EXTRA_CA_CERTS="$HOME/.cortex/demo/ca.crt" \
      CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1 \
      claude
    ```

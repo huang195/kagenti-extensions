@@ -90,3 +90,8 @@ authbridge/authbridge-praxis
 # Local experiment state, not project source.
 mlflow.db
 mlruns/
+
+# Cortex writes its CA + keys under ~/.cortex. This covers the fallback location
+# used when $HOME is unresolvable, and any explicit `--ca-dir ./cortex-ca`, so a
+# private key can never be committed from a demo run inside a checkout.
+cortex-ca/

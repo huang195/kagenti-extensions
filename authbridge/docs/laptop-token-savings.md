@@ -20,6 +20,25 @@ That downloads the released binaries into `~/.local/bin`, writes
 starts the proxy, and prints the command for step 2. Re-running it is safe — it
 never overwrites a config you already have.
 
+Everything Cortex writes lives under `~/.cortex`, so there is one directory to
+inspect, back up, or delete — and no CA or private key left in whichever
+directory you happened to run a command from:
+
+```text
+~/.cortex/
+├── config.yaml     your config — edit freely, the proxy hot-reloads
+├── ca/             the bridge CA Claude Code has to trust
+│   ├── ca.crt      <- NODE_EXTRA_CA_CERTS points here
+│   └── tls.key     private key, never leaves this machine
+├── proxy.log
+├── proxy.pid
+└── demo/           only if you run the throwaway demo (see below)
+```
+
+The directory is created `0700`, because the CA private key is under it. To
+uninstall completely: stop the proxy, then `rm -rf ~/.cortex` and
+`rm ~/.local/bin/{abctl,authbridge-proxy}`.
+
 ## 2. Run Claude Code through it
 
 ```sh
@@ -94,8 +113,9 @@ client-side settings (`--allowedTools`, disabling unused MCP servers).
 ## If it isn't working
 
 - **Metrics pane empty, every event shows `tunnel`** — Claude Code is not trusting
-  the bridge CA. Check `NODE_EXTRA_CA_CERTS` is the absolute path from step 2. The
-  proxy also warns about this in `~/.cortex/proxy.log` after a few requests.
+  the bridge CA. `NODE_EXTRA_CA_CERTS` must point at `~/.cortex/ca/ca.crt`,
+  expanded to an absolute path. The proxy also warns about this in
+  `~/.cortex/proxy.log` after a few requests, naming the path it expects.
 - **The proxy won't start** — read `~/.cortex/proxy.log`; a port conflict is
   logged at `ERROR`. The config pins every listener to loopback on 47600–47604, so
   a clash usually means Cortex is already running.
@@ -105,8 +125,9 @@ client-side settings (`--allowedTools`, disabling unused MCP servers).
 ## Other ways in
 
 - **Just the binaries**, no setup: `... | sh -s -- --install-only`.
-- **A throwaway demo** in the current directory instead of a persistent config:
-  `... | sh` with no arguments.
+- **A throwaway demo** instead of a persistent config: `... | sh` with no
+  arguments. It keeps its own regenerated config and CA in `~/.cortex/demo`, so
+  it never touches the `config.yaml` above.
 - **Pin a version**: `AUTHBRIDGE_VERSION=vX.Y.Z`.
 - **Re-run setup offline**, using the binaries you already have:
   `AUTHBRIDGE_SKIP_DOWNLOAD=1`.

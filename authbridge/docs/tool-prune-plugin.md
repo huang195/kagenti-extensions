@@ -47,7 +47,7 @@ nothing, whatever the policy, so filling the list is the single act that enables
 it:
 
 ```sh
-abctl tools scan --write ./cortex-ca/demo.yaml
+abctl tools scan --write ~/.cortex/demo/demo.yaml
 ```
 
 The config is hot-reloaded, so no restart. A reload does rebuild the plugin and

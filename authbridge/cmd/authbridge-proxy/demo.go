@@ -7,11 +7,35 @@ import (
 	"path/filepath"
 )
 
-// demoCADirDefault is the default CA directory for --demo, relative to the
-// current working directory — no absolute path is baked into the binary.
-// Override with --ca-dir. The built-in config is written into this same
-// directory (demo.yaml), next to the generated CA.
-const demoCADirDefault = "cortex-ca"
+// Everything Cortex writes for a user lives under ~/.cortex, so a laptop ends up
+// with exactly one directory holding config, CA and keys rather than a CA
+// scattered into whichever directory each command happened to run from.
+const (
+	cortexDirName = ".cortex"
+	// demoDirName keeps --demo's throwaway state out of the persistent config's
+	// way. --demo regenerates its config, so it must not share a directory with
+	// the config a user maintains by hand.
+	demoDirName = "demo"
+	// demoCADirFallback is used only when the home directory cannot be
+	// determined, which is the historical cwd-relative behaviour.
+	demoCADirFallback = "cortex-ca"
+)
+
+// defaultDemoCADir returns the directory --demo works in: ~/.cortex/demo, or
+// ./cortex-ca if there is no resolvable home directory.
+//
+// This used to be cwd-relative unconditionally, on the reasoning that no
+// absolute path should be baked into the binary. Resolving $HOME at runtime
+// satisfies that while keeping the private key in one predictable place — and
+// the cwd default had a real cost: it dropped a CA and private key into
+// whatever directory the demo was started from, including checkouts.
+func defaultDemoCADir() string {
+	home, err := os.UserHomeDir()
+	if err != nil || home == "" {
+		return demoCADirFallback
+	}
+	return filepath.Join(home, cortexDirName, demoDirName)
+}
 
 // demoConfigYAML returns the built-in --demo config with caDir interpolated: a
 // forward-only proxy with the TLS bridge on (auto-generated CA in caDir) and
@@ -83,7 +107,8 @@ pipeline:
 // that even a --demo start which then failed on a port clash silently destroyed
 // those edits. Delete the file to regenerate the preset.
 func writeDemoConfig(caDir string) (string, error) {
-	if err := os.MkdirAll(caDir, 0o755); err != nil {
+	// 0700: this directory holds the demo CA's private key.
+	if err := os.MkdirAll(caDir, 0o700); err != nil {
 		return "", err
 	}
 	path := filepath.Join(caDir, "demo.yaml")

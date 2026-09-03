@@ -12,7 +12,7 @@
 # Modes (pass through the pipe with `sh -s --`, e.g.
 #   curl -fsSL ...install-demo.sh | sh -s -- --claude-code):
 #
-#   (default)        install, then start the throwaway demo in ./cortex-ca
+#   (default)        install, then start the throwaway demo in ~/.cortex/demo
 #   --claude-code    install, then set up a PERSISTENT config in ~/.cortex for
 #                    cutting Claude Code token cost: writes the config, fills the
 #                    tool-prune remove: list from your own transcripts, starts the
@@ -35,6 +35,9 @@ set -eu
 
 REPO="rossoctl/cortex"
 BIN_DIR="${HOME}/.local/bin"
+# Every file Cortex writes for this user lives here: config, CA, keys, logs,
+# pidfiles. One directory to inspect, back up, or delete.
+CORTEX_DIR="${HOME}/.cortex"
 
 info() { printf '%s\n' "$*"; }
 warn() { printf 'warning: %s\n' "$*" >&2; }
@@ -114,7 +117,7 @@ esac
 if [ "$MODE" = "demo" ] || [ "$MODE" = "claude-code" ]; then
 	for p in "$DEMO_FORWARD_PORT" "$DEMO_SESSION_PORT" "$DEMO_STATS_PORT"; do
 		if port_in_use "$p"; then
-			die "port ${p} is already in use. Is the demo already running (see ./cortex-ca/demo.pid)? Otherwise free the port, or change the ports in ./cortex-ca/demo.yaml, then re-run."
+			die "port ${p} is already in use. Is Cortex already running (see ${CORTEX_DIR}/demo/demo.pid or ${CORTEX_DIR}/proxy.pid)? Otherwise free the port, or change the ports in the config, then re-run."
 		fi
 	done
 fi
@@ -183,7 +186,7 @@ fi # end of download block
 
 # --- report ---
 proxy="${BIN_DIR}/authbridge-proxy"
-ca_dir="$(pwd)/cortex-ca" # matches demoCADirDefault in demo.go
+ca_dir="${CORTEX_DIR}/demo" # matches defaultDemoCADir() in demo.go
 case ":${PATH}:" in
 	*":${BIN_DIR}:"*) abctl_cmd="abctl" proxy_cmd="authbridge-proxy" ;;
 	*) abctl_cmd="${BIN_DIR}/abctl" proxy_cmd="$proxy" ;;
@@ -208,15 +211,16 @@ fi
 
 # --- claude-code mode: persistent setup under ~/.cortex, then start ---
 #
-# Separate from --demo because --demo regenerates ./cortex-ca/demo.yaml from a
+# Separate from --demo because --demo regenerates its own demo.yaml from a
 # built-in template on every start, so any edit (like the remove: list this mode
 # fills in) would be discarded on the next run. A config under ~/.cortex is
 # outside that path and survives.
 if [ "$MODE" = "claude-code" ]; then
-	cfg_dir="${HOME}/.cortex"
+	cfg_dir="$CORTEX_DIR"
 	cfg="${cfg_dir}/config.yaml"
 	cc_ca_dir="${cfg_dir}/ca"
-	mkdir -p "$cfg_dir"
+	# 0700: the generated CA's private key lives under here.
+	mkdir -p "$cfg_dir" && chmod 700 "$cfg_dir"
 
 	if [ -f "$cfg" ]; then
 		info ""
@@ -323,6 +327,8 @@ fi
 # --- start in the background, then wait until it's actually listening ---
 info ""
 info "Starting the demo in the background..."
+# 0700 on the Cortex directory: a CA private key is written beneath it.
+mkdir -p "$CORTEX_DIR" && chmod 700 "$CORTEX_DIR"
 mkdir -p "$ca_dir"
 log="${ca_dir}/demo.log"
 pidfile="${ca_dir}/demo.pid"

@@ -125,7 +125,7 @@ func main() {
 	demo := flag.Bool("demo", false,
 		"run a built-in local demo (forward-only TLS bridge + protocol parsers) that decrypts and parses an agent's egress; no --config, cluster, Keycloak, or SPIRE needed")
 	caDir := flag.String("ca-dir", "",
-		"CA directory for --demo (auto-generated); defaults to ./"+demoCADirDefault)
+		"CA directory for --demo (auto-generated); defaults to ~/"+cortexDirName+"/"+demoDirName)
 	flag.Parse()
 
 	if *showVersion {
@@ -143,7 +143,17 @@ func main() {
 		}
 		dir := *caDir
 		if dir == "" {
-			dir = demoCADirDefault // relative to cwd — no absolute path baked in
+			dir = defaultDemoCADir()
+			// The default moved here from ./cortex-ca. Someone who still has that
+			// directory almost certainly has a client trusting the CA inside it,
+			// and pointing at a stale CA fails silently — every request tunnels
+			// through opaquely and no plugin sees a body. Name both paths.
+			if st, serr := os.Stat(demoCADirFallback); serr == nil && st.IsDir() {
+				slog.Warn("demo mode — the default CA directory is now under $HOME; the ./"+demoCADirFallback+" here is no longer used",
+					"now_using", dir,
+					"ignored", demoCADirFallback,
+					"hint", "update the client's CA path (e.g. NODE_EXTRA_CA_CERTS), or pass --ca-dir ./"+demoCADirFallback+" to keep the old location")
+			}
 		}
 		abs, aerr := filepath.Abs(dir)
 		if aerr != nil {

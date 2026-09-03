@@ -62,14 +62,18 @@ there even in `roles: [forward]`, and a stale `authbridge-proxy` from
 a prior run will fail boot with `address already in use`. If that
 happens: `pkill -f authbridge-proxy` and relaunch.
 
-The proxy generates `~/.cortex/local/ca.crt` on first launch — that's the
-trust anchor Claude Code needs. The path is the same wherever you start
-the proxy from, so there is no `$PWD` to keep track of. Look for these
+The proxy generates `cortex-ca/ca.crt` on first launch — that's the trust
+anchor Claude Code needs. Note that this path is **relative to the
+directory you started the proxy from**: the config used here
+(`local/config-https.yaml`) sets `ca_dir: "cortex-ca"` explicitly, so it
+does not use the `~/.cortex` default that `--local` would. From the repo
+root it resolves to `<repo-root>/cortex-ca/ca.crt`; get the absolute path
+with `ls "$(pwd)/cortex-ca/ca.crt"` in the same terminal. Look for these
 lines in the log:
 
 ```text
-level=WARN msg="tls-bridge: generated self-signed CA ..." ca_dir=/Users/you/.cortex/local ...
-level=INFO msg="tls-bridge enabled" ca_dir=/Users/you/.cortex/local
+level=WARN msg="tls-bridge: generated self-signed CA ..." ca_dir=cortex-ca ...
+level=INFO msg="tls-bridge enabled" ca_dir=cortex-ca
 level=INFO msg="HTTP server listening" name=forward-proxy addr=127.0.0.1:47600
 level=INFO msg="authbridge-proxy starting" mode=proxy-sidecar
 ```
@@ -85,7 +89,7 @@ settings and out of `~/.claude/settings.json`):
 {
   "env": {
     "HTTPS_PROXY": "http://127.0.0.1:47600",
-    "NODE_EXTRA_CA_CERTS": "/Users/you/.cortex/local/ca.crt",
+    "NODE_EXTRA_CA_CERTS": "/absolute/path/to/cortex-ca/ca.crt",
     "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": "1"
   }
 }
@@ -168,7 +172,7 @@ accumulating. Skip the approver terminal entirely.
 See [`hitl-local.md`](hitl-local.md) —
 [§ Reset between runs](hitl-local.md#reset-between-runs),
 [§ Auto modes for CI](hitl-local.md#auto-modes-for-ci),
-[§ Cleanup](hitl-local.md#cleanup). Add `rm -rf ~/.cortex/local` in the
+[§ Cleanup](hitl-local.md#cleanup). Add `rm -rf cortex-ca` in the
 directory the proxy ran from if you want to regenerate the CA on the
 next run — the new `ca.crt` has a fresh serial, so re-point
 `NODE_EXTRA_CA_CERTS` in `.claude/settings.local.json` at it (same
@@ -181,8 +185,8 @@ will fail the TLS handshake against the proxy.
   bucket. Fine for a single-workload laptop demo; in multi-tenant
   deployments one caller exhausting the budget denies all others.
   Leave it off in production and rely on the inbound A2A session ID.
-- **`--local` has its own config at `~/.cortex/local/config.yaml`.** It no
-  longer depends on which directory you start from, so it cannot clobber
-  a config kept elsewhere — but two `--local` runs share that one file.
-  Point one of them at `--ca-dir` if you need two independent runs.
-  (`--demo` is the old name for this flag and still works.)
+- **`--local` uses `~/.cortex/config.yaml`, not this demo's config.** The
+  two do not collide: this walkthrough passes `-config` explicitly, so
+  running `authbridge-proxy --local` elsewhere touches a different file and
+  a different CA. They do share the loopback ports, so run one at a time.
+  (`--demo` is the old name for `--local` and still works.)

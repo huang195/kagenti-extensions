@@ -150,7 +150,10 @@ func main() {
 		if *configPath != "" {
 			log.Fatal("--local and --config are mutually exclusive")
 		}
-		cortexDir := defaultCortexDir()
+		cortexDir, derr := defaultCortexDir()
+		if derr != nil {
+			log.Fatalf("--local: %v", derr)
+		}
 		// The default moved here from ./cortex-ca. Someone who still has that
 		// directory almost certainly has a client trusting the CA inside it,
 		// and pointing at a stale CA fails silently — every request tunnels

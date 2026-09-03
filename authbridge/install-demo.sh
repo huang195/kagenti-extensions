@@ -8,6 +8,9 @@
 #
 # Local installs are no longer framed as a "demo" — they are the supported way to
 # run Cortex on a machine — hence the rename.
+# set -eu, not -euo pipefail: this is POSIX sh (the documented entry point is
+# `curl ... | sh`), and `pipefail` is a bashism that would abort the script under
+# dash/ash. The repo-wide `set -euo pipefail` convention applies to bash scripts.
 set -eu
 
 URL="https://raw.githubusercontent.com/rossoctl/cortex/main/authbridge/install.sh"

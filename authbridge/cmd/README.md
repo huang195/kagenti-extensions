@@ -51,13 +51,14 @@ ConfigMap contracts are documented in
 `8080` and `8083` are mutually exclusive: `inbound_interception` picks one
 inbound mechanism, and the preset fills only that one's address.
 
-Every one of these is a `listener.*` address and can be overridden — which
-matters for running two proxies on one host, since a second instance on the
-default ports dies on a bind conflict. Local single-host setups typically pin
-them all to `127.0.0.1`; the defaults bind every interface, which is what
-Kubernetes probes and sidecar traffic need but not what a laptop wants. See
-[`docs/laptop-token-savings.md`](../docs/laptop-token-savings.md) for a worked
-loopback-only config.
+All of these are overridable, which matters for running two proxies on one host:
+a second instance on the default ports dies on a bind conflict. They are not all
+under the same config key — everything above is a `listener.*` address except
+`9093`, which is `stats.stats_address`. The defaults bind every interface, which
+is what Kubernetes probes and sidecar traffic need but not what a laptop wants;
+local single-host setups typically pin them all to `127.0.0.1`. `authbridge-proxy
+--local` ships exactly such a config — see
+[`docs/laptop-token-savings.md`](../docs/laptop-token-savings.md).
 
 `8082` and `8083` are the iptables REDIRECT targets installed by
 [`proxy-init`](../proxy-init/) and must match its `TRANSPARENT_PORT` /

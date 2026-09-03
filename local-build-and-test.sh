@@ -97,7 +97,7 @@ echo "Building authbridge-lite (proxy build variant: auth-only plugins)"
 echo "=========================================="
 cd "${SCRIPT_DIR}/authbridge"
 ${CONTAINER_RUNTIME} build -f cmd/authbridge-proxy/Dockerfile \
-  --build-arg GO_BUILD_TAGS="exclude_plugin_a2aparser,exclude_plugin_ibac,exclude_plugin_inferenceparser,exclude_plugin_mcpparser,exclude_plugin_opa,exclude_plugin_sparc,exclude_plugin_tokenbroker" \
+  --build-arg GO_BUILD_TAGS="$(tr -d '[:space:]' < cmd/authbridge-proxy/LITE_BUILD_TAGS)" \
   -t ghcr.io/rossoctl/cortex/authbridge-lite:local .
 load_image_to_kind ghcr.io/rossoctl/cortex/authbridge-lite:local
 echo "✅ Built and loaded: authbridge-lite:local"

@@ -2,6 +2,7 @@ package main
 
 import (
 	"errors"
+	"fmt"
 	"log/slog"
 	"os"
 	"path/filepath"
@@ -22,25 +23,35 @@ const (
 	// caDirName holds the bridge CA. Separate from the config so one directory
 	// listing distinguishes "your settings" from "generated key material".
 	caDirName = "ca"
-	// localDirFallback is used only when the home directory cannot be
-	// determined, which is the historical cwd-relative behaviour.
+	// localDirFallback is the directory --local used before the CA moved under
+	// $HOME. It is no longer written to; it survives so main.go can spot a stale
+	// one left in a working directory and warn that the client's trust anchor
+	// needs updating.
 	localDirFallback = "cortex-ca"
 )
 
-// defaultCortexDir returns ~/.cortex, or ./cortex-ca if there is no resolvable
-// home directory.
+// defaultCortexDir returns ~/.cortex, or an error if there is no resolvable home
+// directory.
 //
 // This used to be cwd-relative unconditionally, on the reasoning that no
 // absolute path should be baked into the binary. Resolving $HOME at runtime
 // satisfies that while keeping the private key in one predictable place — and
 // the cwd default had a real cost: it dropped a CA and private key into
 // whatever directory the proxy was started from, including checkouts.
-func defaultCortexDir() string {
+//
+// It returns an error rather than falling back to a relative path, because that
+// fallback silently reintroduced exactly that bug: no $HOME meant the key landed
+// in the working directory again, with nothing said about it. UserHomeDir only
+// fails when $HOME is unset — a bare `env -i`, some systemd units, a scratch
+// container — so failing loudly costs nothing anyone hits by accident, and
+// --ca-dir remains available for those cases.
+func defaultCortexDir() (string, error) {
 	home, err := os.UserHomeDir()
 	if err != nil || home == "" {
-		return localDirFallback
+		return "", fmt.Errorf("cannot determine your home directory (is $HOME set?); "+
+			"pass --ca-dir to choose where the CA is written: %w", err)
 	}
-	return filepath.Join(home, cortexDirName)
+	return filepath.Join(home, cortexDirName), nil
 }
 
 // builtinConfigYAML returns the built-in --local config with caDir interpolated: a
@@ -124,6 +135,13 @@ pipeline:
 func writeBuiltinConfig(cortexDir, caDir string) (string, error) {
 	// 0700: caDir under here holds the CA's private key.
 	if err := os.MkdirAll(cortexDir, 0o700); err != nil {
+		return "", err
+	}
+	// MkdirAll leaves an existing directory's mode alone, so a ~/.cortex created
+	// before this (or by another tool) would stay 0755 and the perms claim would
+	// be true only for fresh installs. install.sh already chmods it; this makes a
+	// bare `authbridge-proxy --local` match.
+	if err := os.Chmod(cortexDir, 0o700); err != nil {
 		return "", err
 	}
 	path := filepath.Join(cortexDir, localConfigName)

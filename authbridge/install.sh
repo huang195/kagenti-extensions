@@ -38,6 +38,9 @@
 #   AUTHBRIDGE_INSTALL_ONLY=1   same as --install-only
 #   AUTHBRIDGE_SKIP_DOWNLOAD=1  use the already-installed binaries in ~/.local/bin
 #                               instead of downloading (re-run setup offline)
+# set -eu, not -euo pipefail: this is POSIX sh (the documented entry point is
+# `curl ... | sh`), and `pipefail` is a bashism that would abort the script under
+# dash/ash. The repo-wide `set -euo pipefail` convention applies to bash scripts.
 set -eu
 
 REPO="rossoctl/cortex"
@@ -50,6 +53,38 @@ info() { printf '%s\n' "$*"; }
 warn() { printf 'warning: %s\n' "$*" >&2; }
 die()  { printf 'error: %s\n' "$*" >&2; exit 1; }
 
+# usage is a heredoc rather than sed over "$0": piped as `curl ... | sh -s -- --help`
+# the script has no file to read ($0 is "sh"), so the previous version printed
+# nothing at all — for the one flag someone is most likely to try before running an
+# installer they piped from the internet.
+usage() {
+	cat <<'USAGE'
+install.sh — install Cortex on a local machine (macOS/Linux, amd64/arm64).
+
+Usage:
+  curl -fsSL https://raw.githubusercontent.com/rossoctl/cortex/main/authbridge/install.sh | sh
+  curl -fsSL ...install.sh | sh -s -- [option]
+
+Installs abctl and authbridge-proxy to ~/.local/bin, starts the proxy with its
+built-in config in ~/.cortex, and prints the command to send an agent through it.
+Traffic is decrypted and parsed for viewing; nothing is rewritten.
+
+Options:
+  --install-only   install the binaries and stop
+  --local          the default, spelled out
+  -h, --help       this text
+
+Environment:
+  AUTHBRIDGE_VERSION=vX.Y.Z   install a specific release tag (default: newest)
+  AUTHBRIDGE_INSTALL_ONLY=1   same as --install-only
+  AUTHBRIDGE_SKIP_DOWNLOAD=1  use the binaries already in ~/.local/bin instead of
+                              downloading (re-run setup offline)
+
+After installing, to cut Claude Code's token cost:
+  abctl tools scan --write ~/.cortex/config.yaml
+USAGE
+}
+
 # --- mode selection ---
 MODE=local
 for arg in "$@"; do
@@ -59,7 +94,7 @@ for arg in "$@"; do
 		# so it mirrors the proxy flag of the same name.
 		--local) MODE=local ;;
 		-h | --help)
-			sed -n '2,30p' "$0" 2>/dev/null | sed 's/^# \{0,1\}//'
+			usage
 			exit 0
 			;;
 		*) die "unknown option: $arg (try --install-only, --local, or no argument)" ;;
@@ -93,6 +128,9 @@ sha_check() {
 DEMO_FORWARD_PORT=47600
 DEMO_SESSION_PORT=47601
 DEMO_STATS_PORT=47602
+# Bound too, and previously missing from the preflight — an occupied 47604 let the
+# download finish and then killed the proxy during startup.
+DEMO_HEALTH_PORT=47604
 
 # port_in_use exits 0 if something is already listening on the given loopback
 # port. Best-effort: uses lsof, then nc; if neither exists, it assumes free.
@@ -143,9 +181,14 @@ stop_previous_cortex() {
 		rm -f "$pidfile"
 		return 0
 	fi
+	# Match a 15-character prefix, not the full name. Linux caps comm at
+	# TASK_COMM_LEN-1 = 15 and "authbridge-proxy" is 16, so it reports
+	# "authbridge-prox" and a *authbridge-proxy* glob never matches — which made
+	# this whole function a no-op on Linux while passing on macOS, where comm is
+	# not truncated. Still narrow: the pid came from a pidfile we wrote.
 	name=$(ps -p "$pid" -o comm= 2>/dev/null || true)
 	case "$name" in
-		*authbridge-proxy*) ;;
+		*authbridge-prox*) ;;
 		*) return 0 ;; # pid recycled onto something else — never touch it
 	esac
 	info "Stopping the Cortex started earlier (pid ${pid}); the new one replaces it."
@@ -160,15 +203,13 @@ stop_previous_cortex() {
 
 # --- preflight: fail early (before downloading) if a listener port is taken ---
 if [ "$MODE" = "local" ]; then
-	# Clear our own previous instance first, so switching between the two setups
-	# is one command rather than a bind error and a manual kill.
-	for p in "$DEMO_FORWARD_PORT" "$DEMO_SESSION_PORT" "$DEMO_STATS_PORT"; do
-		if port_in_use "$p"; then
-			stop_previous_cortex
-			break
-		fi
-	done
-	for p in "$DEMO_FORWARD_PORT" "$DEMO_SESSION_PORT" "$DEMO_STATS_PORT"; do
+	# Unconditionally, not gated on port_in_use: that probe reports "free" when
+	# neither lsof nor nc exists (see above), so on a minimal container the stop
+	# would be skipped, the new proxy would hit a bind conflict anyway, and the
+	# user would be left with a dead install. The function is already a no-op
+	# when nothing of ours is running, so it needs no probe to justify it.
+	stop_previous_cortex
+	for p in "$DEMO_FORWARD_PORT" "$DEMO_SESSION_PORT" "$DEMO_STATS_PORT" "$DEMO_HEALTH_PORT"; do
 		if port_in_use "$p"; then
 			die "port ${p} is already in use. Is Cortex already running (see ${CORTEX_DIR}/proxy.pid)? Otherwise free the port, or change the ports in the config, then re-run."
 		fi
@@ -180,7 +221,7 @@ if [ "${AUTHBRIDGE_SKIP_DOWNLOAD:-}" = "1" ]; then
 	for b in abctl authbridge-proxy; do
 		[ -x "${BIN_DIR}/${b}" ] || die "AUTHBRIDGE_SKIP_DOWNLOAD=1 but ${BIN_DIR}/${b} is missing"
 	done
-	version="(already installed)"
+	version="already installed"
 	info "Using the binaries already in ${BIN_DIR}"
 else
 

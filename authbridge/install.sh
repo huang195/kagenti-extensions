@@ -18,6 +18,9 @@
 #   curl -fsSL ...install.sh | sh -s -- --install-only):
 #
 #   --install-only   install the binaries and stop
+#   --claude-code    after starting, offer to write the three env vars Claude Code
+#                    needs into ~/.claude/settings.json, so it runs as plain
+#                    `claude`. Prompts before changing anything.
 #
 # There is deliberately only one config. It carries the parsers AND tool-prune,
 # and the proxy preserves edits to it, so a second "cost-optimised" config had
@@ -71,6 +74,8 @@ Traffic is decrypted and parsed for viewing; nothing is rewritten.
 
 Options:
   --install-only   install the binaries and stop
+  --claude-code    after starting, offer to configure Claude Code to use it, so
+                   it runs as plain `claude` with no environment variables
   --local          the default, spelled out
   -h, --help       this text
 
@@ -87,9 +92,11 @@ USAGE
 
 # --- mode selection ---
 MODE=local
+WIRE_CLAUDE_CODE=""
 for arg in "$@"; do
 	case "$arg" in
 		--install-only) MODE=install-only ;;
+		--claude-code) WIRE_CLAUDE_CODE=1 ;;
 		# --local is the default; accepted so writing it out explicitly works, and
 		# so it mirrors the proxy flag of the same name.
 		--local) MODE=local ;;
@@ -97,7 +104,7 @@ for arg in "$@"; do
 			usage
 			exit 0
 			;;
-		*) die "unknown option: $arg (try --install-only, --local, or no argument)" ;;
+		*) die "unknown option: $arg (try --claude-code, --install-only, --local, or no argument)" ;;
 	esac
 done
 # Env form kept working; the flag wins if both are given.
@@ -354,10 +361,34 @@ info ""
 # who knows whether they want it.
 local_cfg="${CORTEX_DIR}/config.yaml"
 if [ -f "${local_cfg}" ]; then
+	info "  Skip the env vars below — configure Claude Code once, then just run \`claude\`:"
+	info "    ${abctl_cmd} claude-code enable"
+	info ""
 	info "  Using Claude Code? Cut its token cost by pruning tools you never call:"
 	info "    ${abctl_cmd} tools scan --write ${local_cfg}"
 	info "    (proposes tools absent from your last 30 days of transcripts;"
 	info "     add --all to spare anything you have ever called; hot-reloaded)"
+	info ""
+fi
+# --claude-code: hand off to abctl, which owns the JSON merge (a shell-side edit
+# of a file holding API tokens is not worth attempting) and prompts on /dev/tty —
+# stdin here is the script itself when piped, so it cannot be read for an answer.
+if [ -n "${WIRE_CLAUDE_CODE:-}" ]; then
+	info ""
+	if "${BIN_DIR}/abctl" claude-code enable; then
+		info ""
+		info "  Run Claude Code:   claude"
+		info "  Watch traffic:     ${abctl_cmd} --endpoint http://localhost:${DEMO_SESSION_PORT}"
+		info "  Undo:              ${abctl_cmd} claude-code disable"
+		info "  Stop Cortex:       kill \$(cat ${pidfile})"
+		info ""
+		exit 0
+	fi
+	# Declined, or no terminal to ask on. Not a failure — fall through to the
+	# manual instructions below.
+	info ""
+	info "  Claude Code left unchanged. To do it later:"
+	info "    ${abctl_cmd} claude-code enable"
 	info ""
 fi
 info "  Watch traffic:   ${abctl_cmd} --endpoint http://localhost:${DEMO_SESSION_PORT}"

@@ -7,7 +7,8 @@ strips the definitions your agent never calls.
 
 Nothing here installs anything: the proxy comes from the
 [README quick start](../../README.md#quick-start-local-no-kubernetes), which sets
-it up to observe traffic without changing it. Pruning is a separate, opt-in step,
+it up to observe traffic without changing it, and points Claude Code at it so
+`claude` needs no environment variables. Pruning is a separate, opt-in step,
 because it rewrites requests and because the list it proposes is read from Claude
 Code's own transcripts — of no use if you drive a different agent.
 
@@ -124,9 +125,11 @@ client-side settings (`--allowedTools`, disabling unused MCP servers).
 ## If it isn't working
 
 - **Metrics pane empty, every event shows `tunnel`** — Claude Code is not trusting
-  the bridge CA. `NODE_EXTRA_CA_CERTS` must point at `~/.cortex/ca/ca.crt`,
-  expanded to an absolute path. The proxy also warns about this in
-  `~/.cortex/proxy.log` after a few requests, naming the path it expects.
+  the bridge CA. Check what it is actually using with `abctl claude-code status`;
+  `NODE_EXTRA_CA_CERTS` must be the absolute path to `~/.cortex/ca/ca.crt`. The
+  proxy also warns about this in `~/.cortex/proxy.log` after a few requests,
+  naming the path it expects. `abctl claude-code enable` sets all three variables
+  from your running config, which is the reliable way to get them right.
 - **`tool-prune` shows `skip`, never `modify`** — expected until you opt in: the
   remove list ships empty. Run the scan above. If it refuses, you have no
   transcript history for it to reason from yet.

@@ -12,32 +12,35 @@ import (
 // scattered into whichever directory each command happened to run from.
 const (
 	cortexDirName = ".cortex"
-	// localDirName keeps --local's regenerated state out of the persistent
-	// config's way. --local rewrites its config from the built-in preset, so it
-	// must not share a directory with a config a user maintains by hand.
-	localDirName = "local"
-	// localConfigName matches the persistent config's filename, so there is one
-	// name to know regardless of which mode wrote it.
+	// localConfigName is the one config a local install has. There is deliberately
+	// no second "cost-optimised" config: this one already carries both the parsers
+	// and tool-prune, and writeBuiltinConfig preserves edits, so filling in
+	// tool-prune's remove list is all the difference ever amounted to. Two configs
+	// meant two CAs, two sets of paths, and two pages of instructions that read
+	// identically.
 	localConfigName = "config.yaml"
+	// caDirName holds the bridge CA. Separate from the config so one directory
+	// listing distinguishes "your settings" from "generated key material".
+	caDirName = "ca"
 	// localDirFallback is used only when the home directory cannot be
 	// determined, which is the historical cwd-relative behaviour.
 	localDirFallback = "cortex-ca"
 )
 
-// defaultLocalDir returns the directory --local works in: ~/.cortex/local, or
-// ./cortex-ca if there is no resolvable home directory.
+// defaultCortexDir returns ~/.cortex, or ./cortex-ca if there is no resolvable
+// home directory.
 //
 // This used to be cwd-relative unconditionally, on the reasoning that no
 // absolute path should be baked into the binary. Resolving $HOME at runtime
 // satisfies that while keeping the private key in one predictable place — and
 // the cwd default had a real cost: it dropped a CA and private key into
-// whatever directory the demo was started from, including checkouts.
-func defaultLocalDir() string {
+// whatever directory the proxy was started from, including checkouts.
+func defaultCortexDir() string {
 	home, err := os.UserHomeDir()
 	if err != nil || home == "" {
 		return localDirFallback
 	}
-	return filepath.Join(home, cortexDirName, localDirName)
+	return filepath.Join(home, cortexDirName)
 }
 
 // builtinConfigYAML returns the built-in --local config with caDir interpolated: a
@@ -112,14 +115,20 @@ pipeline:
 // this function runs before any port is bound, so an unconditional write meant
 // that even a --local start which then failed on a port clash silently destroyed
 // those edits. Delete the file to regenerate the preset.
-func writeBuiltinConfig(caDir string) (string, error) {
-	// 0700: this directory holds the local CA's private key.
-	if err := os.MkdirAll(caDir, 0o700); err != nil {
+// writeBuiltinConfig ensures cortexDir/config.yaml exists, pointing at caDir for
+// the CA, and returns its path.
+//
+// An existing file is never rewritten. That is what makes this the only config a
+// local install needs: the prune list, the on_error policy and any hand edit all
+// survive a restart, so there is nothing for a second "persistent" config to do.
+func writeBuiltinConfig(cortexDir, caDir string) (string, error) {
+	// 0700: caDir under here holds the CA's private key.
+	if err := os.MkdirAll(cortexDir, 0o700); err != nil {
 		return "", err
 	}
-	path := filepath.Join(caDir, localConfigName)
+	path := filepath.Join(cortexDir, localConfigName)
 	if _, err := os.Stat(path); err == nil {
-		slog.Info("demo mode — keeping the existing config (edits and any prune list are preserved)",
+		slog.Info("local mode — keeping the existing config (edits and any prune list are preserved)",
 			"path", path, "hint", "delete it to regenerate the built-in preset")
 		return path, nil
 	} else if !errors.Is(err, os.ErrNotExist) {

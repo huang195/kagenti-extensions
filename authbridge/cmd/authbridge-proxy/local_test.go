@@ -10,19 +10,20 @@ import (
 	"github.com/rossoctl/cortex/authbridge/authlib/config"
 )
 
-// writeBuiltinConfig must produce a config file inside caDir that loads, presets,
+// writeBuiltinConfig must produce a config file in cortexDir that loads, presets,
 // and validates cleanly and describes a forward-only TLS-bridge observe
-// pipeline pointed at that dir — otherwise --local would fail at boot instead of
-// giving users a working, hot-reloadable local demo.
+// pipeline pointed at caDir — otherwise --local would fail at boot instead of
+// giving users a working, hot-reloadable local setup.
 func TestDemoConfig_WriteLoadsAndValidates(t *testing.T) {
-	caDir := t.TempDir()
+	cortexDir := t.TempDir()
+	caDir := filepath.Join(cortexDir, "ca")
 
-	p, err := writeBuiltinConfig(caDir)
+	p, err := writeBuiltinConfig(cortexDir, caDir)
 	if err != nil {
 		t.Fatalf("writeBuiltinConfig: %v", err)
 	}
-	if filepath.Dir(p) != caDir {
-		t.Errorf("config written to %q, want inside %q", p, caDir)
+	if filepath.Dir(p) != cortexDir {
+		t.Errorf("config written to %q, want inside %q", p, cortexDir)
 	}
 
 	cfg, err := config.Load(p)
@@ -108,8 +109,9 @@ func TestDemoConfig_WriteLoadsAndValidates(t *testing.T) {
 // meant a --local start that then failed on a port clash silently destroyed those
 // edits — which is exactly how a populated remove list was lost in practice.
 func TestWriteDemoConfig_PreservesAnExistingFile(t *testing.T) {
-	caDir := t.TempDir()
-	p, err := writeBuiltinConfig(caDir)
+	cortexDir := t.TempDir()
+	caDir := filepath.Join(cortexDir, "ca")
+	p, err := writeBuiltinConfig(cortexDir, caDir)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -118,7 +120,7 @@ func TestWriteDemoConfig_PreservesAnExistingFile(t *testing.T) {
 		t.Fatal(err)
 	}
 	// A second call — a restart — must not clobber it.
-	p2, err := writeBuiltinConfig(caDir)
+	p2, err := writeBuiltinConfig(cortexDir, caDir)
 	if err != nil {
 		t.Fatal(err)
 	}

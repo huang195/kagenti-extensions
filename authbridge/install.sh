@@ -9,22 +9,25 @@
 # commands to watch traffic and point an agent at it, plus how to stop it.
 # macOS + Linux, amd64 + arm64. No cluster, Keycloak, or SPIRE needed.
 #
-# Modes (pass through the pipe with `sh -s --`, e.g.
-#   curl -fsSL ...install.sh | sh -s -- --claude-code):
+# By default it installs, starts Cortex with its built-in config in ~/.cortex,
+# fills in tool-prune's remove list from your own transcripts, and prints the
+# command to send an agent through it.
 #
-#   (default)        install, then start with a built-in config in ~/.cortex/local
-#   --claude-code    install, then set up a PERSISTENT config in ~/.cortex for
-#                    cutting Claude Code token cost: writes the config, fills the
-#                    tool-prune remove: list from your own transcripts, starts the
-#                    proxy, and prints the exact command to run Claude Code
-#                    through it. Safe to re-run; never overwrites an existing
-#                    config.
+# Options (pass through the pipe with `sh -s --`, e.g.
+#   curl -fsSL ...install.sh | sh -s -- --install-only):
+#
 #   --install-only   install the binaries and stop
+#   --no-prune       set up and start, but leave tool-prune's list empty
 #
-# Flags exist because the env-var form has a trap: written
-# `VAR=1 curl ... | sh` the variable reaches curl, not sh, so the script runs
-# without it. `sh -s -- --flag` has no such failure mode. The env vars below
-# still work for backward compatibility.
+# There is deliberately only one config. It carries the parsers AND tool-prune,
+# and the proxy preserves edits to it, so a second "cost-optimised" config had
+# nothing to do that filling in one list did not already do — while costing a
+# second CA, a second set of paths, and a second page of instructions that read
+# identically to the first. `--claude-code` is kept as an accepted no-op alias.
+#
+# Flags rather than env vars: written `VAR=1 curl ... | sh` the variable reaches
+# curl, not sh, so the script runs without it. `sh -s -- --flag` has no such
+# failure mode. The env vars below still work.
 #
 # Environment:
 #   AUTHBRIDGE_VERSION=vX.Y.Z   install a specific release tag (default: newest)
@@ -45,17 +48,19 @@ die()  { printf 'error: %s\n' "$*" >&2; exit 1; }
 
 # --- mode selection ---
 MODE=local
+PRUNE=1
 for arg in "$@"; do
 	case "$arg" in
-		--claude-code) MODE=claude-code ;;
 		--install-only) MODE=install-only ;;
-		# --demo is the old name for the built-in-config run; still accepted.
-		--local | --demo) MODE=local ;;
+		--no-prune) PRUNE="" ;;
+		# --claude-code and --demo were separate modes; both now describe the one
+		# setup this script performs, so they are accepted and change nothing.
+		--local | --demo | --claude-code) MODE=local ;;
 		-h | --help)
 			sed -n '2,30p' "$0" 2>/dev/null | sed 's/^# \{0,1\}//'
 			exit 0
 			;;
-		*) die "unknown option: $arg (try --claude-code, --install-only, or no argument)" ;;
+		*) die "unknown option: $arg (try --install-only, --no-prune, or no argument)" ;;
 	esac
 done
 # Env form kept working; the flag wins if both are given.
@@ -117,43 +122,42 @@ esac
 # stop_previous_cortex stops a Cortex a previous run of this script started, if
 # one is still holding the ports the next one needs.
 #
-# This is the path a new user actually walks: the README quickstart starts the
-# built-in local config, then the token-cost guide starts the --claude-code one.
-# Both use the same loopback ports, so without this the second command dies on a
-# bind conflict and the guide stops working at step 1.
+# Re-running the installer while Cortex is already up is ordinary — following the
+# README and then the token-cost guide does exactly that. Both use the same
+# loopback ports, so without this the second command dies on a bind conflict.
 #
 # Deliberately narrow. It only kills a pid from OUR pidfile whose process name is
 # still authbridge-proxy — a pidfile can outlive its process and the number can
 # be recycled onto something unrelated. Anything else holding the port is left
 # alone and reported by the preflight below.
 stop_previous_cortex() {
-	STOPPED_LOCAL=""
-	for pidfile in "${CORTEX_DIR}/proxy.pid" "${CORTEX_DIR}/local/proxy.pid"; do
-		[ -f "$pidfile" ] || continue
-		pid=$(cat "$pidfile" 2>/dev/null) || continue
-		case "$pid" in
-			'' | *[!0-9]*) continue ;;
-		esac
-		kill -0 "$pid" 2>/dev/null || { rm -f "$pidfile"; continue; }
-		name=$(ps -p "$pid" -o comm= 2>/dev/null || true)
-		case "$name" in
-			*authbridge-proxy*) ;;
-			*) continue ;; # pid recycled onto something else — never touch it
-		esac
-		info "Stopping the Cortex started earlier (pid ${pid}); the new one replaces it."
-		[ "$pidfile" = "${CORTEX_DIR}/local/proxy.pid" ] && STOPPED_LOCAL=1
-		kill "$pid" 2>/dev/null || true
-		i=0
-		while [ "$i" -lt 25 ] && kill -0 "$pid" 2>/dev/null; do
-			sleep 0.2
-			i=$((i + 1))
-		done
+	pidfile="${CORTEX_DIR}/proxy.pid"
+	[ -f "$pidfile" ] || return 0
+	pid=$(cat "$pidfile" 2>/dev/null) || return 0
+	case "$pid" in
+		'' | *[!0-9]*) return 0 ;;
+	esac
+	if ! kill -0 "$pid" 2>/dev/null; then
 		rm -f "$pidfile"
+		return 0
+	fi
+	name=$(ps -p "$pid" -o comm= 2>/dev/null || true)
+	case "$name" in
+		*authbridge-proxy*) ;;
+		*) return 0 ;; # pid recycled onto something else — never touch it
+	esac
+	info "Stopping the Cortex started earlier (pid ${pid}); the new one replaces it."
+	kill "$pid" 2>/dev/null || true
+	i=0
+	while [ "$i" -lt 25 ] && kill -0 "$pid" 2>/dev/null; do
+		sleep 0.2
+		i=$((i + 1))
 	done
+	rm -f "$pidfile"
 }
 
 # --- preflight: fail early (before downloading) if a listener port is taken ---
-if [ "$MODE" = "local" ] || [ "$MODE" = "claude-code" ]; then
+if [ "$MODE" = "local" ]; then
 	# Clear our own previous instance first, so switching between the two setups
 	# is one command rather than a bind error and a manual kill.
 	for p in "$DEMO_FORWARD_PORT" "$DEMO_SESSION_PORT" "$DEMO_STATS_PORT"; do
@@ -164,7 +168,7 @@ if [ "$MODE" = "local" ] || [ "$MODE" = "claude-code" ]; then
 	done
 	for p in "$DEMO_FORWARD_PORT" "$DEMO_SESSION_PORT" "$DEMO_STATS_PORT"; do
 		if port_in_use "$p"; then
-			die "port ${p} is already in use. Is Cortex already running (see ${CORTEX_DIR}/local/proxy.pid or ${CORTEX_DIR}/proxy.pid)? Otherwise free the port, or change the ports in the config, then re-run."
+			die "port ${p} is already in use. Is Cortex already running (see ${CORTEX_DIR}/proxy.pid)? Otherwise free the port, or change the ports in the config, then re-run."
 		fi
 	done
 fi
@@ -233,7 +237,7 @@ fi # end of download block
 
 # --- report ---
 proxy="${BIN_DIR}/authbridge-proxy"
-ca_dir="${CORTEX_DIR}/local" # matches defaultLocalDir() in local.go
+ca_dir="${CORTEX_DIR}/ca" # matches defaultCortexDir()+caDirName in local.go
 case ":${PATH}:" in
 	*":${BIN_DIR}:"*) abctl_cmd="abctl" proxy_cmd="authbridge-proxy" ;;
 	*) abctl_cmd="${BIN_DIR}/abctl" proxy_cmd="$proxy" ;;
@@ -252,130 +256,6 @@ esac
 if [ "$MODE" = "install-only" ]; then
 	info ""
 	info "Install-only mode. Start it with:  ${proxy_cmd} --local"
-	info "Or set up persistent Claude Code cost-cutting:  re-run with --claude-code"
-	exit 0
-fi
-
-# --- claude-code mode: persistent setup under ~/.cortex, then start ---
-#
-# Separate from --local because --local regenerates its own config.yaml from a
-# built-in template on every start, so any edit (like the remove: list this mode
-# fills in) would be discarded on the next run. A config under ~/.cortex is
-# outside that path and survives.
-if [ "$MODE" = "claude-code" ]; then
-	cfg_dir="$CORTEX_DIR"
-	cfg="${cfg_dir}/config.yaml"
-	cc_ca_dir="${cfg_dir}/ca"
-	# 0700: the generated CA's private key lives under here.
-	mkdir -p "$cfg_dir" && chmod 700 "$cfg_dir"
-
-	if [ -f "$cfg" ]; then
-		info ""
-		info "Keeping your existing config: ${cfg}"
-	else
-		info ""
-		info "Writing ${cfg}"
-		# ${HOME} is left literal on purpose: authbridge expands ${ENV_VAR} when it
-		# loads the file, so the config stays portable and needs no path rewriting
-		# after the fact.
-		cat >"$cfg" <<'YAML'
-# Cortex — cut Claude Code token cost by pruning unused tool definitions.
-# Written by install.sh --claude-code. Safe to edit; the proxy hot-reloads.
-mode: proxy-sidecar
-listener:
-  roles: [forward]
-  forward_proxy_addr: 127.0.0.1:47600
-  session_api_addr: 127.0.0.1:47601
-  # The proxy-sidecar preset turns this listener on and refills it if emptied, so
-  # pin it to loopback on an uncommon port. Left at its ":8082" default it binds
-  # every interface — on a laptop that means the LAN — and collides with anything
-  # else already using 8082.
-  transparent_proxy_addr: 127.0.0.1:47603
-  # Same reasoning: the default ":9091" is every-interface and collides with any
-  # other authbridge on the host.
-  health_addr: 127.0.0.1:47604
-stats:
-  address: 127.0.0.1:47602
-tls_bridge:
-  mode: enabled
-  ca_dir: "${HOME}/.cortex/ca"
-  generate_ca: true
-pipeline:
-  outbound:
-    plugins:
-      - name: inference-parser
-      # tool-prune must stay last: it rewrites the request body, and body
-      # readers have to precede it to see the original bytes.
-      - name: tool-prune
-        config:
-          remove: []
-YAML
-	fi
-
-	# Fill the remove: list before starting, so no hot-reload round-trip is
-	# needed. This edits the config the user just asked us to set up, which is
-	# the point of the mode — but say so, and say how to undo it, because it is
-	# derived from their transcripts rather than chosen by them.
-	info ""
-	info "Choosing tools to prune from your own ~/.claude/projects transcripts..."
-	if "${BIN_DIR}/abctl" tools scan --write "$cfg"; then
-		info ""
-		info "Wrote the remove: list to ${cfg}"
-		info "To keep a tool, delete its name from that list — the proxy hot-reloads."
-	else
-		warn "the scan did not complete; the remove: list is empty, so tool-prune"
-		warn "will do nothing until you run:  ${abctl_cmd} tools scan --write ${cfg}"
-	fi
-
-	info ""
-	info "Starting the proxy in the background..."
-	cc_log="${cfg_dir}/proxy.log"
-	cc_pidfile="${cfg_dir}/proxy.pid"
-	nohup "$proxy" --config "$cfg" </dev/null >"$cc_log" 2>&1 &
-	cc_pid=$!
-	echo "$cc_pid" >"$cc_pidfile"
-
-	ready=0
-	i=0
-	while [ "$i" -lt 50 ]; do
-		if ! kill -0 "$cc_pid" 2>/dev/null; then
-			warn "the proxy exited during startup — last log lines:"
-			tail -n 15 "$cc_log" >&2 || true
-			die "proxy failed to start (full log: ${cc_log})"
-		fi
-		if port_in_use "$DEMO_FORWARD_PORT"; then
-			ready=1
-			break
-		fi
-		sleep 0.2
-		i=$((i + 1))
-	done
-
-	info ""
-	if [ "$ready" -eq 1 ]; then
-		info "Cortex is running (pid ${cc_pid}).   Logs: ${cc_log}"
-	else
-		info "Cortex started (pid ${cc_pid}); couldn't confirm it's listening (install lsof or nc to verify). Logs: ${cc_log}"
-	fi
-	info ""
-	if [ -n "${STOPPED_LOCAL:-}" ]; then
-		info "Note: this setup uses a different CA than the one you were running"
-		info "      (${cc_ca_dir}/ca.crt, not ${CORTEX_DIR}/local/ca.crt)."
-		info "      Restart Claude Code with the command below — a stale"
-		info "      NODE_EXTRA_CA_CERTS fails silently: traffic still flows, but"
-		info "      every request tunnels through opaquely and nothing is pruned."
-		info ""
-	fi
-	info "Run Claude Code through it:"
-	info ""
-	info "    HTTPS_PROXY=http://localhost:${DEMO_FORWARD_PORT} \\"
-	info "      NODE_EXTRA_CA_CERTS=${cc_ca_dir}/ca.crt \\"
-	info "      CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1 claude"
-	info ""
-	info "  See what it saved:   ${abctl_cmd} --endpoint http://localhost:${DEMO_SESSION_PORT}"
-	info "                       (Plugin pane -> tool-prune -> Metrics)"
-	info "  Stop it:             kill \$(cat ${cc_pidfile})"
-	info ""
 	exit 0
 fi
 
@@ -385,8 +265,8 @@ info "Starting Cortex in the background..."
 # 0700 on the Cortex directory: a CA private key is written beneath it.
 mkdir -p "$CORTEX_DIR" && chmod 700 "$CORTEX_DIR"
 mkdir -p "$ca_dir"
-log="${ca_dir}/proxy.log"
-pidfile="${ca_dir}/proxy.pid"
+log="${CORTEX_DIR}/proxy.log"
+pidfile="${CORTEX_DIR}/proxy.pid"
 nohup "$proxy" --local </dev/null >"$log" 2>&1 &
 proxy_pid=$!
 echo "$proxy_pid" >"$pidfile"
@@ -422,15 +302,28 @@ fi
 info ""
 
 # tool-prune ships inert: the remove list is empty, so it does nothing until a
-# name is added. That empty list is the guard — on_error is enforce, because the
-# list is what gates the plugin. Offer the scan that fills it in. Only patch a config
-# that already exists, so a first run never rewrites a file it just created
-# behind the user's back -- print the command instead and let them look first.
-local_cfg="${ca_dir}/config.yaml"
-if [ -f "${local_cfg}" ]; then
-	info "  Cut tool-manifest waste (fills the remove: list; hot-reloaded, no restart):"
+# name is added. Fill it now — that is the whole point of installing this — and
+# say so plainly, because it is derived from the user's transcripts rather than
+# chosen by them. The config is hot-reloaded, so this needs no restart.
+#
+# `abctl tools scan` refuses to write anything when it saw no tool calls to reason
+# from, which is what makes doing this unattended safe: a brand-new install with
+# no history gets an empty list and a message, not a guess.
+local_cfg="${CORTEX_DIR}/config.yaml"
+if [ -n "${PRUNE:-}" ] && [ -f "${local_cfg}" ]; then
+	info "Choosing unused tools to prune from your own ~/.claude/projects transcripts..."
+	if "${BIN_DIR}/abctl" tools scan --write "${local_cfg}"; then
+		info ""
+		info "To keep a tool, delete its name from the remove: list in ${local_cfg}."
+	else
+		info ""
+		info "  Nothing pruned yet. Once you have used Claude Code for a while:"
+		info "    ${abctl_cmd} tools scan --write ${local_cfg}"
+	fi
+	info ""
+elif [ -f "${local_cfg}" ]; then
+	info "  Fill the prune list when you are ready (hot-reloaded, no restart):"
 	info "    ${abctl_cmd} tools scan --write ${local_cfg}"
-	info "  Then watch the Metrics section of tool-prune's pane in abctl."
 	info ""
 fi
 info "  Watch traffic:   ${abctl_cmd} --endpoint http://localhost:${DEMO_SESSION_PORT}"

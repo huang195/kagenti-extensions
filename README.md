@@ -12,13 +12,21 @@ It ships as a single binary; the identity and access layer is **AuthBridge**, an
 
 ## Quick start (local, no Kubernetes)
 
-Watch an AI agent's traffic — its model, tool, and agent-to-agent calls — decrypted and parsed live on your laptop.
+Watch an AI agent's traffic — its model, tool, and agent-to-agent calls —
+decrypted and parsed live on your laptop, and cut what it spends on unused tool
+definitions.
 
-1. **Install and start Cortex** (macOS/Linux). Downloads two small binaries and starts the proxy in the background:
+1. **Install and start Cortex** (macOS/Linux). Downloads two small binaries,
+   writes one config under `~/.cortex`, and starts the proxy in the background:
 
    ```sh
    curl -fsSL https://raw.githubusercontent.com/rossoctl/cortex/main/authbridge/install.sh | sh
    ```
+
+   It also fills in the list of tool definitions to strip from outbound requests,
+   read from your own Claude Code transcripts — that is the cost saving, and it
+   prints exactly what it chose. Add `--no-prune` to skip it, or
+   `--install-only` for just the binaries.
 
 2. **Open the live viewer** in another terminal:
 
@@ -26,28 +34,23 @@ Watch an AI agent's traffic — its model, tool, and agent-to-agent calls — de
    abctl --endpoint http://localhost:47601
    ```
 
-3. **Send an agent's traffic through it** — e.g. Claude Code, from anywhere (the CA path is fixed, not relative to where you started):
+3. **Send an agent's traffic through it** — e.g. Claude Code, from any directory:
 
    ```sh
    HTTPS_PROXY=http://localhost:47600 \
-     NODE_EXTRA_CA_CERTS="$HOME/.cortex/local/ca.crt" \
+     NODE_EXTRA_CA_CERTS="$HOME/.cortex/ca/ca.crt" \
      CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1 \
      claude
    ```
 
-   Its calls stream into `abctl`, decrypted and parsed.
+   Its calls stream into `abctl`, decrypted and parsed. Step 1 prints this line
+   with the paths already filled in. Stop the proxy with
+   `kill $(cat ~/.cortex/proxy.pid)`.
 
-## Cut Claude Code token cost on your laptop
-
-Already using Claude Code? Cortex can strip the tool definitions your agent never
-calls out of every request. Measured over 99 requests in one session: **4–20% of
-the prompt billed per turn, median 6%**. The share is highest early — the removed
-bytes are a fixed size, so as the conversation grows they shrink as a fraction of
-it — and depends on how many of the tools you actually use. Three steps, about two
-minutes: **[Cut Claude Code token cost](./authbridge/docs/laptop-token-savings.md)**.
-
-If you already ran the quick start above, that guide takes over from it — its
-first command replaces the running proxy rather than colliding with it.
+**What the token saving comes to, and how to tune it:**
+**[Cut Claude Code token cost](./authbridge/docs/laptop-token-savings.md)**.
+Measured over 99 requests in one session: **4–20% of the prompt billed per turn,
+median 6%**.
 
 ## Running on Kubernetes
 

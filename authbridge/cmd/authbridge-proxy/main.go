@@ -130,7 +130,7 @@ func main() {
 	// still prints the flag, just with a blank description that reads like a bug.
 	demoDeprecated := flag.Bool("demo", false, "deprecated alias for -local")
 	caDir := flag.String("ca-dir", "",
-		"CA directory for --local (auto-generated); defaults to ~/"+cortexDirName+"/"+localDirName)
+		"CA directory for --local (auto-generated); defaults to ~/"+cortexDirName+"/"+caDirName)
 	flag.Parse()
 
 	if *showVersion {
@@ -150,33 +150,41 @@ func main() {
 		if *configPath != "" {
 			log.Fatal("--local and --config are mutually exclusive")
 		}
+		cortexDir := defaultCortexDir()
+		// The default moved here from ./cortex-ca. Someone who still has that
+		// directory almost certainly has a client trusting the CA inside it,
+		// and pointing at a stale CA fails silently — every request tunnels
+		// through opaquely and no plugin sees a body. Name both paths.
+		if st, serr := os.Stat(localDirFallback); serr == nil && st.IsDir() && *caDir == "" {
+			slog.Warn("local mode — the CA now lives under $HOME; the ./"+localDirFallback+" here is no longer used",
+				"now_using", filepath.Join(cortexDir, caDirName),
+				"ignored", localDirFallback,
+				"hint", "update the client's CA path (e.g. NODE_EXTRA_CA_CERTS), or pass --ca-dir ./"+localDirFallback+" to keep the old location")
+		}
+		// --ca-dir moves only the CA. The config stays at one known path, so a
+		// client's trust anchor can be relocated without the config going
+		// somewhere a later command can't find.
 		dir := *caDir
 		if dir == "" {
-			dir = defaultLocalDir()
-			// The default moved here from ./cortex-ca. Someone who still has that
-			// directory almost certainly has a client trusting the CA inside it,
-			// and pointing at a stale CA fails silently — every request tunnels
-			// through opaquely and no plugin sees a body. Name both paths.
-			if st, serr := os.Stat(localDirFallback); serr == nil && st.IsDir() {
-				slog.Warn("local mode — the default CA directory is now under $HOME; the ./"+localDirFallback+" here is no longer used",
-					"now_using", dir,
-					"ignored", localDirFallback,
-					"hint", "update the client's CA path (e.g. NODE_EXTRA_CA_CERTS), or pass --ca-dir ./"+localDirFallback+" to keep the old location")
-			}
+			dir = filepath.Join(cortexDir, caDirName)
 		}
-		abs, aerr := filepath.Abs(dir)
+		absCA, aerr := filepath.Abs(dir)
 		if aerr != nil {
 			log.Fatalf("--local: resolving --ca-dir %q: %v", dir, aerr)
 		}
-		// Write the built-in config next to the CA and drive the normal
-		// file-based load + hot-reload path — so editing the file reloads live.
-		p, werr := writeBuiltinConfig(abs)
+		absCortex, cerr := filepath.Abs(cortexDir)
+		if cerr != nil {
+			log.Fatalf("--local: resolving %q: %v", cortexDir, cerr)
+		}
+		// Drive the normal file-based load + hot-reload path, so editing the
+		// config reloads live.
+		p, werr := writeBuiltinConfig(absCortex, absCA)
 		if werr != nil {
 			log.Fatalf("--local: %v", werr)
 		}
 		*configPath = p
-		slog.Info("local mode — wrote built-in config next to the CA; edit it to hot-reload",
-			"config", p, "ca_dir", abs)
+		slog.Info("local mode — using the built-in config; edit it to hot-reload",
+			"config", p, "ca_dir", absCA)
 	} else if *caDir != "" {
 		log.Fatal("--ca-dir only applies with --local")
 	}

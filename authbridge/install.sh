@@ -23,7 +23,11 @@
 # and the proxy preserves edits to it, so a second "cost-optimised" config had
 # nothing to do that filling in one list did not already do — while costing a
 # second CA, a second set of paths, and a second page of instructions that read
-# identically to the first. `--claude-code` is kept as an accepted no-op alias.
+# identically to the first.
+#
+# No compatibility aliases here: this script accepted no flags at all until now,
+# so there is no earlier spelling for anyone to still be using. (The proxy's
+# --demo -> --local alias is different: that flag really did ship.)
 #
 # Flags rather than env vars: written `VAR=1 curl ... | sh` the variable reaches
 # curl, not sh, so the script runs without it. `sh -s -- --flag` has no such
@@ -53,9 +57,9 @@ for arg in "$@"; do
 	case "$arg" in
 		--install-only) MODE=install-only ;;
 		--no-prune) PRUNE="" ;;
-		# --claude-code and --demo were separate modes; both now describe the one
-		# setup this script performs, so they are accepted and change nothing.
-		--local | --demo | --claude-code) MODE=local ;;
+		# --local is the default; accepted so writing it out explicitly works, and
+		# so it mirrors the proxy flag of the same name.
+		--local) MODE=local ;;
 		-h | --help)
 			sed -n '2,30p' "$0" 2>/dev/null | sed 's/^# \{0,1\}//'
 			exit 0

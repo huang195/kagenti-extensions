@@ -13,7 +13,7 @@ image is a build variant of the proxy binary (proxy Dockerfile +
 |---|---|---|---|---|
 | [`authbridge-proxy/`](authbridge-proxy/) | `proxy-sidecar` (default) | HTTP forward + reverse proxies | full (jwt-validation, token-exchange, a2a-parser, mcp-parser, inference-parser) | `ghcr.io/rossoctl/cortex/authbridge` |
 | [`authbridge-envoy/`](authbridge-envoy/) | `envoy-sidecar` | gRPC ext_proc on `:9090` (hooked into Envoy) | full | `ghcr.io/rossoctl/cortex/authbridge-envoy` |
-| `authbridge-lite` _(build variant of `authbridge-proxy`)_ | `proxy-sidecar` | HTTP forward + reverse proxies | lite — `authbridge-proxy` built with `exclude_plugin_*` tags (jwt-validation + token-exchange only; OPA + parsers dropped) | `ghcr.io/rossoctl/cortex/authbridge-lite` |
+| `authbridge-lite` _(build variant of `authbridge-proxy`)_ | `proxy-sidecar` | HTTP forward + reverse proxies | lite — `authbridge-proxy` built with `exclude_plugin_*` tags for a trimmed plugin set (see [`../scripts/lite-tags`](../scripts/lite-tags)) | `ghcr.io/rossoctl/cortex/authbridge-lite` |
 | [`abctl/`](abctl/) | n/a | n/a | n/a | not published — local TUI for the Session Events API |
 
 Each binary directory contains `main.go`, `go.mod`/`go.sum`,
@@ -75,6 +75,7 @@ inbound mechanism, and the preset fills only that one's address.
   iptables init container.
 - **Size-constrained, no protocol-aware events needed**: use the
   `authbridge-lite` image — the `authbridge-proxy` binary built with
-  `exclude_plugin_*` tags (auth-only). Same listener layout, but without
-  parsers/OPA — abctl will only see denial events and basic auth-level
-  invocations, not full A2A/MCP/Inference protocol context.
+  `exclude_plugin_*` tags from `authbridge/scripts/lite-tags` (trimmed
+  plugin set). Same listener layout, but without parsers/OPA — abctl
+  will only see denial events and basic auth-level invocations, not
+  full A2A/MCP/Inference protocol context.

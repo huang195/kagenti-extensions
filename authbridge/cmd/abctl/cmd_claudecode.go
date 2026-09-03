@@ -5,6 +5,7 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"net"
 	"os"
 	"path/filepath"
 	"sort"
@@ -19,6 +20,11 @@ import (
 // process shared by every terminal and inherits the environment of whichever
 // shell cold-started it, so a shell export reaches background agents only by
 // luck. Settings reach every session on the machine.
+// exitDeclined is returned when the user said no, or there was no terminal to
+// ask on. Separate from 1 so a caller can tell a refusal — which is a normal
+// outcome — from an operational failure it must not report as success.
+const exitDeclined = 3
+
 const (
 	envProxy     = "HTTPS_PROXY"
 	envCACerts   = "NODE_EXTRA_CA_CERTS"
@@ -51,6 +57,9 @@ survives later runs. disable removes only those three keys.
 
 Note: while enabled, Claude Code needs Cortex running — its requests go to the
 proxy address. "abctl claude-code disable" is the off switch.
+
+Exit status: 0 applied or already correct, 3 declined (or no terminal to ask
+on), 1 something went wrong.
 
 Flags:
   --yes           do not prompt for confirmation
@@ -111,17 +120,26 @@ func wanted(cortexCfgPath string) (map[string]string, error) {
 	if addr == "" {
 		return nil, fmt.Errorf("%s has no listener.forward_proxy_addr; Claude Code needs a forward proxy to point at", cortexCfgPath)
 	}
-	// A bind address is not a URL: ":8081" and "127.0.0.1:47600" both need a
-	// host that a client can actually dial.
-	host, port, ok := strings.Cut(addr, ":")
-	if !ok {
-		return nil, fmt.Errorf("listener.forward_proxy_addr %q is not host:port", addr)
+	// A bind address is not a URL: ":8081" and "127.0.0.1:47600" both need a host
+	// a client can actually dial.
+	//
+	// net.SplitHostPort, not strings.Cut: Cut splits at the FIRST colon, so
+	// "[::1]:47600" gave host="[" and port=":1]:47600" and this wrote a malformed
+	// http://[:1]:47600 into settings.json — a broken value rather than an error,
+	// in the file whose misconfiguration is the silent failure everything else
+	// here works to make loud. SplitHostPort understands the bracketed form and
+	// errors on genuinely bad input.
+	host, port, err := net.SplitHostPort(addr)
+	if err != nil {
+		return nil, fmt.Errorf("listener.forward_proxy_addr %q is not host:port: %w", addr, err)
 	}
 	if host == "" || host == "0.0.0.0" || host == "::" {
 		host = "localhost"
 	}
 	out := map[string]string{
-		envProxy:   "http://" + host + ":" + port,
+		// JoinHostPort, not concatenation: an IPv6 literal must keep its brackets
+		// to be a valid URL authority.
+		envProxy:   "http://" + net.JoinHostPort(host, port),
 		envNoTelem: "1",
 	}
 	if cfg.TLSBridge.CADir != "" {
@@ -197,7 +215,7 @@ func claudeCodeEnable(settingsPath, cortexCfgPath string, yes bool, stdout, stde
 		"  abctl claude-code disable\n\n")
 	if !yes && !confirm(stdout) {
 		fmt.Fprintln(stdout, "Not changed.")
-		return 1
+		return exitDeclined
 	}
 
 	raw := envRaw(doc)
@@ -232,7 +250,7 @@ func claudeCodeDisable(settingsPath string, yes bool, stdout, stderr io.Writer) 
 	fmt.Fprintf(stdout, "This will remove from %s: %s\n\n", settingsPath, strings.Join(present, ", "))
 	if !yes && !confirm(stdout) {
 		fmt.Fprintln(stdout, "Not changed.")
-		return 1
+		return exitDeclined
 	}
 	raw := envRaw(doc)
 	for _, k := range present {
@@ -309,6 +327,11 @@ func readSettings(path string) (map[string]any, error) {
 	var doc map[string]any
 	if err := json.Unmarshal(b, &doc); err != nil {
 		return nil, fmt.Errorf("%s is not valid JSON (%w); fix or move it before enabling", path, err)
+	}
+	// A bare `null` is valid JSON that unmarshals to a nil map, and assigning into
+	// one panics. Treat it as the empty document it means.
+	if doc == nil {
+		doc = map[string]any{}
 	}
 	return doc, nil
 }

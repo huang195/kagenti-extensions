@@ -66,7 +66,8 @@ func main() {
 	// no longer running must not hijack abctl away from the picker for someone
 	// working against a cluster.
 	local := localSessionEndpoint()
-	if *endpoint == "" && localSessionAPIUp(local) {
+	localUp := localSessionAPIUp(local)
+	if *endpoint == "" && localUp {
 		*endpoint = local
 	}
 
@@ -97,7 +98,14 @@ func main() {
 		cancel()
 	}()
 
-	opts := tui.RunOptions{Endpoint: *endpoint, LocalEndpoint: local}
+	// LocalEndpoint only when it answered. Passing an unresponsive configured
+	// address would point [l] at it and take away the in-cluster default, so a
+	// working `kubectl port-forward` on 9094 could not be reached with the one key
+	// that exists for exactly that.
+	opts := tui.RunOptions{Endpoint: *endpoint}
+	if localUp {
+		opts.LocalEndpoint = local
+	}
 	if *endpoint == "" {
 		opts.Lister = cluster.NewLister()
 		opts.PortForwarder = cluster.NewPortForwarder()

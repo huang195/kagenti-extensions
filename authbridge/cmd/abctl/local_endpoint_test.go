@@ -13,7 +13,7 @@ const endpointCfg = `mode: proxy-sidecar
 listener:
   roles: [forward]
   forward_proxy_addr: 127.0.0.1:47600
-  session_api_addr: SESSIONADDR
+  session_api_addr: "SESSIONADDR"
   health_addr: 127.0.0.1:47604
 pipeline:
   outbound:
@@ -51,6 +51,14 @@ func TestLocalSessionEndpoint_ReadsTheConfiguredPort(t *testing.T) {
 		// A bind address is not a dial address.
 		{":9094", "http://localhost:9094"},
 		{"0.0.0.0:9094", "http://localhost:9094"},
+		// IPv6. strings.Cut split at the first colon and produced host="[",
+		// yielding an unusable URL; the brackets must also survive into the
+		// authority.
+		{"[::1]:47601", "http://[::1]:47601"},
+		{"[fe80::1]:9094", "http://[fe80::1]:9094"},
+		// The v6 wildcard is a real host after SplitHostPort, so the branch that
+		// rewrites it to localhost is finally reachable.
+		{"[::]:9094", "http://localhost:9094"},
 	} {
 		withCortexConfig(t, tc.addr)
 		if got := localSessionEndpoint(); got != tc.want {
@@ -95,14 +103,40 @@ func TestLocalSessionAPIUp_OnlyWhenSomethingAnswers(t *testing.T) {
 	}
 }
 
-// TestLocalSessionAPIUp_RejectsAServerError: a 5xx means something is listening
-// but not serving the API — likelier a wrong port than a working Cortex.
-func TestLocalSessionAPIUp_RejectsAServerError(t *testing.T) {
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		w.WriteHeader(http.StatusInternalServerError)
-	}))
-	defer srv.Close()
-	if localSessionAPIUp(srv.URL) {
-		t.Error("a 500 was accepted as a live session API")
+// TestLocalSessionAPIUp_RejectsNon2xx: only a 2xx proves the session API is
+// there. Anything else means some other service holds the port, and selecting it
+// sends abctl somewhere useless instead of to the cluster picker.
+func TestLocalSessionAPIUp_RejectsNon2xx(t *testing.T) {
+	for _, status := range []int{
+		http.StatusInternalServerError,
+		http.StatusNotFound,     // an unrelated service on the port
+		http.StatusUnauthorized, // something that wants credentials
+		http.StatusMovedPermanently,
+	} {
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			w.WriteHeader(status)
+		}))
+		if localSessionAPIUp(srv.URL) {
+			t.Errorf("HTTP %d was accepted as a live session API", status)
+		}
+		srv.Close()
+	}
+}
+
+// TestLocalSessionEndpoint_RejectsMalformedAddresses: a bad address must yield no
+// endpoint rather than a URL that merely fails to connect, because the
+// consequence of the latter is abctl falling silently through to the cluster
+// picker with no explanation.
+func TestLocalSessionEndpoint_RejectsMalformedAddresses(t *testing.T) {
+	for _, addr := range []string{
+		"127.0.0.1",  // no port
+		"::",         // too many colons, not a host:port
+		"::1:47601",  // unbracketed v6, ambiguous
+		"127.0.0.1:", // empty port
+	} {
+		withCortexConfig(t, addr)
+		if got := localSessionEndpoint(); got != "" {
+			t.Errorf("session_api_addr %q -> %q, want empty", addr, got)
+		}
 	}
 }

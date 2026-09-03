@@ -26,7 +26,7 @@ const settingsWithSecret = `{
 const cortexCfg = `mode: proxy-sidecar
 listener:
   roles: [forward]
-  forward_proxy_addr: 127.0.0.1:47600
+  forward_proxy_addr: "127.0.0.1:47600"
   session_api_addr: 127.0.0.1:47601
   health_addr: 127.0.0.1:47604
 tls_bridge:
@@ -382,4 +382,104 @@ func TestClaudeCodeEnable_WarnsWhenCAMissing(t *testing.T) {
 		filepath.Dir(strings.TrimSuffix(caPath, filepath.Base(caPath))), "", 0)), 0o600)
 	out.Reset()
 	_ = claudeCodeEnable(settings2, cfg2, true, &out, &errb)
+}
+
+// TestClaudeCodeEnable_HandlesIPv6ForwardProxy: strings.Cut split at the first
+// colon, so "[::1]:47600" became host="[" and the value written into
+// settings.json was a malformed http://[:1]:47600 — a broken proxy setting rather
+// than an error, in the file this command works hardest to keep correct.
+func TestClaudeCodeEnable_HandlesIPv6ForwardProxy(t *testing.T) {
+	for _, tc := range []struct {
+		addr string
+		want string
+	}{
+		{"127.0.0.1:47600", "http://127.0.0.1:47600"},
+		{"[::1]:47600", "http://[::1]:47600"},
+		{"[fe80::1]:8081", "http://[fe80::1]:8081"},
+		// Wildcards are rewritten to something dialable.
+		{":8081", "http://localhost:8081"},
+		{"0.0.0.0:8081", "http://localhost:8081"},
+		{"[::]:8081", "http://localhost:8081"},
+	} {
+		settings, cfg := fixture(t, "{}")
+		body, err := os.ReadFile(cfg)
+		if err != nil {
+			t.Fatal(err)
+		}
+		moved := strings.Replace(string(body), "127.0.0.1:47600", tc.addr, 1)
+		if err := os.WriteFile(cfg, []byte(moved), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		var out, errb bytes.Buffer
+		if code := claudeCodeEnable(settings, cfg, true, &out, &errb); code != 0 {
+			t.Errorf("%s: exit %d: %s", tc.addr, code, errb.String())
+			continue
+		}
+		if got := readEnv(t, settings)[envProxy]; got != tc.want {
+			t.Errorf("forward_proxy_addr %q -> %s=%q, want %q", tc.addr, envProxy, got, tc.want)
+		}
+	}
+}
+
+// TestClaudeCodeEnable_RejectsMalformedForwardProxy: an unparseable address must
+// be reported, not written as a URL that silently never connects.
+func TestClaudeCodeEnable_RejectsMalformedForwardProxy(t *testing.T) {
+	settings, cfg := fixture(t, "{}")
+	body, err := os.ReadFile(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	moved := strings.Replace(string(body), "127.0.0.1:47600", "not-a-host-port", 1)
+	if err := os.WriteFile(cfg, []byte(moved), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	var out, errb bytes.Buffer
+	if code := claudeCodeEnable(settings, cfg, true, &out, &errb); code == 0 {
+		t.Fatal("accepted a malformed forward_proxy_addr")
+	}
+	if !strings.Contains(errb.String(), "is not host:port") {
+		t.Errorf("error did not name the problem: %q", errb.String())
+	}
+}
+
+// TestClaudeCodeEnable_NullSettingsRoot: `null` is valid JSON that unmarshals to
+// a nil map, and assigning into one panics. A file someone truncated or a tool
+// wrote badly should not crash the command.
+func TestClaudeCodeEnable_NullSettingsRoot(t *testing.T) {
+	settings, cfg := fixture(t, "null")
+	var out, errb bytes.Buffer
+	code := claudeCodeEnable(settings, cfg, true, &out, &errb)
+	if code != 0 {
+		t.Fatalf("exit %d: %s", code, errb.String())
+	}
+	if got := readEnv(t, settings)[envNoTelem]; got != "1" {
+		t.Errorf("%s = %q after a null root", envNoTelem, got)
+	}
+}
+
+// TestClaudeCodeDeclineUsesADistinctExitCode: the installer treats a refusal as
+// "skipped" and anything else as a failure it must report. One shared code made
+// a genuine error — refusing to clobber a corporate proxy, unparseable settings —
+// look like the user having said no, and the installer then exited 0 with Claude
+// Code unconfigured.
+func TestClaudeCodeDeclineUsesADistinctExitCode(t *testing.T) {
+	// An operational failure: HTTPS_PROXY already set to something foreign.
+	settings, cfg := fixture(t, `{"env":{"HTTPS_PROXY":"http://corp:3128"}}`)
+	var out, errb bytes.Buffer
+	if code := claudeCodeEnable(settings, cfg, true, &out, &errb); code != 1 {
+		t.Errorf("clobber refusal exit = %d, want 1 (a failure, not a decline)", code)
+	}
+
+	// Unparseable settings is also a failure, not a decline.
+	settings2, cfg2 := fixture(t, `{"env": {`)
+	out.Reset()
+	errb.Reset()
+	if code := claudeCodeEnable(settings2, cfg2, true, &out, &errb); code != 1 {
+		t.Errorf("bad-JSON exit = %d, want 1", code)
+	}
+
+	// And exitDeclined must not collide with either.
+	if exitDeclined == 0 || exitDeclined == 1 || exitDeclined == 2 {
+		t.Errorf("exitDeclined = %d collides with success, failure or usage", exitDeclined)
+	}
 }

@@ -200,11 +200,19 @@ stop_previous_cortex() {
 	esac
 	info "Stopping the Cortex started earlier (pid ${pid}); the new one replaces it."
 	kill "$pid" 2>/dev/null || true
+	# 90 * 0.2s = 18s, deliberately longer than the proxy's own 15s shutdown
+	# deadline (cmd/authbridge-proxy/main.go). Waiting only 5s could remove the
+	# pidfile while a draining request still held the listener, and the next port
+	# preflight would then fail with the previous instance invisible.
 	i=0
-	while [ "$i" -lt 25 ] && kill -0 "$pid" 2>/dev/null; do
+	while [ "$i" -lt 90 ] && kill -0 "$pid" 2>/dev/null; do
 		sleep 0.2
 		i=$((i + 1))
 	done
+	if kill -0 "$pid" 2>/dev/null; then
+		# Keep the pidfile: it is the only handle on a process that is still there.
+		die "Cortex (pid ${pid}) did not exit within 18s. Stop it and re-run: kill -9 ${pid}"
+	fi
 	rm -f "$pidfile"
 }
 
@@ -258,11 +266,23 @@ curl -fsSL "${base}/${proxy_tgz}" -o "${tmp}/${proxy_tgz}" || die "download fail
 curl -fsSL "${base}/checksums.txt" -o "${tmp}/checksums.txt" || die "download failed: checksums.txt"
 
 info "Verifying checksums..."
-# Match exactly the two archives we downloaded (anchored to the end of the line),
-# not every entry for this platform — so an unrelated future artifact in
+# One grep per archive, not an alternation. An alternation SUCCEEDS on a single
+# match, so a checksums.txt missing one entry — a truncated or partly-generated
+# release build — passed the guard, sha_check verified only the file that was
+# listed, and the UNVERIFIED binary was installed anyway. This is the one step
+# whose whole job is not to fail open.
+#
+# Matching is anchored to end-of-line so an unrelated future artifact in
 # checksums.txt can't make verification fail on a file we never fetched.
-grep -E "(${abctl_tgz}|${proxy_tgz})\$" "${tmp}/checksums.txt" > "${tmp}/checksums.filtered" \
-	|| die "no checksum entries for ${abctl_tgz} / ${proxy_tgz} in checksums.txt"
+: > "${tmp}/checksums.filtered"
+for archive in "${abctl_tgz}" "${proxy_tgz}"; do
+	grep -E "[[:space:]]\*?${archive}\$" "${tmp}/checksums.txt" >> "${tmp}/checksums.filtered" \
+		|| die "checksums.txt has no entry for ${archive} — refusing to install it unverified"
+done
+# Both entries present, and exactly the two we asked for.
+lines=$(wc -l < "${tmp}/checksums.filtered" | tr -d '[:space:]')
+[ "${lines}" = "2" ] \
+	|| die "expected 2 checksum entries, got ${lines} — refusing to install"
 ( cd "$tmp" && sha_check checksums.filtered ) || die "checksum verification failed"
 
 # --- extract + install ---
@@ -367,7 +387,7 @@ if [ -f "${local_cfg}" ]; then
 	info "    ${abctl_cmd} claude-code enable"
 	info ""
 	info "  Using Claude Code? Cut its token cost by pruning tools you never call:"
-	info "    ${abctl_cmd} tools scan --write ${local_cfg}"
+	info "    \"${abctl_cmd}\" tools scan --write \"${local_cfg}\""
 	info "    (proposes tools absent from your last 30 days of transcripts;"
 	info "     add --all to spare anything you have ever called; hot-reloaded)"
 	info ""
@@ -377,27 +397,43 @@ fi
 # stdin here is the script itself when piped, so it cannot be read for an answer.
 if [ -n "${WIRE_CLAUDE_CODE:-}" ]; then
 	info ""
-	if "${BIN_DIR}/abctl" claude-code enable; then
-		info ""
-		info "  Run Claude Code:   claude"
-		info "  Watch traffic:     ${abctl_cmd}"
-		info "  Undo:              ${abctl_cmd} claude-code disable"
-		info "  Stop Cortex:       kill \$(cat ${pidfile})"
-		info ""
-		exit 0
-	fi
-	# Declined, or no terminal to ask on. Not a failure — fall through to the
-	# manual instructions below.
-	info ""
-	info "  Claude Code left unchanged. To do it later:"
-	info "    ${abctl_cmd} claude-code enable"
-	info ""
+	set +e
+	"${BIN_DIR}/abctl" claude-code enable
+	cc_status=$?
+	set -e
+	case "${cc_status}" in
+		0)
+			info ""
+			info "  Run Claude Code:   claude"
+			info "  Watch traffic:     \"${abctl_cmd}\""
+			info "  Undo:              \"${abctl_cmd}\" claude-code disable"
+			info "  Stop Cortex:       pkill -f authbridge-proxy"
+			info ""
+			exit 0
+			;;
+		3)
+			# Declined, or no terminal to ask on. A normal outcome — fall through to
+			# the manual instructions below.
+			info ""
+			info "  Claude Code left unchanged. To do it later:"
+			info "    \"${abctl_cmd}\" claude-code enable"
+			info ""
+			;;
+		*)
+			# Anything else went wrong (a foreign HTTPS_PROXY, unparseable settings).
+			# Reporting that as "left unchanged" and exiting 0 would claim a success
+			# that did not happen.
+			die "abctl claude-code enable failed (exit ${cc_status}); Cortex is running but Claude Code is not configured for it"
+			;;
+	esac
 fi
-info "  Watch traffic:   ${abctl_cmd}"
+info "  Watch traffic:   \"${abctl_cmd}\""
 info "  Send traffic through it (e.g. Claude Code):"
 info "    HTTPS_PROXY=http://localhost:${DEMO_FORWARD_PORT} \\"
 info "      NODE_EXTRA_CA_CERTS=${ca_dir}/ca.crt \\"
 info "      CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1 claude"
 info ""
-info "  Stop it:         kill ${proxy_pid}   (or: kill \$(cat ${pidfile}))"
+# pkill -f, not `kill $(cat pidfile)`: a stale pidfile can name a recycled pid,
+# and nothing else on the machine is called authbridge-proxy.
+info "  Stop it:         kill ${proxy_pid}   (or: pkill -f authbridge-proxy)"
 info ""

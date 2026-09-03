@@ -36,7 +36,7 @@ decrypted and parsed live. No Kubernetes. macOS or Linux, amd64 or arm64.
 
 Its calls stream into `abctl`. Cortex only reads them — nothing is rewritten.
 
-Stop it with `kill $(cat ~/.cortex/proxy.pid)`. Undo step 1 with
+Stop it with `pkill -f authbridge-proxy`. Undo step 1 with
 `abctl claude-code disable`.
 
 **Cut token cost too:** Cortex can strip the tool definitions your agent never

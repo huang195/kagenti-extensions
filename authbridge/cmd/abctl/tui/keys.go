@@ -88,7 +88,7 @@ func (m *model) handleKey(msg tea.KeyMsg) tea.Cmd {
 			}
 			m.pickerErr = ""
 			m.loading = true
-			return connectLocalCmd(m.ctx, localEndpoint)
+			return connectLocalCmd(m.ctx, m.localEndpointOr())
 		case "r":
 			if m.loading {
 				return nil
@@ -502,7 +502,8 @@ func (m *model) helpView() string {
 	}
 	switch m.pane {
 	case paneNamespaces:
-		return "[↑↓/jk] nav  [↵] open  [l] localhost:9094  [r] reload  [?] keys  [q] quit"
+		return "[↑↓/jk] nav  [↵] open  [l] " + shortHost(m.localEndpointOr()) +
+			"  [r] reload  [?] keys  [q] quit"
 	case panePods:
 		return "[↑↓/jk] nav  [↵] connect  [Esc] back  [r] reload  [?] keys  [q] quit"
 	case paneSessions:

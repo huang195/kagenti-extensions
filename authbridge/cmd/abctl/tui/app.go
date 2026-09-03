@@ -71,12 +71,26 @@ const maxEventsPerSession = 1000
 // confirmation) stays in the footer.
 const flashDuration = 3 * time.Second
 
-// localEndpoint is the address `[l]` from the Namespaces pane connects
-// to: the session API's default port on the local host. Useful when the
-// operator already has their own `kubectl port-forward` running, when
-// abctl runs inside the mesh, or when the cluster's pod list isn't
-// visible to their kubeconfig but a tunnel is.
-const localEndpoint = "http://localhost:9094"
+// defaultLocalEndpoint is where `[l]` connects when nothing better is known:
+// the session API's in-cluster default port, reached through an existing
+// `kubectl port-forward`. Useful when abctl runs inside the mesh, or when the
+// cluster's pod list isn't visible to their kubeconfig but a tunnel is.
+//
+// A local install listens somewhere else entirely (47601 by default), so
+// RunOptions.LocalEndpoint overrides this with the address read from the
+// machine's own Cortex config. Hardcoding 9094 sent `[l]` to the wrong port on
+// every laptop.
+const defaultLocalEndpoint = "http://localhost:9094"
+
+// localEndpointOr returns the resolved local endpoint, falling back to the
+// in-cluster default. One accessor so `[l]`, the footer and the help overlay
+// cannot disagree about where the key goes.
+func (m *model) localEndpointOr() string {
+	if m.localEndpoint != "" {
+		return m.localEndpoint
+	}
+	return defaultLocalEndpoint
+}
 
 // localProbeTimeout bounds the pre-connect reachability check for `[l]`.
 // Without it, a dead localEndpoint would leave the operator in an empty
@@ -178,6 +192,9 @@ func withGen(gen int, c tea.Cmd) tea.Cmd {
 type model struct {
 	endpoint string
 	client   *apiclient.Client
+	// localEndpoint is what `[l]` connects to and what the footer and help
+	// overlay name. Resolved from the local Cortex config when there is one.
+	localEndpoint string
 
 	ctx    context.Context
 	cancel context.CancelFunc
@@ -1041,7 +1058,7 @@ func (m *model) paneView() string {
 		if m.namespaces != nil && len(m.namespaces) == 0 && m.pickerErr == "" {
 			body = styleHint.Render(
 				"No AuthBridge agents found in this cluster.\n" +
-					"Press [l] to connect to " + localEndpoint + " (an existing\n" +
+					"Press [l] to connect to " + m.localEndpointOr() + " (an existing\n" +
 					"port-forward), or use `abctl --endpoint http://...`.")
 		} else {
 			body = m.namespacesTbl.View()
@@ -1200,6 +1217,9 @@ type RunOptions struct {
 	Endpoint      string
 	Lister        cluster.Lister
 	PortForwarder cluster.PortForwarder
+	// LocalEndpoint overrides where `[l]` connects. Empty means
+	// defaultLocalEndpoint.
+	LocalEndpoint string
 }
 
 // Run starts the bubbletea program. See RunOptions for mode selection.
@@ -1214,6 +1234,7 @@ func Run(ctx context.Context, opts RunOptions) error {
 		}
 		m = newPickerModel(ctx, opts.Lister, opts.PortForwarder)
 	}
+	m.localEndpoint = opts.LocalEndpoint
 	defer func() {
 		if m.activePF != nil {
 			_ = m.activePF.Close()
@@ -1237,4 +1258,11 @@ func openEditorCmd(gen int, path string) tea.Cmd {
 	return tea.ExecProcess(c, func(err error) tea.Msg {
 		return editorExitedMsg{gen: gen, err: err}
 	})
+}
+
+// shortHost renders an endpoint for a cramped footer: "http://localhost:9094"
+// becomes "localhost:9094". Display only — never used to dial.
+func shortHost(endpoint string) string {
+	s := strings.TrimPrefix(endpoint, "http://")
+	return strings.TrimPrefix(s, "https://")
 }

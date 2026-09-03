@@ -42,7 +42,7 @@ func main() {
 	}
 
 	endpoint := flag.String("endpoint", "",
-		"AuthBridge session API URL (e.g. http://localhost:9094). When omitted, abctl opens a Namespaces → Pods picker.")
+		"AuthBridge session API URL (e.g. http://localhost:9094). When omitted, abctl connects to the Cortex on this machine if one is running, otherwise it opens a Namespaces → Pods picker.")
 	showVersion := flag.Bool("version", false, "print version and exit")
 	flag.Parse()
 
@@ -57,11 +57,33 @@ func main() {
 	// $TMPDIR bounded for users who edit often.
 	_ = edit.SweepStaleTempfiles()
 
+	// With no --endpoint, prefer a Cortex running on this machine. Before this,
+	// a bare `abctl` on a laptop demanded kubectl and opened a cluster picker,
+	// so the local install — the whole quickstart — needed
+	// `--endpoint http://localhost:47601` typed every time.
+	//
+	// Only when it is actually answering: a stale config from an install that is
+	// no longer running must not hijack abctl away from the picker for someone
+	// working against a cluster.
+	local := localSessionEndpoint()
+	if *endpoint == "" && localSessionAPIUp(local) {
+		*endpoint = local
+	}
+
 	// Friendly check: if picker mode and no kubectl, fail fast with a
 	// clear message instead of a stack trace later.
 	if *endpoint == "" {
 		if _, err := exec.LookPath("kubectl"); err != nil {
-			fmt.Fprintln(os.Stderr, "abctl: kubectl not found on PATH; install it or pass --endpoint http://...")
+			msg := "abctl: kubectl not found on PATH; install it or pass --endpoint http://..."
+			// Name the more likely cause first when there is a local install that
+			// simply is not running — "install kubectl" is unhelpful advice to
+			// someone who has never wanted a cluster.
+			if local != "" && !dialable(local) {
+				msg = "abctl: nothing is listening on " + local + " (from ~/.cortex/config.yaml).\n" +
+					"  Start it:  authbridge-proxy --config ~/.cortex/config.yaml &\n" +
+					"  Or pass --endpoint http://... , or install kubectl to browse a cluster."
+			}
+			fmt.Fprintln(os.Stderr, msg)
 			os.Exit(1)
 		}
 	}
@@ -75,7 +97,7 @@ func main() {
 		cancel()
 	}()
 
-	opts := tui.RunOptions{Endpoint: *endpoint}
+	opts := tui.RunOptions{Endpoint: *endpoint, LocalEndpoint: local}
 	if *endpoint == "" {
 		opts.Lister = cluster.NewLister()
 		opts.PortForwarder = cluster.NewPortForwarder()

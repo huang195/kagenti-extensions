@@ -66,8 +66,9 @@ func defaultCortexDir() (string, error) {
 // usual 8081/909x ports collide with common dev tools. The preset only fills
 // empty addresses, so these explicit values win — keep them in sync with the
 // ports the installer probes and prints (authbridge/install.sh). The
-// enforce-redirect transparent listener isn't used here (no iptables) and
-// main.go skips starting it under --local, so it needs no address.
+// enforce-redirect transparent listener isn't used here (no iptables); --local
+// skips it, and it is pinned anyway so that starting this same file with
+// --config cannot bind it on every interface.
 //
 // The YAML body is flush-left on purpose — a raw string literal preserves
 // leading whitespace, so indenting these lines in source would corrupt the YAML.
@@ -83,6 +84,11 @@ listener:
   # Without this the preset defaults health to ":9091" — every interface, and a
   # port common enough to collide with an unrelated service.
   health_addr: 127.0.0.1:47604
+  # --local skips the enforce-redirect transparent listener, but --config does
+  # not, and the troubleshooting docs tell people to start this same file with
+  # --config. Unpinned it would then bind ":8082" on every interface. Pinning it
+  # makes the config safe however it is launched.
+  transparent_proxy_addr: 127.0.0.1:47603
 stats:
   address: 127.0.0.1:47602
 tls_bridge:

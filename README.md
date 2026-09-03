@@ -25,7 +25,7 @@ decrypted and parsed live. No Kubernetes. macOS or Linux, amd64 or arm64.
 2. **Open the viewer** in another terminal:
 
    ```sh
-   abctl --endpoint http://localhost:47601
+   abctl
    ```
 
 3. **Run Claude Code:**

@@ -48,9 +48,9 @@ session. Two things move it, and neither is a defect:
 A single early turn can read ~24%, which is why a figure quoted from one request is
 not the number to plan with.
 
-Watch it live in `abctl` (`--endpoint http://localhost:47601`): the plugin pane's
-`tool-prune` → `Metrics`, and the per-request saving in the events timeline's
-`TOKENS / SAVED` column.
+Watch it live: run `abctl` (it finds the local proxy on its own), then the plugin
+pane's `tool-prune` → `Metrics`, and the per-request saving in the events
+timeline's `TOKENS / SAVED` column.
 
 ## Reading the dollar figure
 

@@ -378,7 +378,7 @@ if [ -n "${WIRE_CLAUDE_CODE:-}" ]; then
 	if "${BIN_DIR}/abctl" claude-code enable; then
 		info ""
 		info "  Run Claude Code:   claude"
-		info "  Watch traffic:     ${abctl_cmd} --endpoint http://localhost:${DEMO_SESSION_PORT}"
+		info "  Watch traffic:     ${abctl_cmd}"
 		info "  Undo:              ${abctl_cmd} claude-code disable"
 		info "  Stop Cortex:       kill \$(cat ${pidfile})"
 		info ""
@@ -391,7 +391,7 @@ if [ -n "${WIRE_CLAUDE_CODE:-}" ]; then
 	info "    ${abctl_cmd} claude-code enable"
 	info ""
 fi
-info "  Watch traffic:   ${abctl_cmd} --endpoint http://localhost:${DEMO_SESSION_PORT}"
+info "  Watch traffic:   ${abctl_cmd}"
 info "  Send traffic through it (e.g. Claude Code):"
 info "    HTTPS_PROXY=http://localhost:${DEMO_FORWARD_PORT} \\"
 info "      NODE_EXTRA_CA_CERTS=${ca_dir}/ca.crt \\"

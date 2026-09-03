@@ -27,6 +27,13 @@ name abctl does not recognise is never proposed for removal.
 `
 
 // runTools handles the `tools` subcommand. Returns the process exit code.
+// thinEvidenceTools is the number of distinct called tools below which the scan
+// warns that its proposal is aggressive. Chosen as a smell test, not a
+// threshold with meaning: a real session touches Read/Edit/Bash and more within
+// minutes, so fewer than this says "barely any history" rather than "these are
+// the tools I use".
+const thinEvidenceTools = 5
+
 func runTools(args []string, stdout, stderr io.Writer) int {
 	if len(args) == 0 || args[0] != "scan" {
 		fmt.Fprint(stderr, toolsUsage)
@@ -102,11 +109,32 @@ func runTools(args []string, stdout, stderr io.Writer) int {
 	if len(res.Called) == 0 {
 		fmt.Fprintln(stdout)
 		fmt.Fprint(stdout, res.YAMLBlock())
-		fmt.Fprintf(stderr, "\nabctl: not writing %s — the scan observed no tool calls at all in the\n"+
-			"last %d day(s), so it has no evidence for what you do not use. Use Claude Code\n"+
-			"for a while and re-run, widen the window with --days or --all, or paste the\n"+
-			"block above yourself once you have checked it.\n", *write, *days)
+		// Describe the window that actually ran, and only suggest widening when
+		// there is room to widen. Reporting "the last 30 day(s)" after --all was
+		// both false and unactionable — it advised --days, which --all rejects.
+		scope := fmt.Sprintf("the last %d day(s)", window)
+		advice := "Use Claude Code for a while and re-run, widen the window with --days or --all,"
+		if window <= toolscan.AllTime {
+			scope = "any of your transcripts"
+			advice = "Use Claude Code for a while and re-run,"
+		}
+		fmt.Fprintf(stderr, "\nabctl: not writing %s — the scan observed no tool calls in %s,\n"+
+			"so it has no evidence for what you do not use. %s\n"+
+			"or paste the block above yourself once you have checked it.\n",
+			*write, scope, advice)
 		return 1
+	}
+
+	// A single observed call clears the guard above and still proposes removing
+	// nearly everything, because "not called" is measured against whatever little
+	// was seen. The guard cannot be raised to an arbitrary N without blocking
+	// legitimate light users, so warn instead and name the two ways out. Thin
+	// evidence is a property of the input, not an error.
+	if len(res.Called) < thinEvidenceTools {
+		fmt.Fprintf(stderr, "\nabctl: thin evidence — only %d distinct tool(s) seen in %d transcript(s).\n"+
+			"  A short history makes this list aggressive: anything unseen counts as unused.\n"+
+			"  Consider --all, or check the list above before relying on it. Undo any name by\n"+
+			"  deleting it from remove: in the config.\n", len(res.Called), res.Files)
 	}
 
 	changed, err := toolscan.PatchConfig(*write, res.Candidates)

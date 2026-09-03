@@ -1,1 +1,10 @@
-exclude_plugin_a2aparser,exclude_plugin_ibac,exclude_plugin_inferenceparser,exclude_plugin_mcpparser,exclude_plugin_opa,exclude_plugin_sparc,exclude_plugin_tokenbroker,exclude_plugin_toolprune
+# The exclude_plugin_* tag set for the authbridge-lite build variant.
+# Read by ci.yaml, build.yaml, release-binaries.yaml and local-build-and-test.sh.
+# Format: comment lines start with #; everything else is concatenated with
+# whitespace removed, so the tag list may wrap across lines but must not contain
+# anything but tags and commas. Readers must reject an empty result: a missing
+# exclude_plugin_* tag compiles that plugin IN and only changes binary size, so
+# an empty file would silently ship a full binary as "lite".
+exclude_plugin_a2aparser,exclude_plugin_ibac,exclude_plugin_inferenceparser,
+exclude_plugin_mcpparser,exclude_plugin_opa,exclude_plugin_sparc,
+exclude_plugin_tokenbroker,exclude_plugin_toolprune

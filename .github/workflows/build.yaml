@@ -134,7 +134,13 @@ jobs:
         id: buildargs
         run: |
           if [[ "${{ matrix.image_config.name }}" == "authbridge-lite" ]]; then
-            TAGS="$(tr -d '[:space:]' < authbridge/cmd/authbridge-proxy/LITE_BUILD_TAGS)"
+            TAGS="$(grep -v '^[[:space:]]*#' authbridge/cmd/authbridge-proxy/LITE_BUILD_TAGS | tr -d '[:space:]')"
+            # exclude_plugin_* fails open: an empty list would push a full binary
+            # to the authbridge-lite tag.
+            if [[ -z "${TAGS}" ]]; then
+              echo "LITE_BUILD_TAGS produced no tags" >&2
+              exit 1
+            fi
             echo "args=GO_BUILD_TAGS=${TAGS}" >> "$GITHUB_OUTPUT"
           elif [[ "${{ matrix.image_config.name }}" == "authbridge-cpex" ]]; then
             VERSION="$(tr -d '[:space:]' < authbridge/cmd/authbridge-cpex/CPEX_FFI_VERSION)"

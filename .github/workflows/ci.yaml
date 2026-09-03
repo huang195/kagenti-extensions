@@ -124,7 +124,13 @@ jobs:
           # and image builds. It silently can: a missing exclude_plugin_* tag
           # compiles the plugin IN and only makes the binary bigger, so a stale
           # copy produces no error anywhere. working-directory is this module.
-          TAGS="$(tr -d '[:space:]' < LITE_BUILD_TAGS)"
+          TAGS="$(grep -v '^[[:space:]]*#' LITE_BUILD_TAGS | tr -d '[:space:]')"
+          # Fail loudly on an empty list: exclude_plugin_* fails OPEN, so an empty
+          # or malformed file would silently build a full binary and call it lite.
+          if [ -z "$TAGS" ]; then
+            echo "LITE_BUILD_TAGS produced no tags" >&2
+            exit 1
+          fi
           go build -v -tags "$TAGS" ./...
           go test -v -race -cover -tags "$TAGS" ./...
 

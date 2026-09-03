@@ -56,7 +56,10 @@ jobs:
           # local-build-and-test.sh. Drift here is invisible: a missing
           # exclude_plugin_* tag compiles the plugin in and only changes the
           # binary size, so nothing fails.
-          lite_tags="$(tr -d '[:space:]' < authbridge/cmd/authbridge-proxy/LITE_BUILD_TAGS)"
+          lite_tags="$(grep -v '^[[:space:]]*#' authbridge/cmd/authbridge-proxy/LITE_BUILD_TAGS | tr -d '[:space:]')"
+          # exclude_plugin_* fails open, so an empty list would publish a full
+          # binary named -lite. Refuse rather than ship that.
+          [ -n "${lite_tags}" ] || { echo "LITE_BUILD_TAGS produced no tags" >&2; exit 1; }
 
           declare -a proxy_variants=(
             ":"

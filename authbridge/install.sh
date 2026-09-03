@@ -314,7 +314,9 @@ info ""
 info "Starting Cortex in the background..."
 # 0700 on the Cortex directory: a CA private key is written beneath it.
 mkdir -p "$CORTEX_DIR" && chmod 700 "$CORTEX_DIR"
-mkdir -p "$ca_dir"
+# Deliberately NOT creating $ca_dir here. MkdirAll never tightens an existing
+# directory, so pre-creating it at the shell's umask defeated tlsbridge's 0700 —
+# the proxy creates it correctly on first start.
 log="${CORTEX_DIR}/proxy.log"
 pidfile="${CORTEX_DIR}/proxy.pid"
 nohup "$proxy" --local </dev/null >"$log" 2>&1 &

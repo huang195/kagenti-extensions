@@ -45,8 +45,9 @@ CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC into the "env" block of
 always match the running proxy. Afterwards, plain "claude" goes through Cortex.
 
 Only those three keys are added; every other setting, including any other env
-entry, is left exactly as it was. The previous file is copied to
-settings.json.bak first. disable removes only those three keys.
+entry, is left exactly as it was. The first run copies the original file to
+settings.json.bak and never overwrites that copy, so the pristine version
+survives later runs. disable removes only those three keys.
 
 Note: while enabled, Claude Code needs Cortex running — its requests go to the
 proxy address. "abctl claude-code disable" is the off switch.
@@ -150,7 +151,7 @@ func claudeCodeEnable(settingsPath, cortexCfgPath string, yes bool, stdout, stde
 		fmt.Fprintf(stderr, "abctl: %v\n", err)
 		return 1
 	}
-	env := envBlock(doc)
+	env := envStrings(doc)
 
 	// Refuse to overwrite a value the user set to something else — most likely a
 	// corporate proxy. Silently replacing it would break their network access and
@@ -162,6 +163,19 @@ func claudeCodeEnable(settingsPath, cortexCfgPath string, yes bool, stdout, stde
 				k, cur, settingsPath)
 			return 1
 		}
+	}
+
+	// The CA path is written whether or not the file exists, because enabling
+	// before the first start is legitimate — the proxy generates it on boot. But a
+	// NODE_EXTRA_CA_CERTS pointing at a missing file fails SILENTLY: requests keep
+	// working, every one tunnels through opaquely, and nothing is parsed. Say so
+	// now rather than let that be discovered later.
+	if _, serr := os.Stat(want[envCACerts]); serr != nil {
+		fmt.Fprintf(stdout, "Note: %s does not exist yet.\n"+
+			"  Cortex creates it on first start. Until then Claude Code cannot verify the\n"+
+			"  bridge and every request tunnels through unparsed — which looks like nothing\n"+
+			"  is wrong. Start Cortex, then check with: abctl claude-code status\n\n",
+			want[envCACerts])
 	}
 
 	var changes []string
@@ -186,10 +200,10 @@ func claudeCodeEnable(settingsPath, cortexCfgPath string, yes bool, stdout, stde
 		return 1
 	}
 
+	raw := envRaw(doc)
 	for _, k := range managedKeys {
-		env[k] = want[k]
+		raw[k] = want[k]
 	}
-	doc["env"] = env
 	if err := writeSettings(settingsPath, doc); err != nil {
 		fmt.Fprintf(stderr, "abctl: %v\n", err)
 		return 1
@@ -204,7 +218,7 @@ func claudeCodeDisable(settingsPath string, yes bool, stdout, stderr io.Writer) 
 		fmt.Fprintf(stderr, "abctl: %v\n", err)
 		return 1
 	}
-	env := envBlock(doc)
+	env := envStrings(doc)
 	var present []string
 	for _, k := range managedKeys {
 		if _, ok := env[k]; ok {
@@ -220,14 +234,13 @@ func claudeCodeDisable(settingsPath string, yes bool, stdout, stderr io.Writer) 
 		fmt.Fprintln(stdout, "Not changed.")
 		return 1
 	}
+	raw := envRaw(doc)
 	for _, k := range present {
-		delete(env, k)
+		delete(raw, k)
 	}
 	// Drop an env block we just emptied rather than leaving "env": {} behind.
-	if len(env) == 0 {
+	if len(raw) == 0 {
 		delete(doc, "env")
-	} else {
-		doc["env"] = env
 	}
 	if err := writeSettings(settingsPath, doc); err != nil {
 		fmt.Fprintf(stderr, "abctl: %v\n", err)
@@ -243,7 +256,7 @@ func claudeCodeStatus(settingsPath string, stdout io.Writer) int {
 		fmt.Fprintf(stdout, "not enabled (%v)\n", err)
 		return 0
 	}
-	env := envBlock(doc)
+	env := envStrings(doc)
 	set := 0
 	keys := make([]string, 0, len(managedKeys))
 	keys = append(keys, managedKeys...)
@@ -300,7 +313,24 @@ func readSettings(path string) (map[string]any, error) {
 	return doc, nil
 }
 
-func envBlock(doc map[string]any) map[string]string {
+// envRaw returns the env block as stored, creating it if absent. Callers mutate
+// this map in place rather than assigning a rebuilt one: a filtered copy dropped
+// every non-string value on write, so `"env": {"DEBUG": true}` silently
+// disappeared — contradicting this command's own promise that everything else is
+// left exactly as it was.
+func envRaw(doc map[string]any) map[string]any {
+	if raw, ok := doc["env"].(map[string]any); ok {
+		return raw
+	}
+	raw := map[string]any{}
+	doc["env"] = raw
+	return raw
+}
+
+// envStrings is a read-only view for comparison. Non-string values are absent
+// here by design — they are values we neither read nor write — but they survive
+// in the document because envRaw is what gets mutated.
+func envStrings(doc map[string]any) map[string]string {
 	out := map[string]string{}
 	raw, ok := doc["env"].(map[string]any)
 	if !ok {
@@ -322,9 +352,18 @@ func writeSettings(path string, doc map[string]any) error {
 		return err
 	}
 	b = append(b, '\n')
+	// Write the backup ONCE and never overwrite it. Overwriting on every call
+	// meant a second enable, or an enable/disable pair, replaced the pristine
+	// pre-Cortex file with one we had already edited — losing the only copy of
+	// settings the user actually wrote, on a file that commonly holds API tokens.
+	// A stale-but-original backup is worth more here than a fresh one of our own
+	// output.
 	if cur, rerr := os.ReadFile(path); rerr == nil { //nolint:gosec // operator-supplied path
-		if werr := os.WriteFile(path+".bak", cur, 0o600); werr != nil {
-			return fmt.Errorf("writing backup %s.bak: %w", path, werr)
+		bak := path + ".bak"
+		if _, serr := os.Stat(bak); os.IsNotExist(serr) {
+			if werr := os.WriteFile(bak, cur, 0o600); werr != nil {
+				return fmt.Errorf("writing backup %s: %w", bak, werr)
+			}
 		}
 	}
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {

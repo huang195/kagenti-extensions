@@ -255,3 +255,131 @@ func TestConfirmFrom_OnlyExplicitYesApplies(t *testing.T) {
 		}
 	}
 }
+
+// TestClaudeCodeEnable_KeepsNonStringEnvValues: the env block is typed
+// map[string]any in JSON, and a bool or number there is perfectly legal. An
+// earlier version read the block into map[string]string and assigned the filtered
+// copy back, so those entries vanished — while the help text promised every other
+// entry was left exactly as it was. The all-strings fixture above cannot catch it.
+func TestClaudeCodeEnable_KeepsNonStringEnvValues(t *testing.T) {
+	settings, cfg := fixture(t, `{
+	  "env": {
+	    "ANTHROPIC_AUTH_TOKEN": "sk-keep",
+	    "SOME_BOOL": true,
+	    "SOME_NUMBER": 42,
+	    "SOME_NULL": null,
+	    "SOME_LIST": ["a", "b"],
+	    "SOME_OBJECT": {"nested": "value"}
+	  }
+	}`)
+	var out, errb bytes.Buffer
+	if code := claudeCodeEnable(settings, cfg, true, &out, &errb); code != 0 {
+		t.Fatalf("exit %d: %s", code, errb.String())
+	}
+
+	b, err := os.ReadFile(settings)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var doc map[string]any
+	if err := json.Unmarshal(b, &doc); err != nil {
+		t.Fatal(err)
+	}
+	env, ok := doc["env"].(map[string]any)
+	if !ok {
+		t.Fatal("env block is gone")
+	}
+	for _, k := range []string{"SOME_BOOL", "SOME_NUMBER", "SOME_NULL", "SOME_LIST", "SOME_OBJECT"} {
+		if _, present := env[k]; !present {
+			t.Errorf("non-string env entry %q was dropped", k)
+		}
+	}
+	if v, _ := env["SOME_BOOL"].(bool); !v {
+		t.Errorf("SOME_BOOL = %#v, want true", env["SOME_BOOL"])
+	}
+	if env["ANTHROPIC_AUTH_TOKEN"] != "sk-keep" {
+		t.Error("token altered")
+	}
+
+	// And disable must not drop them either.
+	out.Reset()
+	if code := claudeCodeDisable(settings, true, &out, &errb); code != 0 {
+		t.Fatalf("disable: %s", errb.String())
+	}
+	b, _ = os.ReadFile(settings)
+	if err := json.Unmarshal(b, &doc); err != nil {
+		t.Fatal(err)
+	}
+	env, _ = doc["env"].(map[string]any)
+	for _, k := range []string{"SOME_BOOL", "SOME_LIST", "SOME_OBJECT"} {
+		if _, present := env[k]; !present {
+			t.Errorf("disable dropped non-string env entry %q", k)
+		}
+	}
+}
+
+// TestClaudeCodeEnable_BackupKeepsThePristineFile: the backup's whole value is
+// being the version the user wrote. Refreshing it on every call replaced it with
+// our own output after one enable/disable round trip.
+func TestClaudeCodeEnable_BackupKeepsThePristineFile(t *testing.T) {
+	settings, cfg := fixture(t, settingsWithSecret)
+	var out, errb bytes.Buffer
+
+	if code := claudeCodeEnable(settings, cfg, true, &out, &errb); code != 0 {
+		t.Fatalf("enable: %s", errb.String())
+	}
+	if code := claudeCodeDisable(settings, true, &out, &errb); code != 0 {
+		t.Fatalf("disable: %s", errb.String())
+	}
+	if code := claudeCodeEnable(settings, cfg, true, &out, &errb); code != 0 {
+		t.Fatalf("re-enable: %s", errb.String())
+	}
+
+	bak, err := os.ReadFile(settings + ".bak")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var doc map[string]any
+	if err := json.Unmarshal(bak, &doc); err != nil {
+		t.Fatal(err)
+	}
+	env, _ := doc["env"].(map[string]any)
+	for _, k := range managedKeys {
+		if _, present := env[k]; present {
+			t.Errorf("backup is not pristine: it contains %s, so the original was lost", k)
+		}
+	}
+	if env["ANTHROPIC_AUTH_TOKEN"] != "sk-do-not-touch" {
+		t.Error("backup lost the original token")
+	}
+}
+
+// TestClaudeCodeEnable_WarnsWhenCAMissing: writing NODE_EXTRA_CA_CERTS for a file
+// that does not exist fails silently at request time — traffic flows, nothing is
+// parsed, nothing looks broken. Say it at the moment we create that situation.
+func TestClaudeCodeEnable_WarnsWhenCAMissing(t *testing.T) {
+	settings, cfg := fixture(t, "{}")
+	var out, errb bytes.Buffer
+	if code := claudeCodeEnable(settings, cfg, true, &out, &errb); code != 0 {
+		t.Fatalf("exit %d: %s", code, errb.String())
+	}
+	if !strings.Contains(out.String(), "does not exist yet") {
+		t.Errorf("no warning about the missing CA file:\n%s", out.String())
+	}
+
+	// With the file present there should be no such note.
+	caPath := readEnv(t, settings)[envCACerts]
+	if err := os.MkdirAll(filepath.Dir(caPath), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(caPath, []byte("-----BEGIN CERTIFICATE-----\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	settings2, cfg2 := fixture(t, "{}")
+	// Point the second fixture's ca_dir at the file we just made.
+	body, _ := os.ReadFile(cfg2)
+	_ = os.WriteFile(cfg2, []byte(strings.Replace(string(body),
+		filepath.Dir(strings.TrimSuffix(caPath, filepath.Base(caPath))), "", 0)), 0o600)
+	out.Reset()
+	_ = claudeCodeEnable(settings2, cfg2, true, &out, &errb)
+}

@@ -96,8 +96,13 @@ echo "=========================================="
 echo "Building authbridge-lite (proxy build variant: auth-only plugins)"
 echo "=========================================="
 cd "${SCRIPT_DIR}/authbridge"
+# Single source of truth, shared with the three workflows. exclude_plugin_* fails
+# open — a missing tag compiles the plugin in and only changes binary size — so an
+# empty list must stop the build rather than quietly produce a full "lite" image.
+LITE_TAGS="$(grep -v '^[[:space:]]*#' cmd/authbridge-proxy/LITE_BUILD_TAGS | tr -d '[:space:]')"
+[ -n "${LITE_TAGS}" ] || { echo "LITE_BUILD_TAGS produced no tags" >&2; exit 1; }
 ${CONTAINER_RUNTIME} build -f cmd/authbridge-proxy/Dockerfile \
-  --build-arg GO_BUILD_TAGS="$(tr -d '[:space:]' < cmd/authbridge-proxy/LITE_BUILD_TAGS)" \
+  --build-arg GO_BUILD_TAGS="${LITE_TAGS}" \
   -t ghcr.io/rossoctl/cortex/authbridge-lite:local .
 load_image_to_kind ghcr.io/rossoctl/cortex/authbridge-lite:local
 echo "✅ Built and loaded: authbridge-lite:local"

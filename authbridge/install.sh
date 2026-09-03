@@ -315,7 +315,8 @@ local_cfg="${CORTEX_DIR}/config.yaml"
 if [ -f "${local_cfg}" ]; then
 	info "  Using Claude Code? Cut its token cost by pruning tools you never call:"
 	info "    ${abctl_cmd} tools scan --write ${local_cfg}"
-	info "    (proposes from your own transcripts; hot-reloaded, no restart)"
+	info "    (proposes tools absent from your last 30 days of transcripts;"
+	info "     add --all to spare anything you have ever called; hot-reloaded)"
 	info ""
 fi
 info "  Watch traffic:   ${abctl_cmd} --endpoint http://localhost:${DEMO_SESSION_PORT}"

@@ -56,6 +56,12 @@ jobs:
           lite_tags="${lite_tags},exclude_plugin_inferenceparser"
           lite_tags="${lite_tags},exclude_plugin_mcpparser,exclude_plugin_opa"
           lite_tags="${lite_tags},exclude_plugin_sparc,exclude_plugin_tokenbroker"
+          # tool-prune declares RequiresAny: [inference-parser], which lite
+          # excludes — so leaving it compiled in only adds bytes to a variant
+          # whose whole purpose is to be small, and any config naming it would
+          # fail Build. ci.yaml's lite tag set already excludes it; keep these
+          # two in step.
+          lite_tags="${lite_tags},exclude_plugin_toolprune"
           declare -a proxy_variants=(
             ":"
             "lite:${lite_tags}"

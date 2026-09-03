@@ -9,9 +9,28 @@
 # commands to watch traffic and point an agent at it, plus how to stop it.
 # macOS + Linux, amd64 + arm64. No cluster, Keycloak, or SPIRE needed.
 #
+# Modes (pass through the pipe with `sh -s --`, e.g.
+#   curl -fsSL ...install-demo.sh | sh -s -- --claude-code):
+#
+#   (default)        install, then start the throwaway demo in ./cortex-ca
+#   --claude-code    install, then set up a PERSISTENT config in ~/.cortex for
+#                    cutting Claude Code token cost: writes the config, fills the
+#                    tool-prune remove: list from your own transcripts, starts the
+#                    proxy, and prints the exact command to run Claude Code
+#                    through it. Safe to re-run; never overwrites an existing
+#                    config.
+#   --install-only   install the binaries and stop
+#
+# Flags exist because the env-var form has a trap: written
+# `VAR=1 curl ... | sh` the variable reaches curl, not sh, so the script runs
+# without it. `sh -s -- --flag` has no such failure mode. The env vars below
+# still work for backward compatibility.
+#
 # Environment:
 #   AUTHBRIDGE_VERSION=vX.Y.Z   install a specific release tag (default: newest)
-#   AUTHBRIDGE_INSTALL_ONLY=1   install the binaries but do not start the demo
+#   AUTHBRIDGE_INSTALL_ONLY=1   same as --install-only
+#   AUTHBRIDGE_SKIP_DOWNLOAD=1  use the already-installed binaries in ~/.local/bin
+#                               instead of downloading (re-run setup offline)
 set -eu
 
 REPO="rossoctl/cortex"
@@ -20,6 +39,25 @@ BIN_DIR="${HOME}/.local/bin"
 info() { printf '%s\n' "$*"; }
 warn() { printf 'warning: %s\n' "$*" >&2; }
 die()  { printf 'error: %s\n' "$*" >&2; exit 1; }
+
+# --- mode selection ---
+MODE=demo
+for arg in "$@"; do
+	case "$arg" in
+		--claude-code) MODE=claude-code ;;
+		--install-only) MODE=install-only ;;
+		--demo) MODE=demo ;;
+		-h | --help)
+			sed -n '2,30p' "$0" 2>/dev/null | sed 's/^# \{0,1\}//'
+			exit 0
+			;;
+		*) die "unknown option: $arg (try --claude-code, --install-only, or no argument)" ;;
+	esac
+done
+# Env form kept working; the flag wins if both are given.
+if [ "${AUTHBRIDGE_INSTALL_ONLY:-}" = "1" ] && [ "$MODE" = "demo" ]; then
+	MODE=install-only
+fi
 
 command -v curl >/dev/null 2>&1 || die "curl is required"
 command -v tar  >/dev/null 2>&1 || die "tar is required"
@@ -73,13 +111,22 @@ case "$arch" in
 esac
 
 # --- preflight: fail early (before downloading) if a demo port is taken ---
-if [ "${AUTHBRIDGE_INSTALL_ONLY:-}" != "1" ]; then
+if [ "$MODE" = "demo" ] || [ "$MODE" = "claude-code" ]; then
 	for p in "$DEMO_FORWARD_PORT" "$DEMO_SESSION_PORT" "$DEMO_STATS_PORT"; do
 		if port_in_use "$p"; then
 			die "port ${p} is already in use. Is the demo already running (see ./cortex-ca/demo.pid)? Otherwise free the port, or change the ports in ./cortex-ca/demo.yaml, then re-run."
 		fi
 	done
 fi
+
+# --- skip the download entirely when asked (offline re-run) ---
+if [ "${AUTHBRIDGE_SKIP_DOWNLOAD:-}" = "1" ]; then
+	for b in abctl authbridge-proxy; do
+		[ -x "${BIN_DIR}/${b}" ] || die "AUTHBRIDGE_SKIP_DOWNLOAD=1 but ${BIN_DIR}/${b} is missing"
+	done
+	version="(already installed)"
+	info "Using the binaries already in ${BIN_DIR}"
+else
 
 # --- resolve the release tag ---
 # `releases/latest` excludes prereleases, and the project ships prereleases, so
@@ -132,6 +179,7 @@ fi
 
 rm -rf "$tmp"
 trap - EXIT
+fi # end of download block
 
 # --- report ---
 proxy="${BIN_DIR}/authbridge-proxy"
@@ -151,9 +199,124 @@ case ":${PATH}:" in
 		;;
 esac
 
-if [ "${AUTHBRIDGE_INSTALL_ONLY:-}" = "1" ]; then
+if [ "$MODE" = "install-only" ]; then
 	info ""
 	info "Install-only mode. Start the demo with:  ${proxy_cmd} --demo"
+	info "Or set up persistent Claude Code cost-cutting:  re-run with --claude-code"
+	exit 0
+fi
+
+# --- claude-code mode: persistent setup under ~/.cortex, then start ---
+#
+# Separate from --demo because --demo regenerates ./cortex-ca/demo.yaml from a
+# built-in template on every start, so any edit (like the remove: list this mode
+# fills in) would be discarded on the next run. A config under ~/.cortex is
+# outside that path and survives.
+if [ "$MODE" = "claude-code" ]; then
+	cfg_dir="${HOME}/.cortex"
+	cfg="${cfg_dir}/config.yaml"
+	cc_ca_dir="${cfg_dir}/ca"
+	mkdir -p "$cfg_dir"
+
+	if [ -f "$cfg" ]; then
+		info ""
+		info "Keeping your existing config: ${cfg}"
+	else
+		info ""
+		info "Writing ${cfg}"
+		# ${HOME} is left literal on purpose: authbridge expands ${ENV_VAR} when it
+		# loads the file, so the config stays portable and needs no path rewriting
+		# after the fact.
+		cat >"$cfg" <<'YAML'
+# Cortex — cut Claude Code token cost by pruning unused tool definitions.
+# Written by install-demo.sh --claude-code. Safe to edit; the proxy hot-reloads.
+mode: proxy-sidecar
+listener:
+  roles: [forward]
+  forward_proxy_addr: 127.0.0.1:47600
+  session_api_addr: 127.0.0.1:47601
+  # The proxy-sidecar preset turns this listener on and refills it if emptied, so
+  # pin it to loopback on an uncommon port. Left at its ":8082" default it binds
+  # every interface — on a laptop that means the LAN — and collides with anything
+  # else already using 8082.
+  transparent_proxy_addr: 127.0.0.1:47603
+  # Same reasoning: the default ":9091" is every-interface and collides with any
+  # other authbridge on the host.
+  health_addr: 127.0.0.1:47604
+stats:
+  address: 127.0.0.1:47602
+tls_bridge:
+  mode: enabled
+  ca_dir: "${HOME}/.cortex/ca"
+  generate_ca: true
+pipeline:
+  outbound:
+    plugins:
+      - name: inference-parser
+      # tool-prune must stay last: it rewrites the request body, and body
+      # readers have to precede it to see the original bytes.
+      - name: tool-prune
+        config:
+          remove: []
+YAML
+	fi
+
+	# Fill the remove: list before starting, so no hot-reload round-trip is
+	# needed. This edits the config the user just asked us to set up, which is
+	# the point of the mode — but say so, and say how to undo it, because it is
+	# derived from their transcripts rather than chosen by them.
+	info ""
+	info "Choosing tools to prune from your own ~/.claude/projects transcripts..."
+	if "${BIN_DIR}/abctl" tools scan --write "$cfg"; then
+		info ""
+		info "Wrote the remove: list to ${cfg}"
+		info "To keep a tool, delete its name from that list — the proxy hot-reloads."
+	else
+		warn "the scan did not complete; the remove: list is empty, so tool-prune"
+		warn "will do nothing until you run:  ${abctl_cmd} tools scan --write ${cfg}"
+	fi
+
+	info ""
+	info "Starting the proxy in the background..."
+	cc_log="${cfg_dir}/proxy.log"
+	cc_pidfile="${cfg_dir}/proxy.pid"
+	nohup "$proxy" --config "$cfg" </dev/null >"$cc_log" 2>&1 &
+	cc_pid=$!
+	echo "$cc_pid" >"$cc_pidfile"
+
+	ready=0
+	i=0
+	while [ "$i" -lt 50 ]; do
+		if ! kill -0 "$cc_pid" 2>/dev/null; then
+			warn "the proxy exited during startup — last log lines:"
+			tail -n 15 "$cc_log" >&2 || true
+			die "proxy failed to start (full log: ${cc_log})"
+		fi
+		if port_in_use "$DEMO_FORWARD_PORT"; then
+			ready=1
+			break
+		fi
+		sleep 0.2
+		i=$((i + 1))
+	done
+
+	info ""
+	if [ "$ready" -eq 1 ]; then
+		info "Cortex is running (pid ${cc_pid}).   Logs: ${cc_log}"
+	else
+		info "Cortex started (pid ${cc_pid}); couldn't confirm it's listening (install lsof or nc to verify). Logs: ${cc_log}"
+	fi
+	info ""
+	info "Run Claude Code through it:"
+	info ""
+	info "    HTTPS_PROXY=http://localhost:${DEMO_FORWARD_PORT} \\"
+	info "      NODE_EXTRA_CA_CERTS=${cc_ca_dir}/ca.crt \\"
+	info "      CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1 claude"
+	info ""
+	info "  See what it saved:   ${abctl_cmd} --endpoint http://localhost:${DEMO_SESSION_PORT}"
+	info "                       (Plugin pane -> tool-prune -> Metrics)"
+	info "  Stop it:             kill \$(cat ${cc_pidfile})"
+	info ""
 	exit 0
 fi
 

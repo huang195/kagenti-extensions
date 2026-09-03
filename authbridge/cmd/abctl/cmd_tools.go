@@ -73,6 +73,23 @@ func runTools(args []string, stdout, stderr io.Writer) int {
 		return 0
 	}
 
+	// Refuse to write a list inferred from no evidence. With zero observed tool
+	// calls, "tools you have not called" degrades to "every tool I know about",
+	// and the proposal above is that list — including ones a session genuinely
+	// needs. This is not a rare edge: it is exactly a new install, where there is
+	// little or no transcript history yet, which is also when someone is most
+	// likely to accept the default. Printing the proposal is still useful; the
+	// refusal is only about writing it unattended.
+	if len(res.Called) == 0 {
+		fmt.Fprintln(stdout)
+		fmt.Fprint(stdout, res.YAMLBlock())
+		fmt.Fprintf(stderr, "\nabctl: not writing %s — the scan observed no tool calls at all in the\n"+
+			"last %d day(s), so it has no evidence for what you do not use. Use Claude Code\n"+
+			"for a while and re-run, widen the window with --days, or paste the block above\n"+
+			"yourself once you have checked it.\n", *write, *days)
+		return 1
+	}
+
 	changed, err := toolscan.PatchConfig(*write, res.Candidates)
 	if err != nil {
 		fmt.Fprintf(stderr, "abctl: %v\n", err)

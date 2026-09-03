@@ -44,12 +44,20 @@ ConfigMap contracts are documented in
 | 8081 | Forward proxy (outbound; HTTP_PROXY target) |
 | 8082 | Transparent egress listener (enforce-redirect capture target) |
 | 8083 | Transparent inbound listener (`inbound_interception: transparent`) |
-| 9091 | Health |
+| 9091 | Health (`listener.health_addr`) |
 | 9093 | Stats / config inspection |
 | 9094 | Session Events API (consumed by `abctl`) |
 
 `8080` and `8083` are mutually exclusive: `inbound_interception` picks one
 inbound mechanism, and the preset fills only that one's address.
+
+Every one of these is a `listener.*` address and can be overridden — which
+matters for running two proxies on one host, since a second instance on the
+default ports dies on a bind conflict. Local single-host setups typically pin
+them all to `127.0.0.1`; the defaults bind every interface, which is what
+Kubernetes probes and sidecar traffic need but not what a laptop wants. See
+[`docs/laptop-token-savings.md`](../docs/laptop-token-savings.md) for a worked
+loopback-only config.
 
 `8082` and `8083` are the iptables REDIRECT targets installed by
 [`proxy-init`](../proxy-init/) and must match its `TRANSPARENT_PORT` /

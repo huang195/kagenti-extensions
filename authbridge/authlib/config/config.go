@@ -429,6 +429,14 @@ type ListenerConfig struct {
 	// mode preset is ":9094". Set to empty string to disable the endpoint.
 	SessionAPIAddr string `yaml:"session_api_addr" json:"session_api_addr"`
 
+	// HealthAddr is the bind address for the liveness/readiness server
+	// (/healthz, /readyz). Every mode preset defaults it to ":9091", which is
+	// what Kubernetes probes expect. It is configurable because the literal was
+	// previously hardcoded, and two proxies on one host could therefore never
+	// coexist: the second died on a bind conflict. Local setups can pin it to
+	// loopback on another port; leaving it empty keeps the preset default.
+	HealthAddr string `yaml:"health_addr" json:"health_addr"`
+
 	// SkipHosts lists outbound destination host patterns whose traffic
 	// bypasses the plugin pipeline AND session recording entirely. The
 	// listener forwards matched requests as a transparent proxy without

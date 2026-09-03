@@ -52,15 +52,10 @@ jobs:
           # authbridge-proxy variants: "<suffix>:<build-tags>". Empty
           # suffix is the default plugin set. One variant per opt-in
           # plugin (or one combined "full") — never enumerate combos.
-          # Single source of truth shared with ci.yaml, build.yaml and
-          # local-build-and-test.sh. Drift here is invisible: a missing
-          # exclude_plugin_* tag compiles the plugin in and only changes the
-          # binary size, so nothing fails.
-          lite_tags="$(grep -v '^[[:space:]]*#' authbridge/cmd/authbridge-proxy/LITE_BUILD_TAGS | tr -d '[:space:]')"
-          # exclude_plugin_* fails open, so an empty list would publish a full
-          # binary named -lite. Refuse rather than ship that.
-          [ -n "${lite_tags}" ] || { echo "LITE_BUILD_TAGS produced no tags" >&2; exit 1; }
-
+          lite_tags="exclude_plugin_a2aparser,exclude_plugin_ibac"
+          lite_tags="${lite_tags},exclude_plugin_inferenceparser"
+          lite_tags="${lite_tags},exclude_plugin_mcpparser,exclude_plugin_opa"
+          lite_tags="${lite_tags},exclude_plugin_sparc,exclude_plugin_tokenbroker"
           declare -a proxy_variants=(
             ":"
             "lite:${lite_tags}"

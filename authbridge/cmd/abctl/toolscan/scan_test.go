@@ -208,3 +208,91 @@ func TestYAMLBlock(t *testing.T) {
 		t.Errorf("no candidates should render an empty list:\n%s", empty)
 	}
 }
+
+// TestScan_AllTimeIgnoresTheWindow: --all exists because reaching for it via a
+// huge --days is obscure, and because the honest answer to "scan everything" must
+// not be a magic number. A wider window can only find MORE tools in use, so it
+// proposes fewer for removal — the safe direction.
+func TestScan_AllTimeIgnoresTheWindow(t *testing.T) {
+	dir := t.TempDir()
+	now := time.Now()
+	writeTranscript(t, dir, "a.jsonl",
+		entry(now.AddDate(0, 0, -400), "toolu_old", "WebSearch"),
+		entry(now, "toolu_new", "WebFetch"),
+	)
+
+	windowed, err := Scan(dir, 30, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if contains(windowed.Called, "WebSearch") {
+		t.Error("30-day window counted a 400-day-old call as used")
+	}
+	if !contains(windowed.Candidates, "WebSearch") {
+		t.Error("WebSearch should be a removal candidate inside a 30-day window")
+	}
+
+	everything, err := Scan(dir, AllTime, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !contains(everything.Called, "WebSearch") {
+		t.Errorf("AllTime missed the 400-day-old call; Called = %v", everything.Called)
+	}
+	if contains(everything.Candidates, "WebSearch") {
+		t.Error("AllTime must not propose removing a tool it saw called")
+	}
+}
+
+// TestScan_LinesCountsOnlyInWindow guards a fix for a genuinely misleading
+// readout: Lines used to be incremented before the timestamp filter, so the
+// summary printed the same tool-call count for --days 1 and --days 36500 while
+// displaying "window N day(s)" beside it. That reads as a broken window.
+func TestScan_LinesCountsOnlyInWindow(t *testing.T) {
+	dir := t.TempDir()
+	now := time.Now()
+	writeTranscript(t, dir, "a.jsonl",
+		entry(now.AddDate(0, 0, -400), "toolu_old", "WebSearch"),
+		entry(now.AddDate(0, 0, -200), "toolu_mid", "WebFetch"),
+		entry(now, "toolu_new", "Bash"),
+	)
+
+	for _, tc := range []struct {
+		name string
+		days int
+		want int
+	}{
+		{"30 days: only the recent call", 30, 1},
+		{"300 days: two of three", 300, 2},
+		{"all history: every call", AllTime, 3},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			res, err := Scan(dir, tc.days, nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if res.Lines != tc.want {
+				t.Errorf("Lines = %d, want %d", res.Lines, tc.want)
+			}
+		})
+	}
+}
+
+// TestSummary_AllTimeSaysSoInsteadOfPrintingAZeroWindow: with no window there is
+// no meaningful "since" date, and printing "window 0 day(s) since 0001-01-01"
+// would look like a bug.
+func TestSummary_AllTimeSaysSoInsteadOfPrintingAZeroWindow(t *testing.T) {
+	dir := t.TempDir()
+	writeTranscript(t, dir, "a.jsonl", entry(time.Now(), "toolu_1", "Bash"))
+	res, err := Scan(dir, AllTime, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := res.Summary(AllTime)
+	if !strings.Contains(got, "all history") {
+		t.Errorf("summary does not say the scan was unbounded: %q", got)
+	}
+	if strings.Contains(got, "0001-01-01") || strings.Contains(got, "window 0 day") {
+		t.Errorf("summary leaked the zero window: %q", got)
+	}
+}

@@ -17,7 +17,7 @@ import (
 type Result struct {
 	Since      time.Time
 	Files      int
-	Lines      int      // lines that survived the literal prefilter
+	Lines      int      // tool-call lines inside the window
 	Called     []string // tool names actually invoked in the window, sorted
 	CallCounts map[string]int
 	Candidates []string // known, never called, not kept, not implied — sorted
@@ -51,8 +51,17 @@ func DefaultProjectsDir() (string, error) {
 // Tool calls are deduplicated by the unique tool_use block id: the same
 // assistant turn is rewritten into the transcript on every resume, so counting
 // raw occurrences would inflate heavily-resumed sessions.
+// AllTime, passed as days, disables the recency window: every tool call in every
+// transcript counts as used. It is the safe direction to err in — a wider window
+// can only ever find MORE tools in use, so it proposes fewer for removal.
+const AllTime = 0
+
 func Scan(dir string, days int, keep []string) (*Result, error) {
-	since := time.Now().AddDate(0, 0, -days)
+	// A zero Since means unbounded: no real timestamp is Before it.
+	var since time.Time
+	if days > 0 {
+		since = time.Now().AddDate(0, 0, -days)
+	}
 	res := &Result{Since: since, CallCounts: map[string]int{}}
 
 	seenIDs := make(map[string]struct{})
@@ -127,7 +136,6 @@ func scanFile(path string, since time.Time, seenIDs map[string]struct{}, res *Re
 		if !bytes.Contains(line, []byte(`"tool_use"`)) {
 			continue
 		}
-		res.Lines++
 
 		var e transcriptEntry
 		if err := json.Unmarshal(line, &e); err != nil {
@@ -136,6 +144,11 @@ func scanFile(path string, since time.Time, seenIDs map[string]struct{}, res *Re
 		if !e.Timestamp.IsZero() && e.Timestamp.Before(since) {
 			continue
 		}
+		// Counted AFTER the window filter. Counting before it meant the summary
+		// reported the same figure for --days 1 and --days 36500 while printing
+		// "window N day(s)" beside it, which reads as a broken window.
+		res.Lines++
+
 		for _, c := range e.Message.Content {
 			if c.Type != "tool_use" || c.Name == "" {
 				continue
@@ -179,8 +192,13 @@ func (r *Result) YAMLBlock() string {
 // Summary is the human-readable preamble printed above the YAML block.
 func (r *Result) Summary(days int) string {
 	var b strings.Builder
-	fmt.Fprintf(&b, "Scanned %d transcript(s), %d tool-call line(s), window %d day(s) since %s.\n",
-		r.Files, r.Lines, days, r.Since.Format("2006-01-02"))
+	if days <= AllTime {
+		fmt.Fprintf(&b, "Scanned %d transcript(s), %d tool-call line(s), all history (no window).\n",
+			r.Files, r.Lines)
+	} else {
+		fmt.Fprintf(&b, "Scanned %d transcript(s), %d tool-call line(s), window %d day(s) since %s.\n",
+			r.Files, r.Lines, days, r.Since.Format("2006-01-02"))
+	}
 	fmt.Fprintf(&b, "Called in window (%d): %s\n", len(r.Called), joinOrNone(r.Called))
 	fmt.Fprintf(&b, "Removal candidates (%d): %s\n", len(r.Candidates), joinOrNone(r.Candidates))
 	if len(r.Kept) > 0 {

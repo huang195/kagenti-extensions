@@ -21,6 +21,14 @@ That reads your `~/.claude/projects` transcripts, proposes the built-in tools yo
 have not called in 30 days, and writes them to `tool-prune`'s `remove:` list. The
 proxy hot-reloads, so it takes effect immediately — no restart.
 
+**Choosing the window.** `--days N` sets it; `--all` ignores it and counts every
+call in every transcript. Widening is the *cautious* direction: a longer window can
+only find more tools in use, so it proposes fewer for removal. Reach for `--all` if
+you have been using Claude Code for months and want nothing pruned that you have
+ever touched; keep the 30-day default to also drop tools you used once and moved on
+from. (`--days 0` is rejected rather than read as "everything" — a zero-width
+window finds nothing used, which would propose removing every tool it knows.)
+
 It prints what it chose before writing. Two guards on what it will propose:
 
 - It only ever proposes tools it **recognises**, and never one it has **seen you
@@ -93,8 +101,8 @@ merely a smaller saving. So:
   abctl tools scan --write ~/.cortex/config.yaml
   ```
 
-  The proxy hot-reloads; no restart. Use `--days N` to widen the window and
-  `--keep Name,Name` to protect specific tools.
+  The proxy hot-reloads; no restart. `--days N` / `--all` set the window (see
+  above) and `--keep Name,Name` protects specific tools by name.
 
 - **If a tool goes missing, delete its name from `remove:`** in
   `~/.cortex/config.yaml`. It comes back without a restart.

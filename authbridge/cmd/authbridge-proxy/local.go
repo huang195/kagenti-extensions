@@ -45,15 +45,15 @@ func defaultLocalDir() string {
 // the LLM / MCP / A2A parsers, so an agent's egress is decrypted and parsed.
 // Kept in sync with the root README.
 //
-// Every listener the demo uses is pinned to loopback on an uncommon port. This
-// runs on a laptop, so (a) a wildcard bind would expose an open forward proxy,
-// the stats endpoint, and the unauthenticated session API (which carries
-// decrypted bodies and any injected tokens) to the LAN, and (b) the usual
-// 8081/909x ports collide with common dev tools. The preset only fills empty
-// addresses, so these explicit values win — keep them in sync with the ports
-// the installer probes and prints (authbridge/install.sh). The
+// Every listener is pinned to loopback on an uncommon port. This runs on a
+// laptop, so (a) a wildcard bind would expose an open forward proxy, the stats
+// endpoint, the health endpoint, and the unauthenticated session API (which
+// carries decrypted bodies and any injected tokens) to the LAN, and (b) the
+// usual 8081/909x ports collide with common dev tools. The preset only fills
+// empty addresses, so these explicit values win — keep them in sync with the
+// ports the installer probes and prints (authbridge/install.sh). The
 // enforce-redirect transparent listener isn't used here (no iptables) and
-// main.go skips starting it under --local.
+// main.go skips starting it under --local, so it needs no address.
 //
 // The YAML body is flush-left on purpose — a raw string literal preserves
 // leading whitespace, so indenting these lines in source would corrupt the YAML.
@@ -66,6 +66,9 @@ listener:
   roles: [forward]
   forward_proxy_addr: 127.0.0.1:47600
   session_api_addr: 127.0.0.1:47601
+  # Without this the preset defaults health to ":9091" — every interface, and a
+  # port common enough to collide with an unrelated service.
+  health_addr: 127.0.0.1:47604
 stats:
   address: 127.0.0.1:47602
 tls_bridge:

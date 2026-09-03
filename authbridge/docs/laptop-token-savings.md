@@ -8,6 +8,10 @@ trim it without changing every client.
 
 macOS or Linux, amd64 or arm64. No cluster, Keycloak, or SPIRE.
 
+Coming from the [README quick start](../../README.md#quick-start-local-no-kubernetes)?
+Step 1 replaces the proxy it started — same ports, a config tuned for cost instead
+of observation — so there is nothing to stop first.
+
 ## 1. Install and start
 
 ```sh

@@ -114,8 +114,54 @@ case "$arch" in
 	*) die "unsupported architecture: $arch (supported: amd64, arm64)" ;;
 esac
 
+# stop_previous_cortex stops a Cortex a previous run of this script started, if
+# one is still holding the ports the next one needs.
+#
+# This is the path a new user actually walks: the README quickstart starts the
+# built-in local config, then the token-cost guide starts the --claude-code one.
+# Both use the same loopback ports, so without this the second command dies on a
+# bind conflict and the guide stops working at step 1.
+#
+# Deliberately narrow. It only kills a pid from OUR pidfile whose process name is
+# still authbridge-proxy — a pidfile can outlive its process and the number can
+# be recycled onto something unrelated. Anything else holding the port is left
+# alone and reported by the preflight below.
+stop_previous_cortex() {
+	STOPPED_LOCAL=""
+	for pidfile in "${CORTEX_DIR}/proxy.pid" "${CORTEX_DIR}/local/proxy.pid"; do
+		[ -f "$pidfile" ] || continue
+		pid=$(cat "$pidfile" 2>/dev/null) || continue
+		case "$pid" in
+			'' | *[!0-9]*) continue ;;
+		esac
+		kill -0 "$pid" 2>/dev/null || { rm -f "$pidfile"; continue; }
+		name=$(ps -p "$pid" -o comm= 2>/dev/null || true)
+		case "$name" in
+			*authbridge-proxy*) ;;
+			*) continue ;; # pid recycled onto something else — never touch it
+		esac
+		info "Stopping the Cortex started earlier (pid ${pid}); the new one replaces it."
+		[ "$pidfile" = "${CORTEX_DIR}/local/proxy.pid" ] && STOPPED_LOCAL=1
+		kill "$pid" 2>/dev/null || true
+		i=0
+		while [ "$i" -lt 25 ] && kill -0 "$pid" 2>/dev/null; do
+			sleep 0.2
+			i=$((i + 1))
+		done
+		rm -f "$pidfile"
+	done
+}
+
 # --- preflight: fail early (before downloading) if a listener port is taken ---
 if [ "$MODE" = "local" ] || [ "$MODE" = "claude-code" ]; then
+	# Clear our own previous instance first, so switching between the two setups
+	# is one command rather than a bind error and a manual kill.
+	for p in "$DEMO_FORWARD_PORT" "$DEMO_SESSION_PORT" "$DEMO_STATS_PORT"; do
+		if port_in_use "$p"; then
+			stop_previous_cortex
+			break
+		fi
+	done
 	for p in "$DEMO_FORWARD_PORT" "$DEMO_SESSION_PORT" "$DEMO_STATS_PORT"; do
 		if port_in_use "$p"; then
 			die "port ${p} is already in use. Is Cortex already running (see ${CORTEX_DIR}/local/proxy.pid or ${CORTEX_DIR}/proxy.pid)? Otherwise free the port, or change the ports in the config, then re-run."
@@ -312,6 +358,14 @@ YAML
 		info "Cortex started (pid ${cc_pid}); couldn't confirm it's listening (install lsof or nc to verify). Logs: ${cc_log}"
 	fi
 	info ""
+	if [ -n "${STOPPED_LOCAL:-}" ]; then
+		info "Note: this setup uses a different CA than the one you were running"
+		info "      (${cc_ca_dir}/ca.crt, not ${CORTEX_DIR}/local/ca.crt)."
+		info "      Restart Claude Code with the command below — a stale"
+		info "      NODE_EXTRA_CA_CERTS fails silently: traffic still flows, but"
+		info "      every request tunnels through opaquely and nothing is pruned."
+		info ""
+	fi
 	info "Run Claude Code through it:"
 	info ""
 	info "    HTTPS_PROXY=http://localhost:${DEMO_FORWARD_PORT} \\"

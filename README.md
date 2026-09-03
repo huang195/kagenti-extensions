@@ -14,7 +14,7 @@ It ships as a single binary; the identity and access layer is **AuthBridge**, an
 
 Watch an AI agent's traffic — its model, tool, and agent-to-agent calls — decrypted and parsed live on your laptop.
 
-1. **Install and start the demo** (macOS/Linux). Downloads two small binaries and starts the proxy in the background:
+1. **Install and start Cortex** (macOS/Linux). Downloads two small binaries and starts the proxy in the background:
 
    ```sh
    curl -fsSL https://raw.githubusercontent.com/rossoctl/cortex/main/authbridge/install.sh | sh
@@ -43,8 +43,11 @@ Already using Claude Code? Cortex can strip the tool definitions your agent neve
 calls out of every request. Measured over 99 requests in one session: **4–20% of
 the prompt billed per turn, median 6%**. The share is highest early — the removed
 bytes are a fixed size, so as the conversation grows they shrink as a fraction of
-it — and depends on how many of the tools you actually use. Four steps, about two minutes:
-**[Cut Claude Code token cost](./authbridge/docs/laptop-token-savings.md)**.
+it — and depends on how many of the tools you actually use. Three steps, about two
+minutes: **[Cut Claude Code token cost](./authbridge/docs/laptop-token-savings.md)**.
+
+If you already ran the quick start above, that guide takes over from it — its
+first command replaces the running proxy rather than colliding with it.
 
 ## Running on Kubernetes
 

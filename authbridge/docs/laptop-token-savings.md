@@ -1,16 +1,12 @@
 # Cut Claude Code token cost on your laptop
 
-Claude Code sends the full tool manifest on every turn — tens of thousands of
-tokens of JSON schema, billed each time — and the manifest is built by the client,
-so a proxy is the only place to trim it without changing every client. Cortex
-strips the definitions your agent never calls.
+Claude Code sends its whole tool manifest on every turn — tens of thousands of
+tokens of JSON schema, billed each time. Cortex strips the definitions you never
+call.
 
-Nothing here installs anything: the proxy comes from the
-[README quick start](../../README.md#quick-start-local-no-kubernetes), which sets
-it up to observe traffic without changing it, and points Claude Code at it so
-`claude` needs no environment variables. Pruning is a separate, opt-in step,
-because it rewrites requests and because the list it proposes is read from Claude
-Code's own transcripts — of no use if you drive a different agent.
+Needs the proxy from the
+[quick start](../../README.md#quick-start--claude-code-on-your-laptop) first. This
+step is opt-in because it rewrites requests.
 
 ## Turn it on
 
@@ -18,19 +14,14 @@ Code's own transcripts — of no use if you drive a different agent.
 abctl tools scan --write ~/.cortex/config.yaml
 ```
 
-That reads your `~/.claude/projects` transcripts, proposes the built-in tools you
-have not called in 30 days, and writes them to `tool-prune`'s `remove:` list. The
-proxy hot-reloads, so it takes effect immediately — no restart.
+It proposes the tools you have not called in 30 days, prints them, and writes them
+to `tool-prune`'s `remove:` list. Hot-reloaded — no restart.
 
-**Choosing the window.** `--days N` sets it; `--all` ignores it and counts every
-call in every transcript. Widening is the *cautious* direction: a longer window can
-only find more tools in use, so it proposes fewer for removal. Reach for `--all` if
-you have been using Claude Code for months and want nothing pruned that you have
-ever touched; keep the 30-day default to also drop tools you used once and moved on
-from. (`--days 0` is rejected rather than read as "everything" — a zero-width
-window finds nothing used, which would propose removing every tool it knows.)
+`--days N` changes the window, `--all` ignores it. **Wider is safer:** a longer
+window finds more tools in use, so it prunes less. Use `--all` to spare anything
+you have ever called.
 
-It prints what it chose before writing. Two guards on what it will propose:
+Two guards on what it proposes:
 
 - It only ever proposes tools it **recognises**, and never one it has **seen you
   call** — including tools implied by ones you called, so `BashOutput` survives if

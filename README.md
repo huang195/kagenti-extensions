@@ -10,54 +10,41 @@ Cortex delivers easy-to-use platform services to agentic workloads. It runs in a
 
 It ships as a single binary; the identity and access layer is **AuthBridge**, and the code lives under [`authbridge/`](./authbridge/).
 
-## Quick start (local, no Kubernetes)
+## Quick start — Claude Code on your laptop
 
-Watch an AI agent's traffic — its model, tool, and agent-to-agent calls —
-decrypted and parsed live on your laptop.
+See what Claude Code sends: model calls, tool calls, and agent-to-agent traffic,
+decrypted and parsed live. No Kubernetes. macOS or Linux, amd64 or arm64.
 
-1. **Install and start Cortex** (macOS/Linux). Downloads two small binaries,
-   writes one config under `~/.cortex`, and starts the proxy in the background:
+1. **Install, and point Claude Code at it** (asks first, changes nothing else):
 
    ```sh
    curl -fsSL https://raw.githubusercontent.com/rossoctl/cortex/main/authbridge/install.sh \
      | sh -s -- --claude-code
    ```
 
-   `--claude-code` then asks whether to point Claude Code at it, by adding three
-   variables to the `env` block of `~/.claude/settings.json`. It shows them first
-   and changes nothing else. Say no and everything still works — you just pass
-   the variables yourself. (`--install-only` installs the binaries and stops.)
-
-   Traffic is decrypted and parsed for viewing; nothing is rewritten.
-
-2. **Open the live viewer** in another terminal:
+2. **Open the viewer** in another terminal:
 
    ```sh
    abctl --endpoint http://localhost:47601
    ```
 
-3. **Run Claude Code normally:**
+3. **Run Claude Code:**
 
    ```sh
    claude
    ```
 
-   Its calls stream into `abctl`, decrypted and parsed. Stop the proxy with
-   `kill $(cat ~/.cortex/proxy.pid)`, and undo the settings change with
-   `abctl claude-code disable`.
+Its calls stream into `abctl`. Cortex only reads them — nothing is rewritten.
 
-   Settings rather than a shell export on purpose: Claude Code's supervisor is one
-   process shared by every terminal and inherits whichever shell started it first,
-   so an exported variable reaches background agents only by luck. If you would
-   rather not have it edit the file, `abctl claude-code status` shows what it would
-   set and you can pass those three variables to `claude` yourself.
+Stop it with `kill $(cat ~/.cortex/proxy.pid)`. Undo step 1 with
+`abctl claude-code disable`.
 
-**Using Claude Code?** One more command turns this into a cost saving — Cortex
-strips the tool definitions your agent never calls out of every request, worth
-**4–20% of the prompt billed per turn, median 6%** over 99 requests of one real
-session: **[Cut Claude Code token cost](./authbridge/docs/laptop-token-savings.md)**.
-It is opt-in because it rewrites requests, and because the tool list it proposes
-is read from Claude Code's own transcripts.
+**Cut token cost too:** Cortex can strip the tool definitions your agent never
+calls, worth **4–20% of the prompt per turn, median 6%** —
+**[one more command](./authbridge/docs/laptop-token-savings.md)**.
+
+Any agent works, not just Claude Code — point it at the proxy on
+`localhost:47600` and trust `~/.cortex/ca/ca.crt`.
 
 ## Running on Kubernetes
 

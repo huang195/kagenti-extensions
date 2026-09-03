@@ -10,16 +10,16 @@ import (
 	"github.com/rossoctl/cortex/authbridge/authlib/config"
 )
 
-// writeDemoConfig must produce a config file inside caDir that loads, presets,
+// writeBuiltinConfig must produce a config file inside caDir that loads, presets,
 // and validates cleanly and describes a forward-only TLS-bridge observe
-// pipeline pointed at that dir — otherwise --demo would fail at boot instead of
+// pipeline pointed at that dir — otherwise --local would fail at boot instead of
 // giving users a working, hot-reloadable local demo.
 func TestDemoConfig_WriteLoadsAndValidates(t *testing.T) {
 	caDir := t.TempDir()
 
-	p, err := writeDemoConfig(caDir)
+	p, err := writeBuiltinConfig(caDir)
 	if err != nil {
-		t.Fatalf("writeDemoConfig: %v", err)
+		t.Fatalf("writeBuiltinConfig: %v", err)
 	}
 	if filepath.Dir(p) != caDir {
 		t.Errorf("config written to %q, want inside %q", p, caDir)
@@ -47,7 +47,7 @@ func TestDemoConfig_WriteLoadsAndValidates(t *testing.T) {
 	// installer probes/prints, never a wildcard that would expose an open forward
 	// proxy, the stats endpoint, or the unauthenticated session API (decrypted
 	// bodies + injected tokens) to the LAN. The transparent listener isn't started
-	// under --demo (main.go gates it), so it's not asserted here.
+	// under --local (main.go gates it), so it's not asserted here.
 	if got := cfg.Listener.ForwardProxyAddr; got != "127.0.0.1:47600" {
 		t.Errorf("ForwardProxyAddr = %q, want loopback 127.0.0.1:47600", got)
 	}
@@ -105,11 +105,11 @@ func TestDemoConfig_WriteLoadsAndValidates(t *testing.T) {
 // TestWriteDemoConfig_PreservesAnExistingFile: the config's own header invites
 // editing it, and `abctl tools scan --write` writes a prune list into it. This
 // function also runs before any port is bound, so an unconditional overwrite
-// meant a --demo start that then failed on a port clash silently destroyed those
+// meant a --local start that then failed on a port clash silently destroyed those
 // edits — which is exactly how a populated remove list was lost in practice.
 func TestWriteDemoConfig_PreservesAnExistingFile(t *testing.T) {
 	caDir := t.TempDir()
-	p, err := writeDemoConfig(caDir)
+	p, err := writeBuiltinConfig(caDir)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -118,7 +118,7 @@ func TestWriteDemoConfig_PreservesAnExistingFile(t *testing.T) {
 		t.Fatal(err)
 	}
 	// A second call — a restart — must not clobber it.
-	p2, err := writeDemoConfig(caDir)
+	p2, err := writeBuiltinConfig(caDir)
 	if err != nil {
 		t.Fatal(err)
 	}

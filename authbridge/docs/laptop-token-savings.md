@@ -11,7 +11,7 @@ macOS or Linux, amd64 or arm64. No cluster, Keycloak, or SPIRE.
 ## 1. Install and start
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/rossoctl/cortex/main/authbridge/install-demo.sh \
+curl -fsSL https://raw.githubusercontent.com/rossoctl/cortex/main/authbridge/install.sh \
   | sh -s -- --claude-code
 ```
 
@@ -32,7 +32,7 @@ directory you happened to run a command from:
 │   └── tls.key     private key, never leaves this machine
 ├── proxy.log
 ├── proxy.pid
-└── demo/           only if you run the throwaway demo (see below)
+└── local/          only if you use the built-in config (see below)
 ```
 
 The directory is created `0700`, because the CA private key is under it. To
@@ -125,9 +125,11 @@ client-side settings (`--allowedTools`, disabling unused MCP servers).
 ## Other ways in
 
 - **Just the binaries**, no setup: `... | sh -s -- --install-only`.
-- **A throwaway demo** instead of a persistent config: `... | sh` with no
-  arguments. It keeps its own regenerated config and CA in `~/.cortex/demo`, so
-  it never touches the `config.yaml` above.
+- **A built-in config** instead of a tailored one: `... | sh` with no arguments,
+  or `authbridge-proxy --local`. It regenerates its own config and CA in
+  `~/.cortex/local`, so it never touches the `config.yaml` above. Use it to look
+  at decrypted agent traffic through the protocol parsers; use `--claude-code`
+  for cutting token cost.
 - **Pin a version**: `AUTHBRIDGE_VERSION=vX.Y.Z`.
 - **Re-run setup offline**, using the binaries you already have:
   `AUTHBRIDGE_SKIP_DOWNLOAD=1`.

@@ -79,7 +79,7 @@ func TestPatchConfig_TouchesOnlyTheRemoveLine(t *testing.T) {
 	}
 }
 
-// TestPatchConfig_Idempotent: install-demo.sh may run the scan on every
+// TestPatchConfig_Idempotent: install.sh may run the scan on every
 // invocation, so re-writing the same candidates must not report a change or
 // rewrite the file.
 func TestPatchConfig_Idempotent(t *testing.T) {
@@ -184,7 +184,7 @@ func TestPatchConfig_MissingFileExplainsWhere(t *testing.T) {
 		t.Fatal("expected an error")
 	}
 	msg := err.Error()
-	for _, want := range []string{"no config at", "/definitely-not-here/demo.yaml", "--demo", "absolute path", "ca_dir"} {
+	for _, want := range []string{"no config at", "/definitely-not-here/demo.yaml", "--local", "absolute path", "ca_dir"} {
 		if !strings.Contains(msg, want) {
 			t.Errorf("error should mention %q:\n%s", want, msg)
 		}

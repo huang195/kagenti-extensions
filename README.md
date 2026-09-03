@@ -17,7 +17,7 @@ Watch an AI agent's traffic — its model, tool, and agent-to-agent calls — de
 1. **Install and start the demo** (macOS/Linux). Downloads two small binaries and starts the proxy in the background:
 
    ```sh
-   curl -fsSL https://raw.githubusercontent.com/rossoctl/cortex/main/authbridge/install-demo.sh | sh
+   curl -fsSL https://raw.githubusercontent.com/rossoctl/cortex/main/authbridge/install.sh | sh
    ```
 
 2. **Open the live viewer** in another terminal:
@@ -26,11 +26,11 @@ Watch an AI agent's traffic — its model, tool, and agent-to-agent calls — de
    abctl --endpoint http://localhost:47601
    ```
 
-3. **Send an agent's traffic through it** — e.g. Claude Code, from the directory where you started the demo:
+3. **Send an agent's traffic through it** — e.g. Claude Code, from anywhere (the CA path is fixed, not relative to where you started):
 
    ```sh
    HTTPS_PROXY=http://localhost:47600 \
-     NODE_EXTRA_CA_CERTS="$HOME/.cortex/demo/ca.crt" \
+     NODE_EXTRA_CA_CERTS="$HOME/.cortex/local/ca.crt" \
      CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1 \
      claude
    ```

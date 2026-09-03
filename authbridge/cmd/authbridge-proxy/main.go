@@ -59,13 +59,13 @@ import (
 // via -ldflags "-X main.version=<tag>". Defaults to "dev" for local builds.
 var version = "dev"
 
-// demoMode is set by --demo. It suppresses listeners that only make sense with
+// localMode is set by --local. It suppresses listeners that only make sense with
 // iptables enforce-redirect: the demo uses cooperative HTTPS_PROXY, so nothing
 // is ever REDIRECTed to the transparent listener and opening it would just be
 // an idle port. The forward-role preset defaults transparent_proxy_addr to
 // :8082, and config can't unset it (the preset refills an empty value), so this
 // gate is the only way to keep the demo to the listeners it actually uses.
-var demoMode bool
+var localMode bool
 
 // spiffeProviderNeeded reports whether any configured feature actually consumes
 // the SPIFFE Provider: top-level mTLS (needs the X509Source on both listeners)
@@ -122,10 +122,15 @@ func pluginUsesSPIFFEIdentity(p config.PluginEntry) bool {
 func main() {
 	configPath := flag.String("config", "", "path to config YAML file")
 	showVersion := flag.Bool("version", false, "print version and exit")
-	demo := flag.Bool("demo", false,
-		"run a built-in local demo (forward-only TLS bridge + protocol parsers) that decrypts and parses an agent's egress; no --config, cluster, Keycloak, or SPIRE needed")
+	local := flag.Bool("local", false,
+		"run with a built-in local config (forward-only TLS bridge + protocol parsers) that decrypts and parses an agent's egress; no --config, cluster, Keycloak, or SPIRE needed")
+	// --demo is what this flag used to be called. Kept working so a command
+	// already in someone's shell history or notes does not start failing, and
+	// listed as a deprecated alias rather than hidden: an empty usage string
+	// still prints the flag, just with a blank description that reads like a bug.
+	demoDeprecated := flag.Bool("demo", false, "deprecated alias for -local")
 	caDir := flag.String("ca-dir", "",
-		"CA directory for --demo (auto-generated); defaults to ~/"+cortexDirName+"/"+demoDirName)
+		"CA directory for --local (auto-generated); defaults to ~/"+cortexDirName+"/"+localDirName)
 	flag.Parse()
 
 	if *showVersion {
@@ -136,44 +141,48 @@ func main() {
 	runtimeutil.InitLogging("authbridge-proxy")
 	runtimeutil.StartSignalToggle()
 
-	if *demo {
-		demoMode = true
+	if *demoDeprecated && !*local {
+		slog.Warn("--demo has been renamed to --local; it still works but will be removed",
+			"use", "--local")
+	}
+	if *local || *demoDeprecated {
+		localMode = true
 		if *configPath != "" {
-			log.Fatal("--demo and --config are mutually exclusive")
+			log.Fatal("--local and --config are mutually exclusive")
 		}
 		dir := *caDir
 		if dir == "" {
-			dir = defaultDemoCADir()
+			dir = defaultLocalDir()
 			// The default moved here from ./cortex-ca. Someone who still has that
 			// directory almost certainly has a client trusting the CA inside it,
 			// and pointing at a stale CA fails silently — every request tunnels
 			// through opaquely and no plugin sees a body. Name both paths.
-			if st, serr := os.Stat(demoCADirFallback); serr == nil && st.IsDir() {
-				slog.Warn("demo mode — the default CA directory is now under $HOME; the ./"+demoCADirFallback+" here is no longer used",
+			if st, serr := os.Stat(localDirFallback); serr == nil && st.IsDir() {
+				slog.Warn("local mode — the default CA directory is now under $HOME; the ./"+localDirFallback+" here is no longer used",
 					"now_using", dir,
-					"ignored", demoCADirFallback,
-					"hint", "update the client's CA path (e.g. NODE_EXTRA_CA_CERTS), or pass --ca-dir ./"+demoCADirFallback+" to keep the old location")
+					"ignored", localDirFallback,
+					"hint", "update the client's CA path (e.g. NODE_EXTRA_CA_CERTS), or pass --ca-dir ./"+localDirFallback+" to keep the old location")
 			}
 		}
 		abs, aerr := filepath.Abs(dir)
 		if aerr != nil {
-			log.Fatalf("--demo: resolving --ca-dir %q: %v", dir, aerr)
+			log.Fatalf("--local: resolving --ca-dir %q: %v", dir, aerr)
 		}
 		// Write the built-in config next to the CA and drive the normal
 		// file-based load + hot-reload path — so editing the file reloads live.
-		p, werr := writeDemoConfig(abs)
+		p, werr := writeBuiltinConfig(abs)
 		if werr != nil {
-			log.Fatalf("--demo: %v", werr)
+			log.Fatalf("--local: %v", werr)
 		}
 		*configPath = p
-		slog.Info("demo mode — wrote built-in config next to the CA; edit it to hot-reload",
+		slog.Info("local mode — wrote built-in config next to the CA; edit it to hot-reload",
 			"config", p, "ca_dir", abs)
 	} else if *caDir != "" {
-		log.Fatal("--ca-dir only applies with --demo")
+		log.Fatal("--ca-dir only applies with --local")
 	}
 
 	if *configPath == "" {
-		log.Fatal("--config is required (or use --demo for the local demo)")
+		log.Fatal("--config is required (or use --local for a built-in local config)")
 	}
 
 	// Build the SPIFFE Provider when the spiffe block is configured. The
@@ -412,9 +421,9 @@ func main() {
 				log.Fatalf("creating transparent inbound proxy: %v", rerr)
 			}
 			rpSrv.Shared = sharedStore
-			// Skipped in --demo: there is no iptables there, so nothing would ever
+			// Skipped in --local: there is no iptables there, so nothing would ever
 			// be REDIRECTed to the listener and every request would fail closed.
-			if demoMode {
+			if localMode {
 				slog.Warn("demo mode: transparent inbound listener not started (no iptables to REDIRECT to it)")
 			} else {
 				rpHTTP, rerr := runtimeutil.StartTransparentInboundServer("transparent-inbound", rpSrv, cfg.Listener.TransparentInboundAddr)
@@ -466,8 +475,8 @@ func main() {
 		// forward proxy's outbound pipeline via HandleTransparentConn, so explicit
 		// HTTP_PROXY egress and iptables-REDIRECTed bypass egress are gated and
 		// tunnelled identically. Closed explicitly on shutdown (not an *http.Server).
-		// Skipped in --demo: no iptables there, so nothing is ever REDIRECTed to it.
-		if !demoMode {
+		// Skipped in --local: no iptables there, so nothing is ever REDIRECTed to it.
+		if !localMode {
 			transparentLn = startTransparentProxy(fpSrv, cfg.Listener.TransparentProxyAddr)
 		}
 	}
@@ -569,10 +578,13 @@ func startTransparentProxy(fp *forwardproxy.Server, addr string) *net.TCPListene
 	return ln
 }
 
-// caTrustPath returns the absolute path of the CA clients must trust. Absolute
-// because --demo anchors the CA to its launch directory, so a relative path in
-// a log line is only correct for someone standing in that same directory —
-// which is exactly how the trust anchor gets mismatched.
+// caTrustPath returns the absolute path of the CA clients must trust.
+//
+// Absolute because a client is configured with this path (NODE_EXTRA_CA_CERTS
+// and friends) and a mismatched trust anchor fails silently — every request
+// tunnels through opaquely and no plugin sees a body. --local now resolves under
+// $HOME rather than the launch directory, which removes most of the ways that
+// happened, but --ca-dir still accepts a relative path.
 func caTrustPath(caDir string) string {
 	p := filepath.Join(caDir, "ca.crt")
 	if abs, err := filepath.Abs(p); err == nil {

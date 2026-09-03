@@ -12,16 +12,19 @@ import (
 // scattered into whichever directory each command happened to run from.
 const (
 	cortexDirName = ".cortex"
-	// demoDirName keeps --demo's throwaway state out of the persistent config's
-	// way. --demo regenerates its config, so it must not share a directory with
-	// the config a user maintains by hand.
-	demoDirName = "demo"
-	// demoCADirFallback is used only when the home directory cannot be
+	// localDirName keeps --local's regenerated state out of the persistent
+	// config's way. --local rewrites its config from the built-in preset, so it
+	// must not share a directory with a config a user maintains by hand.
+	localDirName = "local"
+	// localConfigName matches the persistent config's filename, so there is one
+	// name to know regardless of which mode wrote it.
+	localConfigName = "config.yaml"
+	// localDirFallback is used only when the home directory cannot be
 	// determined, which is the historical cwd-relative behaviour.
-	demoCADirFallback = "cortex-ca"
+	localDirFallback = "cortex-ca"
 )
 
-// defaultDemoCADir returns the directory --demo works in: ~/.cortex/demo, or
+// defaultLocalDir returns the directory --local works in: ~/.cortex/local, or
 // ./cortex-ca if there is no resolvable home directory.
 //
 // This used to be cwd-relative unconditionally, on the reasoning that no
@@ -29,15 +32,15 @@ const (
 // satisfies that while keeping the private key in one predictable place — and
 // the cwd default had a real cost: it dropped a CA and private key into
 // whatever directory the demo was started from, including checkouts.
-func defaultDemoCADir() string {
+func defaultLocalDir() string {
 	home, err := os.UserHomeDir()
 	if err != nil || home == "" {
-		return demoCADirFallback
+		return localDirFallback
 	}
-	return filepath.Join(home, cortexDirName, demoDirName)
+	return filepath.Join(home, cortexDirName, localDirName)
 }
 
-// demoConfigYAML returns the built-in --demo config with caDir interpolated: a
+// builtinConfigYAML returns the built-in --local config with caDir interpolated: a
 // forward-only proxy with the TLS bridge on (auto-generated CA in caDir) and
 // the LLM / MCP / A2A parsers, so an agent's egress is decrypted and parsed.
 // Kept in sync with the root README.
@@ -48,14 +51,14 @@ func defaultDemoCADir() string {
 // decrypted bodies and any injected tokens) to the LAN, and (b) the usual
 // 8081/909x ports collide with common dev tools. The preset only fills empty
 // addresses, so these explicit values win — keep them in sync with the ports
-// the installer probes and prints (authbridge/install-demo.sh). The
+// the installer probes and prints (authbridge/install.sh). The
 // enforce-redirect transparent listener isn't used here (no iptables) and
-// main.go skips starting it under --demo.
+// main.go skips starting it under --local.
 //
 // The YAML body is flush-left on purpose — a raw string literal preserves
 // leading whitespace, so indenting these lines in source would corrupt the YAML.
-func demoConfigYAML(caDir string) string {
-	return `# Built-in config for: authbridge-proxy --demo
+func builtinConfigYAML(caDir string) string {
+	return `# Built-in config for: authbridge-proxy --local
 # Forward-only proxy + TLS bridge (auto-generated CA) + LLM/MCP/A2A parsers.
 # The running proxy watches this file — edit it to hot-reload.
 mode: proxy-sidecar
@@ -96,22 +99,22 @@ pipeline:
 `
 }
 
-// writeDemoConfig ensures the built-in --demo config exists next to the CA (in
-// caDir) and returns its path, so --demo reuses the normal file-based load +
+// writeBuiltinConfig ensures the built-in --local config exists next to the CA (in
+// caDir) and returns its path, so --local reuses the normal file-based load +
 // hot-reload path. caDir is caller-resolved (cwd-relative by default, or
 // --ca-dir); no absolute path is baked into the binary.
 //
 // An existing file is KEPT, not overwritten. The config's own header invites
 // editing it, and `abctl tools scan --write` writes a prune list into it — and
 // this function runs before any port is bound, so an unconditional write meant
-// that even a --demo start which then failed on a port clash silently destroyed
+// that even a --local start which then failed on a port clash silently destroyed
 // those edits. Delete the file to regenerate the preset.
-func writeDemoConfig(caDir string) (string, error) {
-	// 0700: this directory holds the demo CA's private key.
+func writeBuiltinConfig(caDir string) (string, error) {
+	// 0700: this directory holds the local CA's private key.
 	if err := os.MkdirAll(caDir, 0o700); err != nil {
 		return "", err
 	}
-	path := filepath.Join(caDir, "demo.yaml")
+	path := filepath.Join(caDir, localConfigName)
 	if _, err := os.Stat(path); err == nil {
 		slog.Info("demo mode — keeping the existing config (edits and any prune list are preserved)",
 			"path", path, "hint", "delete it to regenerate the built-in preset")
@@ -119,7 +122,7 @@ func writeDemoConfig(caDir string) (string, error) {
 	} else if !errors.Is(err, os.ErrNotExist) {
 		return "", err
 	}
-	if err := os.WriteFile(path, []byte(demoConfigYAML(caDir)), 0o644); err != nil {
+	if err := os.WriteFile(path, []byte(builtinConfigYAML(caDir)), 0o644); err != nil {
 		return "", err
 	}
 	return path, nil

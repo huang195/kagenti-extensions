@@ -5,9 +5,33 @@ tokens of JSON schema, billed each time — and the manifest is built by the cli
 so a proxy is the only place to trim it without changing every client. Cortex
 strips the definitions your agent never calls.
 
-**Setup is the [README quick start](../../README.md#quick-start-local-no-kubernetes)** —
-one command, and it fills the prune list for you. This page is what that gets you
-and how to tune it; there is nothing extra to install.
+Nothing here installs anything: the proxy comes from the
+[README quick start](../../README.md#quick-start-local-no-kubernetes), which sets
+it up to observe traffic without changing it. Pruning is a separate, opt-in step,
+because it rewrites requests and because the list it proposes is read from Claude
+Code's own transcripts — of no use if you drive a different agent.
+
+## Turn it on
+
+```sh
+abctl tools scan --write ~/.cortex/config.yaml
+```
+
+That reads your `~/.claude/projects` transcripts, proposes the built-in tools you
+have not called in 30 days, and writes them to `tool-prune`'s `remove:` list. The
+proxy hot-reloads, so it takes effect immediately — no restart.
+
+It prints what it chose before writing. Two guards on what it will propose:
+
+- It only ever proposes tools it **recognises**, and never one it has **seen you
+  call** — including tools implied by ones you called, so `BashOutput` survives if
+  you have used background `Bash`.
+- It **refuses to write at all** if it saw no tool calls to reason from. With no
+  history, "tools you have not called" would be every tool it knows, which is a
+  guess rather than a measurement.
+
+To undo: delete names from `remove:` in `~/.cortex/config.yaml`, or empty the list
+to disable pruning entirely. Either way the proxy reloads without a restart.
 
 ## What to expect
 
@@ -58,11 +82,7 @@ Full reference, including how to measure your own from a gateway's cost headers:
 
 ## Keeping the prune list honest
 
-The scan proposes tools you have not called in 30 days. It only ever proposes tools
-it recognises, never one it has seen you call, and it refuses to write a list at
-all if it saw no tool calls to reason from.
-
-**What it cannot know is the future.** It reports what you have not used, not what
+**What the scan cannot know is the future.** It reports what you have not used, not what
 you will not need. If you start work that needs a pruned tool, its definition is
 gone from the request and the model cannot call it — a functional failure, not
 merely a smaller saving. So:
@@ -99,9 +119,9 @@ client-side settings (`--allowedTools`, disabling unused MCP servers).
   the bridge CA. `NODE_EXTRA_CA_CERTS` must point at `~/.cortex/ca/ca.crt`,
   expanded to an absolute path. The proxy also warns about this in
   `~/.cortex/proxy.log` after a few requests, naming the path it expects.
-- **`tool-prune` shows `skip`, never `modify`** — the remove list is empty. Run the
-  scan above; if it refuses, you have no transcript history for it to reason from
-  yet.
+- **`tool-prune` shows `skip`, never `modify`** — expected until you opt in: the
+  remove list ships empty. Run the scan above. If it refuses, you have no
+  transcript history for it to reason from yet.
 - **The proxy won't start** — read `~/.cortex/proxy.log`; a port conflict is logged
   at `ERROR`. Every listener is pinned to loopback on 47600–47604, so a clash
   usually means Cortex is already running (`kill $(cat ~/.cortex/proxy.pid)`).

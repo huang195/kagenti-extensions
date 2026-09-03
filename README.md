@@ -13,8 +13,7 @@ It ships as a single binary; the identity and access layer is **AuthBridge**, an
 ## Quick start (local, no Kubernetes)
 
 Watch an AI agent's traffic — its model, tool, and agent-to-agent calls —
-decrypted and parsed live on your laptop, and cut what it spends on unused tool
-definitions.
+decrypted and parsed live on your laptop.
 
 1. **Install and start Cortex** (macOS/Linux). Downloads two small binaries,
    writes one config under `~/.cortex`, and starts the proxy in the background:
@@ -23,9 +22,7 @@ definitions.
    curl -fsSL https://raw.githubusercontent.com/rossoctl/cortex/main/authbridge/install.sh | sh
    ```
 
-   It also fills in the list of tool definitions to strip from outbound requests,
-   read from your own Claude Code transcripts — that is the cost saving, and it
-   prints exactly what it chose. Add `--no-prune` to skip it, or
+   Traffic is decrypted and parsed for viewing; nothing is rewritten. Add
    `--install-only` for just the binaries.
 
 2. **Open the live viewer** in another terminal:
@@ -47,10 +44,12 @@ definitions.
    with the paths already filled in. Stop the proxy with
    `kill $(cat ~/.cortex/proxy.pid)`.
 
-**What the token saving comes to, and how to tune it:**
-**[Cut Claude Code token cost](./authbridge/docs/laptop-token-savings.md)**.
-Measured over 99 requests in one session: **4–20% of the prompt billed per turn,
-median 6%**.
+**Using Claude Code?** One more command turns this into a cost saving — Cortex
+strips the tool definitions your agent never calls out of every request, worth
+**4–20% of the prompt billed per turn, median 6%** over 99 requests of one real
+session: **[Cut Claude Code token cost](./authbridge/docs/laptop-token-savings.md)**.
+It is opt-in because it rewrites requests, and because the tool list it proposes
+is read from Claude Code's own transcripts.
 
 ## Running on Kubernetes
 

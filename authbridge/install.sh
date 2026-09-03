@@ -9,15 +9,15 @@
 # commands to watch traffic and point an agent at it, plus how to stop it.
 # macOS + Linux, amd64 + arm64. No cluster, Keycloak, or SPIRE needed.
 #
-# By default it installs, starts Cortex with its built-in config in ~/.cortex,
-# fills in tool-prune's remove list from your own transcripts, and prints the
-# command to send an agent through it.
+# It installs, starts Cortex with its built-in config in ~/.cortex, and prints the
+# command to send an agent through it. Traffic is decrypted and parsed for viewing;
+# nothing is rewritten. Cutting Claude Code's token cost is one opt-in command
+# afterwards, printed at the end.
 #
 # Options (pass through the pipe with `sh -s --`, e.g.
 #   curl -fsSL ...install.sh | sh -s -- --install-only):
 #
 #   --install-only   install the binaries and stop
-#   --no-prune       set up and start, but leave tool-prune's list empty
 #
 # There is deliberately only one config. It carries the parsers AND tool-prune,
 # and the proxy preserves edits to it, so a second "cost-optimised" config had
@@ -52,11 +52,9 @@ die()  { printf 'error: %s\n' "$*" >&2; exit 1; }
 
 # --- mode selection ---
 MODE=local
-PRUNE=1
 for arg in "$@"; do
 	case "$arg" in
 		--install-only) MODE=install-only ;;
-		--no-prune) PRUNE="" ;;
 		# --local is the default; accepted so writing it out explicitly works, and
 		# so it mirrors the proxy flag of the same name.
 		--local) MODE=local ;;
@@ -64,7 +62,7 @@ for arg in "$@"; do
 			sed -n '2,30p' "$0" 2>/dev/null | sed 's/^# \{0,1\}//'
 			exit 0
 			;;
-		*) die "unknown option: $arg (try --install-only, --no-prune, or no argument)" ;;
+		*) die "unknown option: $arg (try --install-only, --local, or no argument)" ;;
 	esac
 done
 # Env form kept working; the flag wins if both are given.
@@ -305,29 +303,19 @@ else
 fi
 info ""
 
-# tool-prune ships inert: the remove list is empty, so it does nothing until a
-# name is added. Fill it now — that is the whole point of installing this — and
-# say so plainly, because it is derived from the user's transcripts rather than
-# chosen by them. The config is hot-reloaded, so this needs no restart.
+# tool-prune is in the config but INERT: its remove list is empty, so it does
+# nothing until a name is added. That is deliberate for an install.
 #
-# `abctl tools scan` refuses to write anything when it saw no tool calls to reason
-# from, which is what makes doing this unattended safe: a brand-new install with
-# no history gets an empty list and a message, not a guess.
+# Filling it here would mean a quickstart whose job is to *observe* traffic
+# silently starts *rewriting* it. It is also Claude-Code-specific — the scan reads
+# ~/.claude/projects — so for anyone driving a different agent it would be a
+# mutation with no upside. Opting in is one command, and it belongs to the person
+# who knows whether they want it.
 local_cfg="${CORTEX_DIR}/config.yaml"
-if [ -n "${PRUNE:-}" ] && [ -f "${local_cfg}" ]; then
-	info "Choosing unused tools to prune from your own ~/.claude/projects transcripts..."
-	if "${BIN_DIR}/abctl" tools scan --write "${local_cfg}"; then
-		info ""
-		info "To keep a tool, delete its name from the remove: list in ${local_cfg}."
-	else
-		info ""
-		info "  Nothing pruned yet. Once you have used Claude Code for a while:"
-		info "    ${abctl_cmd} tools scan --write ${local_cfg}"
-	fi
-	info ""
-elif [ -f "${local_cfg}" ]; then
-	info "  Fill the prune list when you are ready (hot-reloaded, no restart):"
+if [ -f "${local_cfg}" ]; then
+	info "  Using Claude Code? Cut its token cost by pruning tools you never call:"
 	info "    ${abctl_cmd} tools scan --write ${local_cfg}"
+	info "    (proposes from your own transcripts; hot-reloaded, no restart)"
 	info ""
 fi
 info "  Watch traffic:   ${abctl_cmd} --endpoint http://localhost:${DEMO_SESSION_PORT}"

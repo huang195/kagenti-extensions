@@ -31,7 +31,50 @@ const (
 	envNoTelem   = "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC"
 	settingsRel  = ".claude/settings.json"
 	cortexCfgRel = ".cortex/config.yaml"
+	// stateRel records what each managed key looked like BEFORE enable, so disable
+	// can put it back. Without it, disable deleted every managed key it found —
+	// including one the user had set themselves, which is indistinguishable by
+	// value (their CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1 is byte-identical to
+	// ours). Kept outside ~/.claude so this command's bookkeeping never appears in
+	// a file Claude Code owns.
+	stateRel = ".cortex/claude-code-state.json"
 )
+
+// managedState is the ownership record. A nil entry means the key was absent
+// before enable, so disable deletes it; a non-nil entry is the value to restore.
+type managedState struct {
+	Settings string             `json:"settings"`
+	Prior    map[string]*string `json:"prior"`
+}
+
+func readState(path string) *managedState {
+	b, err := os.ReadFile(path) //nolint:gosec // operator-supplied path
+	if err != nil {
+		return nil
+	}
+	var st managedState
+	if err := json.Unmarshal(b, &st); err != nil || st.Prior == nil {
+		return nil
+	}
+	return &st
+}
+
+// writeState records ownership on the FIRST enable only. A second enable must not
+// overwrite it with our own values, or the original would be lost exactly when it
+// is needed.
+func writeState(path string, st managedState) error {
+	if existing := readState(path); existing != nil && existing.Settings == st.Settings {
+		return nil
+	}
+	b, err := json.MarshalIndent(st, "", "  ")
+	if err != nil {
+		return err
+	}
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		return err
+	}
+	return os.WriteFile(path, append(b, '\n'), 0o600)
+}
 
 // managedKeys is exactly what enable writes and disable removes. Nothing else in
 // the file is touched — notably not ANTHROPIC_BASE_URL or any auth token, which
@@ -94,12 +137,13 @@ func runClaudeCode(args []string, stdout, stderr io.Writer) int {
 	if *cortexCfg == "" {
 		*cortexCfg = filepath.Join(home, cortexCfgRel)
 	}
+	statePath := filepath.Join(home, stateRel)
 
 	switch action {
 	case "enable":
-		return claudeCodeEnable(*settingsPath, *cortexCfg, *yes, stdout, stderr)
+		return claudeCodeEnable2(*settingsPath, *cortexCfg, statePath, *yes, stdout, stderr)
 	case "disable":
-		return claudeCodeDisable(*settingsPath, *yes, stdout, stderr)
+		return claudeCodeDisable2(*settingsPath, statePath, *yes, stdout, stderr)
 	case "status":
 		return claudeCodeStatus(*settingsPath, stdout)
 	default:
@@ -152,7 +196,7 @@ func wanted(cortexCfgPath string) (map[string]string, error) {
 	return out, nil
 }
 
-func claudeCodeEnable(settingsPath, cortexCfgPath string, yes bool, stdout, stderr io.Writer) int {
+func claudeCodeEnable2(settingsPath, cortexCfgPath, statePath string, yes bool, stdout, stderr io.Writer) int {
 	want, err := wanted(cortexCfgPath)
 	if err != nil {
 		fmt.Fprintf(stderr, "abctl: %v\n", err)
@@ -218,6 +262,23 @@ func claudeCodeEnable(settingsPath, cortexCfgPath string, yes bool, stdout, stde
 		return exitDeclined
 	}
 
+	// Record what was there before, so disable restores rather than deletes.
+	if statePath != "" {
+		st := managedState{Settings: settingsPath, Prior: map[string]*string{}}
+		for _, k := range managedKeys {
+			if v, ok := env[k]; ok {
+				vv := v
+				st.Prior[k] = &vv
+			} else {
+				st.Prior[k] = nil
+			}
+		}
+		if werr := writeState(statePath, st); werr != nil {
+			fmt.Fprintf(stderr, "abctl: could not record prior settings (%v); disable will delete\n"+
+				"  these keys rather than restore any you had set yourself\n", werr)
+		}
+	}
+
 	raw := envRaw(doc)
 	for _, k := range managedKeys {
 		raw[k] = want[k]
@@ -230,7 +291,7 @@ func claudeCodeEnable(settingsPath, cortexCfgPath string, yes bool, stdout, stde
 	return 0
 }
 
-func claudeCodeDisable(settingsPath string, yes bool, stdout, stderr io.Writer) int {
+func claudeCodeDisable2(settingsPath, statePath string, yes bool, stdout, stderr io.Writer) int {
 	doc, err := readSettings(settingsPath)
 	if err != nil {
 		fmt.Fprintf(stderr, "abctl: %v\n", err)
@@ -252,8 +313,24 @@ func claudeCodeDisable(settingsPath string, yes bool, stdout, stderr io.Writer) 
 		fmt.Fprintln(stdout, "Not changed.")
 		return exitDeclined
 	}
+	st := readState(statePath)
 	raw := envRaw(doc)
+	var restored []string
 	for _, k := range present {
+		if st != nil && st.Settings == settingsPath {
+			if prior, recorded := st.Prior[k]; recorded {
+				if prior == nil {
+					delete(raw, k)
+				} else {
+					// The user had this set before enable; put their value back.
+					raw[k] = *prior
+					restored = append(restored, k)
+				}
+				continue
+			}
+		}
+		// No ownership record (enabled by an older abctl, or state lost): fall back
+		// to removing it, which is what this always did.
 		delete(raw, k)
 	}
 	// Drop an env block we just emptied rather than leaving "env": {} behind.
@@ -263,6 +340,12 @@ func claudeCodeDisable(settingsPath string, yes bool, stdout, stderr io.Writer) 
 	if err := writeSettings(settingsPath, doc); err != nil {
 		fmt.Fprintf(stderr, "abctl: %v\n", err)
 		return 1
+	}
+	if len(restored) > 0 {
+		fmt.Fprintf(stdout, "\nRestored to the value(s) you had before: %s\n", strings.Join(restored, ", "))
+	}
+	if statePath != "" {
+		_ = os.Remove(statePath)
 	}
 	fmt.Fprintf(stdout, "\nDisabled. Claude Code no longer routes through Cortex.\n")
 	return 0
@@ -435,4 +518,16 @@ func confirmFrom(r io.Reader, stdout io.Writer) bool {
 		return true
 	}
 	return false
+}
+
+// claudeCodeEnable and claudeCodeDisable keep the pre-ownership signatures for
+// callers and tests that do not care about the state file. Passing an empty
+// statePath disables ownership tracking, which is the historical behaviour:
+// disable then deletes the managed keys rather than restoring any the user had.
+func claudeCodeEnable(settingsPath, cortexCfgPath string, yes bool, stdout, stderr io.Writer) int {
+	return claudeCodeEnable2(settingsPath, cortexCfgPath, "", yes, stdout, stderr)
+}
+
+func claudeCodeDisable(settingsPath string, yes bool, stdout, stderr io.Writer) int {
+	return claudeCodeDisable2(settingsPath, "", yes, stdout, stderr)
 }

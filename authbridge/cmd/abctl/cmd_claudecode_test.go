@@ -366,22 +366,44 @@ func TestClaudeCodeEnable_WarnsWhenCAMissing(t *testing.T) {
 	if !strings.Contains(out.String(), "does not exist yet") {
 		t.Errorf("no warning about the missing CA file:\n%s", out.String())
 	}
+}
 
-	// With the file present there should be no such note.
+// TestClaudeCodeEnable_SilentWhenCAPresent is the other half. An earlier version
+// of this test used strings.Replace with a count of 0, which replaces nothing, so
+// the CA stayed missing and this branch was never exercised — the assertion
+// existed but could not fail.
+func TestClaudeCodeEnable_SilentWhenCAPresent(t *testing.T) {
+	settings, cfg := fixture(t, "{}")
+
+	// Create the CA exactly where the config's ca_dir points.
+	var out, errb bytes.Buffer
+	if code := claudeCodeEnable(settings, cfg, true, &out, &errb); code != 0 {
+		t.Fatalf("first pass: %s", errb.String())
+	}
 	caPath := readEnv(t, settings)[envCACerts]
+	if caPath == "" {
+		t.Fatal("no CA path was written")
+	}
 	if err := os.MkdirAll(filepath.Dir(caPath), 0o700); err != nil {
 		t.Fatal(err)
 	}
 	if err := os.WriteFile(caPath, []byte("-----BEGIN CERTIFICATE-----\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	settings2, cfg2 := fixture(t, "{}")
-	// Point the second fixture's ca_dir at the file we just made.
-	body, _ := os.ReadFile(cfg2)
-	_ = os.WriteFile(cfg2, []byte(strings.Replace(string(body),
-		filepath.Dir(strings.TrimSuffix(caPath, filepath.Base(caPath))), "", 0)), 0o600)
+
+	// Re-run against a clean settings file, same config, now that the CA exists.
+	settings2 := filepath.Join(filepath.Dir(caPath), "..", "settings2.json")
+	if err := os.WriteFile(settings2, []byte("{}"), 0o600); err != nil {
+		t.Fatal(err)
+	}
 	out.Reset()
-	_ = claudeCodeEnable(settings2, cfg2, true, &out, &errb)
+	errb.Reset()
+	if code := claudeCodeEnable(settings2, cfg, true, &out, &errb); code != 0 {
+		t.Fatalf("second pass: %s", errb.String())
+	}
+	if strings.Contains(out.String(), "does not exist yet") {
+		t.Errorf("warned about a CA file that exists at %s:\n%s", caPath, out.String())
+	}
 }
 
 // TestClaudeCodeEnable_HandlesIPv6ForwardProxy: strings.Cut split at the first
@@ -481,5 +503,90 @@ func TestClaudeCodeDeclineUsesADistinctExitCode(t *testing.T) {
 	// And exitDeclined must not collide with either.
 	if exitDeclined == 0 || exitDeclined == 1 || exitDeclined == 2 {
 		t.Errorf("exitDeclined = %d collides with success, failure or usage", exitDeclined)
+	}
+}
+
+// TestClaudeCodeDisable_RestoresAValueTheUserSetFirst is the ownership property.
+// A user who already had CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1 lost it on
+// disable, because "1" is byte-identical to what we write and nothing recorded
+// that it predated us.
+func TestClaudeCodeDisable_RestoresAValueTheUserSetFirst(t *testing.T) {
+	settings, cfg := fixture(t, `{"env":{
+	  "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC":"1",
+	  "ANTHROPIC_AUTH_TOKEN":"sk-x"
+	}}`)
+	state := filepath.Join(t.TempDir(), "claude-code-state.json")
+
+	var out, errb bytes.Buffer
+	if code := claudeCodeEnable2(settings, cfg, state, true, &out, &errb); code != 0 {
+		t.Fatalf("enable: %s", errb.String())
+	}
+	if code := claudeCodeDisable2(settings, state, true, &out, &errb); code != 0 {
+		t.Fatalf("disable: %s", errb.String())
+	}
+
+	env := readEnv(t, settings)
+	if got, ok := env[envNoTelem]; !ok || got != "1" {
+		t.Errorf("%s = %q present=%v; the user set this before enable and it must survive",
+			envNoTelem, got, ok)
+	}
+	// The keys we genuinely added are still removed.
+	for _, k := range []string{envProxy, envCACerts} {
+		if _, ok := env[k]; ok {
+			t.Errorf("%s survived disable although we added it", k)
+		}
+	}
+	if env["ANTHROPIC_AUTH_TOKEN"] != "sk-x" {
+		t.Error("unrelated entry lost")
+	}
+}
+
+// TestClaudeCodeEnable_StateRecordedOnlyOnce: a second enable must not overwrite
+// the ownership record with our own values, or the original is lost exactly when
+// it is needed.
+func TestClaudeCodeEnable_StateRecordedOnlyOnce(t *testing.T) {
+	settings, cfg := fixture(t, `{"env":{"CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC":"1"}}`)
+	state := filepath.Join(t.TempDir(), "state.json")
+
+	var out, errb bytes.Buffer
+	for i := 0; i < 3; i++ {
+		if code := claudeCodeEnable2(settings, cfg, state, true, &out, &errb); code != 0 {
+			t.Fatalf("enable %d: %s", i, errb.String())
+		}
+	}
+	st := readState(state)
+	if st == nil {
+		t.Fatal("no state recorded")
+	}
+	prior, recorded := st.Prior[envNoTelem]
+	if !recorded || prior == nil || *prior != "1" {
+		t.Errorf("prior for %s = %v, want the user's original \"1\"", envNoTelem, prior)
+	}
+	// And the keys we added are recorded as absent-before.
+	if p, ok := st.Prior[envProxy]; !ok || p != nil {
+		t.Errorf("prior for %s = %v, want nil (absent before)", envProxy, p)
+	}
+}
+
+// TestClaudeCodeDisable_NoStateFallsBackToRemoval: enabled by an older abctl, or
+// the record was lost. Removing is what this always did, and is better than
+// leaving the proxy pointed at a Cortex the user is trying to turn off.
+func TestClaudeCodeDisable_NoStateFallsBackToRemoval(t *testing.T) {
+	settings, cfg := fixture(t, `{"env":{"ANTHROPIC_AUTH_TOKEN":"sk-x"}}`)
+	var out, errb bytes.Buffer
+	if code := claudeCodeEnable(settings, cfg, true, &out, &errb); code != 0 {
+		t.Fatalf("enable: %s", errb.String())
+	}
+	if code := claudeCodeDisable2(settings, filepath.Join(t.TempDir(), "absent.json"), true, &out, &errb); code != 0 {
+		t.Fatalf("disable: %s", errb.String())
+	}
+	env := readEnv(t, settings)
+	for _, k := range managedKeys {
+		if _, ok := env[k]; ok {
+			t.Errorf("%s survived disable with no state file", k)
+		}
+	}
+	if env["ANTHROPIC_AUTH_TOKEN"] != "sk-x" {
+		t.Error("unrelated entry lost")
 	}
 }

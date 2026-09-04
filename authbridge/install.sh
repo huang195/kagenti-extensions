@@ -440,6 +440,34 @@ rm -rf "$tmp"
 trap - EXIT
 fi # end of download block
 
+# --- refuse to drive binaries older than this script ---
+#
+# The script and the binaries can come from different releases: when the resolved
+# release has no authbridge/install.sh the bootstrap falls back to the copy from
+# main, but the BINARIES still come from that older release. A newer script then
+# passes flags and subcommands the older binaries never had, and the run dies
+# deep in startup with "flag provided but not defined: -local" — which reads like
+# a bug in Cortex rather than a version mismatch.
+#
+# Probing the flag beats comparing version strings: the flags are the actual
+# contract, and a probe needs no updating when the scheme changes. `--local`
+# arrived in the same change as abctl's `claude-code` and `tools scan`
+# subcommands, so it stands in for all of them.
+if ! "${BIN_DIR}/authbridge-proxy" --help 2>&1 | grep -q -- '-local'; then
+	# Deliberately not suggesting --ref=${version}: a release old enough to fail
+	# this probe is old enough that its tree has no authbridge/install.sh either,
+	# so the bootstrap would 404, fall back to main, and land right back here.
+	die "the ${version} binaries are older than this installer.
+  They have no --local (it was --demo then), and their abctl has no claude-code
+  or tools subcommands, so this script cannot drive them — and no installer can
+  give you --claude-code from ${version}, because the feature is not in it.
+  Either:
+    wait for a release newer than ${version}, or set
+    AUTHBRIDGE_VERSION=<newer tag> to install newer binaries with this script;
+  or run that release's own installer, which matches its binaries:
+    curl -fsSL https://raw.githubusercontent.com/${REPO}/${version}/authbridge/install-demo.sh | sh"
+fi
+
 # --- report ---
 proxy="${BIN_DIR}/authbridge-proxy"
 ca_dir="${CORTEX_DIR}/ca" # matches defaultCortexDir()+caDirName in local.go

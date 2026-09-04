@@ -131,8 +131,24 @@ command -v tar  >/dev/null 2>&1 || die "tar is required"
 # `releases/latest` excludes prereleases and this project ships them, so list
 # releases (newest first) and take the first tag_name.
 newest_release() {
-	curl -fsSL "https://api.github.com/repos/${REPO}/releases?per_page=1" 2>/dev/null \
-		| grep -m1 '"tag_name"' | sed -e 's/.*"tag_name": *"//' -e 's/".*//'
+	# Returns non-zero on empty. The pipeline ends in sed, which exits 0 for empty
+	# input, so `version=$(newest_release) || die` could never fire on a
+	# rate-limited or offline API — the caller got an empty tag and failed later
+	# with an unactionable "download failed: abctl__darwin_arm64.tar.gz".
+	_tag=$(curl -fsSL "https://api.github.com/repos/${REPO}/releases?per_page=1" 2>/dev/null \
+		| grep -m1 '"tag_name"' | sed -e 's/.*"tag_name": *"//' -e 's/".*//')
+	[ -n "${_tag}" ] || return 1
+	printf '%s\n' "${_tag}"
+}
+
+# ere_escape quotes the ERE metacharacters in a literal so it matches exactly.
+# Archive names contain dots, and an unescaped "." matches any character: the
+# pattern for abctl_v0.7.0-alpha.3_..tar.gz also accepted
+# abctl_v0X7X0-alpha_3_..Xtar.gz. Nothing exploitable followed — the count check
+# or sha_check rejected it — but this script's whole subject is precision here.
+ere_escape() {
+	# shellcheck disable=SC2016 # the sed script is literal on purpose
+	printf '%s' "$1" | sed 's/[].[^$()*+?{}|\\]/\\&/g'
 }
 
 # --- run the released copy of this script, not the one from main ---
@@ -175,19 +191,42 @@ if [ -z "${SCRIPT_REF}" ]; then
 
 		boot=$(mktemp)
 		url="https://raw.githubusercontent.com/${REPO}/${want_ref}/authbridge/install.sh"
-		if curl -fsSL "${url}" -o "${boot}" 2>/dev/null && [ -s "${boot}" ]; then
+		# Capture the status code rather than collapsing every failure into one
+		# branch. A 404 means that ref genuinely predates this script — fall back.
+		# A transport error means we could not ask, and silently dropping to main
+		# there would break the exact guarantee this bootstrap exists to give.
+		# On a transport failure curl still prints "000" via -w AND exits non-zero,
+		# so appending our own default produced "HTTP 000000". Overwrite instead.
+		http=$(curl -sSL -o "${boot}" -w '%{http_code}' "${url}" 2>/dev/null) || http="000"
+		[ -n "${http}" ] || http="000"
+		if [ "${http}" = "200" ] && [ -s "${boot}" ]; then
 			info "Using the installer from ${want_ref}."
-			AUTHBRIDGE_SCRIPT_REF="${want_ref}" sh "${boot}" "$@"
-			status=$?
+			# set -e would abort the parent on a non-zero child before any of the
+			# lines below ran, leaking the downloaded script on every failed
+			# install. The if/else keeps the status and still cleans up.
+			if AUTHBRIDGE_SCRIPT_REF="${want_ref}" sh "${boot}" "$@"; then
+				status=0
+			else
+				status=$?
+			fi
 			rm -f "${boot}"
 			exit "${status}"
 		fi
 		rm -f "${boot}"
-		# A release from before this script existed under that name, or a network
-		# blip. Falling back is better than refusing to install, but say which
-		# copy is running so a surprise is attributable.
-		warn "${want_ref} has no authbridge/install.sh; continuing with the copy from main"
-		SCRIPT_REF="main"
+		if [ "${http}" = "404" ]; then
+			# A release from before this script existed under that name. Falling
+			# back beats refusing to install, but name the copy that is running so
+			# a surprise is attributable.
+			warn "${want_ref} has no authbridge/install.sh (HTTP 404); continuing with the copy from main"
+			SCRIPT_REF="main"
+		else
+			# Blocked, offline, rate-limited, proxied, 5xx. We cannot tell whether a
+			# released installer exists, so do not quietly run main instead.
+			die "could not fetch the installer for ${want_ref} (HTTP ${http}) from ${url}.
+  Check the network, or choose explicitly:
+    --ref=main       run the copy from main (unreleased changes)
+    --ref=vX.Y.Z     use a specific release"
+		fi
 	fi
 fi
 
@@ -361,7 +400,8 @@ for archive in "${abctl_tgz}" "${proxy_tgz}"; do
 	# real line reads "HASH  ./abctl_....tar.gz". An earlier version of this
 	# pattern required the name immediately after whitespace or "*", which matched
 	# nothing against an actual release and refused every install.
-	grep -E "(^|[[:space:]*/])${archive}\$" "${tmp}/checksums.txt" >> "${tmp}/checksums.filtered" \
+	archive_re=$(ere_escape "${archive}")
+	grep -E "(^|[[:space:]*/])${archive_re}\$" "${tmp}/checksums.txt" >> "${tmp}/checksums.filtered" \
 		|| die "checksums.txt has no entry for ${archive} — refusing to install it unverified"
 done
 # Both entries present, and exactly the two we asked for.

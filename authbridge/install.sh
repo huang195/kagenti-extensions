@@ -400,9 +400,19 @@ for archive in "${abctl_tgz}" "${proxy_tgz}"; do
 	# real line reads "HASH  ./abctl_....tar.gz". An earlier version of this
 	# pattern required the name immediately after whitespace or "*", which matched
 	# nothing against an actual release and refused every install.
+	# Anchored to the whole line and to the exact shape our own workflow emits:
+	# "HASH  ./name" (from `cd dist && sha256sum ./*.tar.gz`), with a bare name and
+	# binary-mode "*" also accepted.
+	#
+	# Deliberately NOT any path. sha_check runs from ${tmp}, so a permissive class
+	# let a crafted entry like "HASH  ../name" or "HASH  /etc/name" match and be
+	# verified against a file outside the download directory — passing verification
+	# for something other than the archive we then extract. Only ./ and a bare name
+	# are ours, so nothing else is accepted.
 	archive_re=$(ere_escape "${archive}")
-	grep -E "(^|[[:space:]*/])${archive_re}\$" "${tmp}/checksums.txt" >> "${tmp}/checksums.filtered" \
-		|| die "checksums.txt has no entry for ${archive} — refusing to install it unverified"
+	grep -E "^[0-9a-fA-F]+[[:space:]]+\*?(\./)?${archive_re}\$" "${tmp}/checksums.txt" \
+		>> "${tmp}/checksums.filtered" \
+		|| die "checksums.txt has no usable entry for ${archive} — refusing to install it unverified"
 done
 # Both entries present, and exactly the two we asked for.
 lines=$(wc -l < "${tmp}/checksums.filtered" | tr -d '[:space:]')

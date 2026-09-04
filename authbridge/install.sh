@@ -276,7 +276,12 @@ info "Verifying checksums..."
 # checksums.txt can't make verification fail on a file we never fetched.
 : > "${tmp}/checksums.filtered"
 for archive in "${abctl_tgz}" "${proxy_tgz}"; do
-	grep -E "[[:space:]]\*?${archive}\$" "${tmp}/checksums.txt" >> "${tmp}/checksums.filtered" \
+	# The name may be preceded by whitespace, sha256sum's binary-mode "*", or a
+	# path component: the release workflow runs `sha256sum ./*.tar.gz`, so every
+	# real line reads "HASH  ./abctl_....tar.gz". An earlier version of this
+	# pattern required the name immediately after whitespace or "*", which matched
+	# nothing against an actual release and refused every install.
+	grep -E "(^|[[:space:]*/])${archive}\$" "${tmp}/checksums.txt" >> "${tmp}/checksums.filtered" \
 		|| die "checksums.txt has no entry for ${archive} — refusing to install it unverified"
 done
 # Both entries present, and exactly the two we asked for.

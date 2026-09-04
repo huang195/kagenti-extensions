@@ -36,8 +36,15 @@
 # curl, not sh, so the script runs without it. `sh -s -- --flag` has no such
 # failure mode. The env vars below still work.
 #
+# By default this script re-runs the copy from the newest RELEASE rather than
+# executing whatever is currently on main — main is unstable by definition, and a
+# `curl | sh` should not be the first thing to run a change nobody has released.
+# --ref=main opts back in; --ref=vX.Y.Z pins.
+#
 # Environment:
-#   AUTHBRIDGE_VERSION=vX.Y.Z   install a specific release tag (default: newest)
+#   AUTHBRIDGE_REF=REF          same as --ref
+#   AUTHBRIDGE_VERSION=vX.Y.Z   install binaries from a specific release
+#                               (default: the release this script came from)
 #   AUTHBRIDGE_INSTALL_ONLY=1   same as --install-only
 #   AUTHBRIDGE_SKIP_DOWNLOAD=1  use the already-installed binaries in ~/.local/bin
 #                               instead of downloading (re-run setup offline)
@@ -77,6 +84,10 @@ Options:
   --claude-code    after starting, offer to configure Claude Code to use it, so
                    it runs as plain `claude` with no environment variables
   --local          the default, spelled out
+  --ref=REF        take THIS SCRIPT from a git ref instead of the newest release
+                   (e.g. --ref=main for unreleased changes, --ref=v0.7.0-alpha.4
+                   to pin). Binaries come from the same release unless
+                   AUTHBRIDGE_VERSION says otherwise.
   -h, --help       this text
 
 Environment:
@@ -97,6 +108,7 @@ for arg in "$@"; do
 	case "$arg" in
 		--install-only) MODE=install-only ;;
 		--claude-code) WIRE_CLAUDE_CODE=1 ;;
+		--ref=*) AUTHBRIDGE_REF="${arg#*=}" ;;
 		# --local is the default; accepted so writing it out explicitly works, and
 		# so it mirrors the proxy flag of the same name.
 		--local) MODE=local ;;
@@ -104,7 +116,7 @@ for arg in "$@"; do
 			usage
 			exit 0
 			;;
-		*) die "unknown option: $arg (try --claude-code, --install-only, --local, or no argument)" ;;
+		*) die "unknown option: $arg (try --claude-code, --install-only, --local, --ref=REF, or no argument)" ;;
 	esac
 done
 # Env form kept working; the flag wins if both are given.
@@ -114,6 +126,70 @@ fi
 
 command -v curl >/dev/null 2>&1 || die "curl is required"
 command -v tar  >/dev/null 2>&1 || die "tar is required"
+
+# newest_release prints the newest release tag, prereleases included.
+# `releases/latest` excludes prereleases and this project ships them, so list
+# releases (newest first) and take the first tag_name.
+newest_release() {
+	curl -fsSL "https://api.github.com/repos/${REPO}/releases?per_page=1" 2>/dev/null \
+		| grep -m1 '"tag_name"' | sed -e 's/.*"tag_name": *"//' -e 's/".*//'
+}
+
+# --- run the released copy of this script, not the one from main ---
+#
+# The documented command fetches this file from main, which is whatever landed
+# last: an unreviewed or half-finished change there runs on someone's laptop
+# immediately. Releases are tested, so by default this bootstrap re-runs the copy
+# from the newest release and hands it the same arguments.
+#
+# SCRIPT_REF names the ref this copy came from and doubles as the recursion guard:
+# the child sees it set and does not bootstrap again.
+SCRIPT_REF="${AUTHBRIDGE_SCRIPT_REF:-}"
+if [ -z "${SCRIPT_REF}" ]; then
+	want_ref="${AUTHBRIDGE_REF:-}"
+	if [ -z "${want_ref}" ]; then
+		want_ref="$(newest_release)" || true
+	fi
+	if [ -z "${want_ref}" ]; then
+		warn "could not resolve the newest release; continuing with the copy from main"
+		SCRIPT_REF="main"
+	elif [ "${want_ref}" = "main" ]; then
+		# Explicitly asked for main: this copy already is main.
+		SCRIPT_REF="main"
+	else
+		# Rebuild the argument list without --ref: it is meta, consumed here, and a
+		# released script from before --ref existed rejects it as an unknown option.
+		# Rotating the positional parameters keeps arguments with spaces intact,
+		# which building a string would not.
+		argc=$#
+		argi=0
+		while [ "${argi}" -lt "${argc}" ]; do
+			a="$1"
+			shift
+			argi=$((argi + 1))
+			case "$a" in
+				--ref=*) ;;
+				*) set -- "$@" "$a" ;;
+			esac
+		done
+
+		boot=$(mktemp)
+		url="https://raw.githubusercontent.com/${REPO}/${want_ref}/authbridge/install.sh"
+		if curl -fsSL "${url}" -o "${boot}" 2>/dev/null && [ -s "${boot}" ]; then
+			info "Using the installer from ${want_ref}."
+			AUTHBRIDGE_SCRIPT_REF="${want_ref}" sh "${boot}" "$@"
+			status=$?
+			rm -f "${boot}"
+			exit "${status}"
+		fi
+		rm -f "${boot}"
+		# A release from before this script existed under that name, or a network
+		# blip. Falling back is better than refusing to install, but say which
+		# copy is running so a surprise is attributable.
+		warn "${want_ref} has no authbridge/install.sh; continuing with the copy from main"
+		SCRIPT_REF="main"
+	fi
+fi
 
 # Verify the checklist file passed as $1 (run from the directory holding the
 # files). shasum is preferred: it's always present on macOS and its -c reads the
@@ -241,14 +317,18 @@ if [ "${AUTHBRIDGE_SKIP_DOWNLOAD:-}" = "1" ]; then
 else
 
 # --- resolve the release tag ---
-# `releases/latest` excludes prereleases, and the project ships prereleases, so
-# list releases (newest first) and take the first tag_name instead.
 version="${AUTHBRIDGE_VERSION:-}"
 if [ -z "$version" ]; then
-	info "Resolving newest release..."
-	version=$(curl -fsSL "https://api.github.com/repos/${REPO}/releases?per_page=1" \
-		| grep -m1 '"tag_name"' | sed -e 's/.*"tag_name": *"//' -e 's/".*//')
-	[ -n "$version" ] || die "could not resolve the newest release (set AUTHBRIDGE_VERSION=vX.Y.Z)"
+	# Default the binaries to the same release this script came from, so the
+	# script and the binaries it installs are one tested set rather than two
+	# independently-moving things.
+	case "${SCRIPT_REF}" in
+		v*) version="${SCRIPT_REF}" ;;
+		*)
+			info "Resolving newest release..."
+			version=$(newest_release) || die "could not resolve the newest release (set AUTHBRIDGE_VERSION=vX.Y.Z)"
+			;;
+	esac
 fi
 info "Release: $version"
 

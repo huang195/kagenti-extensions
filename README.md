@@ -22,6 +22,10 @@ decrypted and parsed live. No Kubernetes. macOS or Linux, amd64 or arm64.
      | sh -s -- --claude-code
    ```
 
+   The URL is on `main`, but the script immediately re-runs the copy from the
+   newest **release** — so a `curl | sh` never executes an unreleased change.
+   Add `--ref=main` to opt into main anyway, or `--ref=vX.Y.Z` to pin.
+
 2. **Open the viewer** in another terminal:
 
    ```sh

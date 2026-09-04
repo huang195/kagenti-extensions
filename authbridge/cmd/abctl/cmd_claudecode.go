@@ -47,23 +47,43 @@ type managedState struct {
 	Prior    map[string]*string `json:"prior"`
 }
 
-func readState(path string) *managedState {
+// readState distinguishes "no record" from "record unreadable".
+//
+// Collapsing them was a silent hole: disable treats a missing record as
+// "enabled by an older abctl" and falls back to deleting every managed key, so a
+// truncated or hand-mangled state file re-opened exactly the data loss the record
+// exists to prevent — a corrupt record looked identical to no record. A nil
+// state with a nil error means genuinely absent; a non-nil error means the record
+// was there and could not be trusted, which the caller must say out loud.
+func readState(path string) (*managedState, error) {
 	b, err := os.ReadFile(path) //nolint:gosec // operator-supplied path
 	if err != nil {
-		return nil
+		if os.IsNotExist(err) {
+			return nil, nil
+		}
+		return nil, err
 	}
 	var st managedState
-	if err := json.Unmarshal(b, &st); err != nil || st.Prior == nil {
-		return nil
+	if uerr := json.Unmarshal(b, &st); uerr != nil {
+		return nil, fmt.Errorf("%s is not valid JSON: %w", path, uerr)
 	}
-	return &st
+	if st.Prior == nil {
+		return nil, fmt.Errorf("%s has no prior-value record", path)
+	}
+	return &st, nil
 }
 
 // writeState records ownership on the FIRST enable only. A second enable must not
 // overwrite it with our own values, or the original would be lost exactly when it
 // is needed.
 func writeState(path string, st managedState) error {
-	if existing := readState(path); existing != nil && existing.Settings == st.Settings {
+	// An unreadable existing record is not a reason to overwrite it: if it can be
+	// repaired by hand it is still the only copy of what the user had.
+	existing, err := readState(path)
+	if err != nil {
+		return fmt.Errorf("refusing to overwrite the existing record: %w", err)
+	}
+	if existing != nil && existing.Settings == st.Settings {
 		return nil
 	}
 	b, err := json.MarshalIndent(st, "", "  ")
@@ -313,7 +333,15 @@ func claudeCodeDisable2(settingsPath, statePath string, yes bool, stdout, stderr
 		fmt.Fprintln(stdout, "Not changed.")
 		return exitDeclined
 	}
-	st := readState(statePath)
+	st, sterr := readState(statePath)
+	if sterr != nil {
+		// Proceed — the user asked for this off — but say what is about to be lost.
+		// Silence here would repeat the bug the record was added to fix.
+		fmt.Fprintf(stderr, "abctl: cannot read the record of what you had before enabling (%v).\n"+
+			"  Falling back to removing these keys outright. If you had set any of them\n"+
+			"  yourself before running enable, that value is not recoverable from here —\n"+
+			"  check %s afterwards.\n\n", sterr, settingsPath)
+	}
 	raw := envRaw(doc)
 	var restored []string
 	for _, k := range present {

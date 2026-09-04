@@ -554,9 +554,9 @@ func TestClaudeCodeEnable_StateRecordedOnlyOnce(t *testing.T) {
 			t.Fatalf("enable %d: %s", i, errb.String())
 		}
 	}
-	st := readState(state)
-	if st == nil {
-		t.Fatal("no state recorded")
+	st, err := readState(state)
+	if err != nil || st == nil {
+		t.Fatalf("no state recorded: %v", err)
 	}
 	prior, recorded := st.Prior[envNoTelem]
 	if !recorded || prior == nil || *prior != "1" {
@@ -588,5 +588,65 @@ func TestClaudeCodeDisable_NoStateFallsBackToRemoval(t *testing.T) {
 	}
 	if env["ANTHROPIC_AUTH_TOKEN"] != "sk-x" {
 		t.Error("unrelated entry lost")
+	}
+}
+
+// TestClaudeCodeDisable_WarnsOnCorruptState: a truncated record looked identical
+// to no record, so disable silently fell back to deleting every managed key —
+// re-opening the exact data loss the record was added to prevent. It still
+// proceeds (the user asked for this off) but must say what is being lost.
+func TestClaudeCodeDisable_WarnsOnCorruptState(t *testing.T) {
+	settings, cfg := fixture(t, `{"env":{"CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC":"1"}}`)
+	state := filepath.Join(t.TempDir(), "state.json")
+
+	var out, errb bytes.Buffer
+	if code := claudeCodeEnable2(settings, cfg, state, true, &out, &errb); code != 0 {
+		t.Fatalf("enable: %s", errb.String())
+	}
+	// A partial write, a disk-full, a hand edit.
+	if err := os.WriteFile(state, []byte(`{"settings":"`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	out.Reset()
+	errb.Reset()
+	if code := claudeCodeDisable2(settings, state, true, &out, &errb); code != 0 {
+		t.Fatalf("disable: %s", errb.String())
+	}
+	if !strings.Contains(errb.String(), "cannot read the record") {
+		t.Errorf("corrupt state produced no warning:\nstderr=%q", errb.String())
+	}
+	if !strings.Contains(errb.String(), "not recoverable") {
+		t.Errorf("warning does not say what is lost:\nstderr=%q", errb.String())
+	}
+}
+
+// TestReadState_AbsentIsNotAnError: the silent fallback is correct for a machine
+// that enabled with an older abctl, and must stay silent — a warning on every
+// disable would be noise that trains people to ignore it.
+func TestReadState_AbsentIsNotAnError(t *testing.T) {
+	st, err := readState(filepath.Join(t.TempDir(), "nope.json"))
+	if err != nil {
+		t.Errorf("absent state reported as an error: %v", err)
+	}
+	if st != nil {
+		t.Error("absent state returned a record")
+	}
+}
+
+// TestWriteState_RefusesToOverwriteAnUnreadableRecord: if it can be repaired by
+// hand it is still the only copy of what the user had.
+func TestWriteState_RefusesToOverwriteAnUnreadableRecord(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "state.json")
+	if err := os.WriteFile(path, []byte(`{"settings":"`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	err := writeState(path, managedState{Settings: "/x/settings.json", Prior: map[string]*string{}})
+	if err == nil {
+		t.Fatal("overwrote an unreadable record")
+	}
+	b, _ := os.ReadFile(path)
+	if string(b) != `{"settings":"` {
+		t.Errorf("the unreadable record was modified: %q", b)
 	}
 }

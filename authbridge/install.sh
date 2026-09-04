@@ -1,0 +1,439 @@
+#!/bin/sh
+# install.sh — one-line installer for Cortex on a local machine.
+#
+#   curl -fsSL https://raw.githubusercontent.com/rossoctl/cortex/main/authbridge/install.sh | sh
+#
+# Detects your OS/arch, downloads the prebuilt `abctl` and `authbridge-proxy`
+# binaries for the newest release, verifies their SHA-256 checksums, installs
+# them to ~/.local/bin, and starts Cortex in the background — then prints the
+# commands to watch traffic and point an agent at it, plus how to stop it.
+# macOS + Linux, amd64 + arm64. No cluster, Keycloak, or SPIRE needed.
+#
+# It installs, starts Cortex with its built-in config in ~/.cortex, and prints the
+# command to send an agent through it. Traffic is decrypted and parsed for viewing;
+# nothing is rewritten. Cutting Claude Code's token cost is one opt-in command
+# afterwards, printed at the end.
+#
+# Options (pass through the pipe with `sh -s --`, e.g.
+#   curl -fsSL ...install.sh | sh -s -- --install-only):
+#
+#   --install-only   install the binaries and stop
+#   --claude-code    after starting, offer to write the three env vars Claude Code
+#                    needs into ~/.claude/settings.json, so it runs as plain
+#                    `claude`. Prompts before changing anything.
+#
+# There is deliberately only one config. It carries the parsers AND tool-prune,
+# and the proxy preserves edits to it, so a second "cost-optimised" config had
+# nothing to do that filling in one list did not already do — while costing a
+# second CA, a second set of paths, and a second page of instructions that read
+# identically to the first.
+#
+# No compatibility aliases here: this script accepted no flags at all until now,
+# so there is no earlier spelling for anyone to still be using. (The proxy's
+# --demo -> --local alias is different: that flag really did ship.)
+#
+# Flags rather than env vars: written `VAR=1 curl ... | sh` the variable reaches
+# curl, not sh, so the script runs without it. `sh -s -- --flag` has no such
+# failure mode. The env vars below still work.
+#
+# Environment:
+#   AUTHBRIDGE_VERSION=vX.Y.Z   install a specific release tag (default: newest)
+#   AUTHBRIDGE_INSTALL_ONLY=1   same as --install-only
+#   AUTHBRIDGE_SKIP_DOWNLOAD=1  use the already-installed binaries in ~/.local/bin
+#                               instead of downloading (re-run setup offline)
+# set -eu, not -euo pipefail: this is POSIX sh (the documented entry point is
+# `curl ... | sh`), and `pipefail` is a bashism that would abort the script under
+# dash/ash. The repo-wide `set -euo pipefail` convention applies to bash scripts.
+set -eu
+
+REPO="rossoctl/cortex"
+BIN_DIR="${HOME}/.local/bin"
+# Every file Cortex writes for this user lives here: config, CA, keys, logs,
+# pidfiles. One directory to inspect, back up, or delete.
+CORTEX_DIR="${HOME}/.cortex"
+
+info() { printf '%s\n' "$*"; }
+warn() { printf 'warning: %s\n' "$*" >&2; }
+die()  { printf 'error: %s\n' "$*" >&2; exit 1; }
+
+# usage is a heredoc rather than sed over "$0": piped as `curl ... | sh -s -- --help`
+# the script has no file to read ($0 is "sh"), so the previous version printed
+# nothing at all — for the one flag someone is most likely to try before running an
+# installer they piped from the internet.
+usage() {
+	cat <<'USAGE'
+install.sh — install Cortex on a local machine (macOS/Linux, amd64/arm64).
+
+Usage:
+  curl -fsSL https://raw.githubusercontent.com/rossoctl/cortex/main/authbridge/install.sh | sh
+  curl -fsSL ...install.sh | sh -s -- [option]
+
+Installs abctl and authbridge-proxy to ~/.local/bin, starts the proxy with its
+built-in config in ~/.cortex, and prints the command to send an agent through it.
+Traffic is decrypted and parsed for viewing; nothing is rewritten.
+
+Options:
+  --install-only   install the binaries and stop
+  --claude-code    after starting, offer to configure Claude Code to use it, so
+                   it runs as plain `claude` with no environment variables
+  --local          the default, spelled out
+  -h, --help       this text
+
+Environment:
+  AUTHBRIDGE_VERSION=vX.Y.Z   install a specific release tag (default: newest)
+  AUTHBRIDGE_INSTALL_ONLY=1   same as --install-only
+  AUTHBRIDGE_SKIP_DOWNLOAD=1  use the binaries already in ~/.local/bin instead of
+                              downloading (re-run setup offline)
+
+After installing, to cut Claude Code's token cost:
+  abctl tools scan --write ~/.cortex/config.yaml
+USAGE
+}
+
+# --- mode selection ---
+MODE=local
+WIRE_CLAUDE_CODE=""
+for arg in "$@"; do
+	case "$arg" in
+		--install-only) MODE=install-only ;;
+		--claude-code) WIRE_CLAUDE_CODE=1 ;;
+		# --local is the default; accepted so writing it out explicitly works, and
+		# so it mirrors the proxy flag of the same name.
+		--local) MODE=local ;;
+		-h | --help)
+			usage
+			exit 0
+			;;
+		*) die "unknown option: $arg (try --claude-code, --install-only, --local, or no argument)" ;;
+	esac
+done
+# Env form kept working; the flag wins if both are given.
+if [ "${AUTHBRIDGE_INSTALL_ONLY:-}" = "1" ] && [ "$MODE" = "local" ]; then
+	MODE=install-only
+fi
+
+command -v curl >/dev/null 2>&1 || die "curl is required"
+command -v tar  >/dev/null 2>&1 || die "tar is required"
+
+# Verify the checklist file passed as $1 (run from the directory holding the
+# files). shasum is preferred: it's always present on macOS and its -c reads the
+# GNU-style checksums.txt reliably, whereas some non-GNU sha256sum builds reject
+# -c. Linux without shasum falls back to sha256sum (GNU coreutils).
+sha_check() {
+	if command -v shasum >/dev/null 2>&1; then
+		shasum -a 256 -c "$1"
+	elif command -v sha256sum >/dev/null 2>&1; then
+		sha256sum -c "$1"
+	else
+		die "need shasum or sha256sum to verify downloads"
+	fi
+}
+
+# Demo listener ports — loopback, and deliberately uncommon to avoid colliding
+# with common dev tools. Keep in sync with the built-in config in
+# authbridge/cmd/authbridge-proxy/local.go.
+DEMO_FORWARD_PORT=47600
+DEMO_SESSION_PORT=47601
+DEMO_STATS_PORT=47602
+# Bound too, and previously missing from the preflight — an occupied 47604 let the
+# download finish and then killed the proxy during startup.
+DEMO_HEALTH_PORT=47604
+
+# port_in_use exits 0 if something is already listening on the given loopback
+# port. Best-effort: uses lsof, then nc; if neither exists, it assumes free.
+port_in_use() {
+	if command -v lsof >/dev/null 2>&1; then
+		lsof -nP -iTCP@127.0.0.1:"$1" -sTCP:LISTEN >/dev/null 2>&1
+	elif command -v nc >/dev/null 2>&1; then
+		nc -z 127.0.0.1 "$1" >/dev/null 2>&1
+	else
+		return 1
+	fi
+}
+
+# --- detect platform ---
+os=$(uname -s)
+case "$os" in
+	Darwin) os=darwin ;;
+	Linux) os=linux ;;
+	*) die "unsupported OS: $os (the installer supports macOS and Linux)" ;;
+esac
+
+arch=$(uname -m)
+case "$arch" in
+	x86_64 | amd64) arch=amd64 ;;
+	arm64 | aarch64) arch=arm64 ;;
+	*) die "unsupported architecture: $arch (supported: amd64, arm64)" ;;
+esac
+
+# stop_previous_cortex stops a Cortex a previous run of this script started, if
+# one is still holding the ports the next one needs.
+#
+# Re-running the installer while Cortex is already up is ordinary — following the
+# README and then the token-cost guide does exactly that. Both use the same
+# loopback ports, so without this the second command dies on a bind conflict.
+#
+# Deliberately narrow. It only kills a pid from OUR pidfile whose process name is
+# still authbridge-proxy — a pidfile can outlive its process and the number can
+# be recycled onto something unrelated. Anything else holding the port is left
+# alone and reported by the preflight below.
+stop_previous_cortex() {
+	pidfile="${CORTEX_DIR}/proxy.pid"
+	[ -f "$pidfile" ] || return 0
+	pid=$(cat "$pidfile" 2>/dev/null) || return 0
+	case "$pid" in
+		'' | *[!0-9]*) return 0 ;;
+	esac
+	if ! kill -0 "$pid" 2>/dev/null; then
+		rm -f "$pidfile"
+		return 0
+	fi
+	# Match a 15-character prefix, not the full name. Linux caps comm at
+	# TASK_COMM_LEN-1 = 15 and "authbridge-proxy" is 16, so it reports
+	# "authbridge-prox" and a *authbridge-proxy* glob never matches — which made
+	# this whole function a no-op on Linux while passing on macOS, where comm is
+	# not truncated. Still narrow: the pid came from a pidfile we wrote.
+	name=$(ps -p "$pid" -o comm= 2>/dev/null || true)
+	case "$name" in
+		*authbridge-prox*) ;;
+		*) return 0 ;; # pid recycled onto something else — never touch it
+	esac
+	info "Stopping the Cortex started earlier (pid ${pid}); the new one replaces it."
+	kill "$pid" 2>/dev/null || true
+	# 90 * 0.2s = 18s, deliberately longer than the proxy's own 15s shutdown
+	# deadline (cmd/authbridge-proxy/main.go). Waiting only 5s could remove the
+	# pidfile while a draining request still held the listener, and the next port
+	# preflight would then fail with the previous instance invisible.
+	i=0
+	while [ "$i" -lt 90 ] && kill -0 "$pid" 2>/dev/null; do
+		sleep 0.2
+		i=$((i + 1))
+	done
+	if kill -0 "$pid" 2>/dev/null; then
+		# Keep the pidfile: it is the only handle on a process that is still there.
+		die "Cortex (pid ${pid}) did not exit within 18s. Stop it and re-run: kill -9 ${pid}"
+	fi
+	rm -f "$pidfile"
+}
+
+# --- preflight: fail early (before downloading) if a listener port is taken ---
+if [ "$MODE" = "local" ]; then
+	# Unconditionally, not gated on port_in_use: that probe reports "free" when
+	# neither lsof nor nc exists (see above), so on a minimal container the stop
+	# would be skipped, the new proxy would hit a bind conflict anyway, and the
+	# user would be left with a dead install. The function is already a no-op
+	# when nothing of ours is running, so it needs no probe to justify it.
+	stop_previous_cortex
+	for p in "$DEMO_FORWARD_PORT" "$DEMO_SESSION_PORT" "$DEMO_STATS_PORT" "$DEMO_HEALTH_PORT"; do
+		if port_in_use "$p"; then
+			die "port ${p} is already in use. Is Cortex already running (see ${CORTEX_DIR}/proxy.pid)? Otherwise free the port, or change the ports in the config, then re-run."
+		fi
+	done
+fi
+
+# --- skip the download entirely when asked (offline re-run) ---
+if [ "${AUTHBRIDGE_SKIP_DOWNLOAD:-}" = "1" ]; then
+	for b in abctl authbridge-proxy; do
+		[ -x "${BIN_DIR}/${b}" ] || die "AUTHBRIDGE_SKIP_DOWNLOAD=1 but ${BIN_DIR}/${b} is missing"
+	done
+	version="already installed"
+	info "Using the binaries already in ${BIN_DIR}"
+else
+
+# --- resolve the release tag ---
+# `releases/latest` excludes prereleases, and the project ships prereleases, so
+# list releases (newest first) and take the first tag_name instead.
+version="${AUTHBRIDGE_VERSION:-}"
+if [ -z "$version" ]; then
+	info "Resolving newest release..."
+	version=$(curl -fsSL "https://api.github.com/repos/${REPO}/releases?per_page=1" \
+		| grep -m1 '"tag_name"' | sed -e 's/.*"tag_name": *"//' -e 's/".*//')
+	[ -n "$version" ] || die "could not resolve the newest release (set AUTHBRIDGE_VERSION=vX.Y.Z)"
+fi
+info "Release: $version"
+
+# --- download + verify ---
+tmp=$(mktemp -d)
+trap 'rm -rf "$tmp"' EXIT
+
+base="https://github.com/${REPO}/releases/download/${version}"
+abctl_tgz="abctl_${version}_${os}_${arch}.tar.gz"
+proxy_tgz="authbridge-proxy_${version}_${os}_${arch}.tar.gz"
+
+info "Downloading binaries for ${os}/${arch}..."
+curl -fsSL "${base}/${abctl_tgz}" -o "${tmp}/${abctl_tgz}" || die "download failed: ${abctl_tgz}"
+curl -fsSL "${base}/${proxy_tgz}" -o "${tmp}/${proxy_tgz}" || die "download failed: ${proxy_tgz}"
+curl -fsSL "${base}/checksums.txt" -o "${tmp}/checksums.txt" || die "download failed: checksums.txt"
+
+info "Verifying checksums..."
+# One grep per archive, not an alternation. An alternation SUCCEEDS on a single
+# match, so a checksums.txt missing one entry — a truncated or partly-generated
+# release build — passed the guard, sha_check verified only the file that was
+# listed, and the UNVERIFIED binary was installed anyway. This is the one step
+# whose whole job is not to fail open.
+#
+# Matching is anchored to end-of-line so an unrelated future artifact in
+# checksums.txt can't make verification fail on a file we never fetched.
+: > "${tmp}/checksums.filtered"
+for archive in "${abctl_tgz}" "${proxy_tgz}"; do
+	grep -E "[[:space:]]\*?${archive}\$" "${tmp}/checksums.txt" >> "${tmp}/checksums.filtered" \
+		|| die "checksums.txt has no entry for ${archive} — refusing to install it unverified"
+done
+# Both entries present, and exactly the two we asked for.
+lines=$(wc -l < "${tmp}/checksums.filtered" | tr -d '[:space:]')
+[ "${lines}" = "2" ] \
+	|| die "expected 2 checksum entries, got ${lines} — refusing to install"
+( cd "$tmp" && sha_check checksums.filtered ) || die "checksum verification failed"
+
+# --- extract + install ---
+info "Installing to ${BIN_DIR}..."
+mkdir -p "$BIN_DIR"
+tar -xzf "${tmp}/${abctl_tgz}" -C "$tmp"
+tar -xzf "${tmp}/${proxy_tgz}" -C "$tmp"
+for b in abctl authbridge-proxy; do
+	[ -f "${tmp}/${b}" ] || die "archive did not contain expected binary: ${b}"
+	chmod +x "${tmp}/${b}"
+	mv -f "${tmp}/${b}" "${BIN_DIR}/${b}"
+done
+
+# macOS: clear the quarantine flag so Gatekeeper doesn't block the unsigned binaries.
+if [ "$os" = "darwin" ] && command -v xattr >/dev/null 2>&1; then
+	xattr -dr com.apple.quarantine "${BIN_DIR}/abctl" "${BIN_DIR}/authbridge-proxy" 2>/dev/null || true
+fi
+
+rm -rf "$tmp"
+trap - EXIT
+fi # end of download block
+
+# --- report ---
+proxy="${BIN_DIR}/authbridge-proxy"
+ca_dir="${CORTEX_DIR}/ca" # matches defaultCortexDir()+caDirName in local.go
+case ":${PATH}:" in
+	*":${BIN_DIR}:"*) abctl_cmd="abctl" proxy_cmd="authbridge-proxy" ;;
+	*) abctl_cmd="${BIN_DIR}/abctl" proxy_cmd="$proxy" ;;
+esac
+
+info ""
+info "Installed abctl and authbridge-proxy (${version}) to ${BIN_DIR}"
+case ":${PATH}:" in
+	*":${BIN_DIR}:"*) ;;
+	*)
+		warn "${BIN_DIR} is not on your PATH."
+		warn "Add it for future sessions:  export PATH=\"${BIN_DIR}:\$PATH\""
+		;;
+esac
+
+if [ "$MODE" = "install-only" ]; then
+	info ""
+	info "Install-only mode. Start it with:  ${proxy_cmd} --local"
+	exit 0
+fi
+
+# --- start in the background, then wait until it's actually listening ---
+info ""
+info "Starting Cortex in the background..."
+# 0700 on the Cortex directory: a CA private key is written beneath it.
+mkdir -p "$CORTEX_DIR" && chmod 700 "$CORTEX_DIR"
+# Deliberately NOT creating $ca_dir here. MkdirAll never tightens an existing
+# directory, so pre-creating it at the shell's umask defeated tlsbridge's 0700 —
+# the proxy creates it correctly on first start.
+log="${CORTEX_DIR}/proxy.log"
+pidfile="${CORTEX_DIR}/proxy.pid"
+nohup "$proxy" --local </dev/null >"$log" 2>&1 &
+proxy_pid=$!
+echo "$proxy_pid" >"$pidfile"
+
+# Confirm readiness from real signals, not the "listening" log line — that line is
+# emitted just *before* the socket is bound, so a bind failure could look ready.
+# A bind failure exits within ms (the proxy Fatalf's), so watch for early exit;
+# and probe the forward port for a true post-bind signal.
+ready=0
+i=0
+while [ "$i" -lt 50 ]; do
+	if ! kill -0 "$proxy_pid" 2>/dev/null; then
+		warn "Cortex exited during startup — last log lines:"
+		tail -n 15 "$log" >&2 || true
+		die "Cortex failed to start (full log: ${log})"
+	fi
+	if port_in_use "$DEMO_FORWARD_PORT"; then
+		ready=1
+		break
+	fi
+	sleep 0.2
+	i=$((i + 1))
+done
+
+info ""
+if [ "$ready" -eq 1 ]; then
+	info "Cortex is running (pid ${proxy_pid}).   Logs: ${log}"
+else
+	# It didn't exit during the startup window (a bind failure would have killed
+	# it), but no probe tool confirmed the port — most likely up. Say so honestly.
+	info "Cortex started (pid ${proxy_pid}); couldn't confirm it's listening (install lsof or nc to verify). Logs: ${log}"
+fi
+info ""
+
+# tool-prune is in the config but INERT: its remove list is empty, so it does
+# nothing until a name is added. That is deliberate for an install.
+#
+# Filling it here would mean a quickstart whose job is to *observe* traffic
+# silently starts *rewriting* it. It is also Claude-Code-specific — the scan reads
+# ~/.claude/projects — so for anyone driving a different agent it would be a
+# mutation with no upside. Opting in is one command, and it belongs to the person
+# who knows whether they want it.
+local_cfg="${CORTEX_DIR}/config.yaml"
+if [ -f "${local_cfg}" ]; then
+	info "  Skip the env vars below — configure Claude Code once, then just run \`claude\`:"
+	info "    ${abctl_cmd} claude-code enable"
+	info ""
+	info "  Using Claude Code? Cut its token cost by pruning tools you never call:"
+	info "    \"${abctl_cmd}\" tools scan --write \"${local_cfg}\""
+	info "    (proposes tools absent from your last 30 days of transcripts;"
+	info "     add --all to spare anything you have ever called; hot-reloaded)"
+	info ""
+fi
+# --claude-code: hand off to abctl, which owns the JSON merge (a shell-side edit
+# of a file holding API tokens is not worth attempting) and prompts on /dev/tty —
+# stdin here is the script itself when piped, so it cannot be read for an answer.
+if [ -n "${WIRE_CLAUDE_CODE:-}" ]; then
+	info ""
+	set +e
+	"${BIN_DIR}/abctl" claude-code enable
+	cc_status=$?
+	set -e
+	case "${cc_status}" in
+		0)
+			info ""
+			info "  Run Claude Code:   claude"
+			info "  Watch traffic:     \"${abctl_cmd}\""
+			info "  Undo:              \"${abctl_cmd}\" claude-code disable"
+			info "  Stop Cortex:       pkill -f authbridge-proxy"
+			info ""
+			exit 0
+			;;
+		3)
+			# Declined, or no terminal to ask on. A normal outcome — fall through to
+			# the manual instructions below.
+			info ""
+			info "  Claude Code left unchanged. To do it later:"
+			info "    \"${abctl_cmd}\" claude-code enable"
+			info ""
+			;;
+		*)
+			# Anything else went wrong (a foreign HTTPS_PROXY, unparseable settings).
+			# Reporting that as "left unchanged" and exiting 0 would claim a success
+			# that did not happen.
+			die "abctl claude-code enable failed (exit ${cc_status}); Cortex is running but Claude Code is not configured for it"
+			;;
+	esac
+fi
+info "  Watch traffic:   \"${abctl_cmd}\""
+info "  Send traffic through it (e.g. Claude Code):"
+info "    HTTPS_PROXY=http://localhost:${DEMO_FORWARD_PORT} \\"
+info "      NODE_EXTRA_CA_CERTS=${ca_dir}/ca.crt \\"
+info "      CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1 claude"
+info ""
+# pkill -f, not `kill $(cat pidfile)`: a stale pidfile can name a recycled pid,
+# and nothing else on the machine is called authbridge-proxy.
+info "  Stop it:         kill ${proxy_pid}   (or: pkill -f authbridge-proxy)"
+info ""

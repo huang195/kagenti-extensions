@@ -27,18 +27,18 @@ func PatchConfig(path string, candidates []string) (changed bool, err error) {
 	orig, err := os.ReadFile(path) //nolint:gosec // operator-supplied config path
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
-			// The bare os error ("open ./cortex-ca/demo.yaml: no such file or
-			// directory") is technically complete and practically useless: the
-			// demo anchors its config to the directory it was launched from, so
-			// a relative path resolves against the wrong place more often than
-			// the right one. Say where we looked and what to do about it.
+			// The bare os error ("open config.yaml: no such file or directory")
+			// is technically complete and practically useless when the caller
+			// passed a relative path. Say where we looked and where the config
+			// actually is. This message exists to rescue a lost user, so a wrong
+			// path here is worse than no path at all.
 			abs, aerr := filepath.Abs(path)
 			if aerr != nil {
 				abs = path
 			}
 			return false, fmt.Errorf("no config at %s\n"+
-				"  authbridge-proxy --demo writes cortex-ca/demo.yaml into the directory it is started from,\n"+
-				"  so run this from there or pass an absolute path. To find it:\n"+
+				"  authbridge-proxy --local writes ~/.cortex/config.yaml,\n"+
+				"  so pass that, or an absolute path. To find it:\n"+
 				"    curl -s localhost:47602/config | grep ca_dir", abs)
 		}
 		return false, err

@@ -1,108 +1,42 @@
 # Cut Claude Code token cost on your laptop
 
-Cortex runs as a local proxy in front of Claude Code and strips tool
-definitions your agent never calls out of every request. Claude Code sends the
-full tool manifest on every turn — tens of thousands of tokens of JSON schema,
-billed each time — and the manifest is built by the client, so the proxy is the
-only place to trim it without changing every client.
+Claude Code sends its whole tool manifest on every turn — tens of thousands of
+tokens of JSON schema, billed each time. Cortex strips the definitions you never
+call.
 
-Four steps, about two minutes.
+Needs the proxy from the
+[quick start](../../README.md#quick-start--claude-code-on-your-laptop) first. This
+step is opt-in because it rewrites requests.
 
-## 1. Install the binaries
-
-```sh
-curl -fsSL https://raw.githubusercontent.com/rossoctl/cortex/main/authbridge/install-demo.sh \
-  | AUTHBRIDGE_INSTALL_ONLY=1 sh
-```
-
-Puts `authbridge-proxy` and `abctl` in `~/.local/bin`. `INSTALL_ONLY` skips
-starting the demo — you want a config that persists, which the next step writes.
-
-The variable goes on `sh`, not on `curl`. Written the other way round
-(`VAR=1 curl … | sh`) it only reaches `curl`, the script runs without it and
-starts the demo — binding 47600-47602 and writing a `cortex-ca/demo.yaml`, so
-step 3 then fails on the port clash.
-
-## 2. Write a config
+## Turn it on
 
 ```sh
-mkdir -p ~/.cortex
-cat > ~/.cortex/config.yaml <<'YAML'
-mode: proxy-sidecar
-listener:
-  roles: [forward]
-  forward_proxy_addr: 127.0.0.1:47600
-  session_api_addr: 127.0.0.1:47601
-stats:
-  address: 127.0.0.1:47602
-tls_bridge:
-  mode: enabled
-  ca_dir: "CA_DIR_PLACEHOLDER"
-  generate_ca: true
-pipeline:
-  outbound:
-    plugins:
-      - name: inference-parser
-      # tool-prune must stay last: it rewrites the request body, and body
-      # readers have to precede it to see the original bytes.
-      - name: tool-prune
-        config:
-          remove: []
-YAML
-sed -i.bak "s|CA_DIR_PLACEHOLDER|$HOME/.cortex/ca|" ~/.cortex/config.yaml && rm ~/.cortex/config.yaml.bak
-```
-
-Keep this outside any `cortex-ca/` directory. `authbridge-proxy --demo`
-regenerates `cortex-ca/demo.yaml` from a built-in template on startup — before
-it binds ports, so even a start that fails on a port clash discards your edits.
-Running with `--config` avoids that entirely.
-
-## 3. Fill in the prune list and start
-
-```sh
-authbridge-proxy --config ~/.cortex/config.yaml &
 abctl tools scan --write ~/.cortex/config.yaml
 ```
 
-`tools scan` reads your own `~/.claude/projects/*.jsonl` transcripts and proposes
-the built-in tools you have not called in 30 days. It only ever proposes tools it
-recognises, and never one it has seen you call. The config is hot-reloaded; no
-restart.
+It proposes the tools you have not called in 30 days, prints them, and writes them
+to `tool-prune`'s `remove:` list. Hot-reloaded — no restart.
 
-**What the scan cannot know is the future.** It reports what you have not used,
-not what you will not need. If you start a kind of work that needs a pruned tool,
-its definition is gone from the request and the model cannot call it — that is a
-functional failure, not merely a smaller saving. Two things keep it cheap:
+`--days N` changes the window, `--all` ignores it. **Wider is safer:** a longer
+window finds more tools in use, so it prunes less. Use `--all` to spare anything
+you have ever called.
 
-- **Rescan occasionally** (say monthly, or after your work changes shape) so the
-  list tracks what you actually use. The list is only ever as current as the last
-  scan.
-- **Reach for `on_error: observe` when in doubt.** It measures the saving and
-  changes nothing, so you can see what a list would be worth before trusting it.
-  abctl marks those figures with `~`.
+Two guards on what it proposes:
 
-If a tool goes missing, the fix is to delete its name from `remove:` — the config
-hot-reloads, so it comes back without a restart.
+- It only ever proposes tools it **recognises**, and never one it has **seen you
+  call** — including tools implied by ones you called, so `BashOutput` survives if
+  you have used background `Bash`.
+- It **refuses to write at all** if it saw no tool calls to reason from. With no
+  history, "tools you have not called" would be every tool it knows, which is a
+  guess rather than a measurement.
 
-## 4. Point Claude Code at it
+To undo: delete names from `remove:` in `~/.cortex/config.yaml`, or empty the list
+to disable pruning entirely. Either way the proxy reloads without a restart.
 
-```sh
-HTTPS_PROXY=http://localhost:47600 \
-  NODE_EXTRA_CA_CERTS="$HOME/.cortex/ca/ca.crt" \
-  CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1 \
-  claude
-```
+## What to expect
 
-Then watch what it saved:
-
-```sh
-abctl --endpoint http://localhost:47601
-```
-
-Plugin pane → `tool-prune` → `Metrics`.
-
-What to expect, measured over 99 requests of one real session: **4–20% of the
-prompt per turn, median 6%**. Two things move it, and neither is a defect:
+**4–20% of the prompt per turn, median 6%**, measured over 99 requests of one real
+session. Two things move it, and neither is a defect:
 
 - **How much of the manifest is yours to prune.** Requests carrying the full tool
   set saved 15–20%; most requests in that session offered a reduced set and saved
@@ -111,33 +45,63 @@ prompt per turn, median 6%**. Two things move it, and neither is a defect:
   so their share of a growing prompt falls — 13% early in that session, 4% by the
   end.
 
-A single early turn can read ~24%, which is why a figure quoted from one request
-is not the number to plan with.
+A single early turn can read ~24%, which is why a figure quoted from one request is
+not the number to plan with.
 
-Stop it with `pkill -f 'authbridge-proxy --config'`.
+Watch it live: run `abctl` (it finds the local proxy on its own), then the plugin
+pane's `tool-prune` → `Metrics`, and the per-request saving in the events
+timeline's `TOKENS / SAVED` column.
 
-## Seeing the saving in money
+## Reading the dollar figure
 
-`$ saved` and `$ saved / request` appear with no extra configuration, labelled
-`default rates` to be clear they come from a built-in table rather than your own
-account.
+`$ saved` appears with no configuration, labelled `default rates`. **Read it as a
+floor.** The built-in rates were measured on a shared gateway that bills below
+vendor list; if your Claude Code talks straight to Anthropic — which it does unless
+you have set `ANTHROPIC_BASE_URL` — you pay list, so the real saving is several
+times what the column shows.
 
-**Read that figure as a floor, not a measurement.** The built-in rates were
-measured on a shared gateway that bills below vendor list. If your Claude Code
-talks straight to Anthropic — which it does unless you have set
-`ANTHROPIC_BASE_URL` — you are paying list, so the real saving is several times
-what the column shows. Set your own rates to make it accurate; the number is
-useful as-is only for confirming the plugin is working and comparing turns
-against each other.
+Savings are reported per prompt-cache tier, never as one blended number: providers
+charge ~1.25x the input rate for a cache write and ~0.1x for a cache read, so
+identical saved bytes differ by more than 12x depending on cache state.
 
-Token savings are reported per prompt-cache tier, never as one blended number:
-providers charge ~1.25x the input rate for a cache write and ~0.1x for a cache
-read, so identical saved bytes differ by more than 12x depending on cache state.
+To make the figure accurate, set your own rates — per million tokens, the unit
+price lists use, and keyed by model family so a version bump needs no edit:
 
-If you are on a different gateway, or the rates have moved, override them per
-model — see
-[`tool-prune-plugin.md`](./tool-prune-plugin.md#costing-it), which also has the
-method for measuring your own from the gateway's cost headers.
+```yaml
+# ~/.cortex/config.yaml, under the tool-prune plugin
+config:
+  pricing:
+    "*claude-opus-*":
+      input_cost_per_million: 3.80
+      cache_write_cost_per_million: 4.75
+      cache_read_cost_per_million: 0.38
+```
+
+Full reference, including how to measure your own from a gateway's cost headers:
+[`tool-prune-plugin.md`](./tool-prune-plugin.md#costing-it).
+
+## Keeping the prune list honest
+
+**What the scan cannot know is the future.** It reports what you have not used, not what
+you will not need. If you start work that needs a pruned tool, its definition is
+gone from the request and the model cannot call it — a functional failure, not
+merely a smaller saving. So:
+
+- **Re-run it occasionally** (monthly, or when your work changes shape):
+
+  ```sh
+  abctl tools scan --write ~/.cortex/config.yaml
+  ```
+
+  The proxy hot-reloads; no restart. `--days N` / `--all` set the window (see
+  above) and `--keep Name,Name` protects specific tools by name.
+
+- **If a tool goes missing, delete its name from `remove:`** in
+  `~/.cortex/config.yaml`. It comes back without a restart.
+
+- **To try a list without committing to it**, set `on_error: observe` on the
+  `tool-prune` plugin. It measures the saving and changes nothing; abctl marks
+  those figures with `~` instead of `−`.
 
 ## What this does and does not change
 
@@ -149,6 +113,17 @@ the pruning happens downstream. So this saves money, not context window;
 auto-compact still triggers at the same point. Recovering headroom needs
 client-side settings (`--allowedTools`, disabling unused MCP servers).
 
-If the Metrics pane stays empty and every event shows `tunnel`, Claude Code is not
-trusting the bridge CA — check `NODE_EXTRA_CA_CERTS` points at the absolute path
-above. The proxy also warns about this in its log after a few requests.
+## If it isn't working
+
+- **Metrics pane empty, every event shows `tunnel`** — Claude Code is not trusting
+  the bridge CA. Check what it is actually using with `abctl claude-code status`;
+  `NODE_EXTRA_CA_CERTS` must be the absolute path to `~/.cortex/ca/ca.crt`. The
+  proxy also warns about this in `~/.cortex/proxy.log` after a few requests,
+  naming the path it expects. `abctl claude-code enable` sets all three variables
+  from your running config, which is the reliable way to get them right.
+- **`tool-prune` shows `skip`, never `modify`** — expected until you opt in: the
+  remove list ships empty. Run the scan above. If it refuses, you have no
+  transcript history for it to reason from yet.
+- **The proxy won't start** — read `~/.cortex/proxy.log`; a port conflict is logged
+  at `ERROR`. Every listener is pinned to loopback on 47600–47604, so a clash
+  usually means Cortex is already running (`pkill -f authbridge-proxy`).

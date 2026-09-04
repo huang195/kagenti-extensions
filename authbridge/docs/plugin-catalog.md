@@ -297,13 +297,17 @@ Requires `inference-parser` earlier in the chain, and must sit after any
 body-reading plugin (it rewrites the request body). Declares
 `WritesRequestBody` only, so response streaming is unaffected.
 
-- `remove` (`[]string`) — tool names to delete from the manifest. The complete verdict: no learning, no state, no storage. Names absent from a given request are ignored.
+- `remove` (`[]string`) — tool names to delete from the manifest. The complete verdict: no learning, no state, no storage. Names absent from a given request are ignored. **An empty list is the off switch** — the plugin is inert until a name is added, which is how it ships in the local install.
 - `paths` (`[]string`) — request paths to act on, matched exactly or by suffix. Defaults to `/v1/chat/completions`, `/v1/completions`, `/v1/messages`.
 - `pricing` (`map[model]rates`) — rates keyed by model name **or glob** (`*claude-opus-*`), each with `input_cost_per_million`, `cache_write_cost_per_million`, `cache_read_cost_per_million` (per-million: the unit providers publish, so `3.80` not `0.0000038`). The per-token names are also accepted for `litellm-budget-track` parity; setting both units for one tier fails startup, since they differ by 10^6 and picking a winner silently would misprice by that factor. **Optional**: built-in patterns cover the Claude families on the rossoctl gateway, so `$ saved` works unconfigured; any entry here overrides the built-in. Per model because rates differ ~5x across opus/sonnet/haiku. Built-ins are keyed by *family*, not version, so an opus 4.8 → 5 rename needs no code change. Resolution: exact key → longest matching glob → built-in pattern → flat fallback → unpriced; keys matched case-insensitively. An invalid glob fails startup with the key named.
 - `input_cost_per_million`, `cache_write_cost_per_million`, `cache_read_cost_per_million` (`float`) — optional flat fallback for models absent from `pricing` (per-token variants also accepted). A figure from built-in rates is labelled as such; a model in neither the table nor config is counted in a `requests unpriced` row instead of charged at another model's rate. No output rate: pruning only shrinks the prompt.
 
 Generate the list from local transcripts with `abctl tools scan`, which
-proposes only tools it recognises as Claude Code built-ins and never
-proposes one it has seen called. See
+proposes only tools it recognises as Claude Code built-ins and never proposes
+one it has seen called. `--days N` sets the recency window (30 by default) and
+`--all` drops it; widening is the cautious direction, since a longer window
+finds more tools in use and so proposes fewer for removal. With `--write` it
+refuses when it observed no tool calls at all, because "tools you have not
+called" would then mean every tool it knows. See
 [`tool-prune-plugin.md`](./tool-prune-plugin.md) for the measure-then-enforce
 rollout, the metrics readout, and what the saving does and does not change.

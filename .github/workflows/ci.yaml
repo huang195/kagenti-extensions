@@ -76,6 +76,19 @@ jobs:
         binary:
           - authbridge-proxy
           - authbridge-envoy
+          # abctl is published by release-binaries.yaml, so it has to build
+          # under GOWORK=off here too. Omitting it let a missing go.sum entry
+          # for an authlib transitive dep reach main: the workspace build used
+          # everywhere else resolved it, and the per-module release build did
+          # not — surfacing only when a tag was cut.
+          - abctl
+          # authbridge-praxis was in no workflow at all, which is how it ended
+          # up broken under GOWORK=off by the same missing go.sum entry. Any
+          # cmd/* module absent from every workflow will drift this way — the
+          # workspace hides exactly this class of breakage. (authbridge-cpex is
+          # deliberately not here: it needs CGO and libcpex_ffi.a from a pinned
+          # release, so build.yaml covers it via its image build instead.)
+          - authbridge-praxis
     defaults:
       run:
         working-directory: authbridge/cmd/${{ matrix.binary }}

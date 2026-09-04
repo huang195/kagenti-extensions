@@ -47,7 +47,7 @@ nothing, whatever the policy, so filling the list is the single act that enables
 it:
 
 ```sh
-abctl tools scan --write ./cortex-ca/demo.yaml
+abctl tools scan --write ~/.cortex/config.yaml
 ```
 
 The config is hot-reloaded, so no restart. A reload does rebuild the plugin and
@@ -296,15 +296,22 @@ change the plugin.
 ## Where the list comes from
 
 ```sh
-abctl tools scan [--days 30] [--keep Name,Name] [--dir PATH] [--write CONFIG]
+abctl tools scan [--days N | --all] [--keep Name,Name] [--dir PATH] [--write CONFIG]
 ```
 
 It reads `~/.claude/projects/**/*.jsonl`, deduplicates tool calls by their
 unique `tool_use` block id (a transcript is rewritten on every resume, so raw
 occurrences would inflate heavily-resumed sessions), and windows to the last
-`--days`. Without `--write` it prints the YAML block; with `--write` it patches
-the `remove:` list of the `tool-prune` entry in place, idempotently and without
-reformatting the rest of the file.
+`--days` (30 by default). Without `--write` it prints the YAML block; with
+`--write` it patches the `remove:` list of the `tool-prune` entry in place,
+idempotently and without reformatting the rest of the file.
+
+`--all` drops the window entirely: every call in every transcript counts as use.
+Widening is the cautious direction — a longer window can only find more tools in
+use, so it proposes fewer for removal — which is why `--days 0` is an error
+rather than a synonym for `--all`: a zero-width window finds nothing used and
+would propose removing every tool in the table. The summary line states which
+mode ran, so a figure is never ambiguous about the window behind it.
 
 **The offered-set problem.** Transcripts record tools that were *called*, never
 tools that were *offered*. This is structural, not a defect: a

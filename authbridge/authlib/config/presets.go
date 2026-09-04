@@ -44,6 +44,10 @@ func ApplyPreset(cfg *Config) {
 	// session.enabled: false — main.go skips the API server when the
 	// store itself is nil.
 	setDefault(&cfg.Listener.SessionAPIAddr, ":9094")
+
+	// Health server is default-on for every mode; ":9091" is what the operator's
+	// probe config and the container images expect.
+	setDefault(&cfg.Listener.HealthAddr, ":9091")
 }
 
 func setDefault(field *string, value string) {

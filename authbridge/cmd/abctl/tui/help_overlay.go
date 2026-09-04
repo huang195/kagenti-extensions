@@ -48,7 +48,7 @@ var paneKeys = map[paneID]keyGroup{
 		bindings: []keyBinding{
 			{"↑↓ / jk", "navigate"},
 			{"↵", "open namespace"},
-			{"l", "connect to localhost:9094"},
+			{"l", "connect to the local session API"},
 			{"r", "reload agent list"},
 			{"q · esc", "quit"},
 		},

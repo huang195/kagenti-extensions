@@ -120,16 +120,10 @@ jobs:
           if gh release view "${TAG}" >/dev/null 2>&1; then
             gh release upload "${TAG}" dist/*.tar.gz dist/checksums.txt --clobber
           else
-            # --prerelease is honest: -alpha/-beta/-rc are not stable. But GitHub's
-            # "Latest" badge EXCLUDES prereleases, and with nothing but prereleases
-            # since v0.3.1 the repo page, `gh release view` and /releases/latest all
-            # reported that January tag as current. --latest pins the badge to the
-            # release just published, without claiming it is stable, so the web UI, gh
-            # and the API agree with what install.sh actually installs.
             prerelease=""
             case "${TAG}" in *-rc*|*-alpha*|*-beta*) prerelease="--prerelease" ;; esac
             gh release create "${TAG}" dist/*.tar.gz dist/checksums.txt \
-              --title "${TAG}" --notes "${notes}" ${prerelease} --latest
+              --title "${TAG}" --notes "${notes}" ${prerelease}
           fi
 
       - name: Upload dry-run artifacts

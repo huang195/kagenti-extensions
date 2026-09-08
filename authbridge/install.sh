@@ -153,43 +153,13 @@ command -v tar  >/dev/null 2>&1 || die "tar is required"
 # `releases/latest` excludes prereleases and this project ships them, so list
 # releases (newest first) and take the first tag_name.
 newest_release() {
-	# Three steps, each doing one thing that cannot silently go wrong:
-	#
-	#   tr ',{}' '\n'   put every JSON field on its own line, so nothing greedy can
-	#                   run past the field it was aimed at. Without this the old
-	#                   `sed 's/.*"tag_name": *"//'` depended on GitHub pretty-printing:
-	#                   against a COMPACT response the whole array is one line, the
-	#                   greedy .* runs to the LAST tag_name, and it returns the OLDEST
-	#                   release. Verified — it yields v0.3.1 from compact JSON.
-	#   grep -m1 ...    match tag_name only where it is a KEY (anchored, colon after).
-	#                   An unanchored match is hijacked by any release whose name or
-	#                   body contains the text "tag_name", and release bodies are ours
-	#                   to author.
-	#   cut -d'"' -f4   take the value by position, not by pattern.
-	#
-	# Then check the shape: a tag looks like v<digit>... Anything else means the API
-	# returned something we did not expect — an error page, a rate-limit body, a schema
-	# change — and the right move is to say so, not to build a download URL out of it.
-	# This is the difference that matters: a surprise becomes an error instead of a
-	# wrong answer.
-	#
-	# Not jq (not installed everywhere) and not gh (a far larger dependency than a
-	# curl|sh installer should require; this script needs curl, tar and a checksum tool).
-	# Not /releases/latest either: it excludes prereleases, and this project ships them,
-	# so it names a tag from January. Listing releases asks what we actually mean — the
-	# newest release, whatever its flags.
+	# Returns non-zero on empty. The pipeline ends in sed, which exits 0 for empty
+	# input, so `version=$(newest_release) || die` could never fire on a
+	# rate-limited or offline API — the caller got an empty tag and failed later
+	# with an unactionable "download failed: abctl__darwin_arm64.tar.gz".
 	_tag=$(curl -fsSL "https://api.github.com/repos/${REPO}/releases?per_page=1" 2>/dev/null \
-		| tr ',{}' '\n' \
-		| grep -m1 '^[[:space:]]*"tag_name"[[:space:]]*:' \
-		| cut -d'"' -f4)
-	case "${_tag}" in
-		v[0-9]*) ;;
-		'') return 1 ;;
-		*)
-			warn "the release API returned an unexpected tag: ${_tag}"
-			return 1
-			;;
-	esac
+		| grep -m1 '"tag_name"' | sed -e 's/.*"tag_name": *"//' -e 's/".*//')
+	[ -n "${_tag}" ] || return 1
 	printf '%s\n' "${_tag}"
 }
 

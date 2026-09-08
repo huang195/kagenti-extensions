@@ -157,8 +157,17 @@ newest_release() {
 	# input, so `version=$(newest_release) || die` could never fire on a
 	# rate-limited or offline API — the caller got an empty tag and failed later
 	# with an unactionable "download failed: abctl__darwin_arm64.tar.gz".
+	# `tr` first, so each JSON field lands on its own line before anything greedy runs.
+	# The previous form — grep -m1 then `sed 's/.*"tag_name": *"//'` — depended on
+	# GitHub pretty-printing: against a COMPACT response the whole array is one line,
+	# the greedy .* runs to the LAST tag_name, and it silently returns the OLDEST
+	# release. Verified: it returns v0.3.1 from compact JSON. Nothing promises the API
+	# keeps pretty-printing, and the failure is a wrong answer rather than an error.
+	#
+	# Still deliberately not jq (not installed everywhere) and not `gh` (a much larger
+	# dependency than this script has any business requiring).
 	_tag=$(curl -fsSL "https://api.github.com/repos/${REPO}/releases?per_page=1" 2>/dev/null \
-		| grep -m1 '"tag_name"' | sed -e 's/.*"tag_name": *"//' -e 's/".*//')
+		| tr ',{}' '\n' | grep -m1 '"tag_name"' | cut -d'"' -f4)
 	[ -n "${_tag}" ] || return 1
 	printf '%s\n' "${_tag}"
 }

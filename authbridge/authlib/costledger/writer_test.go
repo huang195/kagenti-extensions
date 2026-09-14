@@ -124,10 +124,15 @@ func TestWriter_AccumulatesTheOpenMinuteWithoutWriting(t *testing.T) {
 
 	w.Record("s1", costedEvent(t, "gw", "m", 0.25, 100, 50))
 	w.Record("s1", costedEvent(t, "gw", "m", 0.25, 100, 50))
+	// Wait for the writer goroutine, so "no files" is a fact about behaviour rather
+	// than about having asked before it got there.
+	if err := w.sync(); err != nil {
+		t.Fatalf("sync: %v", err)
+	}
 
-	// The open minute belongs to the in-memory ring, not to the ledger. Writing it
-	// would mean the same minute existed in two places and a reader stitching them
-	// would double-count.
+	// The open minute stays in the writer's own accumulator. Writing it would mean the
+	// same minute existed in two places, and a reader composing them would
+	// double-count.
 	if entries, _ := os.ReadDir(dir); len(entries) != 0 {
 		t.Errorf("wrote %d files while the minute was still open; want 0", len(entries))
 	}
@@ -146,6 +151,9 @@ func TestWriter_FlushesOnMinuteRoll(t *testing.T) {
 	later := costedEvent(t, "gw", "m", 0.10, 10, 5)
 	later.At = now
 	w.Record("s1", later)
+	if err := w.sync(); err != nil {
+		t.Fatalf("sync: %v", err)
+	}
 
 	rows := readAllRows(t, dir)
 	if len(rows) != 1 {
@@ -453,6 +461,145 @@ func TestWriter_FlushStraddlingMidnightSplitsByDay(t *testing.T) {
 	}
 }
 
+// The property finding 3 is about: a filesystem that has stopped responding must not
+// reach the request path. Record is called under session.Store's write lock, so a
+// blocking hand-off would stall every other request in the proxy.
+//
+// Closing the writer first leaves nothing draining the queue, which is the only way a
+// unit test can stand in for a hung mount. A blocking implementation would hang here
+// rather than fail.
+func TestRecord_DropsRatherThanBlocksWhenTheWriterCannotKeepUp(t *testing.T) {
+	dir := t.TempDir()
+	now := at
+	w := newTestWriter(t, dir, func() time.Time { return now })
+	if err := w.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	// Each new minute closes the previous one, so this is one queued batch per event.
+	for i := 0; i < opsBuffer+50; i++ {
+		now = at.Add(time.Duration(i) * time.Minute)
+		e := costedEvent(t, "gw", "m", 0.25, 100, 50)
+		e.At = now
+		w.Record("s1", e)
+	}
+
+	if w.Dropped() == 0 {
+		t.Error("Dropped() = 0 after overrunning the queue; a drop that is not counted " +
+			"is a cost total that is short by an unknown amount")
+	}
+}
+
+// The settle path: a minute that has ENDED is written even though no new event has
+// arrived to roll it. Without this an idle proxy held its last minute in memory
+// indefinitely, so a kill lost it and every reader had to reach into memory for it.
+func TestSettleClosedMinute_WritesAnEndedMinuteWithNoNewTraffic(t *testing.T) {
+	dir := t.TempDir()
+	now := at
+	w := newTestWriter(t, dir, func() time.Time { return now })
+	w.Record("s1", costedEvent(t, "gw", "m", 0.25, 100, 50))
+
+	// Time moves on; no further traffic.
+	now = at.Add(90 * time.Second)
+	w.settleClosedMinute()
+
+	rows := readAllRows(t, dir)
+	if len(rows) != 1 || rows[0].CostMicros != 250_000 {
+		t.Fatalf("got %+v, want the ended minute written", rows)
+	}
+	if _, open := w.pending(); !open.IsZero() {
+		t.Error("the minute is still held after being settled; it would be counted twice")
+	}
+}
+
+// And it must NOT write the minute that is still accumulating — the one state that
+// would put a minute on disk and in memory at once.
+func TestSettleClosedMinute_LeavesTheCurrentMinuteAlone(t *testing.T) {
+	dir := t.TempDir()
+	now := at
+	w := newTestWriter(t, dir, func() time.Time { return now })
+	w.Record("s1", costedEvent(t, "gw", "m", 0.25, 100, 50))
+
+	now = at.Add(20 * time.Second) // same minute
+	w.settleClosedMinute()
+
+	if entries, _ := os.ReadDir(dir); len(entries) != 0 {
+		t.Errorf("wrote %d files for a minute that has not ended yet", len(entries))
+	}
+}
+
+// Retention still runs on a day roll — it just runs on the writer goroutine now
+// rather than inside a request. The prune request rides the same queue as the rows,
+// so a sync is what proves it arrived.
+func TestPrune_OnADayRollRunsThroughTheWriter(t *testing.T) {
+	dir := t.TempDir()
+	now := at
+	w, err := New(dir, WithClock(func() time.Time { return now }), WithRetentionDays(3))
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	t.Cleanup(func() { _ = w.Close() })
+
+	old := w.store.path(at.AddDate(0, 0, -10))
+	if werr := os.WriteFile(old, []byte("{}\n"), 0o600); werr != nil {
+		t.Fatalf("seed: %v", werr)
+	}
+	w.Record("s1", costedEvent(t, "gw", "m", 0.25, 100, 50))
+
+	// Cross local midnight, which is what arms the prune.
+	now = dayOf(at).AddDate(0, 0, 1).Add(9 * time.Hour)
+	next := costedEvent(t, "gw", "m", 0.25, 100, 50)
+	next.At = now
+	w.Record("s1", next)
+	if serr := w.sync(); serr != nil {
+		t.Fatalf("sync: %v", serr)
+	}
+
+	if _, serr := os.Stat(old); !os.IsNotExist(serr) {
+		t.Errorf("the 10-day-old file survived a day roll under a 3-day retention: %v", serr)
+	}
+}
+
+// Close is called from a shutdown path that may already have failed once, so a second
+// call must not panic on a closed channel or block on a goroutine that has gone.
+func TestClose_IsIdempotent(t *testing.T) {
+	dir := t.TempDir()
+	now := at
+	w := newTestWriter(t, dir, func() time.Time { return now })
+	w.Record("s1", costedEvent(t, "gw", "m", 0.25, 100, 50))
+
+	if err := w.Close(); err != nil {
+		t.Fatalf("first Close: %v", err)
+	}
+	if err := w.Close(); err != nil {
+		t.Fatalf("second Close: %v", err)
+	}
+	if rows := readAllRows(t, dir); len(rows) != 1 {
+		t.Errorf("got %d rows, want the open minute flushed by Close", len(rows))
+	}
+}
+
+// Flush after Close still writes: main flushes the ledger during shutdown, and a
+// Writer whose goroutine has gone must do the work inline rather than queue it for
+// nobody.
+func TestFlush_AfterCloseStillWrites(t *testing.T) {
+	dir := t.TempDir()
+	now := at
+	w := newTestWriter(t, dir, func() time.Time { return now })
+	if err := w.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	w.Record("s1", costedEvent(t, "gw", "m", 0.25, 100, 50))
+	if err := w.Flush(); err != nil {
+		t.Fatalf("Flush after Close: %v", err)
+	}
+
+	if rows := readAllRows(t, dir); len(rows) != 1 {
+		t.Errorf("got %d rows, want 1 written inline after Close", len(rows))
+	}
+}
+
 // shortWriter accepts limit bytes and then fails, the way a file on a filesystem
 // that has just run out of space does.
 type shortWriter struct {
@@ -537,6 +684,11 @@ func TestWriteLines_EveryLineEndsWithANewline(t *testing.T) {
 // held in memory, nothing on disk carries that minute or a later one.
 func assertOwnership(t *testing.T, w *Writer, dir, step string) {
 	t.Helper()
+	// Settle the writer first: the rule is about what is ON DISK versus what is held,
+	// and a batch still in flight would make the disk side look emptier than it is.
+	if err := w.sync(); err != nil {
+		t.Fatalf("sync: %v", err)
+	}
 	_, open := w.pending()
 	if open.IsZero() {
 		return

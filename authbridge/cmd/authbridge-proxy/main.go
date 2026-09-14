@@ -428,7 +428,7 @@ func main() {
 					sessions.AddRecorder(costLedger)
 					slog.Info("cost ledger enabled — durable cost history for window=today and window=7d",
 						"dir", dir, "retentionDays", retention,
-						"note", "closed minutes only; an unclean stop loses up to 60s of cost")
+						"note", "closed minutes only, written off the request path; an unclean stop loses up to 60s of cost")
 				}
 			}
 		} else {
@@ -746,9 +746,11 @@ func main() {
 	// written; any later and the store is gone.
 	//
 	// This is what turns "a restart loses up to 60 seconds of cost" into "an orderly
-	// stop loses nothing" — the ledger holds only closed minutes precisely so the ring
-	// owns the open one, and Close is what closes it. A SIGKILL still loses the open
-	// minute, and nothing can change that.
+	// stop loses nothing" — the ledger holds only closed minutes on disk precisely so
+	// that the minute still accumulating has exactly one owner, and Close is what hands
+	// it over. Close also stops the ledger's writer goroutine, so it must come after
+	// anything that can still record. A SIGKILL still loses the open minute, and
+	// nothing can change that.
 	if costLedger != nil {
 		if err := costLedger.Close(); err != nil {
 			slog.Warn("cost ledger: final flush failed; the last minute of cost is lost", "error", err)

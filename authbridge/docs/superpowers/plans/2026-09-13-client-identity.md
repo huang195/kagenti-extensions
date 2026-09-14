@@ -1,5 +1,9 @@
 # Client Identity Implementation Plan (commit 6)
 
+> **STATUS: NOT YET IMPLEMENTED.** Nothing described here exists in the tree. There is
+> no `EventClient`, no `GroupAgent`, and the cost ledger's `agent` column ships empty.
+> Do not read this as documentation of behaviour.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Make "which agent spent this" answerable — capture the calling coding agent from the request's User-Agent, carry it on the session event, and break cost down by it.
@@ -12,7 +16,7 @@
 
 ## Global Constraints
 
-- **Module root is `authbridge/`.** Go commands from `.worktrees/cost-first-class/authbridge`; `git` from the worktree root.
+- **Module root is `authbridge/`.** Go commands run from `authbridge/`, relative to the repo root; `git` from the repo root itself.
 - **`git commit -s` mandatory.** Trailer `Assisted-By: Claude (Anthropic AI) <noreply@anthropic.com>`; never `Co-Authored-By`.
 - **A User-Agent is client-controlled. This is a DISPLAY axis, not a security boundary.** Say so where the field is defined, so nobody later builds authorisation on it. Never use it for a policy decision.
 - **Additive on the wire.** Old events decode with an empty client; old consumers ignore the new field.

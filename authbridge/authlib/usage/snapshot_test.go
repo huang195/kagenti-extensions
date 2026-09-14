@@ -43,6 +43,30 @@ func TestSnapshot_GroupModelReturnsTheModelSeries(t *testing.T) {
 	}
 }
 
+// PresentKinds has to be right per SERIES ENTRY, not merely in the window total.
+// The blank-column case the field exists for is a by-model read: one model that
+// reports cache counters and one that does not must carry DIFFERENT flags under the
+// same grouping, or a reader cannot tell an empty CACHE-WRITE cell meaning "this
+// model wrote no cache" from one meaning "this model never reports it".
+//
+// It is carried today because foldInto passes `one` whole to addLabel, but nothing
+// asserted it at this level: Totals would stay green if a series entry lost the
+// field or inherited another entry's bits.
+func TestSnapshot_PresentKindsIsPerSeriesEntry(t *testing.T) {
+	a := New()
+	a.Record("s1", inferenceEvent("reports-cache", 10, 200, 5, 5, 0, 0b1111))
+	a.Record("s1", inferenceEvent("no-cache-fields", 10, 0, 0, 5, 0, 0b1001))
+
+	series := mergeSeries(a.Snapshot(10*time.Minute, BucketWidth, "s1", GroupModel).Buckets)
+
+	if got := series["reports-cache"].PresentKinds; got != 0b1111 {
+		t.Errorf("reports-cache PresentKinds = %#b, want %#b", got, 0b1111)
+	}
+	if got := series["no-cache-fields"].PresentKinds; got != 0b1001 {
+		t.Errorf("no-cache-fields PresentKinds = %#b, want %#b — one model must not inherit another's reported kinds", got, 0b1001)
+	}
+}
+
 func TestSnapshot_GroupMethodIsAnAliasForModel(t *testing.T) {
 	// group=method is on the wire today and tui/usage_pane.go's cycleGroup passes
 	// it, so it must keep working -- and it must return the SAME series as

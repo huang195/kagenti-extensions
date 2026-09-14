@@ -792,12 +792,19 @@ func TestCounts_SplitAccumulatesAcrossEvents(t *testing.T) {
 }
 
 func TestCounts_PresentKindsFoldsByOr(t *testing.T) {
-	// One model reports cache counters, another does not. A reader of the window
-	// total must be able to tell "no cache writes happened" from "nothing here
-	// reports cache writes" -- otherwise a blank column is unreadable.
+	// One provider reports cache counters, another reports input/output. A reader of
+	// the window total must be able to tell "no cache writes happened" from "nothing
+	// here reports cache writes" -- otherwise a blank column is unreadable.
+	//
+	// The two operands are deliberately DISJOINT (0b0110 | 0b1001 == 0b1111, and
+	// neither operand equals the union), because that is what makes this test pin
+	// `|=` specifically. When one operand is a superset of the other -- as an earlier
+	// version of this test had it -- max() and an `if == 0` guard both yield the
+	// right answer, so the assertion said nothing about which operator was used.
+	// Verified by mutation: max() survives a superset pair and dies against this one.
 	a := New()
-	a.Record("s1", inferenceEvent("reports-cache", 10, 0, 0, 5, 0, 0b1111))
-	a.Record("s1", inferenceEvent("no-cache-fields", 10, 0, 0, 5, 0, 0b1001))
+	a.Record("s1", inferenceEvent("reports-cache-only", 0, 200, 5, 0, 0, 0b0110))
+	a.Record("s1", inferenceEvent("reports-io-only", 10, 0, 0, 5, 0, 0b1001))
 
 	snap := a.Snapshot(10*time.Minute, BucketWidth, "s1", GroupNone)
 

@@ -22,7 +22,10 @@ import (
 //	            arithmetic — see usage.fold for why latency in particular cannot
 //	            be folded naively.
 //	session     session ID; omit for all sessions combined
-//	group       none (default), method, status, plugin
+//	group       none (default), model, endpoint, status, plugin. "method" is
+//	            accepted as an alias for "model" — the series shipped under that
+//	            name before it was clear the aggregator only ever populated it
+//	            from the inference model.
 //
 // UNAUTHENTICATED, like every endpoint on this listener. Bind it on in-cluster
 // addresses only, never behind ingress — the trust model is documented in
@@ -30,11 +33,16 @@ import (
 //
 // This response is less sensitive than /v1/sessions, which serves raw prompts,
 // completions and tool results. It carries no message content at all: only
-// counts, timings and cost. But it is not free of information either, and two
+// counts, timings and cost. But it is not free of information either, and three
 // groupings leak deployment shape to anyone who can reach the port:
 //
-//   - group=method exposes the model names in use (claude-sonnet-5, and any
-//     internal or preview model an operator is testing against).
+//   - group=model exposes the model names in use (claude-sonnet-5, and any
+//     internal or preview model an operator is testing against). group=method is
+//     an alias for it and exposes exactly the same thing.
+//   - group=endpoint exposes which gateways and vendor endpoints this deployment
+//     sends inference to, including internal hostnames. That is deployment
+//     topology, not just model choice, and it is the most sensitive of the
+//     groupings for that reason.
 //   - group=plugin exposes the active pipeline composition — though /v1/pipeline
 //     already publishes that in full, so this adds no new exposure.
 //
@@ -43,24 +51,37 @@ import (
 // it is written down so the decision to expose it is a decision rather than an
 // oversight.
 //
-// costMicros is populated from the per-request figure litellm-budget-track
-// settles and publishes on the session event: it prefers LiteLLM's own
-// X-Litellm-Response-Cost header — the authoritative post-discount cost — and
-// falls back to pricing the parsed usage block when the header reports 0, which
-// every streamed response does. The figure is therefore that plugin's
-// measurement rather than a rate table's guess, and this package models no rates
-// itself.
+// costMicros is populated from the figure inference-parser settles on the
+// response pass. It prefers the gateway's own post-discount cost header — the
+// authoritative figure — and falls back to pricing the parsed token counters when
+// the header is absent or reports 0, which every streamed response does.
 //
-// Requests the plugin did not price contribute no cost and appear as the gap
+// The parser owns that decision because it is the only component that knows when
+// the token counters are final. Cost used to be computed in four places, and
+// which one answered depended on which plugins an operator had enabled: a request
+// could carry a token count with no money in a live abctl view while showing
+// dollars here. litellm-budget-track now consumes the settled figure to enforce a
+// budget rather than computing one of its own.
+//
+// Requests the parser did not price contribute no cost and appear as the gap
 // between totals.pricedRequests and totals.requests. Where those differ the
 // dollar total covers only the priced subset, so a client rendering it must
 // present it as partial rather than complete. priced:false means nothing at all
 // was priced — render "cost unavailable", never $0.00, which would read as "this
 // traffic was free".
 //
-// Modelled rates for traffic with no cost event (no litellm-budget-track in the
-// pipeline, or an endpoint it cannot price) arrive with the pricing resolver; see
+// Traffic that carries no settled figure is still priced here, from the process
+// rate table: the pricing resolver has landed, so modelled rates are no longer
+// something that arrives later — usage.Aggregator.costOf resolves a rate for any
+// request carrying a model and tokens but no cost record. See
 // docs/superpowers/specs/2026-09-09-pricing-consolidation-design.md.
+//
+// Which means cost is NOT single-sourced, and this comment deliberately stops
+// short of claiming that it is. inference-parser settles the figure most requests
+// arrive with, but the aggregator still prices independently when none is present,
+// so the two can answer differently about the same request. Collapsing them onto
+// the parser's figure alone is a later change; until it lands, do not write here
+// that cost is computed in exactly one place, because it is not.
 func (s *Server) handleUsage(w http.ResponseWriter, r *http.Request) {
 	if s.usage == nil {
 		// Aggregation not wired up (session store disabled, or an older binary

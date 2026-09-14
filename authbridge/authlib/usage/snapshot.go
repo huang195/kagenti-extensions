@@ -11,10 +11,31 @@ import (
 type Group string
 
 const (
-	GroupNone   Group = "none"
+	GroupNone Group = "none"
+	// GroupModel breaks totals down by the model named on the request.
+	//
+	// This is the series that shipped as GroupMethod. The aggregator only ever
+	// populated it from Inference.Model (see foldInto) — A2A and MCP method names
+	// never entered it — so "method" was a misnomer from the start. abctl's
+	// events-table METHOD cell DOES show A2A/MCP methods, which is what made the
+	// name look right; that is a different code path.
+	GroupModel Group = "model"
+	// GroupMethod is the name GroupModel shipped under. Accepted forever, resolves
+	// to the same series.
+	//
+	// Kept because it is on the wire and tui/usage_pane.go's cycleGroup passes it:
+	// dropping it would break a live client to fix a spelling. NOT a second map —
+	// series() maps both to byMethod.
 	GroupMethod Group = "method"
-	GroupStatus Group = "status"
-	GroupPlugin Group = "plugin"
+	// GroupEndpoint breaks totals down by target host.
+	//
+	// Half of the rate key. The same model bills differently on a discounted
+	// gateway than on the vendor endpoint, and only the host distinguishes them, so
+	// a cost table without this axis cannot explain why two identical-looking
+	// requests cost different amounts.
+	GroupEndpoint Group = "endpoint"
+	GroupStatus   Group = "status"
+	GroupPlugin   Group = "plugin"
 )
 
 // ParseGroup validates a group parameter. Empty means GroupNone.
@@ -22,8 +43,16 @@ func ParseGroup(s string) (Group, error) {
 	switch Group(s) {
 	case "", GroupNone:
 		return GroupNone, nil
+	case GroupModel:
+		return GroupModel, nil
+	// Returned as itself rather than normalised to GroupModel: Snapshot echoes the
+	// requested group back on the wire, and rewriting a caller's parameter into a
+	// name it did not ask for would make the response look like it answered a
+	// different question.
 	case GroupMethod:
 		return GroupMethod, nil
+	case GroupEndpoint:
+		return GroupEndpoint, nil
 	case GroupStatus:
 		return GroupStatus, nil
 	case GroupPlugin:
@@ -33,7 +62,7 @@ func ParseGroup(s string) (Group, error) {
 	// over an unauthenticated endpoint, and reflecting arbitrary query input
 	// into a response body is how a reflected-content issue starts. The valid
 	// set is short enough that naming it is more useful than quoting the input.
-	return "", errors.New("unknown group (want none, method, status or plugin)")
+	return "", errors.New("unknown group (want none, model, endpoint, status, plugin; method is accepted as an alias for model)")
 }
 
 // Snapshot is the wire shape of GET /v1/usage.
@@ -320,8 +349,12 @@ func (b *bucket) latStats() (mean, stddev float64) {
 func (b *bucket) series(g Group) map[string]Counts {
 	var src map[string]Counts
 	switch g {
-	case GroupMethod:
+	// Both spellings read the same map. GroupMethod is the name this series
+	// shipped under; see its godoc.
+	case GroupModel, GroupMethod:
 		src = b.byMethod
+	case GroupEndpoint:
+		src = b.byEndpoint
 	case GroupStatus:
 		src = b.byStatus
 	case GroupPlugin:

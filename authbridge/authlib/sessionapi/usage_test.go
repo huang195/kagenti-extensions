@@ -198,3 +198,86 @@ func TestHandleUsage_SessionIDLengthCap(t *testing.T) {
 		t.Error("error body echoes the over-long id back")
 	}
 }
+
+// inferenceEventForAPI builds a response event carrying an explicit token split.
+//
+// A local copy of authlib/usage's own inferenceEvent: that one is unexported and
+// this is a different package, so there is nothing to import.
+func inferenceEventForAPI(model string, in, cacheRead, cacheWrite, out int) pipeline.SessionEvent {
+	return pipeline.SessionEvent{
+		At:         time.Now(),
+		Direction:  pipeline.Outbound,
+		Phase:      pipeline.SessionResponse,
+		StatusCode: 200,
+		Host:       "gw.example.com",
+		Inference: &pipeline.InferenceExtension{
+			Model:            model,
+			InputTokens:      in,
+			CacheReadTokens:  cacheRead,
+			CacheWriteTokens: cacheWrite,
+			OutputTokens:     out,
+			TotalTokens:      in + cacheRead + cacheWrite + out,
+		},
+	}
+}
+
+// The handler delegates group parsing to usage.ParseGroup, so the axes a cost
+// table needs are served with no code change here. This pins that: a future
+// refactor that reintroduced a local allow-list would silently drop the new
+// groupings while every other test in this file kept passing.
+func TestHandleUsage_AcceptsModelAndEndpointGroups(t *testing.T) {
+	for _, group := range []string{"model", "endpoint", "method", "status", "plugin", "none", ""} {
+		t.Run("group="+group, func(t *testing.T) {
+			ts, _ := newTestServer(t, WithUsage(usage.New()))
+
+			status, body := fetchUsage(t, ts.URL, "?group="+group)
+			if status != http.StatusOK {
+				t.Fatalf("status = %d, want 200; body = %s", status, body)
+			}
+			var snap usage.Snapshot
+			if err := json.Unmarshal([]byte(body), &snap); err != nil {
+				t.Fatalf("decode: %v", err)
+			}
+		})
+	}
+}
+
+// Complements TestHandleUsage_ErrorsDoNotEchoInput, which sends the probe as raw
+// bytes: this one sends it percent-encoded, so the assertion holds for what the
+// query decoder hands the handler rather than only for what survives the URL.
+func TestHandleUsage_RejectsUnknownGroupWithoutReflectingIt(t *testing.T) {
+	ts, _ := newTestServer(t, WithUsage(usage.New()))
+
+	status, body := fetchUsage(t, ts.URL, "?group=%3Cscript%3E")
+	if status != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400", status)
+	}
+	if strings.Contains(body, "script") {
+		t.Errorf("response reflects caller input: %s", body)
+	}
+}
+
+// The whole point of the schema rule is that a consumer reads the same field
+// names the parser published. Assert on the JSON, not the struct.
+//
+// Presence is a real assertion rather than a trivial one because every split
+// field is omitempty: a name only reaches the wire if the aggregate actually
+// carried a non-zero value for it. So this fails both if a field is renamed and
+// if foldInto stops populating it from the event.
+func TestHandleUsage_SplitFieldsAppearOnTheWire(t *testing.T) {
+	agg := usage.New()
+	ts, store := newTestServer(t, WithUsage(agg))
+	store.AddRecorder(agg)
+
+	store.Append("s1", inferenceEventForAPI("claude-opus-5", 10, 2000, 50, 30))
+
+	status, body := fetchUsage(t, ts.URL, "?session=s1")
+	if status != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body = %s", status, body)
+	}
+	for _, field := range []string{"inputTokens", "cacheReadTokens", "cacheWriteTokens", "outputTokens"} {
+		if !strings.Contains(body, field) {
+			t.Errorf("response body has no %q field: %s", field, body)
+		}
+	}
+}

@@ -50,6 +50,39 @@ type Counts struct {
 	Requests int64 `json:"requests"`
 	Errors   int64 `json:"errors,omitempty"`
 	Tokens   int64 `json:"tokens,omitempty"`
+	// The four billed token kinds, plus reasoning. Names match
+	// pipeline.InferenceExtension exactly: one vocabulary from parser to aggregate
+	// to ledger to collector, because aggregate-side synonyms are how two halves
+	// of a system come to disagree about what a field means.
+	//
+	// Tokens above stays as the sum for clients written against it. These are
+	// additive to the wire, not a replacement.
+	//
+	// They matter because the kinds price very differently — a cache read is
+	// roughly 0.1x uncached input and a cache write roughly 1.25x — so for a
+	// long-running agent, whose traffic is overwhelmingly cache reads, the split
+	// IS the shape of the bill. One scalar cannot express that.
+	InputTokens      int64 `json:"inputTokens,omitempty"`
+	CacheReadTokens  int64 `json:"cacheReadTokens,omitempty"`
+	CacheWriteTokens int64 `json:"cacheWriteTokens,omitempty"`
+	OutputTokens     int64 `json:"outputTokens,omitempty"`
+	// ReasoningTokens is a SUBSET of OutputTokens, not a sibling of it: the
+	// provider reports how much of what it generated was reasoning. Adding the two
+	// double-counts every reasoning token at the output rate, which is the most
+	// expensive tier there is.
+	ReasoningTokens int64 `json:"reasoningTokens,omitempty"`
+	// PresentKinds is the OR of every folded event's InferenceExtension.PresentKinds:
+	// a set bit means at least one response in this bucket actually REPORTED that
+	// kind. Bit layout matches parsercommon.Kind (Input=1, CacheRead=2,
+	// CacheWrite=4, Output=8, Reasoning=16).
+	//
+	// Summing would be meaningless, hence the union. It exists because a zero in
+	// one of the fields above has two readings — "this traffic wrote no cache" and
+	// "nothing here reports cache writes" — and a by-model table showing a blank
+	// column cannot be interpreted without knowing which. The per-event flag
+	// already carries that distinction; dropping it at the aggregate would throw
+	// away the only thing that makes an empty cell readable.
+	PresentKinds uint8 `json:"presentKinds,omitempty"`
 	// CostMicros is millionths of a US dollar. An integer unit keeps bucket
 	// addition exact and JSON round-tripping lossless, which float dollars do
 	// not; a client divides by 1e6 to display. Zero when nothing here could be
@@ -80,7 +113,10 @@ type Counts struct {
 	PriceableRequests int64 `json:"priceableRequests,omitempty"`
 }
 
-// Add accumulates o into c, field by field.
+// Add accumulates o into c, field by field — except PresentKinds, which is
+// OR-ed. It is a set of which token kinds a response reported, so adding two
+// buckets' flags would produce a number that is not a bit set at all. Do not
+// pattern-match on the `+=` below when adding a field of that shape.
 //
 // Exported because consumers fold these too — abctl collapses low-volume series
 // into an "(other)" band — and an unexported version left them hand-summing the
@@ -97,6 +133,16 @@ func (c *Counts) Add(o Counts) {
 	c.CostMicros += o.CostMicros
 	c.PricedRequests += o.PricedRequests
 	c.PriceableRequests += o.PriceableRequests
+	c.InputTokens += o.InputTokens
+	c.CacheReadTokens += o.CacheReadTokens
+	c.CacheWriteTokens += o.CacheWriteTokens
+	c.OutputTokens += o.OutputTokens
+	// Summed alongside OutputTokens, never into it: it is a subset of the output
+	// the provider already reported, so folding it in would bill it twice.
+	c.ReasoningTokens += o.ReasoningTokens
+	// Union, not sum: PresentKinds is a set of which kinds were reported, so
+	// adding two buckets' flags would produce a number that is not a bit set.
+	c.PresentKinds |= o.PresentKinds
 }
 
 // Bucket is one BucketWidth slice of time, as served to clients.
@@ -134,10 +180,17 @@ type bucket struct {
 	// latN counts only the requests that actually carried a duration. Dividing
 	// latSum by Requests instead reports a mean diluted by every unmeasured
 	// response: one 2s response plus one unmeasured one reported 1s, not 2s.
-	latN     int64
+	latN int64
+	// byMethod tallies by the model named on the request — despite the name, which
+	// is the one GroupModel shipped under. See GroupModel's godoc: nothing has ever
+	// put an A2A or MCP method name in here.
 	byMethod map[string]Counts
-	byStatus map[string]Counts
-	byPlugin map[string]Counts
+	// byEndpoint tallies by target host. Bounded by maxLabelsPerBucket like every
+	// other label map: Host comes off the request, so its cardinality is set
+	// off-host rather than by anything this process controls.
+	byEndpoint map[string]Counts
+	byStatus   map[string]Counts
+	byPlugin   map[string]Counts
 	// byProvenance tallies priced requests by where their figure came from, so a
 	// total can disclose how much of it is a gateway's own number versus modelled
 	// from a rate table. Like byUnpriced, kept outside the Group machinery: it
@@ -542,9 +595,21 @@ func (a *Aggregator) foldInto(ring []bucket, t time.Time, e *pipeline.SessionEve
 
 	var tokens int64
 	var model string
+	// split is read from the wire event's own split counters rather than derived
+	// from tokens: the parser is the only component that knows the breakdown, and
+	// there is no way to recover it from the total afterwards.
+	var split Counts
 	if e.Inference != nil {
 		tokens = int64(e.Inference.TotalTokens)
 		model = e.Inference.Model
+		split = Counts{
+			InputTokens:      int64(e.Inference.InputTokens),
+			CacheReadTokens:  int64(e.Inference.CacheReadTokens),
+			CacheWriteTokens: int64(e.Inference.CacheWriteTokens),
+			OutputTokens:     int64(e.Inference.OutputTokens),
+			ReasoningTokens:  int64(e.Inference.ReasoningTokens),
+			PresentKinds:     e.Inference.PresentKinds,
+		}
 	}
 
 	one := Counts{
@@ -553,6 +618,12 @@ func (a *Aggregator) foldInto(ring []bucket, t time.Time, e *pipeline.SessionEve
 		CostMicros:        ec.micros,
 		PricedRequests:    ec.priced,
 		PriceableRequests: ec.priceable,
+		InputTokens:       split.InputTokens,
+		CacheReadTokens:   split.CacheReadTokens,
+		CacheWriteTokens:  split.CacheWriteTokens,
+		OutputTokens:      split.OutputTokens,
+		ReasoningTokens:   split.ReasoningTokens,
+		PresentKinds:      split.PresentKinds,
 	}
 	if ec.unpricedKey != "" {
 		addLabel(&b.byUnpriced, truncateLabel(ec.unpricedKey), Counts{Requests: 1})
@@ -575,6 +646,12 @@ func (a *Aggregator) foldInto(ring []bucket, t time.Time, e *pipeline.SessionEve
 
 	if model != "" {
 		addLabel(&b.byMethod, truncateLabel(model), one)
+	}
+	// Guarded on non-empty: Host is unset when the listener did not populate it,
+	// and an "" key renders as a blank row in a breakdown table, which reads as a
+	// bug rather than as missing data.
+	if e.Host != "" {
+		addLabel(&b.byEndpoint, truncateLabel(e.Host), one)
 	}
 	if e.StatusCode > 0 {
 		addLabel(&b.byStatus, strconv.Itoa(e.StatusCode), one)

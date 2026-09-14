@@ -156,6 +156,36 @@ type Settled struct {
 	// priced.
 	DeclaredFree bool
 
+	// Incomplete marks CostUSD as not an EXACT total, and IncompleteReason says why —
+	// pricing.ReasonOutputUncounted for a figure that is known-low, or
+	// pricing.ReasonSplitUnreported for one that is approximate in no known direction.
+	//
+	// It exists because a truncated stream was priced prompt-only and published as a
+	// complete figure. Prompt counts land on Anthropic's message_start and the output
+	// count only on message_delta, so a stream that dies in between yields real prompt
+	// tokens with output at zero — and Settle priced exactly what it was given, set
+	// Priced, and every consumer downstream read the result as an exact figure: the
+	// usage aggregator counted it in PricedRequests and CostMicros, and a budget
+	// enforced against it. A floor presented as a total understates spend by however
+	// much the completion would have cost, which on a long generation is most of it.
+	//
+	// Honest by DISCLOSURE, not by adjustment. CostUSD keeps the figure and Priced stays
+	// TRUE, deliberately and on both counts:
+	//
+	//   - The figure is the best available. Estimating the missing completion would be
+	//     worse than reporting a known-low number and saying it is low.
+	//   - The request IS priced, so removing it from a priced count would misuse a
+	//     counter that answers a different question — coverage, "did anything price
+	//     this" — and would disclose the same fact twice in two vocabularies. It would
+	//     also send a consumer's own fallback down a rate table to recompute the
+	//     identical prompt-only figure and label THAT one exact.
+	//
+	// Never set on a gateway figure, including a declared-free zero: a reported cost is
+	// what the call actually charged whatever our counters saw, so completeness there is
+	// the gateway's assertion rather than an inference from token tallies.
+	Incomplete       bool
+	IncompleteReason string
+
 	// ReportedUSD is the gateway's own figure, when it gave one.
 	ReportedUSD float64
 	HasReported bool
@@ -278,6 +308,22 @@ func Settle(pctx *pipeline.Context, rates pricing.Resolver) Settled {
 		out.CostUSD, out.Source, out.Provenance, out.Priced =
 			out.ModelledUSD, costevent.SourceUsageFallback, out.ModelledProv, true
 	}
+
+	// Qualify a MODELLED figure whose counters cannot support an exact total. Nothing is
+	// adjusted — see Settled.Incomplete; the figure stands and the claim about it does
+	// not.
+	//
+	// This is the only place in the system that holds both the header state and the
+	// usage, so it is the only place that knows WHICH figure won — and therefore the
+	// only place that can gate the disclosure on the answer being modelled. Gated on the
+	// source rather than on "the header was not positive" because DeclaredFree reaches
+	// here as SourceGatewayHeader too: the gateway stating it charged nothing is an
+	// exact total, and publishing a floor of zero would be a lower bound on nothing.
+	if out.Priced && out.Source == costevent.SourceUsageFallback {
+		if reason := pricing.IncompleteReason(pctx.Extensions.Inference); reason != "" {
+			out.Incomplete, out.IncompleteReason = true, reason
+		}
+	}
 	return out
 }
 
@@ -382,8 +428,13 @@ func NewRecord(s Settled, avoided []costevent.Saving) costevent.Event {
 		Source:     s.Source,
 		Provenance: s.Provenance.String(),
 		Settled:    s.Priced,
-		PromptUSD:  s.PromptUSD,
-		OutputUSD:  s.OutputUSD,
-		Avoided:    avoided,
+		// Carried, not derived. A Settled.Incomplete that NewRecord dropped would be
+		// knowledge that reaches nothing — which is exactly the state this fix found the
+		// parser's "token counts will be incomplete" log line in.
+		Incomplete:       s.Incomplete,
+		IncompleteReason: s.IncompleteReason,
+		PromptUSD:        s.PromptUSD,
+		OutputUSD:        s.OutputUSD,
+		Avoided:          avoided,
 	}
 }

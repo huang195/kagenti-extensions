@@ -39,10 +39,20 @@ import (
 //   - group=model exposes the model names in use (claude-sonnet-5, and any
 //     internal or preview model an operator is testing against). group=method is
 //     an alias for it and exposes exactly the same thing.
-//   - group=endpoint exposes which gateways and vendor endpoints this deployment
-//     sends inference to, including internal hostnames. That is deployment
-//     topology, not just model choice, and it is the most sensitive of the
-//     groupings for that reason.
+//
+//   - group=endpoint exposes every upstream host the proxy talked to, not only the
+//     inference ones: the accumulator is populated for any response or denial
+//     carrying a Host, with no inference guard, so MCP servers, A2A peers and tool
+//     backends appear alongside model gateways — internal hostnames included. That
+//     is deployment topology rather than model choice, which makes it the most
+//     sensitive of the groupings.
+//
+//     It also means the two axes of one cost table have different denominators:
+//     group=endpoint rows can carry requests with no tokens and no cost, while
+//     group=model is inference-only because that accumulator requires a model name.
+//     Their request totals will not reconcile, and that is correct rather than a
+//     bug — but a client putting the two side by side has to say so.
+//
 //   - group=plugin exposes the active pipeline composition — though /v1/pipeline
 //     already publishes that in full, so this adds no new exposure.
 //

@@ -242,9 +242,14 @@ func TestHandleUsage_AcceptsModelAndEndpointGroups(t *testing.T) {
 	}
 }
 
-// Complements TestHandleUsage_ErrorsDoNotEchoInput, which sends the probe as raw
-// bytes: this one sends it percent-encoded, so the assertion holds for what the
-// query decoder hands the handler rather than only for what survives the URL.
+// A deliberate DUPLICATE of TestHandleUsage_ErrorsDoNotEchoInput's group case, kept
+// only so the group parameter's no-reflection guarantee is asserted under a name
+// that says so — ParseGroup's error string is the one most likely to be reworded as
+// groupings are added, and this is what a reworder will grep for.
+//
+// It adds no coverage: percent-encoding the probe changes nothing, because both
+// tests read through r.URL.Query().Get, which decodes. Delete this rather than the
+// broader test if one has to go.
 func TestHandleUsage_RejectsUnknownGroupWithoutReflectingIt(t *testing.T) {
 	ts, _ := newTestServer(t, WithUsage(usage.New()))
 

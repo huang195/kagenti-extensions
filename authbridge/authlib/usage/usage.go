@@ -55,8 +55,17 @@ type Counts struct {
 	// to ledger to collector, because aggregate-side synonyms are how two halves
 	// of a system come to disagree about what a field means.
 	//
-	// Tokens above stays as the sum for clients written against it. These are
-	// additive to the wire, not a replacement.
+	// Tokens above stays as the legacy aggregate for clients written against it.
+	// These are additive to the wire, not a replacement.
+	//
+	// Tokens is NOT always the sum of the fields below. parsercommon.Fill prefers
+	// the provider's own total_tokens when one was reported and falls back to
+	// summing the split otherwise, so a gateway reporting only a total — prompt and
+	// completion absent — yields a non-zero Tokens with every split field at 0. A
+	// client normalising a stacked bar against Tokens would be wrong in that case;
+	// PresentKinds below is what keeps it legible, since no bits set means nothing
+	// reported a breakdown at all, which is a different answer from a breakdown that
+	// was genuinely zero.
 	//
 	// They matter because the kinds price very differently — a cache read is
 	// roughly 0.1x uncached input and a cache write roughly 1.25x — so for a

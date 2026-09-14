@@ -13,6 +13,29 @@
 // summing marginals would double-count. Recording independently also means this
 // package cannot regress charting.
 //
+// TWO HALVES, ONE ANSWER. Closed minutes live on disk; the minute still
+// accumulating lives in the Writer. Window returns both, and that is the only
+// entry point a reader should use — see its doc for how non-overlap is enforced.
+//
+// The open minute comes from THIS package's accumulator and not from the usage
+// aggregator's ring, though the ring also holds it. Four reasons, because an
+// earlier draft of this doc claimed the ring and it would have been wrong:
+//
+//   - The ring prices independently. usage.Aggregator.costOf falls back to the
+//     process rate table where this package does not (see the divergence paragraph
+//     below), so a total assembled from both would have one minute priced by one
+//     rule and the rest by another — an internally inconsistent figure, which is
+//     harder to explain than either rule on its own.
+//   - The ring's request denominator is different. It counts every response
+//     carrying a Host, including MCP and health traffic; this package counts
+//     inference only. Requests would jump for exactly one minute of the window.
+//   - The ring is 6 hours. A minute held while the proxy sits idle overnight has
+//     rotated out of the ring, but is still in the map right here.
+//   - Ownership would become a timing question. The ring knows nothing about what
+//     has been flushed, so any periodic flush could put a minute in both halves.
+//     Reading the open minute from the writer that owns it makes the boundary exact
+//     and provable rather than probable.
+//
 // It prices NOTHING. Every figure here is the one authlib/costing settled and
 // inference-parser published on the event; this package only decodes and adds.
 // That is the invariant cortex #972 exists to protect: one component turns

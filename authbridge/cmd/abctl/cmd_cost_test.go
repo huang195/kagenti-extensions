@@ -193,6 +193,40 @@ func TestRunCost_UnreachableProxyExitsNonZeroAndSaysWhatToRun(t *testing.T) {
 	}
 }
 
+// A 400 is the proxy ANSWERING: it understood the request and refused it. Telling the
+// user to go and check whether Cortex is running sends them to the one place that has
+// nothing wrong with it. The real causes are an older proxy that predates today/7d and
+// a --window this one does not accept.
+func TestRunCost_RefusedWindowBlamesTheWindowNotTheProxy(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusBadRequest)
+		if _, err := w.Write([]byte(`{"error":"bad window (want a duration such as 10m, 1h or 6h)"}`)); err != nil {
+			t.Errorf("write: %v", err)
+		}
+	}))
+	defer srv.Close()
+
+	var out, errOut strings.Builder
+	code := runCost([]string{"--endpoint", srv.URL, "--window", "today"}, &out, &errOut)
+
+	if code == 0 {
+		t.Fatal("exit = 0 for a refused window")
+	}
+	stderr := errOut.String()
+	if !strings.Contains(stderr, "does not accept --window") {
+		t.Errorf("stderr does not blame the window:\n%s", stderr)
+	}
+	if strings.Contains(stderr, "abctl service status") {
+		t.Errorf("stderr sends the user to check a proxy that just answered:\n%s", stderr)
+	}
+	// The server's own words reach the user: every 400 message this endpoint returns is
+	// a fixed string authored server-side, so it is the most specific thing available.
+	if !strings.Contains(stderr, "bad window") {
+		t.Errorf("stderr drops the server's own explanation:\n%s", stderr)
+	}
+}
+
 func TestRunCost_NoLedgerServesAShorterWindowAndSaysSo(t *testing.T) {
 	// Kubernetes, or a local install with the ledger disabled. The server answers
 	// with the window it actually served; the CLI must print THAT, not "today".
@@ -269,6 +303,12 @@ func TestRunCost_HelpListsTheFlags(t *testing.T) {
 		if !strings.Contains(combined, want) {
 			t.Errorf("help does not mention %q:\n%s", want, combined)
 		}
+	}
+	// The ring-versus-ledger difference has to be somewhere a user comparing two
+	// figures on screen will actually look. It was documented only at the top of a Go
+	// source file, which is the one place they will not.
+	if !strings.Contains(combined, "can disagree") {
+		t.Errorf("help does not warn that a duration window and today/7d can differ:\n%s", combined)
 	}
 }
 

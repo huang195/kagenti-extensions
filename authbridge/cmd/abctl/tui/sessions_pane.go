@@ -17,34 +17,38 @@ import (
 // resize: fitting the LIVE columns would be cumulative, and a terminal that got narrower once
 // would keep its narrowed columns after being widened again.
 //
-// COST and SPAN are appended rather than slotted next to TOKENS and UPDATED where they read
-// best. table.Row is a []string addressed positionally — selectedSessionID takes [0], and a
-// test pins ACTIVE at [4] — so an INSERT shifts every reader silently instead of failing to
-// compile. Appending trades column order for a change that cannot misattribute a cell.
+// COST is INSERTED before ACTIVE rather than appended after it, because ACTIVE is a
+// status marker and belongs at the end of a row where the eye stops. table.Row is a
+// []string addressed positionally, so that insert shifted every reader of ACTIVE by
+// one — selectedSessionID takes [0] and is unaffected, but a retention test pinned
+// "cached" at [4] and now reads [5]. That shift COMPILES and keeps asserting; it just
+// asserts about COST instead. Both were moved deliberately; if a third positional
+// reader appears, move it in the same commit as any reordering.
 //
-// The declared widths sum to 98, so the table renders 116 display columns with bubbles'
-// two-per-cell padding. That is well past an 80-column terminal, which is exactly why
-// fitTableColumns exists: it drops trailing columns rather than letting the renderer clip a
-// figure mid-digits. Without it a 96-column terminal rendered "$12.5" for a $12.5000 session
-// — a half-rendered dollar amount that reads as a real, smaller one.
+// The declared widths sum to 90, so the table renders 106 display columns with bubbles'
+// two-per-cell padding. That is past an 80-column terminal, which is exactly why
+// fitTableColumns exists: it drops trailing columns rather than letting the renderer clip
+// a figure mid-digits. Without it a 96-column terminal rendered "$12.5" for a $12.5000
+// session — a half-rendered dollar amount that reads as a real, smaller one.
+//
+// SPAN (UpdatedAt-CreatedAt) was here and was removed: it measured ELAPSED time, so a
+// session idle for an hour reported an hour, which made it nearly redundant with UPDATED
+// two columns to its left. It was also always blank on cached-only rows, and it was the
+// first column the fitter dropped, so it cost width on every terminal and showed on few.
 func sessionsColumns() []table.Column {
 	return []table.Column{
 		{Title: "ID", Width: 40},
 		{Title: "UPDATED", Width: 14},
 		{Title: "EVENTS", Width: 8},
 		{Title: "TOKENS", Width: 10},
-		{Title: "ACTIVE", Width: 8},
 		// 10 columns is exactly "$9999.9999", the widest figure formatUSDCell's fixed 4dp
 		// produces below five figures of dollars. Above that bubbles truncates with
 		// runewidth.Truncate, putting an ellipsis inside a dollar amount — the one thing
 		// #953 rules out. The ceiling means one session spending $10,000 inside the
-		// strip's window; pinned by TestSessionsTable_CostAndSpanFitTheirColumns so the
-		// trade is visible if the formatter's precision changes.
+		// strip's window; pinned by TestSessionsTable_CostFitsItsColumn so the trade is
+		// visible if the formatter's precision changes.
 		{Title: "COST", Width: 10},
-		// 8 holds formatSpan's ordinary output. A corrupt CreatedAt can produce more
-		// (up to "106751d23h"), which bubbles then ellipsizes — acceptable for a
-		// duration in a way it is not for money.
-		{Title: "SPAN", Width: 8},
+		{Title: "ACTIVE", Width: 8},
 	}
 }
 
@@ -97,9 +101,8 @@ func (m *model) rebuildSessionsTable() {
 			// use len(cached) because the server does not list those at all.
 			fmt.Sprintf("%d", s.EventCount),
 			sessionTokens(s.TotalTokens, m.events[s.ID]),
-			active,
 			cost,
-			formatSpan(sessionSpan(s)),
+			active,
 		})
 	}
 	// Sessions whose events abctl still holds but the server no longer lists.
@@ -111,21 +114,19 @@ func (m *model) rebuildSessionsTable() {
 			continue
 		}
 		cached := m.events[id]
-		// COST and SPAN are blank for these rows on purpose, not because the lookups
-		// would be awkward. There is no SessionSummary, so there are no
-		// CreatedAt/UpdatedAt to span at all. The cost COULD be looked up — the id is
-		// all sessionCost needs — but these are sessions the server has expired out of
-		// its store, while the strip's window is a rolling hour: any figure found would
-		// cover whatever part of the last hour happens to overlap, not the session the
-		// row is about. Blank says "unknown", which is what it is.
+		// COST is blank for these rows on purpose, not because the lookup would be
+		// awkward. It COULD be looked up — the id is all sessionCost needs — but these
+		// are sessions the server has expired out of its store, while the strip's window
+		// is a rolling hour: any figure found would cover whatever part of the last hour
+		// happens to overlap, not the session the row is about. Blank says "unknown",
+		// which is what it is.
 		rows = append(rows, table.Row{
 			id,
 			"—",
 			fmt.Sprintf("%d", len(cached)),
 			sessionTokens(0, cached),
+			"",
 			"cached",
-			"",
-			"",
 		})
 	}
 	m.sessionsTbl.SetRows(rows)
@@ -181,44 +182,6 @@ func relTime(now, t time.Time) string {
 		return fmt.Sprintf("%dh ago", int(d.Hours()))
 	default:
 		return t.Format("Jan 2 15:04")
-	}
-}
-
-// formatSpan renders a duration for the SPAN cell, compactly.
-//
-// Not time.Duration.String(): that renders 1h23m45.6s for the case this column
-// exists to show, which is 10 columns of which the last four are noise — and in an
-// 8-column cell it is truncated mid-number, which is exactly the clipping the spend
-// work exists to avoid. Two units at most, largest first, and no decimals: the
-// question is "how long has this been going", not "to the millisecond".
-//
-// Sits beside relTime rather than in spend.go because the two are siblings — both
-// turn a time into a cell for this table — and a reader comparing the UPDATED and
-// SPAN columns needs to see both formatters at once. relTime is not reused: it
-// renders "ago" suffixes and "just now", which are wrong for an elapsed span.
-//
-// Non-positive renders "" for the reason sessionSpan returns 0 there: a blank cell
-// says "unknown", "0s" would assert an instantaneous session.
-func formatSpan(d time.Duration) string {
-	switch {
-	case d <= 0:
-		return ""
-	case d < time.Minute:
-		return fmt.Sprintf("%ds", int(d.Seconds()))
-	case d < time.Hour:
-		return fmt.Sprintf("%dm", int(d.Minutes()))
-	case d < 24*time.Hour:
-		h := int(d / time.Hour)
-		if m := int((d % time.Hour) / time.Minute); m > 0 {
-			return fmt.Sprintf("%dh%dm", h, m)
-		}
-		return fmt.Sprintf("%dh", h)
-	default:
-		days := int(d / (24 * time.Hour))
-		if h := int((d % (24 * time.Hour)) / time.Hour); h > 0 {
-			return fmt.Sprintf("%dd%dh", days, h)
-		}
-		return fmt.Sprintf("%dd", days)
 	}
 }
 

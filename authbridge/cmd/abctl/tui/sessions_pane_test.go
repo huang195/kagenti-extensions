@@ -132,46 +132,15 @@ func TestSessionsTable_PriceableButUnpricedSessionShowsNoZero(t *testing.T) {
 	m.rebuildSessionsTable()
 
 	if got := sessionsRowCell(t, m, "COST"); got != "" {
-		t.Errorf("COST cell = %q for a session with priceable-but-unpriced traffic, want blank", got)
+		t.Errorf("COST cell = %q for a priceable-but-unpriced session, want blank", got)
 	}
 }
 
-func TestSessionsTable_ShowsHowLongTheSessionHasBeenGoing(t *testing.T) {
-	created := time.Now().Add(-90 * time.Minute)
-	m := costSessionsModel()
-	m.sessions = []session.SessionSummary{{
-		ID:        "sess-a",
-		CreatedAt: created,
-		UpdatedAt: created.Add(83 * time.Minute),
-	}}
-
-	m.rebuildSessionsTable()
-
-	if got := sessionsRowCell(t, m, "SPAN"); got != "1h23m" {
-		t.Errorf("SPAN cell = %q, want %q", got, "1h23m")
-	}
-}
-
-// A summary with no CreatedAt (an older server, or a row assembled from a stream
-// event) has no span to state. Blank, not "0s": zero seconds asserts that the
-// session began and ended in the same instant.
-func TestSessionsTable_UnknownSpanIsBlankNotZero(t *testing.T) {
-	m := costSessionsModel()
-	m.sessions = []session.SessionSummary{{ID: "sess-a", UpdatedAt: time.Now()}}
-
-	m.rebuildSessionsTable()
-
-	if got := sessionsRowCell(t, m, "SPAN"); got != "" {
-		t.Errorf("SPAN cell = %q for a summary with no CreatedAt, want blank", got)
-	}
-}
-
-// Cached-only rows are sessions the server no longer lists, so there is no
-// SessionSummary to span and the aggregator's ring has been reclaimed too. Both
-// new cells are blank, and the row must still have exactly as many cells as there
-// are columns — a short row shifts nothing but renders one column of nothing,
-// while a long one panics inside bubbles.
-func TestSessionsTable_CachedOnlyRowHasNoCostOrSpan(t *testing.T) {
+// Cached-only rows are sessions the server no longer lists, so the aggregator's ring
+// has been reclaimed too. The COST cell is blank, and the row must still have exactly
+// as many cells as there are columns — a short row shifts nothing but renders one
+// column of nothing, while a long one panics inside bubbles.
+func TestSessionsTable_CachedOnlyRowHasNoCost(t *testing.T) {
 	m := costSessionsModel()
 	m.events = map[string][]pipeline.SessionEvent{"vanished": make([]pipeline.SessionEvent, 2)}
 	m.spend.snap = &usage.Snapshot{
@@ -187,9 +156,6 @@ func TestSessionsTable_CachedOnlyRowHasNoCostOrSpan(t *testing.T) {
 
 	if got := sessionsRowCell(t, m, "COST"); got != "" {
 		t.Errorf("cached-only COST cell = %q, want blank", got)
-	}
-	if got := sessionsRowCell(t, m, "SPAN"); got != "" {
-		t.Errorf("cached-only SPAN cell = %q, want blank", got)
 	}
 }
 
@@ -222,7 +188,7 @@ func TestSessionsTable_EveryRowHasOneCellPerColumn(t *testing.T) {
 // The cells have to fit the columns they were declared with. A cell wider than
 // its column is truncated by bubbles with runewidth.Truncate, which would put an
 // ellipsis in the middle of a dollar amount — the one thing #953 rules out.
-func TestSessionsTable_CostAndSpanFitTheirColumns(t *testing.T) {
+func TestSessionsTable_CostFitsItsColumn(t *testing.T) {
 	widths := map[string]int{}
 	for _, c := range newSessionsTable().Columns() {
 		widths[c.Title] = c.Width
@@ -244,15 +210,6 @@ func TestSessionsTable_CostAndSpanFitTheirColumns(t *testing.T) {
 	// documented ceiling that has silently moved is worse than none.
 	if lipgloss.Width(formatUSDCell(10_000)) <= widths["COST"] {
 		t.Errorf("formatUSDCell(10000) now fits COST (%d wide); the documented ceiling in newSessionsTable is stale", widths["COST"])
-	}
-	for _, d := range []time.Duration{
-		time.Second, 59 * time.Second, time.Minute, 59 * time.Minute,
-		time.Hour, 90 * time.Minute, 23*time.Hour + 59*time.Minute,
-		24 * time.Hour, 400 * 24 * time.Hour,
-	} {
-		if got := lipgloss.Width(formatSpan(d)); got > widths["SPAN"] {
-			t.Errorf("formatSpan(%s) = %q is %d columns, SPAN is %d wide", d, formatSpan(d), got, widths["SPAN"])
-		}
 	}
 }
 
@@ -308,53 +265,5 @@ func TestSessionCost_UnknownCases(t *testing.T) {
 				t.Errorf("usd = %v alongside priced=false; a caller trusting the figure would render it", usd)
 			}
 		})
-	}
-}
-
-func TestSessionSpan(t *testing.T) {
-	base := time.Date(2026, 9, 14, 10, 0, 0, 0, time.UTC)
-	cases := []struct {
-		name string
-		in   session.SessionSummary
-		want time.Duration
-	}{
-		{"normal", session.SessionSummary{CreatedAt: base, UpdatedAt: base.Add(90 * time.Minute)}, 90 * time.Minute},
-		{"no CreatedAt", session.SessionSummary{UpdatedAt: base}, 0},
-		{"no UpdatedAt", session.SessionSummary{CreatedAt: base}, 0},
-		// A clock that went backwards, or a summary assembled from two sources. A
-		// negative span is not a short one; refusing it beats rendering "-3m".
-		{"UpdatedAt before CreatedAt", session.SessionSummary{CreatedAt: base, UpdatedAt: base.Add(-time.Minute)}, 0},
-		{"single event", session.SessionSummary{CreatedAt: base, UpdatedAt: base}, 0},
-	}
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			if got := sessionSpan(tc.in); got != tc.want {
-				t.Errorf("sessionSpan = %s, want %s", got, tc.want)
-			}
-		})
-	}
-}
-
-func TestFormatSpan(t *testing.T) {
-	cases := []struct {
-		in   time.Duration
-		want string
-	}{
-		{0, ""},
-		{-time.Minute, ""},
-		{3 * time.Second, "3s"},
-		{59 * time.Second, "59s"},
-		{time.Minute, "1m"},
-		{59*time.Minute + 59*time.Second, "59m"},
-		{time.Hour, "1h"},
-		{time.Hour + 23*time.Minute, "1h23m"},
-		{23*time.Hour + 59*time.Minute, "23h59m"},
-		{24 * time.Hour, "1d"},
-		{50 * time.Hour, "2d2h"},
-	}
-	for _, tc := range cases {
-		if got := formatSpan(tc.in); got != tc.want {
-			t.Errorf("formatSpan(%s) = %q, want %q", tc.in, got, tc.want)
-		}
 	}
 }

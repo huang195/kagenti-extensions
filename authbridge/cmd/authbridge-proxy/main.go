@@ -33,6 +33,7 @@ import (
 
 	"github.com/rossoctl/cortex/authbridge/authlib/auth"
 	"github.com/rossoctl/cortex/authbridge/authlib/config"
+	"github.com/rossoctl/cortex/authbridge/authlib/costledger"
 	"github.com/rossoctl/cortex/authbridge/authlib/pipeline"
 	"github.com/rossoctl/cortex/authbridge/authlib/plugins"
 	"github.com/rossoctl/cortex/authbridge/authlib/pricing"
@@ -360,6 +361,7 @@ func main() {
 
 	var sessions *session.Store
 	var usageAgg *usage.Aggregator
+	var costLedger *costledger.Writer
 	if cfg.Session.SessionEnabled() {
 		// Store parameters come from config.SessionConfig.Limits, which is where the
 		// defaults and the reasoning behind them live — one home for what used to be
@@ -392,6 +394,56 @@ func main() {
 		usageAgg = usage.New(usage.WithMaxSessions(lim.MaxSessions), usage.WithPricing(pricingRegistry))
 		sessions.AddRecorder(usageAgg)
 
+		// The durable cost ledger is a SECOND Recorder alongside the aggregator, not a
+		// reader of it: the aggregator keeps independent marginals (by-model,
+		// by-endpoint, by-provenance) rather than the joint distribution a ledger row
+		// needs, so summing them would double-count. See authlib/costledger.
+		//
+		// ON for --local, OFF in Kubernetes, and that asymmetry is the decision rather
+		// than an oversight. A laptop has a home directory, a developer who wants
+		// yesterday's number, and a process that restarts several times a day — which is
+		// exactly the case the aggregator's 6-hour in-memory ring cannot answer. A pod
+		// has none of those: its filesystem is ephemeral, one replica's files are
+		// invisible to the next, and the right sink for fleet-wide spend is a central
+		// collector rather than N per-pod files nobody collects. cost_ledger.enabled
+		// overrides the default in either direction.
+		if cfg.CostLedger.LedgerEnabled(localMode) {
+			dir, derr := costLedgerDir(cfg)
+			if derr != nil {
+				// Not fatal. The ledger is observability, and refusing to start the proxy
+				// because cost history has nowhere to live would trade a nicety for an outage.
+				slog.Warn("cost ledger disabled — cannot determine where to write it",
+					"error", derr, "effect", "cost history will not survive a restart")
+			} else {
+				retention := 0
+				if cfg.CostLedger != nil {
+					retention = cfg.CostLedger.RetentionDays
+				}
+				led, lerr := costledger.New(dir, costledger.WithRetentionDays(retention))
+				if lerr != nil {
+					slog.Warn("cost ledger disabled — could not open it",
+						"dir", dir, "error", lerr, "effect", "cost history will not survive a restart")
+				} else {
+					costLedger = led
+					sessions.AddRecorder(costLedger)
+					slog.Info("cost ledger enabled — durable cost history for window=today and window=7d",
+						"dir", dir, "retentionDays", retention,
+						"note", "closed minutes only; an unclean stop loses up to 60s of cost")
+				}
+			}
+		} else {
+			// Said out loud, at the same level as "session tracking disabled", because the
+			// absence is what makes window=today degrade to the ring's 6 hours — and a
+			// degraded answer with no log line behind it reads as a bug in abctl.
+			slog.Info("cost ledger disabled — window=today and window=7d will be served from the 6h in-memory ring",
+				"reason", "not a local install (files in a pod are the wrong sink; use a central collector)")
+		}
+
+		// Through lim.LogAttrs, not a hand-rolled attribute list. #999 gave the session
+		// store's limits one home, and the local "ttl=0s would read like a
+		// misconfiguration" formatting this branch had here moved with them — so the
+		// zero-value wording now lives beside the limits it describes instead of at this
+		// call site.
 		slog.Info("session tracking enabled", lim.LogAttrs()...)
 	} else {
 		slog.Info("session tracking disabled")
@@ -646,6 +698,9 @@ func main() {
 			sessionapi.WithPipelines(inboundH, outboundH),
 			sessionapi.WithCatalog(sessionapi.PluginsCatalog),
 			sessionapi.WithUsage(usageAgg),
+			// nil when the ledger is off, which handleUsage reads as "serve the ring's
+			// maximum window and say which window that was".
+			sessionapi.WithCostLedger(costLedger),
 		)
 		go func() {
 			slog.Warn("session API listening — UNAUTHENTICATED; contains raw user content; never expose via ingress",
@@ -682,9 +737,23 @@ func main() {
 	if sessionAPISrv != nil {
 		sessionAPISrv.Shutdown(shutdownCtx)
 	}
-
 	outboundPipeline.Stop(shutdownCtx)
 	inboundPipeline.Stop(shutdownCtx)
+
+	// Flushed AFTER both pipelines have stopped and before the store closes, so the
+	// final minute includes every event a draining request still produced. Any earlier
+	// and a request finishing during the pipeline drain would land in a minute already
+	// written; any later and the store is gone.
+	//
+	// This is what turns "a restart loses up to 60 seconds of cost" into "an orderly
+	// stop loses nothing" — the ledger holds only closed minutes precisely so the ring
+	// owns the open one, and Close is what closes it. A SIGKILL still loses the open
+	// minute, and nothing can change that.
+	if costLedger != nil {
+		if err := costLedger.Close(); err != nil {
+			slog.Warn("cost ledger: final flush failed; the last minute of cost is lost", "error", err)
+		}
+	}
 
 	if sessions != nil {
 		sessions.Close()

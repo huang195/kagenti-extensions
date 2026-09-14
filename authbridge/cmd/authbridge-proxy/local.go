@@ -6,6 +6,8 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+
+	"github.com/rossoctl/cortex/authbridge/authlib/config"
 )
 
 // Everything Cortex writes for a user lives under ~/.cortex, so a laptop ends up
@@ -217,4 +219,29 @@ func writeBuiltinConfig(cortexDir, caDir string) (string, error) {
 		return "", err
 	}
 	return path, nil
+}
+
+// costLedgerDirName is the ledger's directory under ~/.cortex, beside the config
+// and the CA — one place a user looks for everything Cortex wrote.
+const costLedgerDirName = "cost"
+
+// costLedgerDir returns where the durable cost ledger writes its day files.
+//
+// cost_ledger.dir wins when set, so an operator can put the files on a different
+// volume. Otherwise it is ~/.cortex/cost, derived at runtime rather than stored in
+// the config: a $HOME-derived absolute path written into a file that gets copied
+// between machines is a path that silently points at someone else's home.
+//
+// Returns an error rather than falling back to the working directory, for the reason
+// defaultCortexDir does: a cwd fallback drops spend records into whatever directory
+// the proxy happened to start from, including checkouts, with nothing said about it.
+func costLedgerDir(cfg *config.Config) (string, error) {
+	if cfg != nil && cfg.CostLedger != nil && cfg.CostLedger.Dir != "" {
+		return cfg.CostLedger.Dir, nil
+	}
+	dir, err := defaultCortexDir()
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(dir, costLedgerDirName), nil
 }

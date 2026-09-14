@@ -4,7 +4,9 @@ import (
 	"encoding/json"
 	"log/slog"
 	"net/http"
+	"time"
 
+	"github.com/rossoctl/cortex/authbridge/authlib/costledger"
 	"github.com/rossoctl/cortex/authbridge/authlib/session"
 	"github.com/rossoctl/cortex/authbridge/authlib/usage"
 )
@@ -15,13 +17,23 @@ import (
 // Query parameters:
 //
 //	window      10m (default), 1h, 6h — any multiple of the bucket width up to
-//	            the retained maximum
+//	            the ring's retained maximum — or the SYMBOLIC windows "today"
+//	            (local midnight to now) and "7d" (a rolling 7x24h). A symbolic
+//	            window is answered from the durable cost ledger, which is on for a
+//	            local install and off in Kubernetes; where it is off, the ring's
+//	            maximum window is served instead and the response's own "window"
+//	            field names what was actually served, never what was asked for.
+//	            "today" is LOCAL midnight because a laptop crossing a timezone
+//	            must not have its day reset mid-afternoon.
 //	resolution  bucket width to return, e.g. 5m for a 1h window rendered as 12
 //	            bars. Defaults to the 1m storage resolution. Folding is done
 //	            here, not in the client, so every consumer gets the same
 //	            arithmetic — see usage.fold for why latency in particular cannot
 //	            be folded naively.
-//	session     session ID; omit for all sessions combined
+//	session     session ID; omit for all sessions combined. REJECTED alongside a
+//	            symbolic window — the ledger holds no session ids, and serving
+//	            all-sessions data under a session label would be worse than
+//	            refusing. See the guard in handleUsage.
 //	group       none (default), model, endpoint, session, status, plugin.
 //	            "method" is accepted as an alias for "model" — the series shipped
 //	            under that name before it was clear the aggregator only ever
@@ -70,9 +82,29 @@ import (
 //     already publishes that in full, so this adds no new exposure.
 //
 // Cost figures also disclose spend, which is business-sensitive in a way raw
-// request counts are not. None of this changes the listener's existing posture;
-// it is written down so the decision to expose it is a decision rather than an
-// oversight.
+// request counts are not.
+//
+// And the symbolic windows raise that last exposure materially — the largest single
+// increase in it on this endpoint. Until they existed, everything served here was
+// bounded by the in-memory ring: six hours, gone on restart, so the worst an
+// unauthenticated reader could take was an afternoon's traffic from a process that
+// happened to be up. window=today and window=7d serve a DURABLE spend history from
+// disk, so the same port now answers "what has this developer's agent cost over the
+// last week", which is a business fact about a person and their project rather than
+// a snapshot of current load. Combined with group=model and group=endpoint it also
+// says which models and which gateways that money went to, over a week rather than
+// over an afternoon.
+//
+// Two things bound it rather than remove it: the ledger is off in Kubernetes, so
+// this reach exists only where the listener is already pinned to loopback (the
+// --local config pins every listener to 127.0.0.1 for exactly this class of
+// reason), and session= is refused for a symbolic window, so a week of spend cannot
+// be attributed to one named session through this path. Neither is authentication.
+// If this endpoint is ever exposed beyond loopback or beyond a cluster-internal
+// address, the ledger-backed windows are the first thing that needs a credential.
+//
+// None of this changes the listener's existing posture; it is written down so the
+// decision to expose it is a decision rather than an oversight.
 //
 // costMicros is populated from the figure authlib/costing settles for one
 // response. It prefers the gateway's own post-discount cost header — the
@@ -121,12 +153,21 @@ func (s *Server) handleUsage(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	window, err := usage.ParseWindow(r.URL.Query().Get("window"))
+	spec, err := usage.ParseWindowSpec(r.URL.Query().Get("window"), time.Now())
 	if err != nil {
 		writeUsageError(w, err)
 		return
 	}
-	resolution, err := usage.ParseResolution(r.URL.Query().Get("resolution"), window)
+	// The span resolution is validated against is the one that can actually be
+	// SERVED, not the one requested. A symbolic window is served either as one
+	// ledger-backed bucket, where the requested resolution is not read at all, or as
+	// the ring's maximum; validating "7d" against seven days would accept a 24-hour
+	// bucket and then return a response whose own BucketSeconds contradicted it.
+	resSpan := spec.Dur
+	if spec.Symbolic() {
+		resSpan = usage.MaxWindow
+	}
+	resolution, err := usage.ParseResolution(r.URL.Query().Get("resolution"), resSpan)
 	if err != nil {
 		writeUsageError(w, err)
 		return
@@ -141,8 +182,45 @@ func (s *Server) handleUsage(w http.ResponseWriter, r *http.Request) {
 		writeUsageError(w, errSessionIDTooLong)
 		return
 	}
+	// REJECTED rather than ignored, and rejected whether or not a ledger exists.
+	//
+	// A ledger row carries no session id: a session is a laptop-lifetime concept
+	// while the ledger is a day-lifetime one, and persisting a client-supplied id per
+	// minute would both grow the row key without bound and put an identifier of the
+	// client's choosing on disk. So the filter cannot be applied — and serving
+	// all-sessions data under a session label would be a wrong number wearing a right
+	// label, which is the single failure this whole branch keeps refusing.
+	//
+	// Unconditional, even where the ring COULD answer for one session over six hours,
+	// because the alternative is an API whose behaviour depends on the deployment: the
+	// same request would 400 on a laptop and degrade in Kubernetes, and a client
+	// cannot code against that. Asking for a duration window instead is one edit and
+	// the error says so.
+	if sessionID != "" && spec.Symbolic() {
+		writeUsageError(w, errSessionWithSymbolicWindow)
+		return
+	}
 
-	snap := s.usage.Snapshot(window, resolution, sessionID, group)
+	var snap usage.Snapshot
+	switch {
+	case !spec.Symbolic():
+		snap = s.usage.Snapshot(spec.Dur, resolution, sessionID, group)
+	case s.ledger == nil:
+		// No ledger: Kubernetes by design, where files in a pod are the wrong sink
+		// and the central collector is the right one. Serve what the ring HAS rather
+		// than 400 — an abctl cost view must degrade to a shorter window, not fail —
+		// and Snapshot reports the window actually served, so the client never
+		// mislabels a 6-hour figure as a day's.
+		snap = s.usage.Snapshot(usage.MaxWindow, resolution, sessionID, group)
+	default:
+		snap, err = s.ledgerSnapshot(spec, group)
+		if err != nil {
+			// A read failure is not a client error and must not look like one.
+			slog.Warn("sessionapi: cost ledger read failed", "window", spec.Label, "error", err)
+			http.Error(w, `{"error":"cost history unavailable"}`, http.StatusServiceUnavailable)
+			return
+		}
+	}
 
 	w.Header().Set("Content-Type", "application/json")
 	if err := json.NewEncoder(w).Encode(snap); err != nil {
@@ -155,6 +233,51 @@ type usageError struct{ msg string }
 func (e usageError) Error() string { return e.msg }
 
 var errSessionIDTooLong = usageError{"session id too long"}
+
+// errSessionWithSymbolicWindow refuses session= alongside window=today|7d. A fixed
+// string, like every other message this endpoint returns — see writeUsageError.
+var errSessionWithSymbolicWindow = usageError{
+	"session= cannot be combined with a symbolic window (today, 7d); " +
+		"the durable cost ledger holds no session ids — ask for a duration window such as 1h or 6h"}
+
+// ledgerSnapshot builds a Snapshot from persisted rows.
+//
+// ONE bucket spanning the whole window, not a series at the requested resolution.
+// The ledger exists to answer "what did today cost", and a client wanting a shaped
+// chart asks for a ring window instead — synthesising per-minute buckets from disk
+// for a 7-day span would read millions of rows to draw a chart nothing requests.
+// BucketSeconds reports the real span so a client cannot mistake it for a fine
+// series.
+//
+// Takes no session id: handleUsage rejects that combination before reaching here,
+// for the reason recorded at the guard.
+//
+// UnpricedBy and PricedBy are deliberately absent. Provenance IS in the row key, so
+// PricedBy is reconstructible and a later change can add it; UnpricedBy needs the
+// endpoint-and-model pair of the requests that could NOT be priced, which a row
+// carrying only its own labels cannot distinguish from a priced one of the same
+// pair. Emitting one map and not the other would read as "no pricing gaps here",
+// which is a claim the rows do not support — the gap is still visible, in
+// Totals.PricedRequests against Totals.PriceableRequests.
+func (s *Server) ledgerSnapshot(spec usage.Spec, group usage.Group) (usage.Snapshot, error) {
+	rows, err := s.ledger.Query(spec.From, spec.To)
+	if err != nil {
+		return usage.Snapshot{}, err
+	}
+	totals, series := costledger.Fold(rows, group)
+	return usage.Snapshot{
+		Window:        spec.Label,
+		BucketSeconds: int(spec.To.Sub(spec.From).Seconds()),
+		Group:         group,
+		Buckets:       []usage.Bucket{{At: spec.From, Counts: totals, Series: series}},
+		Totals:        totals,
+		// Same rule as Aggregator.Snapshot: an inexact figure is still a figure, so a
+		// window whose every request was a truncated stream reports priced:true over a
+		// real total and discloses the caveat in Totals.IncompleteRequests. Withholding
+		// the figure would render "cost unavailable" over dollars that are known.
+		Priced: totals.PricedRequests > 0,
+	}, nil
+}
 
 // writeUsageError returns 400 with the validation message. Every message it can
 // carry is a fixed string authored in this package or in authlib/usage: none

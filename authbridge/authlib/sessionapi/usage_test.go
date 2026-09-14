@@ -8,6 +8,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/rossoctl/cortex/authbridge/authlib/costevent"
+	"github.com/rossoctl/cortex/authbridge/authlib/costledger"
 	"github.com/rossoctl/cortex/authbridge/authlib/pipeline"
 	"github.com/rossoctl/cortex/authbridge/authlib/session"
 	"github.com/rossoctl/cortex/authbridge/authlib/usage"
@@ -284,5 +286,189 @@ func TestHandleUsage_SplitFieldsAppearOnTheWire(t *testing.T) {
 		if !strings.Contains(body, field) {
 			t.Errorf("response body has no %q field: %s", field, body)
 		}
+	}
+}
+
+// ledgerWithOneCostedMinute builds a cost ledger holding exactly one CLOSED minute
+// carrying a settled cost, at the instant `at`.
+//
+// Closed, not open: the writer keeps the open minute in memory on purpose, so a row
+// only reaches disk once the minute rolls or Flush is called. A test that skipped
+// the flush would assert against an empty ledger and read as a routing bug.
+func ledgerWithOneCostedMinute(t *testing.T, at time.Time, host, model string, costUSD float64) *costledger.Writer {
+	t.Helper()
+	led, err := costledger.New(t.TempDir(), costledger.WithClock(func() time.Time { return at }))
+	if err != nil {
+		t.Fatalf("costledger.New: %v", err)
+	}
+	t.Cleanup(func() { _ = led.Close() })
+
+	rec, err := json.Marshal(costevent.Event{
+		CostUSD: costUSD, Settled: true,
+		Source: costevent.SourceUsageFallback, Provenance: "bundled",
+	})
+	if err != nil {
+		t.Fatalf("marshal cost record: %v", err)
+	}
+	led.Record("s1", &pipeline.SessionEvent{
+		At: at, Phase: pipeline.SessionResponse, StatusCode: 200, Host: host,
+		Inference: &pipeline.InferenceExtension{
+			Model: model, InputTokens: 100, OutputTokens: 50, TotalTokens: 150, PresentKinds: 0b1001,
+		},
+		Plugins: map[string]json.RawMessage{costevent.Key: rec},
+	})
+	if err := led.Flush(); err != nil {
+		t.Fatalf("Flush: %v", err)
+	}
+	return led
+}
+
+func TestHandleUsage_TodayIsServedFromTheLedger(t *testing.T) {
+	// A closed minute on disk, plus an empty ring, so a non-zero total can only
+	// have come from the ledger.
+	led := ledgerWithOneCostedMinute(t, time.Now().Add(-2*time.Minute), "gw", "opus", 0.25)
+	ts, _ := newTestServer(t, WithUsage(usage.New()), WithCostLedger(led))
+
+	status, body := fetchUsage(t, ts.URL, "?window=today")
+	if status != http.StatusOK {
+		t.Fatalf("status = %d, want 200: %s", status, body)
+	}
+	var snap usage.Snapshot
+	if err := json.Unmarshal([]byte(body), &snap); err != nil {
+		t.Fatalf("decode: %v (%s)", err, body)
+	}
+	if snap.Window != "today" {
+		t.Errorf("window = %q, want \"today\" echoed back", snap.Window)
+	}
+	if snap.Totals.CostMicros == 0 {
+		t.Error("CostMicros = 0; the ledger row did not reach the response")
+	}
+	if !snap.Priced {
+		t.Error("priced = false for a ledger-sourced total")
+	}
+	// One bucket spanning the window, and BucketSeconds says so, so a client cannot
+	// mistake a whole-window total for a fine series.
+	if len(snap.Buckets) != 1 {
+		t.Errorf("got %d buckets, want 1 spanning the window", len(snap.Buckets))
+	}
+	if snap.BucketSeconds <= int(usage.BucketWidth.Seconds()) {
+		t.Errorf("bucketSeconds = %d, want the whole window's span", snap.BucketSeconds)
+	}
+}
+
+func TestHandleUsage_TodayWithoutALedgerDegradesAndSaysSo(t *testing.T) {
+	// Kubernetes has no ledger by design. A 400 would make the abctl cost view
+	// fail there rather than showing what IS available, so the handler serves the
+	// ring's maximum window and reports the window it actually served.
+	ts, _ := newTestServer(t, WithUsage(usage.New())) // no ledger
+
+	status, body := fetchUsage(t, ts.URL, "?window=today")
+	if status != http.StatusOK {
+		t.Fatalf("status = %d, want 200: %s", status, body)
+	}
+	var snap usage.Snapshot
+	if err := json.Unmarshal([]byte(body), &snap); err != nil {
+		t.Fatalf("decode: %v (%s)", err, body)
+	}
+	if snap.Window == "today" {
+		t.Error("window = \"today\" but no ledger exists; the response must name the window actually served")
+	}
+	if snap.Window != usage.MaxWindow.String() {
+		t.Errorf("window = %q, want the ring maximum %q", snap.Window, usage.MaxWindow)
+	}
+}
+
+func TestHandleUsage_SevenDaysIsServedFromTheLedger(t *testing.T) {
+	// Same shape as today, over a span the ring cannot cover at all: six hours of
+	// buckets can never answer for a row written two days ago.
+	led := ledgerWithOneCostedMinute(t, time.Now().Add(-48*time.Hour), "gw", "opus", 1.50)
+	ts, _ := newTestServer(t, WithUsage(usage.New()), WithCostLedger(led))
+
+	status, body := fetchUsage(t, ts.URL, "?window=7d")
+	if status != http.StatusOK {
+		t.Fatalf("status = %d, want 200: %s", status, body)
+	}
+	var snap usage.Snapshot
+	if err := json.Unmarshal([]byte(body), &snap); err != nil {
+		t.Fatalf("decode: %v (%s)", err, body)
+	}
+	if snap.Window != "7d" {
+		t.Errorf("window = %q, want \"7d\"", snap.Window)
+	}
+	if snap.Totals.CostMicros != 1_500_000 {
+		t.Errorf("CostMicros = %d, want 1500000 from a two-day-old row", snap.Totals.CostMicros)
+	}
+}
+
+func TestHandleUsage_UnknownWindowStillDoesNotEchoInput(t *testing.T) {
+	ts, _ := newTestServer(t, WithUsage(usage.New()))
+	status, body := fetchUsage(t, ts.URL, "?window=%3Cscript%3E")
+
+	if status != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400", status)
+	}
+	if strings.Contains(body, "script") {
+		t.Errorf("response reflects caller input: %s", body)
+	}
+}
+
+func TestHandleUsage_LedgerBackedWindowGroupsByModel(t *testing.T) {
+	// The Cost pane's by-model table must work over "today", not only over the
+	// ring's windows — otherwise the breakdown silently covers a different span
+	// from the total above it.
+	led := ledgerWithOneCostedMinute(t, time.Now().Add(-2*time.Minute), "gw", "opus", 0.25)
+	ts, _ := newTestServer(t, WithUsage(usage.New()), WithCostLedger(led))
+
+	status, body := fetchUsage(t, ts.URL, "?window=today&group=model")
+	if status != http.StatusOK {
+		t.Fatalf("status = %d, want 200: %s", status, body)
+	}
+	var snap usage.Snapshot
+	if err := json.Unmarshal([]byte(body), &snap); err != nil {
+		t.Fatalf("decode: %v (%s)", err, body)
+	}
+	if len(snap.Buckets) != 1 {
+		t.Fatalf("got %d buckets, want 1", len(snap.Buckets))
+	}
+	got := snap.Buckets[0].Series["opus"]
+	if got.CostMicros != 250_000 {
+		t.Errorf("series[opus].CostMicros = %d, want 250000", got.CostMicros)
+	}
+	// The breakdown accounts for the total it sits under.
+	if got.CostMicros != snap.Totals.CostMicros {
+		t.Errorf("series sums to %d but totals is %d", got.CostMicros, snap.Totals.CostMicros)
+	}
+}
+
+// A symbolic window with session= is refused, not quietly answered with
+// all-sessions data under a session label. See the guard in handleUsage for why the
+// refusal is unconditional.
+func TestHandleUsage_SessionWithSymbolicWindowIsRejected(t *testing.T) {
+	led := ledgerWithOneCostedMinute(t, time.Now().Add(-2*time.Minute), "gw", "opus", 0.25)
+	for _, srvName := range []string{"with ledger", "without ledger"} {
+		opts := []Option{WithUsage(usage.New())}
+		if srvName == "with ledger" {
+			opts = append(opts, WithCostLedger(led))
+		}
+		ts, _ := newTestServer(t, opts...)
+		for _, window := range []string{"today", "7d"} {
+			status, body := fetchUsage(t, ts.URL, "?window="+window+"&session=s1")
+			if status != http.StatusBadRequest {
+				t.Errorf("%s, window=%s: status = %d, want 400: %s", srvName, window, status, body)
+			}
+			if !strings.Contains(body, "session") {
+				t.Errorf("%s, window=%s: error does not name the problem: %s", srvName, window, body)
+			}
+		}
+	}
+}
+
+// A duration window with session= keeps working. The rejection above must not have
+// widened into "session is unsupported".
+func TestHandleUsage_SessionWithDurationWindowStillWorks(t *testing.T) {
+	ts, _ := newTestServer(t, WithUsage(usage.New()))
+	status, body := fetchUsage(t, ts.URL, "?window=10m&session=s1")
+	if status != http.StatusOK {
+		t.Fatalf("status = %d, want 200: %s", status, body)
 	}
 }

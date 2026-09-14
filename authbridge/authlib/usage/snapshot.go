@@ -81,19 +81,37 @@ func ParseGroup(s string) (Group, error) {
 
 // Snapshot is the wire shape of GET /v1/usage.
 type Snapshot struct {
-	// Window is the requested span, e.g. "10m".
+	// Window is the span this snapshot ACTUALLY covers, e.g. "10m", "6h0m0s" or
+	// "today". Not necessarily the span requested.
+	//
+	// It used to be only the requested one, and the difference now matters: the
+	// symbolic windows ("today", "7d") are served from the durable cost ledger, and a
+	// proxy with no ledger — Kubernetes by design — answers them from the ring's
+	// maximum window instead and reports THAT here. A client must read this field
+	// rather than echo its own request, or it will label six hours of spend as a
+	// day's.
 	Window string `json:"window"`
-	// BucketSeconds is the resolution of the buckets actually returned, which is
-	// the requested resolution rounded to a whole multiple of BucketWidth. A
-	// client reads this rather than assuming: asking for a resolution the
-	// storage cannot divide evenly gets the nearest one that works, not an
-	// error.
+	// BucketSeconds is the resolution of the buckets actually returned, which for a
+	// ring-backed window is the requested resolution rounded to a whole multiple of
+	// BucketWidth. A client reads this rather than assuming: asking for a resolution
+	// the storage cannot divide evenly gets the nearest one that works, not an error.
+	//
+	// For a LEDGER-backed window it is the whole window's span, because that response
+	// is one bucket rather than a series — the ledger answers "what did today cost",
+	// and synthesising per-minute buckets from disk for a 7-day span would read
+	// millions of rows to draw a chart nothing asks for. Reading this field is how a
+	// client tells the two apart.
 	BucketSeconds int `json:"bucketSeconds"`
 	// Session is the session this covers, or "" for all sessions combined.
 	Session string `json:"session,omitempty"`
 	Group   Group  `json:"group"`
-	// Buckets runs oldest to newest and always has Window/BucketWidth entries,
-	// including zeroed ones for idle minutes.
+	// Buckets runs oldest to newest. For a ring-backed window it always has
+	// Window/BucketWidth entries, including zeroed ones for idle minutes, so a client
+	// can distinguish an idle minute from one that fell off the end of the ring.
+	//
+	// A LEDGER-backed window (see BucketSeconds) returns exactly ONE bucket spanning
+	// the request. A client dividing len(Buckets) into the window to recover a
+	// resolution must read BucketSeconds instead.
 	Buckets []Bucket `json:"buckets"`
 	// Totals sums every bucket, so a client need not re-add them to render a
 	// summary line.
@@ -118,7 +136,11 @@ type Snapshot struct {
 	// separate, and this field answers neither on its own.
 	Priced bool `json:"priced"`
 	// UnpricedBy counts the requests that could NOT be priced, keyed
-	// "<endpoint> <model>". Present only when something was unpriced.
+	// "<endpoint> <model>". Present only when something was unpriced — and never
+	// present at all on a ledger-backed window, where a per-minute row carries only
+	// its own labels and cannot distinguish the unpriced pairs from the priced ones.
+	// Absence is therefore not a claim that there were no gaps; compare
+	// Totals.PricedRequests with Totals.PriceableRequests for that.
 	//
 	// A gap has to be nameable, not just countable. "Cost is incomplete" gives an
 	// operator nothing to act on; "api.openai.com gpt-5: 412" names the pricing
@@ -143,6 +165,12 @@ type Snapshot struct {
 }
 
 // ParseWindow validates a window parameter against the storage resolution.
+//
+// Durations ONLY. It rejects the symbolic windows "today" and "7d", because a
+// time.Duration genuinely cannot express a boundary and silently substituting a
+// length would report a number for a span nobody asked for. Callers that accept
+// those use ParseWindowSpec, which delegates here for every fixed length so the
+// duration rules are defined once.
 func ParseWindow(s string) (time.Duration, error) {
 	if s == "" {
 		return 10 * BucketWidth, nil
@@ -164,6 +192,88 @@ func ParseWindow(s string) (time.Duration, error) {
 		return 0, fmt.Errorf("window %s is not a multiple of %s", d, BucketWidth)
 	}
 	return d, nil
+}
+
+// WindowToday and Window7d are the symbolic windows the API accepts.
+//
+// Symbolic because neither is a LENGTH: "today" is a boundary, and while "7d" has a
+// fixed span it is longer than the ring retains, so both can only be answered from
+// the durable cost ledger. time.ParseDuration reads neither string, which is why
+// ParseWindow already rejects them and why they need their own parse.
+const (
+	WindowToday = "today"
+	Window7d    = "7d"
+)
+
+// Spec is a parsed window request. Either Dur is set (a fixed length the ring can
+// serve) or From/To are (a boundary only the ledger can serve).
+//
+// Two representations in one type rather than two functions, because the handler's
+// job is exactly to choose between them and a caller that forgets to ask which
+// kind it has would silently serve the wrong span.
+type Spec struct {
+	// Label is what the response echoes back, so a client always learns which
+	// window it actually got — which matters most when it is not the one asked for.
+	Label string
+	// Dur is non-zero for a fixed-length window.
+	Dur time.Duration
+	// From and To bound a symbolic window. Zero when Dur is set.
+	From, To time.Time
+}
+
+// Symbolic reports whether this window needs the ledger.
+func (s Spec) Symbolic() bool { return s.Dur == 0 }
+
+// ParseWindowSpec parses any window the API accepts, including the symbolic ones.
+//
+// now is passed rather than read from the clock so a test can pin a day boundary,
+// and so "today" is computed once per request instead of drifting between the
+// bound calculation and the response label.
+//
+// "today" is LOCAL midnight to now. Local, not UTC: a laptop that crosses a
+// timezone must not have its day reset mid-afternoon, which a UTC day would do.
+// Just after midnight it is a five-minute window, not a 24-hour one — that is the
+// point of a boundary rather than a length.
+//
+// "7d" is exactly 7x24h back from now, ROLLING rather than seven calendar days.
+// The label is echoed as "7d" so a client can read it that way; a "last 7 days"
+// that silently meant "since last Monday" would be a different number, and the two
+// differ by up to a day of spend.
+//
+// Delegates every fixed-length case to ParseWindow, so the duration set is defined
+// in one place and the two cannot drift.
+func ParseWindowSpec(s string, now time.Time) (Spec, error) {
+	switch s {
+	case WindowToday:
+		return Spec{
+			Label: WindowToday,
+			From:  time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, now.Location()),
+			To:    now,
+		}, nil
+	case Window7d:
+		return Spec{Label: Window7d, From: now.Add(-7 * 24 * time.Hour), To: now}, nil
+	}
+	d, err := ParseWindow(s)
+	if err != nil {
+		// Not wrapped with the caller's string, for the reason in ParseGroup: this
+		// travels back over an unauthenticated endpoint. ParseWindow's own messages are
+		// fixed strings for the same reason, so forwarding one is safe.
+		return Spec{}, err
+	}
+	// Label is the caller's own spelling, not d.String(). It is what a response
+	// SHOULD echo — "1h", not "1h0m0s" — though on the fixed-length path the label
+	// actually served comes from Aggregator.Snapshot, which stringifies the duration;
+	// only the ledger path reads this field. Carried anyway so the type answers "which
+	// window is this" uniformly, and so a future caller cannot get a symbolic label
+	// right and a duration label wrong.
+	//
+	// An empty window means the ten-bucket default, which has no caller spelling to
+	// echo, so the duration's own form is the only label available.
+	label := s
+	if label == "" {
+		label = d.String()
+	}
+	return Spec{Label: label, Dur: d}, nil
 }
 
 // ParseResolution validates a resolution parameter — the width of the buckets

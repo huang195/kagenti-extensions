@@ -52,6 +52,54 @@ type Config struct {
 	// internal usage with no manual setup is the point. Set `pricing.bundled:
 	// false` to price only what you configure. See authlib/pricing.
 	Pricing *pricing.Config `yaml:"pricing,omitempty" json:"pricing,omitempty"`
+	// CostLedger configures the durable per-minute cost ledger (authlib/costledger),
+	// which persists closed minutes so "what did today cost" survives a restart.
+	//
+	// Absent means the caller's default, and the callers differ deliberately: a local
+	// install turns it ON (a laptop has a home directory and a developer who wants
+	// yesterday's number), Kubernetes leaves it OFF (writing files in a pod is the
+	// wrong sink; a central collector is the right one). Set `cost_ledger.enabled:
+	// false` to turn it off locally.
+	CostLedger *CostLedgerConfig `yaml:"cost_ledger,omitempty" json:"cost_ledger,omitempty"`
+}
+
+// CostLedgerConfig configures the durable cost ledger.
+type CostLedgerConfig struct {
+	// Enabled is a POINTER so "unset" and "explicitly false" are different states.
+	// The local default is on, and an operator has to be able to turn it off; with a
+	// plain bool an absent block and `enabled: false` would be the same value, so the
+	// only way to disable it would be to delete the whole block — which also discards
+	// the retention setting beside it.
+	Enabled *bool `yaml:"enabled,omitempty" json:"enabled,omitempty"`
+	// Dir is where day files are written. Empty means the caller's default, which for
+	// a local install is ~/.cortex/cost — kept out of this struct so the config does
+	// not pin a $HOME-derived absolute path into a file that may be copied between
+	// machines.
+	Dir string `yaml:"dir,omitempty" json:"dir,omitempty"`
+	// RetentionDays is how many day files survive. Zero means the package default of
+	// 30, which is roughly 10 MB.
+	RetentionDays int `yaml:"retention_days,omitempty" json:"retention_days,omitempty"`
+}
+
+// LedgerEnabled reports whether the ledger should run, given the default for this
+// deployment shape.
+//
+// A method on the pointer receiver so a nil block — the common case in Kubernetes —
+// answers without every caller writing the same nil check and one of them getting it
+// backwards.
+func (c *CostLedgerConfig) LedgerEnabled(defaultOn bool) bool {
+	if c == nil || c.Enabled == nil {
+		return defaultOn
+	}
+	return *c.Enabled
+}
+
+// Validate is called from the loader when CostLedger != nil.
+func (c *CostLedgerConfig) Validate() error {
+	if c.RetentionDays < 0 {
+		return fmt.Errorf("cost_ledger.retention_days must not be negative, got %d", c.RetentionDays)
+	}
+	return nil
 }
 
 // TLSBridgeConfig configures the outbound TLS bridge (TLS termination of
@@ -766,6 +814,12 @@ func Load(path string) (*Config, error) {
 	}
 	if err := cfg.SPIFFE.Validate(); err != nil {
 		return nil, err
+	}
+
+	if cfg.CostLedger != nil {
+		if err := cfg.CostLedger.Validate(); err != nil {
+			return nil, err
+		}
 	}
 
 	if cfg.TLSBridge != nil {

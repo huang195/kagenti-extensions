@@ -80,6 +80,23 @@ const (
 	// ALREADY knows: foldAnthropicFrame logs "token counts will be incomplete". Nothing
 	// consumed that knowledge, so costing priced the prompt, published Settled: true,
 	// and every consumer read a lower bound as a complete figure.
+	//
+	// KNOWN BOUNDARY, deliberately not closed. The discriminator is the stop reason (see
+	// the block comment in outputUncounted), so a response that carries a stop_reason but
+	// no usage block reads as EXACT even though its output was never tallied — a
+	// message_delta whose usage the wire omitted, or an intermediary that strips usage
+	// while forwarding the stop reason. Such a response is classified complete with
+	// OutputTokens == 0.
+	//
+	// That is the intended trade, not an oversight, and there is a test row pinning it
+	// ("stop reason with zero output is exact"). Closing it would mean flagging every
+	// response whose output legitimately WAS zero — an immediate refusal, a max_tokens of
+	// zero — because those are indistinguishable from it by counters alone. A false
+	// caveat on ordinary traffic is worse than a missed one on a wire shape we have no
+	// evidence of: it becomes a permanent warning with nothing to act on, which is how an
+	// operator learns to ignore the real signal. Do not "fix" this row into a false
+	// positive; if the omitted-usage shape is ever OBSERVED, the fix is a new reason
+	// keyed on something that actually distinguishes it, not a weakening of this one.
 	ReasonOutputUncounted = "output-uncounted"
 
 	// ReasonSplitUnreported: the provider reported a total and no per-kind split at

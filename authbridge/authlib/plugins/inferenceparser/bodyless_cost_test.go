@@ -228,3 +228,80 @@ func TestBodylessResponse_ZeroUsageIsUnpriced(t *testing.T) {
 		t.Errorf("pricing.Cost(rates, zero usage) = (%d, true), want ok=false: unknown usage is not a free request", micros)
 	}
 }
+
+// TestBodylessResponse_DeclaredFreeZeroIsPublishedAsSettled pins the third header state,
+// which is a real behaviour change of this fix and not merely a side effect of it.
+//
+// A non-streamed response carrying an exactly-zero cost header is the gateway SAYING the
+// call was free — a cache hit, or an error it declined to charge for. Before the fix these
+// paths published nothing at all, so a downstream consumer saw no record, fell through to
+// its own rate table, and could fabricate a cost for a call the gateway had explicitly
+// declared free. A settled zero suppresses that fallback, which is the whole reason
+// costevent.Event.Settled exists.
+//
+// So the assertion is specifically that Settled is TRUE while the cost is zero. A record
+// with cost 0 and Settled false would be worse than no record: costevent.Priced() reads it
+// as unpriced, which is the state that invited the fabrication.
+func TestBodylessResponse_DeclaredFreeZeroIsPublishedAsSettled(t *testing.T) {
+	for _, site := range bodylessSites() {
+		t.Run(site.name, func(t *testing.T) {
+			p := NewInferenceParser()
+			p.SetPricingResolver(bodylessRates(t))
+			pctx := bodylessCtx("0", site.stream)
+
+			site.drive(p, pctx)
+
+			ev, ok := publishedCost(t, pctx)
+			if !ok {
+				t.Fatal("no cost record published; a gateway-declared free call is an ANSWER, and publishing nothing lets a consumer re-price it from its own table")
+			}
+			if ev.CostUSD != 0 {
+				t.Errorf("CostUSD = %v, want 0", ev.CostUSD)
+			}
+			if !ev.Settled {
+				t.Error("Settled = false; an unsettled zero reads as unpriced, which is exactly the state that let a cache hit be billed")
+			}
+			if !ev.Priced() {
+				t.Error("Priced() = false; a settled zero must count as priced so no consumer re-prices it")
+			}
+			if ev.Source != costevent.SourceGatewayHeader {
+				t.Errorf("Source = %q, want %q", ev.Source, costevent.SourceGatewayHeader)
+			}
+			// A declared-free call is an EXACT total, so it must carry no inexactness
+			// caveat — this is the gate in costing.Settle that keys on the source rather
+			// than on "the header was not positive".
+			if ev.Incomplete {
+				t.Errorf("Incomplete = true (%q); the gateway stating it charged nothing is an exact total, not a lower bound on nothing", ev.IncompleteReason)
+			}
+			if n := skipRows(pctx); n != 1 {
+				t.Errorf("no_response_body Skip rows = %d, want 1", n)
+			}
+		})
+	}
+}
+
+// The sibling of the case above, and the reason it has to be tested as a PAIR: on a
+// streamed response the very same "0" header means nothing at all. LiteLLM stamps it by
+// design because the total is unknown when headers are sent, so treating it as an answer
+// would publish a settled zero for every streamed response and count unpriced traffic as
+// free.
+//
+// Same header value, same body-less path, opposite outcome — separated only by
+// Content-Type. Without this row, a change that dropped costing's IsEventStream check
+// would still pass the declared-free test above.
+func TestBodylessResponse_StreamPlaceholderZeroPublishesNothing(t *testing.T) {
+	p := NewInferenceParser()
+	p.SetPricingResolver(bodylessRates(t))
+	pctx := bodylessCtx("0", true)
+	// The one thing that changes the meaning of the header.
+	pctx.ResponseHeaders.Set("Content-Type", "text/event-stream")
+
+	p.OnResponseFrame(context.Background(), pctx, nil, true)
+
+	if ev, ok := publishedCost(t, pctx); ok {
+		t.Errorf("published %+v; a stream's zero cost header is a placeholder, not a declaration of free, and publishing it as settled would count unpriced traffic as free", ev)
+	}
+	if n := skipRows(pctx); n != 1 {
+		t.Errorf("no_response_body Skip rows = %d, want 1", n)
+	}
+}

@@ -58,13 +58,29 @@ func TestQuery_SpanCrossingLocalMidnight(t *testing.T) {
 	// The case a UTC-vs-local bug shows up in, and the reason "today" is local
 	// midnight: a laptop crossing a timezone must not have its day reset
 	// mid-afternoon.
+	//
+	// A FIXED NON-UTC ZONE, not time.Local. Building both the input and the
+	// expectation in time.Local made this vacuous wherever time.Local is UTC — the
+	// default in most CI containers — because a dayOf reading UTC would then agree with
+	// the test by construction. At UTC-7 the two rows below straddle local midnight but
+	// fall in the SAME UTC day, so a UTC day walk visits one date and misses a file.
+	// Verified by mutation: with dayOf on a UTC day, the old test passed under TZ=UTC
+	// and failed under TZ=America/New_York; this one fails under both.
 	dir := t.TempDir()
-	midnight := time.Date(2026, 9, 14, 0, 0, 0, 0, time.Local)
-	before := midnight.Add(-30 * time.Minute) // 23:30 on the 13th
-	after := midnight.Add(30 * time.Minute)   // 00:30 on the 14th
+	midnight := time.Date(2026, 9, 14, 0, 0, 0, 0, testZone)
+	before := midnight.Add(-30 * time.Minute) // 23:30 on the 13th, local
+	after := midnight.Add(30 * time.Minute)   // 00:30 on the 14th, local
 	writeDay(t, dir, before, line(before, "gw", "m", 1, 10, 5, 100))
 	writeDay(t, dir, after, line(after, "gw", "m", 1, 20, 5, 200))
 	w := newTestWriter(t, dir, func() time.Time { return after })
+
+	// Two files, named for the two LOCAL days. Asserted rather than assumed, because
+	// this is the property a UTC boundary breaks.
+	for _, want := range []string{"2026-09-13.jsonl", "2026-09-14.jsonl"} {
+		if _, serr := os.Stat(filepath.Join(dir, want)); serr != nil {
+			t.Fatalf("missing %s: %v", want, serr)
+		}
+	}
 
 	got, err := w.Query(before, after)
 	if err != nil {

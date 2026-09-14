@@ -56,3 +56,152 @@ func UsageFromInference(inf *pipeline.InferenceExtension) Usage {
 	}
 	return u
 }
+
+// Reasons a figure modelled from an inference extension's counters is not an exact
+// total. Returned by IncompleteReason and carried per-request on the cost record.
+//
+// Two, not one, because they are different claims and a consumer acts on them
+// differently: a partial figure is known-LOW and bounded on one side, while an
+// approximate one has no known direction at all. Collapsing them into a single
+// "incomplete" boolean would make a totals-only gateway — a permanent, unfixable
+// property of that gateway — indistinguishable from a truncated stream, which is a
+// transient failure worth chasing.
+//
+// Values are wire strings: they travel on costevent.Event.IncompleteReason. Hyphenated
+// lowercase, matching Provenance's spellings ("authoritative", "configured").
+const (
+	// ReasonOutputUncounted: the prompt was counted and whatever was generated never
+	// was, so the figure is a FLOOR — the real cost is this plus an unknown completion.
+	//
+	// The case it exists for is a truncated Anthropic stream. Prompt counts land on
+	// message_start; the output count only ever arrives on message_delta. A stream that
+	// dies in between — an upstream `error` event, a client disconnect, a proxy restart
+	// mid-turn — finalizes with real prompt tokens and output at zero, and the parser
+	// ALREADY knows: foldAnthropicFrame logs "token counts will be incomplete". Nothing
+	// consumed that knowledge, so costing priced the prompt, published Settled: true,
+	// and every consumer read a lower bound as a complete figure.
+	ReasonOutputUncounted = "output-uncounted"
+
+	// ReasonSplitUnreported: the provider reported a total and no per-kind split at
+	// all, so the figure is APPROXIMATE rather than low. UsageFromInference above
+	// attributes such a total wholly to uncached input, which over-prices a cache-heavy
+	// request (a cache read bills at ~0.1x) and under-prices a generation-heavy one (an
+	// output token bills at ~5x), with no way to say which from one number.
+	//
+	// A property of the gateway, not of the request: it will hold for every request
+	// that gateway answers. A consumer should present it as a standing caveat on the
+	// total's precision, never as an incident.
+	ReasonSplitUnreported = "split-unreported"
+)
+
+// Presence bits, mirrored from parsercommon.Kind.
+//
+// Mirrored rather than imported because parsercommon lives under plugins/internal and
+// is unreachable from here — the same constraint that made
+// pipeline.InferenceExtension.PresentKinds a plain uint8 with the layout written into
+// its doc comment. Only the two bits this file reads are declared, so the mirror cannot
+// drift on a bit nothing here uses.
+const (
+	presentInput  uint8 = 1 << 0 // parsercommon.KindInput
+	presentOutput uint8 = 1 << 3 // parsercommon.KindOutput
+)
+
+// IncompleteReason names why a figure modelled from inf's counters is not an exact
+// total, or "" when the counters support one.
+//
+// Only ever consulted for a MODELLED figure. A gateway's own cost header is what the
+// call actually charged whatever our counters managed to observe, so completeness there
+// is the gateway's assertion and not an inference from a token tally — costing.Settle
+// gates this call on the usage-fallback arm for that reason.
+//
+// The two reasons are decided by DIFFERENT instruments, and the asymmetry is the part
+// worth reading before changing anything here: the presence mask is the right test for
+// ReasonSplitUnreported and the wrong one for ReasonOutputUncounted. Not because one
+// reason is special, but because the mask's reliability is DIALECT-specific — OpenAI
+// gates each bit on a pointer while Anthropic asserts Input|Output unconditionally. See
+// the block comment at the discriminator itself, which is the single most important
+// comment in this file.
+//
+// Takes the extension rather than a Usage because none of the three signals it needs —
+// the stop reason, the legacy aggregates, the presence mask — is inside Usage's four
+// tiers.
+func IncompleteReason(inf *pipeline.InferenceExtension) string {
+	if inf == nil {
+		return ""
+	}
+	// Partial first. It is the stronger statement and the two are mutually exclusive in
+	// practice, but ordering it first means a hypothetical extension satisfying both is
+	// reported as a floor rather than as merely approximate — under-claiming precision
+	// rather than over-claiming it.
+	if outputUncounted(inf) {
+		return ReasonOutputUncounted
+	}
+	// Neither prompt nor completion exposed, yet a total arrived: a gateway reporting
+	// only total_tokens. Gated on the total because with no counters at all there is no
+	// figure to qualify — costing publishes nothing for that request.
+	//
+	// The presence mask IS the right instrument HERE, and is the wrong one above. That
+	// asymmetry is deliberate rather than an inconsistency: this branch asks exactly what
+	// the mask answers — did the provider expose a breakdown at all — while the branch
+	// above asks whether a breakdown that WAS exposed finished arriving, which the mask
+	// cannot see. Do not unify the two on the mask.
+	if inf.PresentKinds&(presentInput|presentOutput) == 0 && inf.TotalTokens > 0 {
+		return ReasonSplitUnreported
+	}
+	return ""
+}
+
+// outputUncounted reports the floor case: a prompt was counted, nothing generated was,
+// and the provider never said why it stopped.
+func outputUncounted(inf *pipeline.InferenceExtension) bool {
+	// Something was generated AND counted, so the modelled figure is whole.
+	if inf.OutputTokens > 0 || inf.CompletionTokens > 0 {
+		return false
+	}
+	// THE DISCRIMINATOR, and it is deliberately not the Output presence bit.
+	//
+	// Do not "simplify" this to `PresentKinds & KindOutput == 0`. The mask reads like the
+	// obvious mechanism, and the trap is that it DISCRIMINATES IN ONE DIALECT AND NOT THE
+	// OTHER — and the broken one is the dialect Claude Code speaks:
+	//
+	//	OpenAI     inferenceUsage.toNeutral gates every bit on a pointer, so an absent
+	//	           completion_tokens leaves KindOutput unset. The mask works.
+	//	Anthropic  anthropicUsage.toNeutral sets `Present: KindInput | KindOutput` in the
+	//	           struct literal, unconditionally, because the Messages API always
+	//	           carries both keys. The mask cannot work.
+	//
+	// So checking the mask against the OpenAI path finds it correct and invites the
+	// conclusion that it generalizes. It does not, and Anthropic is where the bug lives.
+	//
+	// The mechanism, on a truncated Anthropic stream: message_start's usage goes through
+	// mergeAnthropicPromptMaxSeen, which ORs Present and merges Input, CacheRead and
+	// CacheWrite — but never assigns Output. Output is assigned only in the
+	// message_delta arm. So the Output BIT arrives on the first frame while the Output
+	// TALLY only ever arrives on the last, nothing records that they came from different
+	// events, and bit-set-count-zero is therefore reachable and identical to a genuine
+	// reported zero.
+	//
+	// The stop reason works because it rides the SAME frame as the tally: message_delta
+	// carries `delta.stop_reason` and the cumulative `usage.output_tokens` together, so
+	// its absence is the wire's own statement that the tally never completed rather than
+	// an inference about it.
+	//
+	// And it generalizes where the mask does not: foldOpenAIFrame sets FinishReason from
+	// `choices[].finish_reason`, so a truncated OpenAI stream leaves it empty too. One
+	// predicate, both dialects.
+	//
+	// It also does not over-flag. A response that legitimately generated nothing still
+	// gets a message_delta with a stop reason — an immediate refusal, a max_tokens of
+	// zero — so its total stays exact.
+	if inf.FinishReason != "" {
+		return false
+	}
+	// A prompt-side count is what makes this a FLOOR rather than simply unpriced:
+	// without one there is nothing for the figure to be a lower bound OF, and costing
+	// publishes nothing at all. TotalTokens is deliberately NOT accepted here — a bare
+	// total includes the completion, so it is the approximate case above, not this one.
+	// PromptTokens is checked alongside the split because Fill derives it from them, and
+	// a producer that set only one of the two should still be read.
+	return inf.PromptTokens > 0 || inf.InputTokens > 0 ||
+		inf.CacheReadTokens > 0 || inf.CacheWriteTokens > 0
+}

@@ -108,6 +108,14 @@ type Snapshot struct {
 	// pipeline for all traffic, and once rates are per-endpoint a deployment can
 	// price some endpoints and not others. Where those differ the dollar total
 	// covers only the priced subset, and a client showing it must say so.
+	//
+	// Nor does it mean the total is EXACT. Totals.IncompleteRequests counts priced
+	// requests whose figure is a lower bound (a stream truncated before its output
+	// count) or an approximation (a gateway reporting only a total). While that is
+	// non-zero the dollar total is inexact, and a client rendering it as an exact figure
+	// is making a claim the data does not support. It is a SUBSET of PricedRequests, not
+	// a deduction from it — the coverage question and the exactness question are
+	// separate, and this field answers neither on its own.
 	Priced bool `json:"priced"`
 	// UnpricedBy counts the requests that could NOT be priced, keyed
 	// "<endpoint> <model>". Present only when something was unpriced.
@@ -329,6 +337,13 @@ func (a *Aggregator) Snapshot(window, resolution time.Duration, sessionID string
 	}
 	// Derived after the loop: Totals is only complete once every bucket has been
 	// added, so this cannot be set in the literal above.
+	//
+	// An inexact figure is still a figure, and PricedRequests counts it — which is what
+	// keeps this flag's contract intact. It promises that false means CostMicros is
+	// absent everywhere, and a floor's dollars ARE in CostMicros, so a window whose every
+	// request was a truncated stream must not report "cost unavailable" over a real
+	// non-zero total. Its inexactness is disclosed by Totals.IncompleteRequests, never by
+	// withholding the figure.
 	out.Priced = out.Totals.PricedRequests > 0
 
 	// Fold last: totals are summed from the raw buckets above and are unaffected

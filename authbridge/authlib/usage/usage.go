@@ -105,7 +105,33 @@ type Counts struct {
 	//
 	// Requests-minus-PricedRequests is the gap, correct at every resolution, and
 	// it is what stops a partial total being presented as a complete one.
+	//
+	// It counts an INEXACT figure too — see IncompleteRequests. This counter answers
+	// "did anything price this", which a request priced from partial counters
+	// truthfully did; withholding it here would answer a question this counter is not
+	// asking and would state the same caveat twice in two vocabularies.
 	PricedRequests int64 `json:"pricedRequests,omitempty"`
+	// IncompleteRequests counts the priced requests whose figure is not EXACT: known-low
+	// because a stream died before its output count arrived, or approximate because the
+	// gateway reported only a total. costevent.Event.IncompleteReason carries which, per
+	// request; this counter is the aggregate's answer to "is this dollar total exact".
+	//
+	// A SUBSET of PricedRequests, never a sibling of it. Their dollars are in CostMicros
+	// and the requests are in PricedRequests, because both of those are true; the
+	// disclosure rides alongside instead of subtracting from either. That is the same
+	// posture as priced-versus-priceable: honest by saying more, not by counting less.
+	// Subtracting would be an adjustment, and an adjustment invites a client to render
+	// the remainder as an exact total, which is the very error this counter exists to
+	// prevent.
+	//
+	// A counter rather than a flag, for the reason PricedRequests is one: buckets are
+	// summed when a client asks for a coarser resolution, and a count survives that
+	// where a flag would degrade to "somewhere in here".
+	//
+	// NOT a pricing gap, and deliberately absent from byUnpriced: nothing an operator
+	// adds to a rate table would make one of these disappear, so naming it there would
+	// point at an entry that already exists.
+	IncompleteRequests int64 `json:"incompleteRequests,omitempty"`
 	// PriceableRequests counts the requests that COULD be priced — those carrying a
 	// model and a non-zero token count.
 	//
@@ -141,6 +167,10 @@ func (c *Counts) Add(o Counts) {
 	c.Tokens += o.Tokens
 	c.CostMicros += o.CostMicros
 	c.PricedRequests += o.PricedRequests
+	// Summed alongside PricedRequests, never out of it: it is a subset disclosure, not a
+	// deduction. See the field's own comment for why the aggregate discloses rather than
+	// adjusts.
+	c.IncompleteRequests += o.IncompleteRequests
 	c.PriceableRequests += o.PriceableRequests
 	c.InputTokens += o.InputTokens
 	c.CacheReadTokens += o.CacheReadTokens
@@ -255,6 +285,11 @@ type eventCost struct {
 	// Counts.PricedRequests as a coverage count rather than needing a separate
 	// branch at every accumulation site.
 	priced int64
+	// incomplete is 1 when micros is not an exact total. It rides ALONGSIDE priced,
+	// which stays 1: the figure exists and belongs in every total it was already in, and
+	// only the claim of exactness is withdrawn. See Counts.IncompleteRequests and
+	// costevent.Event.Incomplete.
+	incomplete int64
 	// priceable is 1 when the request carried a model and tokens, so it belongs in
 	// the coverage denominator whether or not a rate was found.
 	priceable int64
@@ -295,7 +330,16 @@ func (a *Aggregator) costOf(e *pipeline.SessionEvent) eventCost {
 			// silently claiming either.
 			prov = "unlabelled"
 		}
-		return eventCost{micros: ce.Micros(), priced: 1, priceable: 1, provenance: prov}
+		ec := eventCost{micros: ce.Micros(), priced: 1, priceable: 1, provenance: prov}
+		if ce.Incomplete {
+			// Disclosed, not deducted. micros, priced and provenance all stand: the
+			// figure exists, something priced it, and it came from where provenance
+			// says. Only exactness is withdrawn. See costevent.Event.Incomplete for why
+			// adjusting any of the three would be the worse answer, and
+			// Counts.IncompleteRequests for what a client does with this.
+			ec.incomplete = 1
+		}
+		return ec
 	}
 	// Only inference traffic can be priced or named. A plain proxied request has no
 	// model and no tokens, and is neither.
@@ -327,7 +371,16 @@ func (a *Aggregator) costOf(e *pipeline.SessionEvent) eventCost {
 		// extend rather than to create.
 		return eventCost{priceable: 1, unpricedKey: key}
 	}
-	return eventCost{micros: micros, priced: 1, priceable: 1, provenance: prov.String()}
+	ec := eventCost{micros: micros, priced: 1, priceable: 1, provenance: prov.String()}
+	// The same exactness test the producer applies, on this package's OWN figure. There
+	// are two sources of cost here (see the type doc above) and a truncated stream
+	// reaching this fallback is priced prompt-only exactly as it would have been by the
+	// producer — so leaving the test on one side of the fork would disclose the caveat
+	// for one of the two ways a figure can arrive and not the other.
+	if pricing.IncompleteReason(e.Inference) != "" {
+		ec.incomplete = 1
+	}
+	return ec
 }
 
 // Aggregator is a fixed ring of per-minute buckets. Safe for concurrent use.
@@ -652,17 +705,18 @@ func (a *Aggregator) foldInto(ring []bucket, t time.Time, sessionID string, e *p
 	}
 
 	one := Counts{
-		Requests:          1,
-		Tokens:            tokens,
-		CostMicros:        ec.micros,
-		PricedRequests:    ec.priced,
-		PriceableRequests: ec.priceable,
-		InputTokens:       split.InputTokens,
-		CacheReadTokens:   split.CacheReadTokens,
-		CacheWriteTokens:  split.CacheWriteTokens,
-		OutputTokens:      split.OutputTokens,
-		ReasoningTokens:   split.ReasoningTokens,
-		PresentKinds:      split.PresentKinds,
+		Requests:           1,
+		Tokens:             tokens,
+		CostMicros:         ec.micros,
+		PricedRequests:     ec.priced,
+		IncompleteRequests: ec.incomplete,
+		PriceableRequests:  ec.priceable,
+		InputTokens:        split.InputTokens,
+		CacheReadTokens:    split.CacheReadTokens,
+		CacheWriteTokens:   split.CacheWriteTokens,
+		OutputTokens:       split.OutputTokens,
+		ReasoningTokens:    split.ReasoningTokens,
+		PresentKinds:       split.PresentKinds,
 	}
 	if ec.unpricedKey != "" {
 		addLabel(&b.byUnpriced, truncateLabel(ec.unpricedKey), Counts{Requests: 1})

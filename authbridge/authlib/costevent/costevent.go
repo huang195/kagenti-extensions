@@ -95,6 +95,37 @@ type Event struct {
 	// A settled zero is now a real answer that suppresses the fallback.
 	Settled bool `json:"settled,omitempty"`
 
+	// Incomplete marks CostUSD as not an EXACT total, and IncompleteReason says which
+	// way it is inexact: pricing.ReasonOutputUncounted for a known-LOW figure (a stream
+	// that died before the event carrying its output count — the producer's logs already
+	// said "token counts will be incomplete"; this is that knowledge on the wire, where
+	// the totals are actually read), or pricing.ReasonSplitUnreported for one that is
+	// approximate in no known direction (a gateway reporting only total_tokens).
+	//
+	// A reason string beside the flag rather than one undifferentiated boolean, because
+	// the two are different claims and a consumer acts on them differently. A floor is
+	// bounded on one side and usually a transient failure worth chasing; an approximation
+	// is unbounded and a standing property of the gateway. Collapsed into one bit they
+	// would be indistinguishable, and a permanent caveat reads as an incident.
+	//
+	// DISCLOSURE, not adjustment. CostUSD keeps the figure, Settled stays true, and
+	// Priced below still returns true — so a consumer must keep these dollars in its
+	// total. The figure is the best available; estimating the missing completion would be
+	// worse than reporting a known-low number and saying it is low. What the flag
+	// withdraws is the claim of EXACTNESS, nothing else.
+	//
+	// The obligation on a consumer: do not render this as an exact figure. It stays in
+	// every priced count it was already in — usage.Counts keeps it in PricedRequests,
+	// which answers a different question (coverage: did anything price this) — and is
+	// disclosed alongside in usage.Counts.IncompleteRequests.
+	//
+	// ADDITIVE and omitempty, like Provenance and OutputUSD: an event from an older
+	// producer decodes here with Incomplete false, which is the pre-fix reading — every
+	// figure claimed exact — so a consumer that ignores these fields is exactly as
+	// correct as it was before, just less informed.
+	Incomplete       bool   `json:"incomplete,omitempty"`
+	IncompleteReason string `json:"incomplete_reason,omitempty"`
+
 	// PromptUSD is the modelled cost of the PROMPT alone, output excluded.
 	//
 	// A breakdown, not a component of a sum: it is the table's figure even when CostUSD

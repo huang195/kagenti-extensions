@@ -659,3 +659,134 @@ func TestRecord_LabelLengthIsCapped(t *testing.T) {
 		}
 	}
 }
+
+// inferenceEvent builds a priceable response event with an explicit token split.
+//
+// Separate from respEvent because that helper predates the split fields and takes
+// a single scalar token count: the tests below are about the five-way breakdown,
+// which respEvent cannot express.
+func inferenceEvent(model string, in, cacheRead, cacheWrite, out, reasoning int, kinds uint8) *pipeline.SessionEvent {
+	return &pipeline.SessionEvent{
+		At:         time.Now(),
+		Phase:      pipeline.SessionResponse,
+		StatusCode: 200,
+		Host:       "gw.example.com",
+		Inference: &pipeline.InferenceExtension{
+			Model:            model,
+			InputTokens:      in,
+			CacheReadTokens:  cacheRead,
+			CacheWriteTokens: cacheWrite,
+			OutputTokens:     out,
+			ReasoningTokens:  reasoning,
+			TotalTokens:      in + cacheRead + cacheWrite + out,
+			PresentKinds:     kinds,
+		},
+	}
+}
+
+func TestCounts_CarriesTheTokenSplit(t *testing.T) {
+	a := New()
+	a.Record("s1", inferenceEvent("m", 100, 2000, 50, 30, 0, 0b1111))
+
+	snap := a.Snapshot(10*time.Minute, BucketWidth, "s1", GroupNone)
+
+	if got := snap.Totals.InputTokens; got != 100 {
+		t.Errorf("InputTokens = %d, want 100", got)
+	}
+	if got := snap.Totals.CacheReadTokens; got != 2000 {
+		t.Errorf("CacheReadTokens = %d, want 2000", got)
+	}
+	if got := snap.Totals.CacheWriteTokens; got != 50 {
+		t.Errorf("CacheWriteTokens = %d, want 50", got)
+	}
+	if got := snap.Totals.OutputTokens; got != 30 {
+		t.Errorf("OutputTokens = %d, want 30", got)
+	}
+	// The legacy aggregate must keep working for clients written against it.
+	if got := snap.Totals.Tokens; got != 2180 {
+		t.Errorf("Tokens = %d, want 2180 (unchanged legacy sum)", got)
+	}
+}
+
+func TestCounts_ReasoningIsNotAddedToOutput(t *testing.T) {
+	// ReasoningTokens is a SUBSET of OutputTokens: the provider reports how much
+	// of the generated output was reasoning. Adding them double-counts every
+	// reasoning token, and at the output rate -- the most expensive tier.
+	a := New()
+	a.Record("s1", inferenceEvent("m", 0, 0, 0, 100, 40, 0b11001))
+
+	snap := a.Snapshot(10*time.Minute, BucketWidth, "s1", GroupNone)
+
+	if got := snap.Totals.OutputTokens; got != 100 {
+		t.Errorf("OutputTokens = %d, want 100 -- reasoning must not be added", got)
+	}
+	if got := snap.Totals.ReasoningTokens; got != 40 {
+		t.Errorf("ReasoningTokens = %d, want 40 reported alongside, not folded in", got)
+	}
+}
+
+func TestCounts_SplitAccumulatesAcrossEvents(t *testing.T) {
+	a := New()
+	a.Record("s1", inferenceEvent("m", 10, 100, 5, 3, 0, 0b1111))
+	a.Record("s1", inferenceEvent("m", 20, 200, 7, 4, 0, 0b1111))
+
+	snap := a.Snapshot(10*time.Minute, BucketWidth, "s1", GroupNone)
+
+	if got := snap.Totals.InputTokens; got != 30 {
+		t.Errorf("InputTokens = %d, want 30", got)
+	}
+	if got := snap.Totals.CacheReadTokens; got != 300 {
+		t.Errorf("CacheReadTokens = %d, want 300", got)
+	}
+}
+
+func TestCounts_PresentKindsFoldsByOr(t *testing.T) {
+	// One model reports cache counters, another does not. A reader of the window
+	// total must be able to tell "no cache writes happened" from "nothing here
+	// reports cache writes" -- otherwise a blank column is unreadable.
+	a := New()
+	a.Record("s1", inferenceEvent("reports-cache", 10, 0, 0, 5, 0, 0b1111))
+	a.Record("s1", inferenceEvent("no-cache-fields", 10, 0, 0, 5, 0, 0b1001))
+
+	snap := a.Snapshot(10*time.Minute, BucketWidth, "s1", GroupNone)
+
+	if got := snap.Totals.PresentKinds; got != 0b1111 {
+		t.Errorf("PresentKinds = %#b, want %#b (union of what any response reported)", got, 0b1111)
+	}
+}
+
+func TestCounts_PresentKindsZeroWhenNothingReports(t *testing.T) {
+	a := New()
+	a.Record("s1", inferenceEvent("m", 0, 0, 0, 0, 0, 0))
+
+	snap := a.Snapshot(10*time.Minute, BucketWidth, "s1", GroupNone)
+
+	if got := snap.Totals.PresentKinds; got != 0 {
+		t.Errorf("PresentKinds = %#b, want 0", got)
+	}
+}
+
+func TestCounts_SplitSurvivesFolding(t *testing.T) {
+	// fold() is the second place Counts are summed. It delegates to Counts.Add,
+	// so a new field is carried automatically -- but that is exactly the property
+	// that silently broke for PricedRequests once, which is why Add is exported
+	// and why this test exists.
+	a := New()
+	a.Record("s1", inferenceEvent("m", 10, 100, 5, 3, 0, 0b1111))
+
+	snap := a.Snapshot(10*time.Minute, 5*time.Minute, "s1", GroupNone)
+
+	var in, cr int64
+	var kinds uint8
+	for _, b := range snap.Buckets {
+		in += b.InputTokens
+		cr += b.CacheReadTokens
+		kinds |= b.PresentKinds
+	}
+	if in != 10 || cr != 100 {
+		t.Errorf("folded buckets: InputTokens = %d (want 10), CacheReadTokens = %d (want 100)", in, cr)
+	}
+	if kinds != 0b1111 {
+		t.Errorf("folded PresentKinds = %#b, want %#b", kinds, 0b1111)
+	}
+}

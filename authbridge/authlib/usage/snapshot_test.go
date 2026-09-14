@@ -265,3 +265,96 @@ func TestParseGroup_ErrorNamesTheSessionGroup(t *testing.T) {
 		t.Errorf("error %q does not mention the session group", err)
 	}
 }
+
+func TestParseWindowSpec_FixedLengths(t *testing.T) {
+	now := time.Date(2026, 9, 14, 15, 30, 0, 0, time.Local)
+	for _, in := range []string{"10m", "1h", "6h"} {
+		t.Run(in, func(t *testing.T) {
+			got, err := ParseWindowSpec(in, now)
+			if err != nil {
+				t.Fatalf("ParseWindowSpec(%q): %v", in, err)
+			}
+			if got.Symbolic() {
+				t.Errorf("%q reported Symbolic; want a fixed length", in)
+			}
+			if got.Label != in {
+				t.Errorf("Label = %q, want %q", got.Label, in)
+			}
+		})
+	}
+}
+
+func TestParseWindowSpec_TodayIsLocalMidnightToNow(t *testing.T) {
+	// Local, not UTC. A laptop crossing a timezone must not have its day reset
+	// mid-afternoon, and a UTC day would do exactly that.
+	now := time.Date(2026, 9, 14, 15, 30, 0, 0, time.Local)
+	got, err := ParseWindowSpec("today", now)
+	if err != nil {
+		t.Fatalf("ParseWindowSpec: %v", err)
+	}
+	if !got.Symbolic() {
+		t.Fatal("today reported a fixed length; want symbolic")
+	}
+	wantFrom := time.Date(2026, 9, 14, 0, 0, 0, 0, time.Local)
+	if !got.From.Equal(wantFrom) {
+		t.Errorf("From = %v, want local midnight %v", got.From, wantFrom)
+	}
+	if !got.To.Equal(now) {
+		t.Errorf("To = %v, want now %v", got.To, now)
+	}
+	if got.Label != "today" {
+		t.Errorf("Label = %q, want \"today\"", got.Label)
+	}
+}
+
+func TestParseWindowSpec_TodayJustAfterMidnightIsAShortWindow(t *testing.T) {
+	// The boundary case: at 00:05, "today" is five minutes, not 24 hours. A
+	// fixed-length reading would report yesterday evening's spend as today's.
+	now := time.Date(2026, 9, 14, 0, 5, 0, 0, time.Local)
+	got, err := ParseWindowSpec("today", now)
+	if err != nil {
+		t.Fatalf("ParseWindowSpec: %v", err)
+	}
+	if d := got.To.Sub(got.From); d != 5*time.Minute {
+		t.Errorf("span = %v, want 5m", d)
+	}
+}
+
+func TestParseWindowSpec_SevenDaysIsRollingNotCalendar(t *testing.T) {
+	now := time.Date(2026, 9, 14, 15, 30, 0, 0, time.Local)
+	got, err := ParseWindowSpec("7d", now)
+	if err != nil {
+		t.Fatalf("ParseWindowSpec: %v", err)
+	}
+	if d := got.To.Sub(got.From); d != 7*24*time.Hour {
+		t.Errorf("span = %v, want exactly 7x24h (rolling, not calendar)", d)
+	}
+	if !got.Symbolic() {
+		t.Error("7d reported a fixed length; the ring cannot serve it, only the ledger can")
+	}
+	if got.Label != "7d" {
+		t.Errorf("Label = %q, want \"7d\"", got.Label)
+	}
+}
+
+func TestParseWindowSpec_RejectsUnknownWithoutEchoingInput(t *testing.T) {
+	const attack = "<script>alert(1)</script>"
+	_, err := ParseWindowSpec(attack, time.Now())
+	if err == nil {
+		t.Fatal("accepted an unknown window")
+	}
+	if strings.Contains(err.Error(), "script") {
+		t.Errorf("error echoes caller input: %q", err.Error())
+	}
+}
+
+func TestParseWindow_StillRejectsSymbolicWindows(t *testing.T) {
+	// A duration caller cannot express "today". Refusing beats silently
+	// substituting a length, which would report a number for a span nobody asked
+	// for.
+	for _, in := range []string{"today", "7d"} {
+		if _, err := ParseWindow(in); err == nil {
+			t.Errorf("ParseWindow(%q) succeeded; want an error", in)
+		}
+	}
+}

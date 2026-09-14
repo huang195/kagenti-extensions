@@ -16,6 +16,15 @@ import (
 // would spend requests to move a figure the user is not watching.
 const spendPollInterval = 20 * time.Second
 
+// spendTodayPollInterval is how often the "today" headline refreshes.
+//
+// Fifteen times slower than the window poll on purpose: "today" is a figure that
+// moves slowly by construction — it only ever grows, and by the size of one turn —
+// so a 20s cadence would spend a request every 20 seconds to move a number a user
+// reads once a session. It is also the more expensive of the two answers, since the
+// server reads day files off disk for it rather than summing an in-memory ring.
+const spendTodayPollInterval = 5 * time.Minute
+
 // spendWindow is the span the strip REQUESTS, and spendResolution asks for it as
 // a SINGLE bucket. One bucket means the server folds and the client does no
 // arithmetic over buckets — a client-side sum would be a second implementation of
@@ -38,13 +47,27 @@ const (
 // driving both from one chain would blank the strip the moment a user scoped the
 // Usage pane to one session, which is exactly when they are looking at cost.
 //
-// The cost is one extra GET /v1/usage per 20s asking for a single bucket. Both
-// chains can be alive at once; that is two cheap requests per interval, recorded
-// here so it reads as a decision rather than an oversight.
+// The cost is one extra GET /v1/usage per 20s asking for a single bucket, plus one
+// per 5 MINUTES for the ledger-backed "today" figure on its own chain. Together with
+// the Usage pane's chain that is three, and all three can be alive at once —
+// recorded here so it reads as a decision rather than an oversight. The today poll is
+// the only one that touches disk server-side, which is why it is the slow one.
 type spendState struct {
 	snap      *usage.Snapshot
 	err       error
 	lastFetch time.Time
+
+	// todaySnap is the ledger-backed "today" answer, on its OWN chain with its own
+	// counters. Two chains against one endpoint, and a reply from one must never be
+	// applied as the other's: they ask different questions, so a today reply stored
+	// as the window snapshot would label a day's spend with the window's label and
+	// drive the burn rate off it.
+	//
+	// A separate error too, because the two can fail independently — an older proxy
+	// answers the window fine and 400s on window=today — and one broken figure must
+	// not blank the other.
+	todaySnap *usage.Snapshot
+	todayErr  error
 
 	// reqSeq is the id of the most recently ISSUED request; a reply carrying a
 	// different id is stale and dropped. An id rather than a comparison of the
@@ -56,6 +79,13 @@ type spendState struct {
 	// quick exit and re-entry left two chains alive, each rescheduling the other's
 	// successor and doubling the request rate for the life of the session.
 	tickGen uint64
+
+	// todayReqSeq and todayTickGen are the today chain's own counters, for the reason
+	// the snapshot is its own field: sharing reqSeq with the window chain would make
+	// every window reply invalidate the today request in flight, so the slower poll
+	// would never land at all.
+	todayReqSeq  uint64
+	todayTickGen uint64
 }
 
 // invalidate drops the data this state describes and disowns anything in flight.
@@ -77,6 +107,14 @@ func (s *spendState) invalidate() {
 	s.lastFetch = time.Time{}
 	s.reqSeq++
 	s.tickGen++
+	// The today figure is a different pod's day just as much as the window figure is
+	// its hour, and its reply outlives the switch by the same 5s timeout. Both
+	// counters move for the reason the window's do: bumping tickGen alone stops the
+	// old chain from scheduling, not the reply already in the air.
+	s.todaySnap = nil
+	s.todayErr = nil
+	s.todayReqSeq++
+	s.todayTickGen++
 }
 
 // spendLoadedMsg carries a fetched snapshot back to Update.
@@ -90,15 +128,27 @@ type spendLoadedMsg struct {
 // scheduled it, so a tick from a superseded chain is ignored.
 type spendTickMsg struct{ gen uint64 }
 
+// spendTodayLoadedMsg carries the ledger-backed "today" snapshot back to Update.
+// A distinct type from spendLoadedMsg so the two replies cannot be confused by the
+// dispatch switch — the compiler enforces what a shared type would leave to a field.
+type spendTodayLoadedMsg struct {
+	snap *usage.Snapshot
+	req  uint64
+	err  error
+}
+
+// spendTodayTickMsg fires the today refetch, on its own generation.
+type spendTodayTickMsg struct{ gen uint64 }
+
 // spendSummary is what the strip renders.
 //
-// Optional fields rather than a narrower struct, because two of the four figures
-// the spec asks for are not measurable yet: "today" needs the durable cost
-// ledger and "saved" needs tool-prune attribution aggregated across requests.
-// Later commits set HasToday / HasSaved and the renderer picks them up without
-// gaining a branch — and until then the strip shows nothing for them rather than
-// a zero, because "saved $0.00" asserts that pruning saved nothing when the
-// truth is that nothing measures it yet.
+// Optional fields rather than a narrower struct, because a figure can be genuinely
+// unavailable rather than zero. "Today" is now measurable — the durable cost ledger
+// supplies it, and applyTodayFigure sets HasToday only when the server actually
+// served the "today" window AND priced it. "Saved" still is not: it needs tool-prune
+// attribution aggregated across requests, so HasSaved stays false and the strip shows
+// nothing for it rather than a zero, because "saved $0.00" asserts that pruning saved
+// nothing when the truth is that nothing measures it yet.
 type spendSummary struct {
 	WindowUSD   float64
 	WindowLabel string
@@ -130,7 +180,12 @@ type spendSummary struct {
 	// Priceable == 0 and got both wrong the same way.
 	HasSnapshot bool
 
-	TodayUSD float64 // set once the durable cost ledger exists
+	// TodayUSD is spend since local midnight, from the durable cost ledger.
+	//
+	// HasToday false means NO figure, never zero — see applyTodayFigure for the two
+	// ways that happens (the server degraded to a ring window because it has no
+	// ledger, or the window priced nothing).
+	TodayUSD float64
 	HasToday bool
 	SavedUSD float64 // set once tool-prune savings are aggregated
 	HasSaved bool
@@ -145,11 +200,19 @@ func (m *model) spendSummary() spendSummary {
 	// row, leaving a permanent blank line above the footer. Rendering nothing and
 	// having nothing notice is the exact failure this whole strip exists to end.
 	if m.spend.err != nil {
+		// Failed describes the WINDOW poll. The today figure is deliberately NOT carried
+		// here even when its own chain answered: renderSpendStrip returns on Failed
+		// before it reads any figure, so setting one would be an assignment nothing
+		// reads. Showing a good day total beside a failed window poll would be the
+		// better strip, but it is a renderer change — the Failed branch would have to
+		// yield to the figures — and this commit touches the data side only.
 		return spendSummary{Failed: true}
 	}
 	snap := m.spend.snap
 	if snap == nil {
-		return spendSummary{}
+		out := spendSummary{}
+		m.applyTodayFigure(&out)
+		return out
 	}
 	out := spendSummary{
 		WindowLabel: snap.Window,
@@ -179,6 +242,7 @@ func (m *model) spendSummary() spendSummary {
 	if spanOK {
 		out.WindowLabel = formatWindowLabel(span)
 	}
+	m.applyTodayFigure(&out)
 	if snap.Priced {
 		out.WindowUSD = float64(snap.Totals.CostMicros) / 1e6
 		// Suppressed, not approximated, when the span is unknown. A rate is a
@@ -261,11 +325,12 @@ func sessionSpan(s session.SessionSummary) time.Duration {
 
 // parseWindowSpan interprets a snapshot's Window string as a duration.
 //
-// Not every value has to be one. usage.ParseWindow currently rejects anything
-// time.ParseDuration cannot read, so today this always succeeds — but the label is
-// a free-form string on the wire, and a future symbolic window ("today", for a
-// ledger-backed span) would arrive here as unparseable. Returning false then is
-// what lets the caller suppress the rate instead of inventing a denominator.
+// Not every value has to be one. The symbolic windows now exist — usage.WindowToday
+// and usage.Window7d are labels no duration parser reads — and while the strip's
+// WINDOW chain asks only for fixed lengths, so this succeeds on every label it
+// currently sees, the field is free-form on the wire and a server is entitled to
+// answer with a span it names rather than measures. Returning false then is what
+// lets the caller suppress the burn rate instead of inventing a denominator.
 func parseWindowSpan(label string) (time.Duration, bool) {
 	d, err := time.ParseDuration(label)
 	if err != nil || d <= 0 {
@@ -327,7 +392,13 @@ func (m *model) applySpendLoaded(msg spendLoadedMsg) {
 // harmless — the sequence only has to be monotonic.
 func (m *model) startSpendPolling() tea.Cmd {
 	m.spend.invalidate()
-	return tea.Batch(m.fetchSpend(), spendTick(m.spend.tickGen))
+	// Both chains, each on its own generation. The today figure is fetched
+	// immediately too rather than waiting out its 5-minute interval: the whole point
+	// of the headline is that it is there when the user arrives.
+	return tea.Batch(
+		m.fetchSpend(), spendTick(m.spend.tickGen),
+		m.fetchSpendToday(), spendTodayTick(m.spend.todayTickGen),
+	)
 }
 
 // spendTick schedules the next poll for the given generation.
@@ -360,5 +431,85 @@ func (m *model) fetchSpend() tea.Cmd {
 		// is a label map paid for and thrown away.
 		snap, err := client.GetUsage(ctx, spendWindow, spendResolution, "", usage.GroupSession)
 		return spendLoadedMsg{snap: snap, req: req, err: err}
+	}
+}
+
+// applyTodayFigure fills in the strip's "today" headline from the ledger-backed
+// poll, or leaves it unset.
+//
+// Two conditions, and both are load-bearing:
+//
+// The response's window must actually BE "today". A proxy with no durable cost
+// ledger — Kubernetes by design, or a local install with it turned off — answers
+// window=today from the in-memory ring's maximum span and reports that span as the
+// window it served. Setting HasToday from the request rather than from the answer
+// would label a six-hour total as a day's, which is a wrong number wearing a right
+// label. This is the one case where the honest answer is to show less: the strip
+// falls back to its rolling-window figure, which is correctly labelled.
+//
+// And the answer must be PRICED. renderSpendStrip guards its window figure on
+// Priced but renders the today figure whenever HasToday is set, so an unpriced day
+// admitted here would print "$0.0000 today" — a settled zero for a cost nobody
+// knows, the one thing the strip is forbidden to do. Guarded here rather than there
+// because the renderer already handles both fields and this commit is data-only.
+func (m *model) applyTodayFigure(out *spendSummary) {
+	snap := m.spend.todaySnap
+	if snap == nil || m.spend.todayErr != nil {
+		return
+	}
+	if snap.Window != usage.WindowToday {
+		return
+	}
+	if !snap.Priced {
+		return
+	}
+	out.TodayUSD = float64(snap.Totals.CostMicros) / 1e6
+	out.HasToday = true
+}
+
+// spendTodayTickIsCurrent reports whether a today tick belongs to the live chain.
+func (m *model) spendTodayTickIsCurrent(gen uint64) bool { return gen == m.spend.todayTickGen }
+
+// applySpendTodayLoaded stores a today reply unless it is stale.
+//
+// Does not move lastFetch: that field reports the age of the WINDOW figure, and
+// advancing it on a today reply would have the strip claim a freshness the rolling
+// figure does not have.
+func (m *model) applySpendTodayLoaded(msg spendTodayLoadedMsg) {
+	if msg.req != m.spend.todayReqSeq {
+		return
+	}
+	m.spend.todaySnap, m.spend.todayErr = msg.snap, msg.err
+}
+
+// spendTodayTick schedules the next today poll for the given generation.
+func spendTodayTick(gen uint64) tea.Cmd {
+	return tea.Tick(spendTodayPollInterval, func(time.Time) tea.Msg {
+		return spendTodayTickMsg{gen: gen}
+	})
+}
+
+// fetchSpendToday requests the ledger-backed day total off the render loop.
+//
+// GetUsageWindow rather than GetUsage: GetUsage takes a time.Duration and
+// stringifies it, and "today" is a boundary rather than a length, so it cannot be
+// expressed that way at all.
+//
+// group=none, unlike fetchSpend: the strip needs one number from this poll and the
+// sessions table reads the window snapshot's series, so asking for a breakdown here
+// would be a label map paid for and thrown away. Resolution 0 omits the parameter —
+// the ledger serves this as a single bucket and does not read it.
+func (m *model) fetchSpendToday() tea.Cmd {
+	if m.client == nil {
+		return nil
+	}
+	client := m.client
+	m.spend.todayReqSeq++
+	req := m.spend.todayReqSeq
+	return func() tea.Msg {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		snap, err := client.GetUsageWindow(ctx, usage.WindowToday, 0, "", usage.GroupNone)
+		return spendTodayLoadedMsg{snap: snap, req: req, err: err}
 	}
 }

@@ -198,9 +198,36 @@ func trimSlash(s string) string {
 // binary, or session tracking disabled), which callers should render as
 // "unavailable" rather than as an empty chart.
 func (c *Client) GetUsage(ctx context.Context, window, resolution time.Duration, sessionID string, group usage.Group) (*usage.Snapshot, error) {
+	// Expressed in terms of GetUsageWindow so there is ONE request-building path.
+	// Two would drift on query encoding or on the ErrNotFound behaviour the godoc
+	// above promises, and the drift would show up as a chart that works on one code
+	// path and 404s on the other.
+	return c.GetUsageWindow(ctx, window.String(), resolution, sessionID, group)
+}
+
+// GetUsageWindow fetches a snapshot for a symbolic window the server names —
+// "today", "7d" — which a time.Duration cannot express.
+//
+// A sibling of GetUsage rather than a widened signature: GetUsage has several
+// callers and its duration parameters are the right shape for the chart windows,
+// which really are fixed lengths. "Today" is not a length, it is a boundary.
+//
+// Read Snapshot.Window rather than assuming this one was served. A symbolic window
+// requested where the proxy has no durable cost ledger — Kubernetes, by design —
+// is answered from the in-memory ring's maximum span instead, and the response
+// names the window it actually served. Labelling that figure "today" would report
+// six hours as a day.
+//
+// resolution of 0 omits the parameter, leaving the server's default. The ledger
+// serves a symbolic window as a single bucket and does not read the resolution at
+// all, so there is no meaningful value for a caller to invent — and "0s" would be
+// rejected as finer than the storage bucket.
+func (c *Client) GetUsageWindow(ctx context.Context, window string, resolution time.Duration, sessionID string, group usage.Group) (*usage.Snapshot, error) {
 	q := url.Values{}
-	q.Set("window", window.String())
-	q.Set("resolution", resolution.String())
+	q.Set("window", window)
+	if resolution > 0 {
+		q.Set("resolution", resolution.String())
+	}
 	if sessionID != "" {
 		q.Set("session", sessionID)
 	}

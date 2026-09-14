@@ -284,10 +284,20 @@ func TestParseWindowSpec_FixedLengths(t *testing.T) {
 	}
 }
 
+// testZone is a fixed non-UTC zone for the day-boundary tests.
+//
+// Not time.Local, which is what the first version of these tests used on both sides
+// of the assertion. On a host where time.Local IS UTC — the default in most CI
+// containers — that made the guard vacuous: an implementation reading
+// time.Date(..., time.UTC) passed, because the expectation was computed in the same
+// zone as the input. Pinning a zone seven hours off UTC means midnight here is 07:00
+// UTC, so a UTC reading lands on the wrong instant on every machine.
+var testZone = time.FixedZone("test", -7*3600)
+
 func TestParseWindowSpec_TodayIsLocalMidnightToNow(t *testing.T) {
-	// Local, not UTC. A laptop crossing a timezone must not have its day reset
-	// mid-afternoon, and a UTC day would do exactly that.
-	now := time.Date(2026, 9, 14, 15, 30, 0, 0, time.Local)
+	// The caller's zone, not UTC. A laptop crossing a timezone must not have its day
+	// reset mid-afternoon, and a UTC day would do exactly that.
+	now := time.Date(2026, 9, 14, 15, 30, 0, 0, testZone)
 	got, err := ParseWindowSpec("today", now)
 	if err != nil {
 		t.Fatalf("ParseWindowSpec: %v", err)
@@ -295,15 +305,36 @@ func TestParseWindowSpec_TodayIsLocalMidnightToNow(t *testing.T) {
 	if !got.Symbolic() {
 		t.Fatal("today reported a fixed length; want symbolic")
 	}
-	wantFrom := time.Date(2026, 9, 14, 0, 0, 0, 0, time.Local)
+	wantFrom := time.Date(2026, 9, 14, 0, 0, 0, 0, testZone)
 	if !got.From.Equal(wantFrom) {
-		t.Errorf("From = %v, want local midnight %v", got.From, wantFrom)
+		t.Errorf("From = %v, want midnight in the caller's zone %v", got.From, wantFrom)
+	}
+	// The span is the load-bearing assertion, because it is the one a UTC reading gets
+	// wrong: 15:30 minus midnight is 15h30m in the caller's zone and 22h30m if the
+	// boundary is taken in UTC.
+	if d := got.To.Sub(got.From); d != 15*time.Hour+30*time.Minute {
+		t.Errorf("span = %v, want 15h30m; a UTC day boundary would give 22h30m", d)
 	}
 	if !got.To.Equal(now) {
 		t.Errorf("To = %v, want now %v", got.To, now)
 	}
 	if got.Label != "today" {
 		t.Errorf("Label = %q, want \"today\"", got.Label)
+	}
+}
+
+// Just after midnight in a non-UTC zone is where a UTC boundary is not merely a
+// different length but a different DAY: 00:30 at UTC-7 is 07:30 UTC on the same date,
+// so a UTC reading reports seven and a half hours of "today" — most of it yesterday
+// evening's spend.
+func TestParseWindowSpec_TodayJustAfterMidnightInANonUTCZone(t *testing.T) {
+	now := time.Date(2026, 9, 14, 0, 30, 0, 0, testZone)
+	got, err := ParseWindowSpec("today", now)
+	if err != nil {
+		t.Fatalf("ParseWindowSpec: %v", err)
+	}
+	if d := got.To.Sub(got.From); d != 30*time.Minute {
+		t.Errorf("span = %v, want 30m; a UTC boundary would give 7h30m of someone else's day", d)
 	}
 }
 

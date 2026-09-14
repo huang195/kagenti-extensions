@@ -17,6 +17,15 @@ import (
 // midnight-adjacent, so a timezone bug does not accidentally pass.
 var at = time.Date(2026, 9, 13, 9, 14, 30, 0, time.Local)
 
+// testZone is a fixed non-UTC zone for the tests that turn on a day boundary.
+//
+// time.Local is not good enough for those. Building both the input and the
+// expectation in time.Local makes the assertion vacuous wherever time.Local IS UTC —
+// the default in most CI containers — because an implementation that read time.UTC
+// would agree with the test by construction. At UTC-7, local midnight is 07:00 UTC,
+// so the two readings land on different days and only the right one passes.
+var testZone = time.FixedZone("test", -7*3600)
+
 // newTestWriter opens a ledger over dir with a pinned clock, closed on cleanup.
 func newTestWriter(t *testing.T, dir string, clock func() time.Time) *Writer {
 	t.Helper()
@@ -434,9 +443,14 @@ func TestWriter_DayFileIsNotWorldReadable(t *testing.T) {
 // A flush that straddles local midnight must split across two day files. A cached
 // handle would append tomorrow's minute to yesterday's file, silently giving that
 // day 24 extra hours.
+//
+// In testZone rather than time.Local, for the reason recorded there: at UTC-7 these
+// two minutes are in one UTC day and two local days, so a UTC filename would put both
+// rows in one file and the assertion below would fail. Built in time.Local it passed
+// on any UTC host whichever zone the implementation used.
 func TestWriter_FlushStraddlingMidnightSplitsByDay(t *testing.T) {
 	dir := t.TempDir()
-	midnight := time.Date(2026, 9, 14, 0, 0, 0, 0, time.Local)
+	midnight := time.Date(2026, 9, 14, 0, 0, 0, 0, testZone)
 	before := midnight.Add(-time.Minute)
 	now := before
 	w := newTestWriter(t, dir, func() time.Time { return now })

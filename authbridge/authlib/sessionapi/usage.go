@@ -61,19 +61,24 @@ import (
 // it is written down so the decision to expose it is a decision rather than an
 // oversight.
 //
-// costMicros is populated from the figure inference-parser settles on the
-// response pass. It prefers the gateway's own post-discount cost header — the
+// costMicros is populated from the figure authlib/costing settles for one
+// response. It prefers the gateway's own post-discount cost header — the
 // authoritative figure — and falls back to pricing the parsed token counters when
 // the header is absent or reports 0, which every streamed response does.
 //
-// The parser owns that decision because it is the only component that knows when
-// the token counters are final. Cost used to be computed in four places, and
-// which one answered depended on which plugins an operator had enabled: a request
-// could carry a token count with no money in a live abctl view while showing
-// dollars here. litellm-budget-track now consumes the settled figure to enforce a
-// budget rather than computing one of its own.
+// costing is its own package rather than logic inside the parser or inside a
+// plugin, and deliberately so: a gateway's cost header is vendor-specific knowledge
+// with no place in a provider-shaped body parser, and a ledger has no business
+// deciding what a request cost. inference-parser CALLS it at the point the token
+// counters are final, because that is the only place that knows when they are.
 //
-// Requests the parser did not price contribute no cost and appear as the gap
+// Cost used to be decided in two places with two shapes — inside
+// litellm-budget-track and again inside the usage aggregator — and the two could
+// disagree about the same request: one could carry a token count with no money in a
+// live abctl view while showing dollars here. litellm-budget-track now amends the
+// settled record to enforce a budget rather than computing a figure of its own.
+//
+// Requests that arrive with no settled figure contribute no cost and appear as the gap
 // between totals.pricedRequests and totals.requests. Where those differ the
 // dollar total covers only the priced subset, so a client rendering it must
 // present it as partial rather than complete. priced:false means nothing at all
@@ -87,10 +92,11 @@ import (
 // docs/superpowers/specs/2026-09-09-pricing-consolidation-design.md.
 //
 // Which means cost is NOT single-sourced, and this comment deliberately stops
-// short of claiming that it is. inference-parser settles the figure most requests
+// short of claiming that it is. authlib/costing settles the figure most requests
 // arrive with, but the aggregator still prices independently when none is present,
-// so the two can answer differently about the same request. Collapsing them onto
-// the parser's figure alone is a later change; until it lands, do not write here
+// so the two can answer differently about the same request — and the aggregator's
+// path does not go through costing's precedence rule at all. Collapsing them onto
+// the settled figure alone is a later change; until it lands, do not write here
 // that cost is computed in exactly one place, because it is not.
 func (s *Server) handleUsage(w http.ResponseWriter, r *http.Request) {
 	if s.usage == nil {

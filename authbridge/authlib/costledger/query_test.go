@@ -266,6 +266,11 @@ func TestWindow_CountsAMinuteExactlyOnceAcrossTheFlush(t *testing.T) {
 	later := costedEvent(t, "gw", "m", 0.10, 10, 5)
 	later.At = now
 	w.Record("s1", later)
+	// The closed minute reaches disk on the writer goroutine, so wait for it: the
+	// question here is whether BOTH halves claim it, which needs it to be in one.
+	if err := w.sync(); err != nil {
+		t.Fatalf("sync: %v", err)
+	}
 
 	after, err := w.Window(from, to)
 	if err != nil {

@@ -86,7 +86,7 @@ func TestPricing_CostEventStillWins(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	ev.Plugins = map[string]json.RawMessage{costevent.PluginName: raw}
+	ev.Plugins = map[string]json.RawMessage{costevent.Key: raw}
 	a.Record("s1", ev)
 
 	snap := snapshotOf(a, now)
@@ -221,7 +221,7 @@ func TestPricing_SettledZeroIsNotRePriced(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	ev.Plugins = map[string]json.RawMessage{costevent.PluginName: raw}
+	ev.Plugins = map[string]json.RawMessage{costevent.Key: raw}
 	a.Record("s1", ev)
 
 	snap := snapshotOf(a, now)
@@ -310,7 +310,7 @@ func TestPricing_ProvenanceReachesTheSnapshot(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	ev.Plugins = map[string]json.RawMessage{costevent.PluginName: raw}
+	ev.Plugins = map[string]json.RawMessage{costevent.Key: raw}
 	a.Record("s1", ev)
 
 	// Two the aggregator modelled from the configured table.

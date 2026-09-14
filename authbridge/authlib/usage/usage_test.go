@@ -30,14 +30,35 @@ func respEvent(at time.Time, status int, dur time.Duration, model string, tokens
 	return e
 }
 
-// withCost attaches a settled cost event, exactly as a listener would after
-// SnapshotPlugins. Returns e so it composes with respEvent.
+// withCost attaches a settled cost event under costevent.Key — the key production
+// publishes — exactly as a listener would after SnapshotPlugins. Returns e so it
+// composes with respEvent.
 //
 // inference-parser is what settles and publishes the figure; litellm-budget-track
-// consumes it to enforce a budget. Note this writes costevent.PluginName, which is
-// the FROZEN LEGACY key — production publishes under costevent.Key — so the cost
-// tests in this file exercise the decode fallback rather than the current key.
+// consumes it to enforce a budget.
+//
+// Both keys appear in this package deliberately. Every fixture here used to publish
+// costevent.PluginName, the frozen LEGACY key, which meant the aggregator's whole
+// cost coverage exercised only costevent.Find's FALLBACK branch: deleting its
+// primary Plugins[Key] lookup left this package green while /v1/usage would have
+// reported every request unpriced. The default is now the production key, and
+// withLegacyCost keeps the compatibility path held down rather than untested.
 func withCost(t *testing.T, e *pipeline.SessionEvent, costUSD float64) *pipeline.SessionEvent {
+	t.Helper()
+	return withCostUnderKey(t, e, costUSD, costevent.Key)
+}
+
+// withLegacyCost publishes under costevent.PluginName, the frozen legacy key. Only
+// TestCostOf_DecodesTheLegacyProducerKey should use it; everything else wants the
+// production key.
+func withLegacyCost(t *testing.T, e *pipeline.SessionEvent, costUSD float64) *pipeline.SessionEvent {
+	t.Helper()
+	return withCostUnderKey(t, e, costUSD, costevent.PluginName)
+}
+
+// withCostUnderKey is the shared body, parameterised by key so the two spellings
+// cannot drift in anything but the key itself.
+func withCostUnderKey(t *testing.T, e *pipeline.SessionEvent, costUSD float64, key string) *pipeline.SessionEvent {
 	t.Helper()
 	raw, err := json.Marshal(costevent.Event{
 		CostUSD: costUSD,
@@ -49,8 +70,31 @@ func withCost(t *testing.T, e *pipeline.SessionEvent, costUSD float64) *pipeline
 	if e.Plugins == nil {
 		e.Plugins = map[string]json.RawMessage{}
 	}
-	e.Plugins[costevent.PluginName] = raw
+	e.Plugins[key] = raw
 	return e
+}
+
+// The legacy key must keep decoding: session stores hold events recorded under it,
+// and a sidecar in a mixed-version deployment still publishes it — which is why
+// costevent.PluginName's literal value is frozen.
+//
+// This is the one fixture in the package deliberately left on that key. It exists
+// because the swap to costevent.Key would otherwise have moved the fallback from
+// over-tested to untested in a single commit, and the fallback is a real
+// compatibility guarantee for events already sitting in a store.
+func TestCostOf_DecodesTheLegacyProducerKey(t *testing.T) {
+	now := time.Date(2026, 9, 9, 12, 30, 0, 0, time.UTC)
+	a := New(WithClock(fixedClock(now)))
+
+	a.Record("s1", withLegacyCost(t, respEvent(now, 200, time.Second, "claude-opus-5", 1000), 0.0421))
+
+	snap := a.Snapshot(time.Minute, BucketWidth, "", GroupNone)
+	if snap.Totals.CostMicros != 42_100 {
+		t.Errorf("CostMicros = %d, want 42100 — a legacy-key record must still decode", snap.Totals.CostMicros)
+	}
+	if snap.Totals.PricedRequests != 1 {
+		t.Errorf("PricedRequests = %d, want 1", snap.Totals.PricedRequests)
+	}
 }
 
 // TestCountsAddFoldsPricedRequests is why coverage is a counter and not a

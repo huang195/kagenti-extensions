@@ -862,21 +862,42 @@ func (m *model) helpView() string {
 }
 
 // layout recomputes component sizes to fit the current terminal. Called on
-// every WindowSizeMsg. The footer reserves two lines; the title one.
+// every WindowSizeMsg.
+//
+// Up to FIVE rows can be reserved, not three: the title one, the footer two, the
+// spend strip one more whenever the terminal is tall enough (spendStripReservesRow),
+// and the filter input one more while it is open. This comment said "the footer
+// reserves two lines; the title one" and stopped there — true and complete before
+// either conditional row existed. The exact budget is in the body; keep the two in
+// step, and keep app.go's bodyHeight comment in step with both.
 func (m *model) layout() {
 	if m.width == 0 || m.height == 0 {
 		return
 	}
-	// Reserve 3 rows for title + blank + footer lines.
-	bodyH := m.height - 3
-	// And one more while the filter is open: View() prepends filterInput above the body, so
-	// the line exists on screen whether or not the budget admits it. Unreserved, the view came
-	// out one line taller than the terminal at every size, the terminal scrolled, and the
-	// bottom row went missing for as long as the operator was typing a filter — the same
-	// symptom as a mis-sized table, from a line nobody counted.
-	if m.filtering {
-		bodyH--
+	// Reserve 1 row for the title and 2 for the footer (status + hint). Two more
+	// are conditional: the spend strip's, and the filter input's.
+	//
+	// Neither conditional row is BORROWED from the three. An earlier comment here
+	// said "title + blank + footer", but the arithmetic was title(1) + footer(2) = 3
+	// and there was never a blank row to take. Borrowing would leave every table one
+	// row too tall and push the footer off the bottom of the terminal.
+	//
+	// The strip's row is reserved on height alone; see spendStripReservesRow for why
+	// it must not read m.pane, and what that costs the two picker panes.
+	reserved := 3
+	if m.spendStripReservesRow() {
+		reserved++
 	}
+	// The filter's row, whenever it is open: View() prepends filterInput above the
+	// body, so the line exists on screen whether or not the budget admits it.
+	// Unreserved, the view came out one line taller than the terminal at every size,
+	// the terminal scrolled, and the bottom row went missing for as long as the
+	// operator was typing a filter — the same symptom as a mis-sized table, from a
+	// line nobody counted.
+	if m.filtering {
+		reserved++
+	}
+	bodyH := m.height - reserved
 	if bodyH < 4 {
 		bodyH = 4
 	}

@@ -198,8 +198,23 @@ type bucket struct {
 	// other label map: Host comes off the request, so its cardinality is set
 	// off-host rather than by anything this process controls.
 	byEndpoint map[string]Counts
-	byStatus   map[string]Counts
-	byPlugin   map[string]Counts
+	// bySession tallies by the session the event was recorded under, so ONE
+	// snapshot of the all-sessions ring answers for every row of a sessions list
+	// instead of costing a request per row.
+	//
+	// Bounded by maxLabelsPerBucket like every other label map, and here the bound
+	// is the load-bearing one: the id is request-derived rather than process-chosen —
+	// the reverse proxy takes it from the A2A contextId and falls back to "default"
+	// (reverseproxy.inboundSessionID) — so its cardinality is set off-host. A client
+	// varying the contextId every turn would otherwise add a retained map entry and a
+	// retained string per request, in a ring that frees a slot only a full lap later.
+	//
+	// Recorded on the per-session rings too, where it is a single-key map and
+	// redundant. That is deliberate: a uniform call site in foldInto cannot fall out
+	// of step with itself, and one key costs nothing.
+	bySession map[string]Counts
+	byStatus  map[string]Counts
+	byPlugin  map[string]Counts
 	// byProvenance tallies priced requests by where their figure came from, so a
 	// total can disclose how much of it is a gateway's own number versus modelled
 	// from a rate table. Like byUnpriced, kept outside the Group machinery: it
@@ -495,11 +510,11 @@ func (a *Aggregator) Record(sessionID string, e *pipeline.SessionEvent) {
 	}
 
 	t := at.Truncate(BucketWidth)
-	a.foldInto(a.all, t, e, requestPlugins, ec)
+	a.foldInto(a.all, t, sessionID, e, requestPlugins, ec)
 
 	if ring, ok := a.sessions[sessionID]; ok {
 		ring.lastSeen = at
-		a.foldInto(ring.buckets, t, e, requestPlugins, ec)
+		a.foldInto(ring.buckets, t, sessionID, e, requestPlugins, ec)
 		return
 	}
 	// maxSess == 0 means no per-session rings at all — see WithMaxSessions. The
@@ -517,7 +532,7 @@ func (a *Aggregator) Record(sessionID string, e *pipeline.SessionEvent) {
 	}
 	ring := &sessionRing{buckets: make([]bucket, NumBuckets), lastSeen: at}
 	a.sessions[sessionID] = ring
-	a.foldInto(ring.buckets, t, e, requestPlugins, ec)
+	a.foldInto(ring.buckets, t, sessionID, e, requestPlugins, ec)
 }
 
 // holdRequestPluginsLocked stashes a request event's plugin names until its
@@ -605,7 +620,13 @@ func (a *Aggregator) evictColdestLocked() {
 	}
 }
 
-func (a *Aggregator) foldInto(ring []bucket, t time.Time, e *pipeline.SessionEvent, requestPlugins []string, ec eventCost) {
+// foldInto accumulates one event into one ring.
+//
+// sessionID is passed rather than derived because the ring itself does not know
+// which session it belongs to: a.all is shared and a sessionRing holds only
+// buckets. Both call sites pass the same id, which is what lets the bySession
+// label be recorded uniformly instead of only on the all-sessions ring.
+func (a *Aggregator) foldInto(ring []bucket, t time.Time, sessionID string, e *pipeline.SessionEvent, requestPlugins []string, ec eventCost) {
 	b := &ring[slot(t)]
 	if !b.start.Equal(t) {
 		*b = bucket{start: t} // stale lap: reset rather than accumulate onto old data
@@ -664,6 +685,21 @@ func (a *Aggregator) foldInto(ring []bucket, t time.Time, e *pipeline.SessionEve
 
 	if model != "" {
 		addLabel(&b.byMethod, truncateLabel(model), one)
+	}
+	// Recorded on whichever ring is being folded, including the per-session one
+	// where it is redundant — a uniform call site beats a conditional, and the
+	// per-session map has exactly one key so it costs nothing.
+	//
+	// Empty is skipped for the same reason Host is below: an unattributed event
+	// would render as a blank row, which reads as a bug rather than as missing
+	// attribution.
+	//
+	// What a key MEANS is the listener's business, not this package's. While
+	// several concurrent agents are recorded under one session id (#949), their
+	// spend lands in one entry and a per-session figure is a per-id figure — a
+	// caveat about the current session-bucketing behaviour, not about this axis.
+	if sessionID != "" {
+		addLabel(&b.bySession, truncateLabel(sessionID), one)
 	}
 	// Guarded on non-empty: Host is unset when the listener did not populate it,
 	// and an "" key renders as a blank row in a breakdown table, which reads as a

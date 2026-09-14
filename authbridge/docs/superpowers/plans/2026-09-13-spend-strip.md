@@ -1,5 +1,8 @@
 # Spend Strip Implementation Plan (commit 4)
 
+> **STATUS: implemented.** Landed as `c5b1f596`. The SPAN column it specifies was
+> subsequently removed and ACTIVE moved last — see the commit that did so for why.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Put spend on screen unconditionally — one row of chrome, visible from every pane — plus a `COST` column on the sessions list, so cost is read before the data rather than navigated to.
@@ -12,7 +15,7 @@
 
 ## Global Constraints
 
-- **Module root is `authbridge/`.** Go commands run from `/Users/haihuang/works/go/src/github.com/kagenti/kagenti-extensions/.worktrees/cost-first-class/authbridge`. `git` runs from the worktree root above it.
+- **Module root is `authbridge/`.** Go commands run from `authbridge/`, relative to the repo root. `git` runs from the repo root itself.
 - **`abctl` is its own module** (`cmd/abctl/go.mod`) with a `replace` to local `authlib`, satisfied by `authbridge/go.work`. It always builds against the local `authlib`, so new `usage.Counts` fields are visible without a version bump.
 - **`git commit -s` is mandatory.** Trailer `Assisted-By: Claude (Anthropic AI) <noreply@anthropic.com>`; never `Co-Authored-By`.
 - **Never `$0.00` for an unknown cost.** `usage_render.go:347` establishes this — a zero cost and an unknown cost are different answers, and only one means the traffic was free. The strip says `cost unavailable`.

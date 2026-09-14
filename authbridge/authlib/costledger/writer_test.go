@@ -452,6 +452,69 @@ func TestWriter_FlushStraddlingMidnightSplitsByDay(t *testing.T) {
 	}
 }
 
+// assertOwnership checks the rule Window's arithmetic rests on: while a minute is
+// held in memory, nothing on disk carries that minute or a later one.
+func assertOwnership(t *testing.T, w *Writer, dir, step string) {
+	t.Helper()
+	_, open := w.pending()
+	if open.IsZero() {
+		return
+	}
+	for _, r := range readAllRows(t, dir) {
+		if !r.At.Truncate(time.Minute).Before(open) {
+			t.Errorf("after %s: disk row at %v is not below the held minute %v — "+
+				"Window would count it twice", step, r.At, open)
+		}
+	}
+}
+
+// Every path that writes a row has to keep the ownership rule, so this drives all
+// three of them in one sequence rather than trusting the one that is obvious.
+func TestPendingMinute_IsNeverAlsoOnDisk(t *testing.T) {
+	dir := t.TempDir()
+	now := at
+	w := newTestWriter(t, dir, func() time.Time { return now })
+
+	// 1. The ordinary path: accumulate, then roll so the minute is flushed.
+	w.Record("s1", costedEvent(t, "gw", "m", 0.25, 100, 50))
+	assertOwnership(t, w, dir, "the first open minute")
+	now = at.Add(time.Minute)
+	second := costedEvent(t, "gw", "m", 0.25, 100, 50)
+	second.At = now
+	w.Record("s1", second)
+	assertOwnership(t, w, dir, "a minute roll")
+
+	// 2. A late event for a minute below the held one goes straight to disk.
+	late := costedEvent(t, "gw", "m", 0.25, 100, 50)
+	late.At = at.Add(-5 * time.Minute)
+	w.Record("s1", late)
+	assertOwnership(t, w, dir, "a late event")
+
+	// 3. An event arriving in the SAME minute after a Flush must not be re-held —
+	// the case a periodic settle or a shutdown flush creates.
+	if err := w.Flush(); err != nil {
+		t.Fatalf("Flush: %v", err)
+	}
+	sameMinute := costedEvent(t, "gw", "m", 0.25, 100, 50)
+	sameMinute.At = now
+	w.Record("s1", sameMinute)
+	assertOwnership(t, w, dir, "an event in an already-flushed minute")
+
+	// And that last event must still be recorded somewhere — the guard sends it to
+	// disk rather than dropping it.
+	var total int64
+	for _, r := range readAllRows(t, dir) {
+		total += r.CostMicros
+	}
+	pending, _ := w.pending()
+	for _, r := range pending {
+		total += r.CostMicros
+	}
+	if want := int64(4 * 250_000); total != want {
+		t.Errorf("total across disk and memory = %d, want %d — every event exactly once", total, want)
+	}
+}
+
 // Retention deletes day files past the window and leaves everything else alone,
 // including names it cannot date — deleting an unrecognised file under an
 // operator-configured path is the one unrecoverable mistake available here.

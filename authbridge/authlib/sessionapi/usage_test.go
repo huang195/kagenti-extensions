@@ -297,12 +297,29 @@ func TestHandleUsage_SplitFieldsAppearOnTheWire(t *testing.T) {
 // the flush would assert against an empty ledger and read as a routing bug.
 func ledgerWithOneCostedMinute(t *testing.T, at time.Time, host, model string, costUSD float64) *costledger.Writer {
 	t.Helper()
+	led := newTestLedger(t, at)
+	recordCostedMinute(t, led, at, host, model, costUSD)
+	if err := led.Flush(); err != nil {
+		t.Fatalf("Flush: %v", err)
+	}
+	return led
+}
+
+// newTestLedger opens an empty ledger with its clock pinned to at.
+func newTestLedger(t *testing.T, at time.Time) *costledger.Writer {
+	t.Helper()
 	led, err := costledger.New(t.TempDir(), costledger.WithClock(func() time.Time { return at }))
 	if err != nil {
 		t.Fatalf("costledger.New: %v", err)
 	}
 	t.Cleanup(func() { _ = led.Close() })
+	return led
+}
 
+// recordCostedMinute feeds one settled-cost inference response to a ledger, without
+// flushing — so the caller chooses whether the minute is open or closed.
+func recordCostedMinute(t *testing.T, led *costledger.Writer, at time.Time, host, model string, costUSD float64) {
+	t.Helper()
 	rec, err := json.Marshal(costevent.Event{
 		CostUSD: costUSD, Settled: true,
 		Source: costevent.SourceUsageFallback, Provenance: "bundled",
@@ -317,10 +334,6 @@ func ledgerWithOneCostedMinute(t *testing.T, at time.Time, host, model string, c
 		},
 		Plugins: map[string]json.RawMessage{costevent.Key: rec},
 	})
-	if err := led.Flush(); err != nil {
-		t.Fatalf("Flush: %v", err)
-	}
-	return led
 }
 
 func TestHandleUsage_TodayIsServedFromTheLedger(t *testing.T) {
@@ -353,6 +366,71 @@ func TestHandleUsage_TodayIsServedFromTheLedger(t *testing.T) {
 	}
 	if snap.BucketSeconds <= int(usage.BucketWidth.Seconds()) {
 		t.Errorf("bucketSeconds = %d, want the whole window's span", snap.BucketSeconds)
+	}
+}
+
+// The open minute must reach the response. Nothing else supplies it: the day files
+// hold closed minutes only, so a session whose whole conversation fit inside one
+// minute has zero rows on disk — and "today" would have reported priced:false over
+// real spend, which the CLI renders as "cost unavailable".
+func TestHandleUsage_TodayIncludesTheStillOpenMinute(t *testing.T) {
+	now := time.Now()
+	led := newTestLedger(t, now)
+	recordCostedMinute(t, led, now, "gw", "opus", 0.25) // no Flush: the minute is open
+	// An empty ring, so a non-zero total can only have come from the ledger's own
+	// in-memory half rather than from the aggregator.
+	ts, _ := newTestServer(t, WithUsage(usage.New()), WithCostLedger(led))
+
+	status, body := fetchUsage(t, ts.URL, "?window=today")
+	if status != http.StatusOK {
+		t.Fatalf("status = %d, want 200: %s", status, body)
+	}
+	var snap usage.Snapshot
+	if err := json.Unmarshal([]byte(body), &snap); err != nil {
+		t.Fatalf("decode: %v (%s)", err, body)
+	}
+	if snap.Window != "today" {
+		t.Errorf("window = %q, want \"today\"", snap.Window)
+	}
+	if snap.Totals.CostMicros != 250_000 {
+		t.Errorf("CostMicros = %d, want 250000 from the open minute", snap.Totals.CostMicros)
+	}
+	if !snap.Priced {
+		t.Error("priced = false while the ledger holds a priced minute in memory")
+	}
+}
+
+// And it must be counted ONCE. Same spend, asked for either side of the flush that
+// moves it from memory to disk: a total that doubled would mean both halves claimed
+// the minute.
+func TestHandleUsage_TodayCountsTheOpenMinuteOnceAcrossAFlush(t *testing.T) {
+	now := time.Now()
+	led := newTestLedger(t, now)
+	recordCostedMinute(t, led, now, "gw", "opus", 0.25)
+	ts, _ := newTestServer(t, WithUsage(usage.New()), WithCostLedger(led))
+
+	readTotal := func(when string) int64 {
+		t.Helper()
+		status, body := fetchUsage(t, ts.URL, "?window=today")
+		if status != http.StatusOK {
+			t.Fatalf("%s: status = %d: %s", when, status, body)
+		}
+		var snap usage.Snapshot
+		if err := json.Unmarshal([]byte(body), &snap); err != nil {
+			t.Fatalf("%s: decode: %v", when, err)
+		}
+		return snap.Totals.CostMicros
+	}
+
+	open := readTotal("while open")
+	if err := led.Flush(); err != nil {
+		t.Fatalf("Flush: %v", err)
+	}
+	closed := readTotal("after the flush")
+
+	if open != 250_000 || closed != 250_000 {
+		t.Errorf("total was %d while open and %d once written; want 250000 both times "+
+			"(500000 after the flush would mean the minute was counted twice)", open, closed)
 	}
 }
 

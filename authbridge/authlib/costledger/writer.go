@@ -12,11 +12,19 @@ import (
 
 // Writer accumulates the open minute in memory and appends closed minutes.
 //
-// Only CLOSED minutes reach disk. The open one belongs to the in-memory ring, and
-// a reader stitches the two — so a minute never exists in both places and cannot
-// be double-counted. The cost of that boundary is that a restart mid-minute loses
-// up to 60 seconds of cost, which is documented rather than hidden: Flush on
-// shutdown closes the gap for an orderly stop, and nothing can close it for a kill.
+// Only CLOSED minutes reach disk. The open one stays in this writer's own
+// accumulator, and Window stitches the two — so a minute never exists in both
+// places and cannot be double-counted. The cost of that boundary is that a restart
+// mid-minute loses up to 60 seconds of cost, which is documented rather than
+// hidden: Flush on shutdown closes the gap for an orderly stop, and nothing can
+// close it for a kill.
+//
+// OWNERSHIP, stated precisely because Window's correctness rests on it: while
+// pending() reports a minute, NOTHING on disk carries that minute or a later one.
+// Three write paths have to keep that true, and each is guarded below —
+// flushLocked advances flushedThrough as it writes, and the two direct-append
+// paths in add only ever write a minute strictly below the one being held.
+// TestPendingMinute_IsNeverAlsoOnDisk drives all three and asserts it.
 type Writer struct {
 	store *store
 	now   func() time.Time
@@ -28,6 +36,16 @@ type Writer struct {
 	// open is the minute currently accumulating, truncated to the minute.
 	open time.Time
 	rows map[key]*Row
+	// flushedThrough is the newest minute any of whose rows have reached disk.
+	//
+	// It exists so a minute is never HELD after part of it has been written. Without
+	// it, a Flush (shutdown, or the periodic settle) followed by another event in the
+	// same minute would leave that minute both on disk and in memory, and Window —
+	// which counts the held minute from memory and everything else from disk — would
+	// count the flushed part twice. Spend counted twice is worse than spend counted
+	// late, so the guard is on the write side where it can be absolute rather than on
+	// the read side where it would be a heuristic.
+	flushedThrough time.Time
 	// prunedDay is the local day retention was last enforced for. Pruning once per
 	// day rather than per flush keeps a directory listing off the per-minute path,
 	// and pruning on the DAY ROLL rather than only at startup matters for the case
@@ -161,6 +179,15 @@ func (w *Writer) add(minute time.Time, r Row) {
 	defer w.mu.Unlock()
 
 	switch {
+	case !minute.After(w.flushedThrough):
+		// This minute is already on disk, in whole or in part: a late event, or one
+		// arriving after a Flush for the minute it is still in. Straight to disk rather
+		// than back into memory — holding a minute that is partly written is the one
+		// state that would let Window count the written part twice. Appending a second
+		// row for the same minute is correct, because a reader sums every row for a
+		// timestamp rather than assuming there is only one.
+		w.appendRows([]Row{r})
+		return
 	case w.open.IsZero():
 		w.open = minute
 	case minute.After(w.open):
@@ -168,9 +195,9 @@ func (w *Writer) add(minute time.Time, r Row) {
 		w.open = minute
 		w.pruneOnDayRollLocked(minute)
 	case minute.Before(w.open):
-		// A late event for an already-closed minute. Folding it into the open minute
-		// would misdate it; appending a second row for a closed minute is correct,
-		// because a reader sums every row for a timestamp rather than assuming one.
+		// A late event for an already-closed minute that was never flushed. Folding it
+		// into the open minute would misdate it, and it is strictly below the held
+		// minute, so writing it now keeps the ownership rule intact.
 		w.appendRows([]Row{r})
 		return
 	}
@@ -181,6 +208,31 @@ func (w *Writer) add(minute time.Time, r Row) {
 	}
 	row := r
 	w.rows[r.key()] = &row
+}
+
+// pending returns a copy of the open minute's rows and the minute they belong to.
+//
+// This is the half of the ledger that is NOT on disk, and it exists because
+// something has to supply it: for a window whose spend all happened in the current
+// minute, the day files hold nothing at all, and a reader that saw only them would
+// answer "cost unavailable" for a day with real spend sitting right here.
+//
+// COPIED, not aliased: the caller is an HTTP handler that will encode these while
+// the next Record mutates the live map.
+//
+// The returned minute is the ownership boundary Window relies on — see the type
+// doc. Zero, with no rows, when nothing is held.
+func (w *Writer) pending() ([]Row, time.Time) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if len(w.rows) == 0 {
+		return nil, time.Time{}
+	}
+	out := make([]Row, 0, len(w.rows))
+	for _, r := range w.rows {
+		out = append(out, *r)
+	}
+	return out, w.open
 }
 
 // pruneOnDayRollLocked enforces retention the first time a minute in a new local
@@ -208,11 +260,22 @@ func (w *Writer) Flush() error {
 
 func (w *Writer) flushLocked() error {
 	if len(w.rows) == 0 {
+		// No advance of flushedThrough: nothing was written, so the open minute is
+		// still wholly in memory and must stay eligible to accumulate. Advancing here
+		// would send every later event in that minute straight to disk one row at a
+		// time, which is correct but defeats the per-minute accumulation.
 		return nil
 	}
 	out := make([]Row, 0, len(w.rows))
 	for _, r := range w.rows {
 		out = append(out, *r)
+	}
+	// Advanced BEFORE the write and whether or not the write succeeds, for the same
+	// reason the map is cleared unconditionally below: after this point the minute is
+	// no longer wholly in memory, so it must never be held again. A failed write loses
+	// that minute; a re-held one would double-count it.
+	if w.open.After(w.flushedThrough) {
+		w.flushedThrough = w.open
 	}
 	// Cleared whether or not the append succeeds. Retrying next minute would append
 	// the same minute twice on a partial failure — a double-counted minute is worse

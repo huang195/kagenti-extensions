@@ -249,6 +249,14 @@ var errSessionWithSymbolicWindow = usageError{
 // BucketSeconds reports the real span so a client cannot mistake it for a fine
 // series.
 //
+// Reads through costledger.Window, never Query: the ledger's day files hold only
+// CLOSED minutes, so the minute currently accumulating is in the writer's memory
+// and Query alone would omit it. That omission is not small in the case this
+// endpoint exists for — a session whose whole conversation fit inside one minute has
+// nothing on disk at all, and the response would have said priced:false over real
+// spend. Window composes the two halves and guarantees no minute is in both; see its
+// doc.
+//
 // Takes no session id: handleUsage rejects that combination before reaching here,
 // for the reason recorded at the guard.
 //
@@ -260,7 +268,7 @@ var errSessionWithSymbolicWindow = usageError{
 // which is a claim the rows do not support — the gap is still visible, in
 // Totals.PricedRequests against Totals.PriceableRequests.
 func (s *Server) ledgerSnapshot(spec usage.Spec, group usage.Group) (usage.Snapshot, error) {
-	rows, err := s.ledger.Query(spec.From, spec.To)
+	rows, err := s.ledger.Window(spec.From, spec.To)
 	if err != nil {
 		return usage.Snapshot{}, err
 	}

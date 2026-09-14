@@ -112,8 +112,9 @@ func TestQuery_TruncatedFinalLineIsSkippedAndTheRestSurvives(t *testing.T) {
 	}
 }
 
-// The open minute is the RING's, never the ledger's — so a query must not see it.
-// If both owned a minute, a reader stitching the two would double-count it.
+// Only CLOSED minutes reach disk, so the disk half of the ledger must not see the
+// open one. Window is what adds it back; if both halves owned a minute, a reader
+// composing them would double-count it.
 func TestQuery_DoesNotSeeTheOpenMinute(t *testing.T) {
 	dir := t.TempDir()
 	now := at
@@ -126,6 +127,122 @@ func TestQuery_DoesNotSeeTheOpenMinute(t *testing.T) {
 	}
 	if len(got) != 0 {
 		t.Fatalf("got %d rows while the minute was open, want 0: %+v", len(got), got)
+	}
+}
+
+// The defect this whole seam exists to close: a turn whose spend all happened
+// inside the current minute has NOTHING on disk, and a reader that saw only the day
+// files would answer "no spend today" over real money.
+func TestWindow_IncludesTheOpenMinuteWithNothingOnDisk(t *testing.T) {
+	dir := t.TempDir()
+	now := at
+	w := newTestWriter(t, dir, func() time.Time { return now })
+	w.Record("s1", costedEvent(t, "gw", "m", 0.25, 100, 50))
+
+	if disk, err := w.Query(at.Add(-time.Hour), at); err != nil || len(disk) != 0 {
+		t.Fatalf("disk half = %d rows (err %v), want 0 — the premise of this test", len(disk), err)
+	}
+
+	rows, err := w.Window(at.Add(-time.Hour), at)
+	if err != nil {
+		t.Fatalf("Window: %v", err)
+	}
+	totals, _ := Fold(rows, usage.GroupNone)
+	if totals.CostMicros != 250_000 {
+		t.Errorf("CostMicros = %d, want 250000 from the open minute", totals.CostMicros)
+	}
+	if totals.PricedRequests != 1 {
+		t.Errorf("PricedRequests = %d, want 1 — priced:false here reads as $0.00 for a day with spend",
+			totals.PricedRequests)
+	}
+}
+
+// THE non-overlap proof. The same two events are counted once while the minute is
+// open and once after it has been written, and the total must not move: if either
+// half leaked the other's minute, this figure would double.
+func TestWindow_CountsAMinuteExactlyOnceAcrossTheFlush(t *testing.T) {
+	dir := t.TempDir()
+	now := at
+	w := newTestWriter(t, dir, func() time.Time { return now })
+	w.Record("s1", costedEvent(t, "gw", "m", 0.25, 100, 50))
+	w.Record("s1", costedEvent(t, "gw", "m", 0.25, 100, 50))
+
+	from, to := at.Add(-time.Hour), at.Add(time.Hour)
+	before, err := w.Window(from, to)
+	if err != nil {
+		t.Fatalf("Window while open: %v", err)
+	}
+	openTotals, _ := Fold(before, usage.GroupNone)
+
+	// Roll the minute: the same spend moves from memory to disk.
+	now = at.Add(time.Minute)
+	later := costedEvent(t, "gw", "m", 0.10, 10, 5)
+	later.At = now
+	w.Record("s1", later)
+
+	after, err := w.Window(from, to)
+	if err != nil {
+		t.Fatalf("Window after the roll: %v", err)
+	}
+	closedTotals, _ := Fold(after, usage.GroupNone)
+
+	// The first minute's 500000 is now on disk and the second minute's 100000 is held.
+	if openTotals.CostMicros != 500_000 {
+		t.Errorf("open-minute total = %d, want 500000", openTotals.CostMicros)
+	}
+	if closedTotals.CostMicros != 600_000 {
+		t.Errorf("total after the roll = %d, want 600000 (500000 on disk + 100000 held); "+
+			"1100000 would mean the first minute was counted in both halves", closedTotals.CostMicros)
+	}
+	if closedTotals.Requests != 3 {
+		t.Errorf("Requests = %d, want 3", closedTotals.Requests)
+	}
+}
+
+// Step 2 of Window's non-overlap rule, tested against a state the writer's own
+// invariant forbids: a disk row for the minute currently held. Only a flush racing
+// between Window's two reads can produce it, and when it does those rows are the
+// ones already in hand — so they must be dropped, not added.
+func TestWindow_DropsADiskRowForTheHeldMinute(t *testing.T) {
+	dir := t.TempDir()
+	now := at
+	w := newTestWriter(t, dir, func() time.Time { return now })
+	w.Record("s1", costedEvent(t, "gw", "m", 0.25, 100, 50))
+
+	// Hand-seed exactly what a racing flush of the held minute would leave behind.
+	minute := at.Truncate(time.Minute)
+	writeDay(t, dir, minute, line(minute, "gw", "m", 1, 100, 50, 250_000))
+
+	rows, err := w.Window(at.Add(-time.Hour), at)
+	if err != nil {
+		t.Fatalf("Window: %v", err)
+	}
+	totals, _ := Fold(rows, usage.GroupNone)
+	if totals.CostMicros != 250_000 {
+		t.Errorf("CostMicros = %d, want 250000 counted once, not 500000", totals.CostMicros)
+	}
+}
+
+// The held minute is not always in the window asked for. An idle proxy at 00:05
+// still holds yesterday's last minute, and that spend is yesterday's.
+func TestWindow_ExcludesAHeldMinuteOutsideTheRange(t *testing.T) {
+	dir := t.TempDir()
+	midnight := time.Date(2026, 9, 14, 0, 0, 0, 0, time.Local)
+	yesterday := midnight.Add(-30 * time.Second) // 23:59:30
+	now := yesterday
+	w := newTestWriter(t, dir, func() time.Time { return now })
+	e := costedEvent(t, "gw", "m", 0.25, 100, 50)
+	e.At = yesterday
+	w.Record("s1", e)
+
+	// "today" as ParseWindowSpec builds it: local midnight to now.
+	now = midnight.Add(5 * time.Minute)
+	rows, err := w.Window(midnight, now)
+	if err != nil {
+		t.Fatalf("Window: %v", err)
+	}
+	if len(rows) != 0 {
+		t.Errorf("got %d rows; yesterday's held minute must not land in today: %+v", len(rows), rows)
 	}
 }
 

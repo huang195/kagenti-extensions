@@ -225,6 +225,10 @@ type model struct {
 	pane paneID
 	// usage is the Usage pane's view state (metric, window, scope, snapshot).
 	usage usageState
+	// spend backs the always-on spend strip. Separate from usage on purpose —
+	// see spendState, which records why sharing one poll chain would blank the
+	// strip exactly when the operator is looking at cost.
+	spend spendState
 
 	// eventColumns is which events-table columns are shown. Keyed by a stable id
 	// rather than an index, so a future column inserted in the middle does not
@@ -273,9 +277,14 @@ type model struct {
 	// flash producer keeps its timed behaviour.
 	flashSticky   bool
 	width, height int
-	// bodyHeight is the inner height available to panes (terminal height
-	// minus title + footer). Cached by layout() so rebuildEventsTable can
-	// size the events table after accounting for the IDENTITY banner.
+	// bodyHeight is the inner height available to panes: terminal height minus the
+	// title row, the two footer rows, and the spend strip's row when the terminal
+	// is tall enough to show it. Cached by layout() so rebuildEventsTable can size
+	// the events table after accounting for the IDENTITY banner.
+	//
+	// See layout() for the exact budget. Keep this in step with it — the comment
+	// that used to sit there had drifted to claim a blank row that did not exist,
+	// which is how a reader ends up "reclaiming" a row the footer is standing on.
 	bodyHeight int
 
 	// Panel components.
@@ -424,6 +433,13 @@ func (m *model) initSessionView() tea.Cmd {
 		streamPump(m.streamCh),
 		tickCmd(),
 		refreshTickCmd(),
+		// The spend strip's chain starts here rather than in Init, so it also
+		// starts when the user backs out to the pod picker and enters a DIFFERENT
+		// pod: Init runs once, but m.client is replaced on every re-entry, and a
+		// chain armed against the old one would report the previous pod's spend.
+		// startSpendPolling bumps the generation, so re-entry replaces the chain
+		// rather than adding a second one.
+		m.startSpendPolling(),
 	)
 }
 
@@ -461,6 +477,11 @@ func (m *model) backToPodsPane() {
 	// as if it described the new one.
 	m.usage.reqSeq++
 	m.usage.tickGen++
+	// Same for the spend strip, and for the same reason. Not optional just because
+	// the strip is not drawn on the picker panes: without this the old pod's figure
+	// survives the switch and is drawn the moment a data pane opens, and an old
+	// reply landing while the picker is up is stored with a fresh timestamp.
+	m.spend.invalidate()
 	m.eventCt = 0
 	m.lastCt = 0
 	m.rate = 0
@@ -712,6 +733,20 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 		return m, tea.Batch(m.fetchUsage(), usageTick(m.usage.tickGen))
+
+	case spendLoadedMsg:
+		m.applySpendLoaded(msg)
+		return m, nil
+
+	case spendTickMsg:
+		// No pane check, unlike usageTickMsg: the strip is chrome on every data
+		// pane, so its chain runs for the life of the session view. Only the
+		// generation guard applies, and it is what keeps a re-entry from leaving
+		// two chains alive rescheduling each other's successors.
+		if !m.spendTickIsCurrent(msg.gen) {
+			return m, nil
+		}
+		return m, tea.Batch(m.fetchSpend(), spendTick(msg.gen))
 
 	case refreshTickMsg:
 		// In picker mode, skip the fetch — m.client may be nil after a
@@ -1291,11 +1326,26 @@ func (m *model) paneView() string {
 	if m.filtering {
 		body = m.filterInput.View() + "\n" + body
 	}
-	return lipgloss.JoinVertical(lipgloss.Left,
-		header,
-		body,
-		m.footerView(),
-	)
+	// A row slice rather than a fixed JoinVertical, so the strip's row can be
+	// absent without needing a second call site. It sits directly under the title
+	// because that is the whole requirement: spend read BEFORE the data rather
+	// than navigated to.
+	//
+	// Styled AFTER fitting. renderSpendStrip measures with lipgloss.Width, and
+	// styleMuted only adds a colour escape so the column count is unchanged — but
+	// fitting an already-styled string would measure the escape bytes and silently
+	// over-truncate.
+	//
+	// Nothing here touches eventsTbl: the strip holds no cursor, filter or scroll
+	// state, so it cannot perturb the pane it sits above.
+	rows := []string{header}
+	if m.spendStripVisible() {
+		if strip := renderSpendStrip(m.spendSummary(), m.width); strip != "" {
+			rows = append(rows, styleMuted.Render(strip))
+		}
+	}
+	rows = append(rows, body, m.footerView())
+	return lipgloss.JoinVertical(lipgloss.Left, rows...)
 }
 
 // viewTabs renders the top-level tab strip "[Sessions] Pipeline" with the

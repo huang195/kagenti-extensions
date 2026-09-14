@@ -154,6 +154,25 @@ func (p *InferenceParser) OnResponse(_ context.Context, pctx *pipeline.Context) 
 	}
 	if len(pctx.ResponseBody) == 0 {
 		pctx.Skip("no_response_body")
+		// Priced anyway, because a body is not what makes a response cost money. The
+		// gateway reports its own post-discount figure in a RESPONSE HEADER, and
+		// costing.Settle prefers that figure over anything modelled from token
+		// counters — so a LiteLLM-costed response whose body was empty or
+		// unrecognised is real spend. Returning before settleCost dropped it
+		// entirely: no cost record, nothing in the aggregator's dollar total, and
+		// nothing in litellm-budget-track's ledger, so the money escaped the budget
+		// as well as the chart.
+		//
+		// This cannot flood the aggregate with settled zeros. With no body there are
+		// no token counters, and pricing.Cost refuses an all-zero Usage as UNPRICED
+		// rather than as free (costing.modelledCost short-circuits on it first), so
+		// settleCost's own gate publishes nothing when neither a header nor a
+		// modelled figure exists. A body-less response with no cost header therefore
+		// records only the Skip row above, exactly as before.
+		//
+		// The Skip is a diagnostic that pairs the response row with the request row;
+		// it is not a reason to stop charging. Both happen, in that order.
+		p.settleCost(pctx)
 		return pipeline.Action{Type: pipeline.Continue}
 	}
 
@@ -248,6 +267,15 @@ func (p *InferenceParser) OnResponseFrame(_ context.Context, pctx *pipeline.Cont
 	if last && !ext.Stream {
 		if len(frame) == 0 {
 			pctx.Skip("no_response_body")
+			// Charged before returning, for the reason spelled out on OnResponse's
+			// identical guard: a positive gateway cost header needs no body at all.
+			//
+			// This is the arm a genuinely body-less response takes in production. The
+			// extproc listener has no body phase for one, so it synthesizes the
+			// terminal frame — RunResponseFrame(ctx, pctx, nil, true) in its
+			// header-only branch — and lands here whenever the REQUEST did not ask
+			// for a stream.
+			p.settleCost(pctx)
 			return pipeline.Action{Type: pipeline.Continue}
 		}
 		if endpointPath(pctx) == anthropicMessagesPath {
@@ -287,6 +315,13 @@ func (p *InferenceParser) OnResponseFrame(_ context.Context, pctx *pipeline.Cont
 		if ext.Completion == "" && ext.FinishReason == "" && ext.TotalTokens == 0 &&
 			len(ext.ToolCalls) == 0 {
 			pctx.Skip("no_response_body")
+			// Same as the two guards above: an empty stream can still carry a gateway
+			// cost header, and the Skip row is a diagnostic rather than a reason to
+			// stop charging. This is the arm a body-less response takes when the
+			// REQUEST asked for a stream — ext.Stream comes off the request, so a
+			// header-only reply to a streaming request arrives here rather than on
+			// the buffered-JSON arm.
+			p.settleCost(pctx)
 			return pipeline.Action{Type: pipeline.Continue}
 		}
 		logInferenceFinalized(ext)

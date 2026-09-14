@@ -34,8 +34,20 @@ const (
 	// a cost table without this axis cannot explain why two identical-looking
 	// requests cost different amounts.
 	GroupEndpoint Group = "endpoint"
-	GroupStatus   Group = "status"
-	GroupPlugin   Group = "plugin"
+	// GroupSession breaks totals down by session.
+	//
+	// Requested on the ALL-sessions ring (session=""), which is the point: one
+	// response then answers for every session a client is listing. Asked for
+	// alongside session=<id> it is legal but degenerate — a single-entry series
+	// duplicating Totals.
+	//
+	// What one key means depends on how the listener assigns session ids. While
+	// several concurrent agents share one id (#949), their spend lands in one entry
+	// and this axis reports per-id rather than per-agent cost. That is a property of
+	// the current session bucketing, not of this grouping.
+	GroupSession Group = "session"
+	GroupStatus  Group = "status"
+	GroupPlugin  Group = "plugin"
 )
 
 // ParseGroup validates a group parameter. Empty means GroupNone.
@@ -53,6 +65,8 @@ func ParseGroup(s string) (Group, error) {
 		return GroupMethod, nil
 	case GroupEndpoint:
 		return GroupEndpoint, nil
+	case GroupSession:
+		return GroupSession, nil
 	case GroupStatus:
 		return GroupStatus, nil
 	case GroupPlugin:
@@ -62,7 +76,7 @@ func ParseGroup(s string) (Group, error) {
 	// over an unauthenticated endpoint, and reflecting arbitrary query input
 	// into a response body is how a reflected-content issue starts. The valid
 	// set is short enough that naming it is more useful than quoting the input.
-	return "", errors.New("unknown group (want none, model, endpoint, status, plugin; method is accepted as an alias for model)")
+	return "", errors.New("unknown group (want none, model, endpoint, session, status, plugin; method is accepted as an alias for model)")
 }
 
 // Snapshot is the wire shape of GET /v1/usage.
@@ -355,6 +369,8 @@ func (b *bucket) series(g Group) map[string]Counts {
 		src = b.byMethod
 	case GroupEndpoint:
 		src = b.byEndpoint
+	case GroupSession:
+		src = b.bySession
 	case GroupStatus:
 		src = b.byStatus
 	case GroupPlugin:

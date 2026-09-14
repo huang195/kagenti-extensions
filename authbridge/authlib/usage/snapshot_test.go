@@ -1,6 +1,7 @@
 package usage
 
 import (
+	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -162,5 +163,105 @@ func TestSnapshot_GroupEndpointOmitsEventsWithNoHost(t *testing.T) {
 
 	if _, ok := series[""]; ok {
 		t.Error(`series has an "" key; an unknown host must be omitted, not shown as a blank row`)
+	}
+}
+
+func TestSnapshot_GroupSessionBreaksDownBySession(t *testing.T) {
+	a := New()
+	a.Record("sess-a", inferenceEvent("m", 10, 0, 0, 5, 0, 0b1001))
+	a.Record("sess-b", inferenceEvent("m", 20, 0, 0, 7, 0, 0b1001))
+
+	// The ALL-sessions ring must carry the breakdown: one request has to answer
+	// for every session, or a sessions list costs one request per row.
+	series := mergeSeries(a.Snapshot(10*time.Minute, BucketWidth, "", GroupSession).Buckets)
+
+	if got := series["sess-a"].InputTokens; got != 10 {
+		t.Errorf("sess-a InputTokens = %d, want 10", got)
+	}
+	if got := series["sess-b"].InputTokens; got != 20 {
+		t.Errorf("sess-b InputTokens = %d, want 20", got)
+	}
+}
+
+func TestSnapshot_GroupSessionOmitsAnEmptyID(t *testing.T) {
+	a := New()
+	a.Record("", inferenceEvent("m", 10, 0, 0, 5, 0, 0b1001))
+	series := mergeSeries(a.Snapshot(10*time.Minute, BucketWidth, "", GroupSession).Buckets)
+	if _, ok := series[""]; ok {
+		t.Error(`series has an "" key; an unattributed event must not render as a blank row`)
+	}
+}
+
+// The per-session ring carries the label too, redundant though it is there. Not
+// for its own sake: it pins that foldInto records the id on WHICHEVER ring it is
+// folding, so the uniform call site cannot be "optimised" into an all-ring-only
+// conditional that a later reader would have to re-derive.
+func TestSnapshot_GroupSessionOnAScopedSnapshotNamesOnlyThatSession(t *testing.T) {
+	a := New()
+	a.Record("sess-a", inferenceEvent("m", 10, 0, 0, 5, 0, 0b1001))
+	a.Record("sess-b", inferenceEvent("m", 20, 0, 0, 7, 0, 0b1001))
+
+	series := mergeSeries(a.Snapshot(10*time.Minute, BucketWidth, "sess-a", GroupSession).Buckets)
+
+	if len(series) != 1 {
+		t.Fatalf("scoped series has %d keys (%v), want just sess-a", len(series), series)
+	}
+	if got := series["sess-a"].InputTokens; got != 10 {
+		t.Errorf("sess-a InputTokens = %d, want 10", got)
+	}
+}
+
+// Session ids are request-derived (the A2A contextId, via
+// reverseproxy.inboundSessionID), so the bound that protects every other label map
+// has to protect this one. Without it a client varying the contextId every turn
+// grows a retained map entry and a retained string per request, in a ring that
+// frees a slot only a full lap later.
+func TestSnapshot_GroupSessionIsBoundedLikeEveryOtherLabel(t *testing.T) {
+	a := New()
+	for i := 0; i < maxLabelsPerBucket+50; i++ {
+		a.Record(fmt.Sprintf("sess-%03d", i), inferenceEvent("m", 1, 0, 0, 1, 0, 0b1001))
+	}
+
+	snap := a.Snapshot(10*time.Minute, BucketWidth, "", GroupSession)
+	for _, b := range snap.Buckets {
+		if len(b.Series) > maxLabelsPerBucket {
+			t.Fatalf("bucket carries %d session labels, want at most %d", len(b.Series), maxLabelsPerBucket)
+		}
+	}
+	series := mergeSeries(snap.Buckets)
+	if _, ok := series[overflowLabel]; !ok {
+		t.Errorf("no %q key past the cap; the excess was dropped silently instead of being named", overflowLabel)
+	}
+	// The totals must still reconcile with the sum of the series, overflow
+	// included: that is the whole reason overflow is named rather than dropped.
+	var sum int64
+	for _, c := range series {
+		sum += c.Requests
+	}
+	if sum != snap.Totals.Requests {
+		t.Errorf("series requests sum to %d, totals say %d; the overflow key is not absorbing the excess", sum, snap.Totals.Requests)
+	}
+}
+
+func TestParseGroup_AcceptsSession(t *testing.T) {
+	g, err := ParseGroup("session")
+	if err != nil {
+		t.Fatalf("ParseGroup(\"session\") errored: %v", err)
+	}
+	if g != GroupSession {
+		t.Errorf("ParseGroup(\"session\") = %q, want %q", g, GroupSession)
+	}
+}
+
+// The error names the valid set instead of echoing the caller's input (see
+// ParseGroup). A new grouping the message does not list is a grouping an operator
+// cannot discover from the only place the endpoint tells them.
+func TestParseGroup_ErrorNamesTheSessionGroup(t *testing.T) {
+	_, err := ParseGroup("nonsense")
+	if err == nil {
+		t.Fatal("ParseGroup accepted a bogus group")
+	}
+	if !strings.Contains(err.Error(), "session") {
+		t.Errorf("error %q does not mention the session group", err)
 	}
 }

@@ -22,10 +22,12 @@ import (
 //	            arithmetic — see usage.fold for why latency in particular cannot
 //	            be folded naively.
 //	session     session ID; omit for all sessions combined
-//	group       none (default), model, endpoint, status, plugin. "method" is
-//	            accepted as an alias for "model" — the series shipped under that
-//	            name before it was clear the aggregator only ever populated it
-//	            from the inference model.
+//	group       none (default), model, endpoint, session, status, plugin.
+//	            "method" is accepted as an alias for "model" — the series shipped
+//	            under that name before it was clear the aggregator only ever
+//	            populated it from the inference model. "session" is meant for
+//	            session="" (all sessions), where one response answers for every
+//	            session a client is listing.
 //
 // UNAUTHENTICATED, like every endpoint on this listener. Bind it on in-cluster
 // addresses only, never behind ingress — the trust model is documented in
@@ -33,7 +35,7 @@ import (
 //
 // This response is less sensitive than /v1/sessions, which serves raw prompts,
 // completions and tool results. It carries no message content at all: only
-// counts, timings and cost. But it is not free of information either, and three
+// counts, timings and cost. But it is not free of information either, and four
 // groupings leak deployment shape to anyone who can reach the port:
 //
 //   - group=model exposes the model names in use (claude-sonnet-5, and any
@@ -52,6 +54,17 @@ import (
 //     group=model is inference-only because that accumulator requires a model name.
 //     Their request totals will not reconcile, and that is correct rather than a
 //     bug — but a client putting the two side by side has to say so.
+//
+//   - group=session exposes session identifiers, and attaches spend to each one.
+//     /v1/sessions already lists the ids (along with the message content), so the
+//     ids themselves are no new exposure on this listener; pairing them with cost
+//     is.
+//
+//     Unlike every other grouping, its keys are not drawn from a vocabulary this
+//     process controls: the id arrives from the client. How much it discloses is
+//     therefore set off-host — an opaque uuid discloses nothing, an id derived
+//     from a user, agent or ticket name discloses a great deal. That is why it is
+//     not ranked against group=endpoint above rather than placed below it.
 //
 //   - group=plugin exposes the active pipeline composition — though /v1/pipeline
 //     already publishes that in full, so this adds no new exposure.

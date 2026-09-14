@@ -7,7 +7,6 @@ import (
 
 	tea "github.com/charmbracelet/bubbletea"
 
-	"github.com/rossoctl/cortex/authbridge/authlib/session"
 	"github.com/rossoctl/cortex/authbridge/authlib/usage"
 )
 
@@ -294,33 +293,6 @@ func (m *model) sessionCost(id string) (usd float64, priced bool) {
 		return 0, false
 	}
 	return float64(micros) / 1e6, true
-}
-
-// sessionSpan is how long a session has been alive: UpdatedAt - CreatedAt.
-//
-// Both come from session.SessionSummary, which carries them on the wire. Second
-// resolution beats the alternative of deriving the span from the usage snapshot's
-// buckets, which would be capped at the bucket width and would silently disagree
-// with the UPDATED column right beside it.
-//
-// Note what this measures: elapsed wall time from first to last event, NOT time
-// spent active. A session idle for an hour reports an hour. That is the honest
-// reading of "how long has this session been going", and it matches what UPDATED
-// already implies; a duty-cycle figure would need a different name.
-//
-// Returns 0 for anything it cannot state, including a non-advancing or backwards
-// UpdatedAt. Zero means "no span to show" and the caller renders it blank — a
-// literal "0s" would assert that the session began and ended in one instant, and a
-// negative span would render as "-3m", which is not a shorter session but a
-// broken clock.
-//
-// A free function rather than a method: it needs no model state, so it is
-// table-testable directly.
-func sessionSpan(s session.SessionSummary) time.Duration {
-	if s.CreatedAt.IsZero() || !s.UpdatedAt.After(s.CreatedAt) {
-		return 0
-	}
-	return s.UpdatedAt.Sub(s.CreatedAt)
 }
 
 // parseWindowSpan interprets a snapshot's Window string as a duration.

@@ -3,6 +3,7 @@ package costledger
 import (
 	"bytes"
 	"encoding/json"
+	"io"
 	"os"
 	"path/filepath"
 	"testing"
@@ -448,6 +449,86 @@ func TestWriter_FlushStraddlingMidnightSplitsByDay(t *testing.T) {
 	for _, want := range []string{"2026-09-13.jsonl", "2026-09-14.jsonl"} {
 		if _, err := os.Stat(filepath.Join(dir, want)); err != nil {
 			t.Errorf("missing %s: %v", want, err)
+		}
+	}
+}
+
+// shortWriter accepts limit bytes and then fails, the way a file on a filesystem
+// that has just run out of space does.
+type shortWriter struct {
+	limit     int
+	written   []byte
+	truncated []int64
+}
+
+func (s *shortWriter) Write(b []byte) (int, error) {
+	n := len(b)
+	if n > s.limit {
+		n = s.limit
+	}
+	s.written = append(s.written, b[:n]...)
+	return n, io.ErrShortWrite
+}
+
+func (s *shortWriter) Truncate(size int64) error {
+	s.truncated = append(s.truncated, size)
+	return nil
+}
+
+// The reachability argument for the whole corrupt-line problem: a short write leaves
+// a fragment with no trailing newline, and the NEXT append concatenates onto it,
+// guaranteeing a syntax error mid-file. Rolling back to where the file started costs
+// this one minute and leaves the day readable.
+func TestAppendBytes_ShortWriteIsRolledBack(t *testing.T) {
+	f := &shortWriter{limit: 7}
+
+	err := appendBytes(f, 4096, []byte(`{"at":"2026-09-13T09:14:00Z"}`+"\n"))
+
+	if err == nil {
+		t.Fatal("appendBytes swallowed a short write; the caller has to be able to log it")
+	}
+	if len(f.truncated) != 1 || f.truncated[0] != 4096 {
+		t.Errorf("truncated = %v, want one rollback to the pre-write size 4096", f.truncated)
+	}
+}
+
+// Nothing was written, so nothing needs undoing — and truncating anyway would be a
+// pointless write against a file we have just been told we cannot write to.
+func TestAppendBytes_FailureBeforeAnyByteDoesNotTruncate(t *testing.T) {
+	f := &shortWriter{limit: 0}
+
+	if err := appendBytes(f, 4096, []byte("{}\n")); err == nil {
+		t.Fatal("appendBytes reported success for a write that wrote nothing")
+	}
+	if len(f.truncated) != 0 {
+		t.Errorf("truncated = %v, want no rollback when no bytes landed", f.truncated)
+	}
+}
+
+// Every line a successful write produces has to be independently decodable, because
+// that is the property readDay's per-line resync depends on. A row written without a
+// terminating newline would make the NEXT row unreadable.
+func TestWriteLines_EveryLineEndsWithANewline(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "day.jsonl")
+	rows := []Row{
+		{At: at, Endpoint: "gw", Model: "opus"},
+		{At: at, Endpoint: "gw", Model: "haiku"},
+	}
+	if err := writeLines(path, rows); err != nil {
+		t.Fatalf("writeLines: %v", err)
+	}
+	b, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read: %v", err)
+	}
+	if len(b) == 0 || b[len(b)-1] != '\n' {
+		t.Error("the file does not end with a newline; the next append would concatenate")
+	}
+	for i, l := range bytes.Split(bytes.TrimRight(b, "\n"), []byte("\n")) {
+		var r Row
+		if err := json.Unmarshal(l, &r); err != nil {
+			t.Errorf("line %d is not independently decodable: %v", i, err)
 		}
 	}
 }

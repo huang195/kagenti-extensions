@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -109,6 +110,92 @@ func TestQuery_TruncatedFinalLineIsSkippedAndTheRestSurvives(t *testing.T) {
 	}
 	if len(got) != 2 {
 		t.Fatalf("got %d rows, want the 2 intact ones: %+v", len(got), got)
+	}
+}
+
+// The case a single json.Decoder over the whole file CANNOT survive: a bad line in
+// the middle. A Decoder has no way to resync, so it stopped there and silently
+// dropped every later row for that day — permanently, and the shortened figure was
+// still labelled "today". Only the final-line variant above passed under that
+// behaviour, which is why this test exists.
+func TestQuery_CorruptLineMidFileSkipsOnlyThatLine(t *testing.T) {
+	dir := t.TempDir()
+	base := time.Date(2026, 9, 13, 9, 0, 0, 0, time.Local)
+	writeDay(t, dir, base,
+		line(base, "gw", "m", 1, 10, 5, 100),
+		`{"at":"2026-09-13T09:01:00Z","endpoint":"gw"`, // no closing brace: the damage
+		line(base.Add(2*time.Minute), "gw", "m", 1, 30, 5, 300),
+		line(base.Add(3*time.Minute), "gw", "m", 1, 40, 5, 400),
+	)
+	w := newTestWriter(t, dir, func() time.Time { return base })
+
+	got, err := w.Query(base, base.Add(time.Hour))
+	if err != nil {
+		t.Fatalf("Query: %v", err)
+	}
+	if len(got) != 3 {
+		t.Fatalf("got %d rows, want the 3 intact ones — a mid-file corruption must not "+
+			"truncate the rest of the day: %+v", len(got), got)
+	}
+	var total int64
+	for _, r := range got {
+		total += r.CostMicros
+	}
+	if total != 800 {
+		t.Errorf("CostMicros total = %d, want 800 (100 + 300 + 400)", total)
+	}
+}
+
+// The exact byte pattern the old write path produced: a fragment with no trailing
+// newline, then a later append concatenated onto it. One line is unreadable and
+// everything after it survives.
+func TestQuery_FragmentConcatenatedWithTheNextAppendCostsOneLine(t *testing.T) {
+	dir := t.TempDir()
+	base := time.Date(2026, 9, 13, 9, 0, 0, 0, time.Local)
+	name := filepath.Join(dir, base.Format(dayLayout)+".jsonl")
+	body := line(base, "gw", "m", 1, 10, 5, 100) + "\n" +
+		`{"at":"2026-09-13T09:01:00Z","endpo` + // short write, no newline
+		line(base.Add(2*time.Minute), "gw", "m", 1, 30, 5, 300) + "\n" +
+		line(base.Add(3*time.Minute), "gw", "m", 1, 40, 5, 400) + "\n"
+	if err := os.WriteFile(name, []byte(body), 0o600); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	w := newTestWriter(t, dir, func() time.Time { return base })
+
+	got, err := w.Query(base, base.Add(time.Hour))
+	if err != nil {
+		t.Fatalf("Query: %v", err)
+	}
+	// The fragment swallows the row it was concatenated with — one line lost, not the
+	// day. The 09:03 row is the one that proves the read did not stop.
+	if len(got) != 2 {
+		t.Fatalf("got %d rows, want 2 (the intact first and last): %+v", len(got), got)
+	}
+	if got[len(got)-1].CostMicros != 400 {
+		t.Errorf("last row = %d micros, want the 400 that follows the damage", got[len(got)-1].CostMicros)
+	}
+}
+
+// A line past maxLineBytes cannot be skipped — a scanner will not buffer it, so it
+// cannot step over it. Documented consequence: that day's read ends there. Asserted
+// so the behaviour is a decision rather than a surprise, and so the rows BEFORE it
+// are known to survive.
+func TestQuery_LineBeyondTheBufferLimitEndsThatDay(t *testing.T) {
+	dir := t.TempDir()
+	base := time.Date(2026, 9, 13, 9, 0, 0, 0, time.Local)
+	writeDay(t, dir, base,
+		line(base, "gw", "m", 1, 10, 5, 100),
+		`{"at":"`+strings.Repeat("x", maxLineBytes+1)+`"}`,
+		line(base.Add(2*time.Minute), "gw", "m", 1, 30, 5, 300),
+	)
+	w := newTestWriter(t, dir, func() time.Time { return base })
+
+	got, err := w.Query(base, base.Add(time.Hour))
+	if err != nil {
+		t.Fatalf("Query must not fail the whole request over one day file: %v", err)
+	}
+	if len(got) != 1 || got[0].CostMicros != 100 {
+		t.Errorf("got %+v, want the one row that preceded the oversized line", got)
 	}
 }
 

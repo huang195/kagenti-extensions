@@ -30,8 +30,13 @@ func respEvent(at time.Time, status int, dur time.Duration, model string, tokens
 	return e
 }
 
-// withCost attaches the cost event litellm-budget-track publishes, exactly as a
-// listener would after SnapshotPlugins. Returns e so it composes with respEvent.
+// withCost attaches a settled cost event, exactly as a listener would after
+// SnapshotPlugins. Returns e so it composes with respEvent.
+//
+// inference-parser is what settles and publishes the figure; litellm-budget-track
+// consumes it to enforce a budget. Note this writes costevent.PluginName, which is
+// the FROZEN LEGACY key — production publishes under costevent.Key — so the cost
+// tests in this file exercise the decode fallback rather than the current key.
 func withCost(t *testing.T, e *pipeline.SessionEvent, costUSD float64) *pipeline.SessionEvent {
 	t.Helper()
 	raw, err := json.Marshal(costevent.Event{
@@ -81,8 +86,10 @@ func TestCountsPricedRequestsOmittedWhenZero(t *testing.T) {
 	}
 }
 
-// The cost is taken from the figure litellm-budget-track already settled and
-// published, not modelled here from a rate table.
+// The cost is taken from the figure inference-parser already settled and published.
+// The aggregator does hold a rate table of its own (see WithPricing), but a
+// published figure always wins over a modelled one; no resolver is configured here,
+// so the published path is the only one that can answer.
 func TestRecord_PricesFromCostEvent(t *testing.T) {
 	now := time.Date(2026, 9, 9, 12, 30, 0, 0, time.UTC)
 	a := New(WithClock(fixedClock(now)))
@@ -363,7 +370,7 @@ func TestSnapshot_AllGroupingsPopulatedFromOnePass(t *testing.T) {
 // rendering $0.00 — which would read as "this traffic was free".
 //
 // Formerly TestSnapshot_CostRequiresPricer: the assertions are unchanged, but the
-// source is now the figure litellm-budget-track publishes rather than an injected
+// source is now the figure inference-parser publishes rather than an injected
 // Pricer that no production caller ever supplied.
 func TestSnapshot_CostRequiresACostSource(t *testing.T) {
 	now := time.Date(2026, 9, 4, 23, 30, 30, 0, time.UTC)

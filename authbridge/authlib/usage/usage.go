@@ -207,16 +207,23 @@ type bucket struct {
 // eventCost is one event's settled cost, decoded once per Record and passed to
 // each ring's foldInto.
 //
-// Cost is read from the figure litellm-budget-track settles per response and
-// publishes on the session event (see authlib/costevent): it prefers the
-// gateway's own post-discount cost header and falls back to pricing the usage
-// block. So the number here is a plugin's measurement, not a rate table's guess,
-// and this package holds no rates of its own — deployment-specific pricing is
-// not something authlib should assert.
+// Cost is read from the figure inference-parser settles per response and publishes
+// on the session event (see authlib/costevent): it prefers the gateway's own
+// post-discount cost header and falls back to pricing the parsed token counters.
+// litellm-budget-track consumes that figure to enforce a budget; it settles nothing
+// of its own.
 //
-// Traffic the plugin did not price contributes no cost and is visible as the gap
-// between Counts.PricedRequests and Counts.Requests. Modelled rates for that
-// traffic arrive with the pricing resolver; see
+// This package is NOT rate-free, which this comment previously claimed. WithPricing
+// stores a pricing.Resolver, and costOf below resolves a rate for any request that
+// carries a model and tokens but arrives with no cost record. So there are two
+// sources: a published figure is preferred, a modelled one is the fallback, and the
+// two can answer differently about the same request. Collapsing them onto the
+// parser's figure alone is later work — until it lands, do not describe cost here as
+// coming from a single place.
+//
+// Traffic neither path could price contributes no cost and is visible as the gap
+// between Counts.PricedRequests and Counts.Requests; Snapshot.UnpricedBy names the
+// endpoint/model pairs involved. See
 // docs/superpowers/specs/2026-09-09-pricing-consolidation-design.md.
 type eventCost struct {
 	micros int64
@@ -241,15 +248,17 @@ type eventCost struct {
 // costOf settles one event's cost, preferring a published figure and falling back
 // to the rate table.
 //
-// The order is deliberate. A cost event is a figure litellm-budget-track already
+// The order is deliberate. A cost event is a figure inference-parser already
 // settled — often the gateway's own post-discount number — so it is never
-// second-guessed by a model. The resolver covers what that plugin did not: a
-// pipeline without it, or a request whose response carried no header.
+// second-guessed by a model. The resolver covers what the parser did not: a
+// pipeline without it, or a request whose response carried no usable figure.
 //
-// Before this fallback, cost required that plugin to be present. A deployment
-// running only inference-parser reported every request unpriced however many
-// tokens it burned, which reads as "this traffic was free" rather than "nothing
-// here priced it".
+// Before this fallback, cost required some plugin to have published a figure, and
+// litellm-budget-track was the only thing that did. A deployment running only
+// inference-parser reported every request unpriced however many tokens it burned,
+// which reads as "this traffic was free" rather than "nothing here priced it". That
+// is history on both counts now: the parser settles cost itself, and this resolver
+// backs it up when nothing published one.
 //
 // Runs outside the aggregator's lock: resolution is a read of an immutable table
 // and must not hold up the hot path.

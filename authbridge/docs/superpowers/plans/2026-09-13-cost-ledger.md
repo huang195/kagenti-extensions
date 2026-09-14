@@ -1,5 +1,7 @@
 # Cost Ledger Implementation Plan (commit 5)
 
+> **STATUS: implemented.** Landed as `4765644f`.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Make "what did today cost" answerable, and make it survive `abctl service restart`.
@@ -12,7 +14,7 @@
 
 ## Global Constraints
 
-- **Module root is `authbridge/`.** Go commands from `/Users/haihuang/works/go/src/github.com/kagenti/kagenti-extensions/.worktrees/cost-first-class/authbridge`; `git` from the worktree root above.
+- **Module root is `authbridge/`.** Go commands run from `authbridge/`, relative to the repo root; `git` from the repo root itself.
 - **`git commit -s` mandatory.** Trailer `Assisted-By: Claude (Anthropic AI) <noreply@anthropic.com>`; never `Co-Authored-By`.
 - **Field names come from `usage.Counts`**, verbatim, so the ledger, `/v1/usage` and the future collector share one vocabulary. Do not invent ledger-side spellings.
 - **The ledger holds NO prompt content.** Hosts, model names, counts, dollars, timestamps. Nothing else, ever. This is a user-facing promise in the docs.

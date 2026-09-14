@@ -1,5 +1,7 @@
 # Cost Aggregation Implementation Plan (commit 3)
 
+> **STATUS: implemented.** Landed as `cbe34bbc` plus three follow-ups.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Make the usage aggregator carry the four-way token split and break totals down by model and by endpoint, so a cost table can say *what* the money went on rather than only *how much* there was.
@@ -12,8 +14,8 @@
 
 ## Global Constraints
 
-- **Module root is `authbridge/`.** All Go commands run from `/Users/haihuang/works/go/src/github.com/kagenti/kagenti-extensions/.worktrees/cost-first-class/authbridge`.
-- **Worktree:** `.worktrees/cost-first-class`, branch `feat/cost-first-class`. Never commit from the main checkout — it has unrelated uncommitted edits under `authlib/pricing/`.
+- **Module root is `authbridge/`.** All Go commands run from `authbridge/`, relative to the repo root.
+- **Work in an isolated checkout**, not the shared one: it may carry unrelated uncommitted edits under `authlib/pricing/`.
 - **`git commit -s` is mandatory** (DCO; a `commit-msg` hook enforces it).
 - **Attribution trailer is `Assisted-By: Claude (Anthropic AI) <noreply@anthropic.com>`.** Never `Co-Authored-By` — the hook rejects it.
 - **Field names come from the wire event, not invented here.** The spec's rule is one vocabulary end to end: `inputTokens`, `cacheReadTokens`, `cacheWriteTokens`, `outputTokens`, `reasoningTokens`, `presentKinds` — exactly as `pipeline.InferenceExtension` spells them (`authlib/pipeline/extensions.go:184-195`).
@@ -710,7 +712,7 @@ Expected: no output.
 
 - [ ] **Step 6: Commit — this is commit 3 of the PR**
 
-Run these from the **worktree root** (`.worktrees/cost-first-class`), not from `authbridge/` — the paths below are repo-relative. Every other command in this plan runs from `authbridge/`; this is the one exception.
+Run these from the **repo root**, not from `authbridge/` — the paths below are repo-relative. Every other command in this plan runs from `authbridge/`; this is the one exception.
 
 ```bash
 git add authbridge/authlib/usage authbridge/authlib/sessionapi \

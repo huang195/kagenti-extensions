@@ -10,6 +10,7 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"strings"
 	"time"
 
 	"github.com/rossoctl/cortex/authbridge/authlib/pipeline"
@@ -74,6 +75,18 @@ func (c *Client) GetSession(ctx context.Context, id string) (*pipeline.SessionVi
 
 // ErrNotFound is returned when the server responds 404.
 var ErrNotFound = fmt.Errorf("apiclient: not found")
+
+// ErrBadRequest is returned when the server responds 400 — it understood the request
+// and refused it.
+//
+// Distinguished from every other non-200 because it is the one that is the CALLER's
+// fault and the one a caller can act on: an unsupported window, a resolution the
+// storage cannot divide, session= alongside a symbolic window. Without it "unexpected
+// status 400" was indistinguishable from a dial failure, and `abctl cost` told a user
+// their proxy was down when the real answer was "that proxy does not know that
+// window". The server's own message is carried through, since every message this
+// endpoint returns is a fixed string authored server-side.
+var ErrBadRequest = fmt.Errorf("apiclient: bad request")
 
 // PipelineView is the decoded shape of GET /v1/pipeline.
 type PipelineView struct {
@@ -171,6 +184,18 @@ func (c *Client) getJSON(ctx context.Context, path string, out any) error {
 		io.Copy(io.Discard, resp.Body)
 		return fmt.Errorf("%s: %w", path, ErrNotFound)
 	}
+	if resp.StatusCode == http.StatusBadRequest {
+		// The server's own words, bounded. Every message /v1/* returns for a 400 is a
+		// fixed string authored server-side and interpolates no query input — that is a
+		// stated requirement of writeUsageError — so forwarding it cannot reflect the
+		// caller's own bytes back at them. Bounded anyway, because this client cannot
+		// verify what it is talking to.
+		msg, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
+		if detail := badRequestDetail(msg); detail != "" {
+			return fmt.Errorf("%s: %w: %s", path, ErrBadRequest, detail)
+		}
+		return fmt.Errorf("%s: %w", path, ErrBadRequest)
+	}
 	if resp.StatusCode != http.StatusOK {
 		return fmt.Errorf("%s: unexpected status %d", path, resp.StatusCode)
 	}
@@ -178,6 +203,21 @@ func (c *Client) getJSON(ctx context.Context, path string, out any) error {
 		return fmt.Errorf("%s: decode: %w", path, err)
 	}
 	return nil
+}
+
+// badRequestDetail pulls the "error" field out of a 400 body.
+//
+// Returns "" for anything it cannot read as the documented shape, so a proxy that
+// answered 400 with HTML or with nothing produces a bare ErrBadRequest rather than a
+// line of markup in a terminal.
+func badRequestDetail(body []byte) string {
+	var payload struct {
+		Error string `json:"error"`
+	}
+	if err := json.Unmarshal(body, &payload); err != nil {
+		return ""
+	}
+	return strings.TrimSpace(payload.Error)
 }
 
 func trimSlash(s string) string {

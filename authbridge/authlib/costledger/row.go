@@ -41,14 +41,33 @@
 // That is the invariant cortex #972 exists to protect: one component turns
 // tokens into dollars.
 //
-// A CONSEQUENCE of pricing nothing, stated because it is a real difference a
-// reader will otherwise discover by comparing two totals: usage.Aggregator.costOf
-// falls back to the process rate table for a request that arrives with no settled
-// record, and this package does not. Where that fallback fires, /v1/usage over a
-// ring window reports dollars the ledger records as priceable-but-unpriced. On the
-// live pipeline inference-parser settles every inference response, so the two
-// agree; a composition without it would show the gap rather than a wrong number,
-// which is the failure mode to prefer.
+// CONSEQUENCES of pricing nothing, stated because they are real differences a reader
+// will otherwise discover by comparing two totals on one screen. THREE of them, not
+// one — the first is about dollars and the other two about the denominator those
+// dollars are a fraction of:
+//
+//   - usage.Aggregator.costOf falls back to the process rate table for a request that
+//     arrives with no settled record, and this package does not. Where that fallback
+//     fires, /v1/usage over a ring window reports dollars the ledger records as
+//     priceable-but-unpriced. On the live pipeline inference-parser settles every
+//     inference response, so the two agree; a composition without it would show the
+//     gap rather than a wrong number, which is the failure mode to prefer.
+//
+//   - PriceableRequests is counted differently. costOf sets priceable for ANY request
+//     carrying a settled cost record, whatever its token counts, while the writer here
+//     requires Model != "" and Tokens > 0. A settled record over zero tokens — a
+//     gateway that reported a cost and no usage — therefore lands in the ring's
+//     coverage denominator and not in the ledger's. It is priced in both, so the
+//     dollars match and only the ratio differs.
+//
+//   - The token fields read here are the modern ones only. pricing.UsageFromInference
+//     still falls back to InferenceExtension.PromptTokens and CompletionTokens when the
+//     split counters are absent, so a producer emitting only the legacy pair yields a
+//     ring figure with usage and a ledger row with Tokens == 0 — which then fails the
+//     priceable test above. Not fixed by adding the legacy fields to Row: the schema
+//     rule at the bottom of this doc is add-never-rename, and adding two columns for a
+//     shape parsercommon.Fill no longer produces would put them on every future row.
+//     The right fix is upstream, where the legacy pair is normalised into the split.
 //
 // On disk it holds hosts, model names, counts, dollars and timestamps. No prompt
 // content, no completions, no tool arguments — ever. That is a user-facing promise

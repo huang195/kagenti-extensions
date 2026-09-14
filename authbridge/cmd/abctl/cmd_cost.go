@@ -50,6 +50,13 @@ longest window it does hold and this command prints THAT window, never the one y
 asked for — a six-hour figure labelled "today" would be a wrong number wearing a
 right label.
 
+A duration window (1h, 6h) comes from a different place than "today" and "7d", and
+the two can disagree slightly about the same traffic: the in-memory ring prices a
+request nothing else priced, from the rate table, while the ledger reports it as
+unpriced instead. Where a request arrives with a settled cost — which is every
+inference response on a normal pipeline — they agree. Do not subtract one from the
+other and call the difference spend.
+
 Flags:
 `)
 		fs.PrintDefaults()
@@ -82,12 +89,22 @@ Flags:
 	snap, err := apiclient.New(target).GetUsageWindow(ctx, *window, 0, "", usage.GroupNone)
 	if err != nil {
 		fmt.Fprintf(stderr, "abctl cost: %v\n", err)
-		if errors.Is(err, apiclient.ErrNotFound) {
+		switch {
+		case errors.Is(err, apiclient.ErrNotFound):
 			// A reachable proxy with no aggregator. Different problem, different fix.
 			fmt.Fprintln(stderr, "  this proxy has no usage aggregation — is session tracking enabled?")
+			fmt.Fprintln(stderr, "  is Cortex running? `abctl service status`")
+		case errors.Is(err, apiclient.ErrBadRequest):
+			// The proxy answered. It understood the request and refused it, so telling a
+			// user to go and check whether Cortex is running sends them to the one place
+			// that has nothing wrong with it. An older proxy predating window=today, or a
+			// --window this one does not accept, are the two real causes.
+			fmt.Fprintf(stderr, "  this proxy does not accept --window %q\n", *window)
+			fmt.Fprintln(stderr, "  it may predate the today/7d windows; try --window 1h, or a duration it does hold")
+		default:
+			// A user whose proxy is down needs the next command, not a bare dial error.
+			fmt.Fprintln(stderr, "  is Cortex running? `abctl service status`")
 		}
-		// A user whose proxy is down needs the next command, not a bare dial error.
-		fmt.Fprintln(stderr, "  is Cortex running? `abctl service status`")
 		return 1
 	}
 

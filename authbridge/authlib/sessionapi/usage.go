@@ -25,6 +25,19 @@ import (
 //	            field names what was actually served, never what was asked for.
 //	            "today" is LOCAL midnight because a laptop crossing a timezone
 //	            must not have its day reset mid-afternoon.
+//
+//	            THE TWO KINDS OF WINDOW CAN DISAGREE ABOUT THE SAME TRAFFIC, and a
+//	            client showing both — "$X today" beside "$Y /1h" is exactly that —
+//	            has to expect it. A duration window is answered from the ring,
+//	            which prices a request the parser left unpriced from the process
+//	            rate table; the ledger does not, and records such a request as
+//	            priceable-but-unpriced instead. The ring also counts non-inference
+//	            traffic in requests where the ledger counts inference only. On the
+//	            live pipeline inference-parser settles every inference response, so
+//	            the dollar figures agree; a composition without it shows the gap
+//	            (pricedRequests below priceableRequests) rather than a wrong number.
+//	            Do not compute a difference between a ledger figure and a ring
+//	            figure and present it as spend.
 //	resolution  bucket width to return, e.g. 5m for a 1h window rendered as 12
 //	            bars. Defaults to the 1m storage resolution. Folding is done
 //	            here, not in the client, so every consumer gets the same

@@ -45,9 +45,11 @@ const stripGap = "   "
 // traffic says that. An always-on strip that renders nothing has failed at its
 // only job.
 //
-// Two of the four figures the spec wants do not exist yet ("today" needs the
-// durable ledger, "saved" needs prune attribution), so the strip ships with two
-// and reports the other two only once HasToday / HasSaved are set.
+// "Today" now exists — the durable cost ledger supplies it and spend.go's
+// applyTodayFigure sets HasToday only when the server really served that window and
+// priced it — so the strip reports three of the four figures the spec wants. "Saved"
+// still needs prune attribution aggregated across requests, and until HasSaved is set
+// the strip says nothing for it rather than a zero.
 func renderSpendStrip(s spendSummary, width int) string {
 	if width <= 0 {
 		return ""
@@ -99,11 +101,12 @@ func renderSpendStrip(s spendSummary, width int) string {
 	// Guarded on Priced independently of the branch above, which lets !Priced
 	// through whenever HasToday is set. Without this guard that combination — a
 	// ledger-backed today figure over a rolling window that priced nothing —
-	// rendered "$0.0000 /1h", stating a settled zero for a cost nobody knows. It is
-	// unreachable while nothing sets HasToday, which is why it survived two review
-	// rounds; the commit that adds the ledger arms it. Fixed here rather than left
-	// as a note because an unreachable bug still has to be reasoned about by every
-	// reader, and this is two lines.
+	// rendered "$0.0000 /1h", stating a settled zero for a cost nobody knows.
+	//
+	// It was unreachable while nothing set HasToday, which is why it survived two
+	// review rounds. It is REACHABLE now: the today poll lands on its own 5-minute
+	// chain, so a fresh session can hold a priced day total beside a rolling hour that
+	// has priced nothing yet. The guard is what makes that state render honestly.
 	if s.Priced {
 		figures = append(figures, formatUSDCell(s.WindowUSD)+" /"+s.WindowLabel)
 	}

@@ -429,3 +429,217 @@ func TestFetchSpend_AsksForThePerSessionBreakdown(t *testing.T) {
 		t.Errorf("session = %q; the poll must cover every session", got)
 	}
 }
+
+// A ledger-backed "today" answer becomes the headline. The strip's whole reason for
+// a second poll is that the rolling window cannot answer "what did today cost".
+func TestSpendSummary_LedgerBackedTodayBecomesTheHeadline(t *testing.T) {
+	m := &model{}
+	m.spend.snap = &usage.Snapshot{
+		Window: "1h",
+		Totals: usage.Counts{Requests: 10, CostMicros: 1_120_000, PricedRequests: 10, PriceableRequests: 10},
+		Priced: true,
+	}
+	m.spend.todaySnap = &usage.Snapshot{
+		Window: "today",
+		Totals: usage.Counts{Requests: 318, CostMicros: 4_170_000, PricedRequests: 318, PriceableRequests: 318},
+		Priced: true,
+	}
+
+	got := m.spendSummary()
+
+	if !got.HasToday {
+		t.Fatal("HasToday = false for a ledger-backed today snapshot")
+	}
+	if got.TodayUSD != 4.17 {
+		t.Errorf("TodayUSD = %v, want 4.17", got.TodayUSD)
+	}
+	// The window figure is unaffected: today is an additional reading, not a
+	// replacement, and the burn rate is still derived from the rolling window.
+	if got.WindowUSD != 1.12 {
+		t.Errorf("WindowUSD = %v, want the window figure untouched", got.WindowUSD)
+	}
+}
+
+// THE case where the honest answer is to show less. A proxy with no durable cost
+// ledger — Kubernetes by design — answers window=today from the ring's maximum span
+// and reports THAT span. Trusting the request rather than the answer would label a
+// six-hour total as a day's.
+func TestSpendSummary_DegradedTodayWindowLeavesHasTodayFalse(t *testing.T) {
+	m := &model{}
+	m.spend.snap = &usage.Snapshot{
+		Window: "1h",
+		Totals: usage.Counts{Requests: 10, CostMicros: 1_120_000, PricedRequests: 10, PriceableRequests: 10},
+		Priced: true,
+	}
+	m.spend.todaySnap = &usage.Snapshot{
+		Window: usage.MaxWindow.String(), // "6h0m0s" — the ring, not the ledger
+		Totals: usage.Counts{Requests: 50, CostMicros: 2_000_000, PricedRequests: 50, PriceableRequests: 50},
+		Priced: true,
+	}
+
+	got := m.spendSummary()
+
+	if got.HasToday {
+		t.Errorf("HasToday = true for a %q window; a 6h total must not be labelled a day's", m.spend.todaySnap.Window)
+	}
+	if got.TodayUSD != 0 {
+		t.Errorf("TodayUSD = %v, want 0 when there is no today figure", got.TodayUSD)
+	}
+}
+
+// An unpriced today must not become a headline. renderSpendStrip renders the today
+// figure whenever HasToday is set, with no Priced guard of its own, so admitting an
+// unpriced day here would print "$0.0000 today" — a settled zero for a cost nobody
+// knows.
+func TestSpendSummary_UnpricedTodayLeavesHasTodayFalse(t *testing.T) {
+	m := &model{}
+	m.spend.todaySnap = &usage.Snapshot{
+		Window: "today",
+		Totals: usage.Counts{Requests: 10, PriceableRequests: 10},
+		Priced: false,
+	}
+
+	got := m.spendSummary()
+
+	if got.HasToday {
+		t.Error("HasToday = true for an unpriced today; the strip would render $0.0000")
+	}
+}
+
+// A failed today poll must not become a zero headline either.
+func TestSpendSummary_FailedTodayPollLeavesHasTodayFalse(t *testing.T) {
+	m := &model{}
+	m.spend.todayErr = context.DeadlineExceeded
+	m.spend.todaySnap = &usage.Snapshot{Window: "today", Priced: true}
+
+	if got := m.spendSummary(); got.HasToday {
+		t.Error("HasToday = true after a failed today poll")
+	}
+}
+
+// The today figure survives a window poll that has not answered yet: the two chains
+// are independent, and the headline is the figure a user actually wants.
+func TestSpendSummary_TodaySurvivesAWindowPollThatHasNotAnswered(t *testing.T) {
+	m := &model{}
+	m.spend.todaySnap = &usage.Snapshot{
+		Window: "today",
+		Totals: usage.Counts{Requests: 318, CostMicros: 4_170_000, PricedRequests: 318, PriceableRequests: 318},
+		Priced: true,
+	}
+
+	got := m.spendSummary()
+
+	if !got.HasToday || got.TodayUSD != 4.17 {
+		t.Errorf("today figure lost with no window snapshot: HasToday=%v TodayUSD=%v", got.HasToday, got.TodayUSD)
+	}
+	if got.HasSnapshot {
+		t.Error("HasSnapshot = true with no window snapshot")
+	}
+}
+
+// The today chain must ask for window=today, which no time.Duration can express —
+// the reason GetUsageWindow exists at all.
+func TestFetchSpendToday_AsksForTheSymbolicWindow(t *testing.T) {
+	var gotQuery string
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotQuery = r.URL.RawQuery
+		_, _ = w.Write([]byte(`{"window":"today","buckets":[],"totals":{}}`))
+	}))
+	defer ts.Close()
+
+	m := &model{client: apiclient.New(ts.URL)}
+	cmd := m.fetchSpendToday()
+	if cmd == nil {
+		t.Fatal("fetchSpendToday returned no command with a client set")
+	}
+	msg, ok := cmd().(spendTodayLoadedMsg)
+	if !ok {
+		t.Fatalf("fetchSpendToday produced %T, want spendTodayLoadedMsg", cmd())
+	}
+	if msg.err != nil {
+		t.Fatalf("fetch errored: %v", msg.err)
+	}
+	q, err := url.ParseQuery(gotQuery)
+	if err != nil {
+		t.Fatalf("parse %q: %v", gotQuery, err)
+	}
+	if q.Get("window") != "today" {
+		t.Errorf("window = %q, want \"today\"", q.Get("window"))
+	}
+	// session= alongside a symbolic window is refused by the server, because the
+	// ledger holds no session ids. Asking for one would 400 every poll.
+	if q.Has("session") {
+		t.Errorf("today poll sent session=%q; the server refuses that with a symbolic window", q.Get("session"))
+	}
+	// No breakdown: the strip needs one number from this poll, and the sessions table
+	// reads the window snapshot's series instead.
+	if q.Has("group") && q.Get("group") != string(usage.GroupNone) {
+		t.Errorf("group = %q, want none", q.Get("group"))
+	}
+	// resolution is omitted rather than sent as "0s", which the server rejects as
+	// finer than its storage bucket.
+	if q.Has("resolution") {
+		t.Errorf("resolution = %q; the ledger serves one bucket and does not read it", q.Get("resolution"))
+	}
+}
+
+// A today reply must not be accepted under the window chain's sequence, and vice
+// versa: they ask different questions on different cadences, and a shared counter
+// would let the fast chain invalidate the slow one's request forever.
+func TestApplySpendTodayLoaded_UsesItsOwnSequence(t *testing.T) {
+	m := &model{}
+	m.spend.reqSeq = 7
+	m.spend.todayReqSeq = 2
+	fresh := &usage.Snapshot{Window: "today", Priced: true, Totals: usage.Counts{CostMicros: 1, PricedRequests: 1}}
+
+	// The window chain's current sequence is not the today chain's.
+	m.applySpendTodayLoaded(spendTodayLoadedMsg{req: 7, snap: fresh})
+	if m.spend.todaySnap != nil {
+		t.Error("a reply carrying the window chain's sequence was accepted as today's")
+	}
+	m.applySpendTodayLoaded(spendTodayLoadedMsg{req: 2, snap: fresh})
+	if m.spend.todaySnap != fresh {
+		t.Error("the today chain's own sequence was rejected")
+	}
+	// lastFetch reports the age of the WINDOW figure and must not move for a today
+	// reply, or the strip claims a freshness the rolling figure does not have.
+	if !m.spend.lastFetch.IsZero() {
+		t.Errorf("lastFetch moved on a today reply: %v", m.spend.lastFetch)
+	}
+}
+
+// invalidate must disown the today chain too. A different pod is a different day
+// total, and its reply outlives the switch by the fetch timeout.
+func TestSpendInvalidate_DisownsTheTodayChain(t *testing.T) {
+	s := &spendState{
+		todaySnap:    &usage.Snapshot{Window: "today"},
+		todayErr:     context.DeadlineExceeded,
+		todayReqSeq:  3,
+		todayTickGen: 4,
+	}
+
+	s.invalidate()
+
+	if s.todaySnap != nil || s.todayErr != nil {
+		t.Errorf("today state survived invalidate: snap=%v err=%v", s.todaySnap, s.todayErr)
+	}
+	if s.todayReqSeq != 4 {
+		t.Errorf("todayReqSeq = %d, want 4 — an in-flight reply must be disowned", s.todayReqSeq)
+	}
+	if s.todayTickGen != 5 {
+		t.Errorf("todayTickGen = %d, want 5 — the old chain must stop scheduling", s.todayTickGen)
+	}
+}
+
+// The today poll is deliberately far slower than the window poll: the figure only
+// grows, by one turn at a time, and it is the more expensive answer to compute.
+func TestSpendTodayPollInterval_IsMuchSlowerThanTheWindowPoll(t *testing.T) {
+	if spendTodayPollInterval <= spendPollInterval {
+		t.Fatalf("today interval %v is not slower than the window interval %v",
+			spendTodayPollInterval, spendPollInterval)
+	}
+	if spendTodayPollInterval < 5*time.Minute {
+		t.Errorf("today interval %v is faster than the 5m the comment claims is ample",
+			spendTodayPollInterval)
+	}
+}

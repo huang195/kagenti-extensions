@@ -748,6 +748,19 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		return m, tea.Batch(m.fetchSpend(), spendTick(msg.gen))
 
+	case spendTodayLoadedMsg:
+		m.applySpendTodayLoaded(msg)
+		return m, nil
+
+	case spendTodayTickMsg:
+		// Its own generation, checked against its own counter: the today chain is
+		// slower than the window chain, so a shared guard would let a window reply
+		// invalidate a today request still in flight and the slow poll would never land.
+		if !m.spendTodayTickIsCurrent(msg.gen) {
+			return m, nil
+		}
+		return m, tea.Batch(m.fetchSpendToday(), spendTodayTick(msg.gen))
+
 	case refreshTickMsg:
 		// In picker mode, skip the fetch — m.client may be nil after a
 		// back-out. Keep the ticker alive so it's ready when the user

@@ -101,6 +101,24 @@ Flags:
 	// the server's default is right for every other case. group none — this command
 	// reports one total, and a breakdown belongs in the TUI's Cost pane where there
 	// is room for a table.
+	//
+	// GROUP NONE IS ALSO WHY THIS SURFACE RENDERS NO RESIDUAL BAND, and the absence is
+	// structural rather than an oversight. usage.Snapshot.UngroupedCostMicros is the part of
+	// the total that no SERIES entry carries, and both producers compute it only where
+	// usage.Group.Reconcilable is true — false for exactly GroupNone and GroupPlugin, because
+	// a request that asks for no breakdown has nothing to reconcile and a residual equal to
+	// the whole total would then appear on every group-less answer and read as a fault. So
+	// the field can never arrive here, and there would be nothing for it to disclose if it
+	// did: this command prints Totals.CostMicros, which already INCLUDES every ungrouped
+	// dollar, and sums no series that a reader could find short. The TUI's Cost pane is the
+	// consumer, because it is the surface that draws the breakdown.
+	//
+	// A FUTURE CHANGE OF AXIS INHERITS THE DISCLOSURE. The moment this asks for a
+	// reconcilable group — to print a by-model table, say — the answer starts carrying a
+	// residual, and a table summing to less than the headline above it with nothing to
+	// explain the difference is the defect the field exists to end. Pinned by
+	// TestRunCost_AsksForAnAxisThatCannotCarryAResidual, which fails on that change and says
+	// what is then owed.
 	snap, err := apiclient.New(target).GetUsageWindow(ctx, *window, 0, "", usage.GroupNone)
 	if err != nil {
 		fmt.Fprintf(stderr, "abctl cost: %v\n", err)
@@ -156,6 +174,15 @@ Flags:
 // only field here that says the totals are INCOMPLETE rather than merely qualified, and a
 // script summing CostMicros across days had no way to know one of them was short. The
 // server logs a warning for it, which is a line no scripted consumer can read.
+//
+// UngroupedCostMicros is the one disclosure deliberately NOT here, and the reason is not the
+// argument above running out. It is the part of the total that no SERIES entry carries, this
+// command requests group=none, and both producers compute it only where
+// usage.Group.Reconcilable is true — so the field can never arrive on this path (see the
+// request site) and Totals.CostMicros here already includes every ungrouped dollar. A schema
+// field that nothing can ever populate is a promise to a script that nothing keeps: a
+// consumer would read its absence as "the breakdown reconciles" when the truth is that no
+// breakdown was asked for. Whoever gives this command an axis owes it a place in this struct.
 type costJSON struct {
 	// Window is what the SERVER served, so a script reading this learns it got six
 	// hours rather than a day without having to ask a second question.

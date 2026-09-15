@@ -1002,6 +1002,66 @@ func costSeries(snap *usage.Snapshot) map[string]usage.Counts {
 	return out
 }
 
+// costUngroupedLabel names the residual band: the spend NO row on this axis carries.
+//
+// A STATE, not a name, in costUnattributedLabel's convention — parenthesised and
+// lowercase — rather than a second spelling of the same idea. That constant's brackets
+// are load-bearing for the reason its own doc gives, and the reason carries over here: no
+// User-Agent product token begins with one, and nor does a model or a host a gateway
+// would route, so the band cannot be mistaken for a key at a glance.
+//
+// "(unattributed)" rather than "(other)". "Other" implies a residual of the same KIND as
+// the rows above it — a quieter model, a cheaper endpoint — when the truth is that these
+// dollars have no value on this axis AT ALL: usage.Snapshot.UngroupedCostMicros' dominant
+// case is a gateway-priced /v1/embeddings response, which carries no model to be "other"
+// than.
+//
+// NOT collision-proof, and cannot be, exactly as costUnattributedLabel records: a series
+// key is wire-derived, so a caller may send this literal. On group=agent both labels can
+// appear in one table, and they say different things — "(no user-agent)" is a row of real
+// spend whose requests named no client, "(unattributed)" is spend with no row at all.
+// Two spellings because they are two facts; one spelling would lose the distinction.
+const costUngroupedLabel = "(unattributed)"
+
+// costUngroupedRow is the residual band, or false when the breakdown accounts for every
+// dollar.
+//
+// ABSENT MEANS RECONCILED, so a nil pointer renders NOTHING rather than a zero band. A
+// "(unattributed) $0.0000" row would assert a residual that does not exist, on every
+// correctly attributed window there is — the permanent-caveat-with-nothing-to-act-on
+// failure this pane refuses in costCoverageSection and in every caveat above. The field is
+// a pointer for precisely that reading; see usage.Snapshot.UngroupedCostMicros and
+// usage.Group.Reconcilable, where absence on group=none and group=plugin means "no
+// reconciliation is offered" rather than "the breakdown is complete".
+//
+// A non-positive value renders nothing too, and that is DEFENCE IN DEPTH rather than dead
+// code: usage.SetUngroupedCost already refuses to publish one, and this pane restates the
+// guarantees it leans on instead of inheriting them silently — the same rule costTotalBody
+// applies to a negative total, which is a figure the server also promises never to send. A
+// zero is the absent case wearing a value; a negative residual is not spend.
+//
+// The share and the bar come from costShare, the same ratio-of-two-published-figures the
+// label rows get, against the same denominator. That is what makes the band comparable
+// with the rows rather than merely adjacent to them.
+func costUngroupedRow(snap *usage.Snapshot) (costRow, bool) {
+	if snap.UngroupedCostMicros == nil {
+		return costRow{}, false
+	}
+	micros := *snap.UngroupedCostMicros
+	if micros <= 0 || negativeCost(micros) {
+		return costRow{}, false
+	}
+	row := costRow{label: costUngroupedLabel, right: costMoney(micros)}
+	if pct := costShare(micros, snap.Totals.CostMicros); pct != "" {
+		// Padded like the label rows' share so the two line up on the percent sign; see the
+		// same expression in costBreakdownSection for why that matters.
+		row.right += costColGap + fmt.Sprintf("%6s", pct)
+		row.frac = float64(micros) / float64(snap.Totals.CostMicros)
+		row.hasBar = true
+	}
+	return row, true
+}
+
 // costBreakdownSection is where the money went, by the selected axis.
 //
 // Ordered by cost descending, ties broken on the label: map iteration is
@@ -1012,6 +1072,15 @@ func costSeries(snap *usage.Snapshot) map[string]usage.Counts {
 // figure. Their cost is unknown, not zero, and Snapshot.Priced is window-wide — so a
 // snapshot that priced another model's traffic says priced:true, and trusting that
 // flag per row would print $0.0000 against a model whose cost nobody knows.
+//
+// The RESIDUAL BAND closes the arithmetic. sum(rows) is NOT the window total: a
+// gateway-priced response the inference parser cannot read (/v1/embeddings, /v1/rerank)
+// carries no model, so it counts toward Totals and can be no series key — and until
+// usage.Snapshot.UngroupedCostMicros landed, that difference was undisclosed. A reader
+// adding this column up got a smaller number than the total two sections above, with
+// nothing on screen to explain the gap. The band is that difference, and with it
+// sum(rows) + band == Totals.CostMicros exactly, for every axis this pane offers (all four
+// are usage.Group.Reconcilable).
 func costBreakdownSection(snap *usage.Snapshot, group usage.Group, width int) costSection {
 	// The requested axis rather than snap.Group: beginCostFetch clears the snapshot on
 	// every view change, so the two cannot disagree, and snap.Group can echo the
@@ -1024,6 +1093,14 @@ func costBreakdownSection(snap *usage.Snapshot, group usage.Group, width int) co
 		// Not silence. group=session on a ledger-backed window carries no series at all —
 		// a per-minute row holds no session id — and an empty block under a "BY SESSION"
 		// heading reads as "none of this cost anything".
+		//
+		// And NO RESIDUAL BAND here, though this is the path where the field is largest: a
+		// session-grouped ledger window populates UngroupedCostMicros with the WHOLE total,
+		// because costledger.Fold finds no label for any row and every dollar is therefore
+		// ungrouped. A "(unattributed) 100.0%" band would restate the sentence above in a
+		// form that reads as a mystery spender, and a residual is the part a BREAKDOWN leaves
+		// out — where there is no breakdown there is nothing for it to be residual of.
+		// Nothing is understated either way: TOTAL still carries every dollar.
 		for _, l := range wrapCells(fmt.Sprintf(
 			"no %s breakdown for this window", group), body) {
 			sec.lines = append(sec.lines, costIndent+l)
@@ -1078,6 +1155,42 @@ func costBreakdownSection(snap *usage.Snapshot, group usage.Group, width int) co
 		}
 		rows = append(rows, row)
 	}
+	// WHERE THE BAND RANKS. It is a row, so it competes for height like one, and it sits
+	// LAST INSIDE THIS SECTION — after the label rows, after the "+N more" note — and is
+	// deliberately NOT a caveat unit on TOTAL.
+	//
+	// After the label rows because it is not one of them: it is what they leave out, and a
+	// residual read before the rows it is residual of says nothing.
+	//
+	// After the "+N more" note because that note ends "each smaller than the last row". A
+	// band between the rows and the note would make "the last row" name the BAND, so the
+	// note would appear to be counting series entries cheaper than the residual — a claim
+	// nothing here makes. The two are also DIFFERENT DISCLOSURES and must not read as one:
+	// "+N more" is rows omitted FOR SPACE, and a wider or taller terminal reveals them; the
+	// band is spend with no row on this axis AT ALL, and no terminal will ever produce one.
+	// Merged, they would send a reader looking for a row that cannot exist.
+	//
+	// Not a TOTAL caveat, though it is arithmetic about money, because nothing the caveats'
+	// ranking protects is at stake here. A caveat rides on TOTAL because a partial or
+	// inexact figure shown without it reads as a complete one, which is why costTotalFigure
+	// puts each claim on the figure as a marker. The residual qualifies the ROWS, not the
+	// figure: Totals.CostMicros already includes every ungrouped dollar, so when the height
+	// budget drops this section whole the pane still states the total exactly and leaves no
+	// column for a reader to add up. It travels with the rows it is about, and it is never
+	// half-shown, because fitCostSections drops sections and never clips one.
+	//
+	// ONE renderCostRows call for the rows and the band together, so they share a single
+	// column grid. Rendered separately their figures would sit at different columns, and a
+	// band a reader cannot align with the rows is a band they cannot compare — which is the
+	// whole purpose of giving it the same share and bar.
+	//
+	// Outside costMaxSeriesRows on purpose: that cap limits LABEL rows, so counting the band
+	// against it would let a long tail of cheap models push the reconciliation off screen.
+	labelRows := len(rows)
+	band, hasBand := costUngroupedRow(snap)
+	if hasBand {
+		rows = append(rows, band)
+	}
 	// The rows FIRST, and an empty section when there are none. renderCostRows returns
 	// nil when even a one-cell label cannot sit beside the figures, and appending the
 	// "+N more" note regardless produced a section that was all disclosure and no data:
@@ -1089,7 +1202,16 @@ func costBreakdownSection(snap *usage.Snapshot, group usage.Group, width int) co
 	if len(lines) == 0 {
 		return costSection{}
 	}
-	sec.lines = lines
+	// Clamped for the reason renderCostRows clamps its own pads: renderCostRows returns one
+	// line per row or none at all, so this cannot bite today, and relying on that invariant
+	// silently would cost a panic inside View() if it ever changed.
+	if labelRows > len(lines) {
+		labelRows = len(lines)
+	}
+	// Copied rather than sliced onto sec.lines. lines[:labelRows] keeps the whole backing
+	// array, so appending the note to it would overwrite the band's own line — the section
+	// would then show the note twice and the residual not at all.
+	sec.lines = append(sec.lines, lines[:labelRows]...)
 	if rest := len(labels) - len(shown); rest > 0 {
 		// Disclosed, not silently dropped: a truncated list reads as a complete one, and
 		// the elided rows are the cheap ones only because the sort put them there.
@@ -1097,6 +1219,7 @@ func costBreakdownSection(snap *usage.Snapshot, group usage.Group, width int) co
 			sec.lines = append(sec.lines, costIndent+l)
 		}
 	}
+	sec.lines = append(sec.lines, lines[labelRows:]...)
 	return sec
 }
 
@@ -1114,6 +1237,11 @@ func costBreakdownSection(snap *usage.Snapshot, group usage.Group, width int) co
 // identically. That is strictly narrower than the status quo it replaces — "unknown" is
 // a plausible thing for a real client to send, "(no user-agent)" is not — and the
 // spoofability of the whole axis is documented on pipeline.EventClient.
+//
+// The PARENTHESISED-LOWERCASE FORM is the pane's convention for "this is a state, not a
+// key", and costUngroupedLabel is the other member of it. Add to the convention rather
+// than inventing a second one: two spellings of "not a name" in one table teaches a
+// reader neither.
 const costUnattributedLabel = "(no user-agent)"
 
 // costSeriesLabel renders one breakdown key.

@@ -88,16 +88,24 @@ func (s *store) path(t time.Time) string {
 	return filepath.Join(s.dir, s.dayOf(t).Format(dayLayout)+".jsonl")
 }
 
-// append writes rows to whichever day files they belong to.
+// append writes rows to whichever day files they belong to, and reports HOW MANY ROWS
+// DID NOT REACH DISK alongside the first error.
 //
 // Grouped by day rather than assuming one, because a flush can straddle local
 // midnight: the minute that closes at 00:00 belongs to yesterday's file while the
 // one that opened belongs to today's. No long-lived handle is held for the same
 // reason — a handle cached across a day boundary would keep writing yesterday's
 // file forever, which is the bug that makes a day silently gain 24 hours of rows.
-func (s *store) append(rows []Row) error {
+//
+// The count is SUMMED PER DAY FILE, so a batch whose second file is unwritable reports
+// only that file's rows rather than all of them. That half is DEFENSIVE rather than a live
+// case: a batch is one minute today, so byDay has one entry, and the over-count
+// Writer.Dropped actually suffered was inside a single file — see writeLinesTo, which
+// carries that argument. Counting per file is what keeps this correct if a batch ever does
+// carry two days, which the grouping above already assumes it can.
+func (s *store) append(rows []Row) (int, error) {
 	if len(rows) == 0 {
-		return nil
+		return 0, nil
 	}
 	byDay := map[string][]Row{}
 	for _, r := range rows {
@@ -107,12 +115,15 @@ func (s *store) append(rows []Row) error {
 	// The first error is returned but every day is still attempted: a failure
 	// writing one file is no reason to drop the rows destined for another.
 	var firstErr error
+	var lost int
 	for p, dayRows := range byDay {
-		if err := writeLines(p, dayRows); err != nil && firstErr == nil {
+		dayLost, err := writeLines(p, dayRows)
+		lost += dayLost
+		if err != nil && firstErr == nil {
 			firstErr = err
 		}
 	}
-	return firstErr
+	return lost, firstErr
 }
 
 // dayFile is what writeLinesTo needs of an open day file: append the bytes, get them
@@ -132,8 +143,9 @@ type dayFile interface {
 	Close() error
 }
 
-// writeLines appends one day's rows as JSON lines to the day file at path.
-func writeLines(path string, rows []Row) error {
+// writeLines appends one day's rows as JSON lines to the day file at path, returning
+// how many of them did not land. See writeLinesTo.
+func writeLines(path string, rows []Row) (int, error) {
 	return writeLinesTo(rows, func() (dayFile, error) {
 		return os.OpenFile(path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, fileMode)
 	})
@@ -149,27 +161,50 @@ func writeLines(path string, rows []Row) error {
 // error at that offset. readDay resyncs past one now, but not producing the damage
 // beats tolerating it, and a laptop filling its disk is exactly when someone asks
 // what things cost.
-func writeLinesTo(rows []Row, open func() (dayFile, error)) error {
+//
+// RETURNS HOW MANY ROWS DID NOT LAND, which is not the same as len(rows) whenever the
+// write tore. The single Write reports the byte count it stored, the rows are laid out in
+// that same buffer in order, and O_APPEND means the bytes it stored are in the file — so
+// every row that ends at or before that offset is on disk and readable, and only the row
+// straddling the tear and the ones after it are gone. Counting the whole batch was true
+// only while this function truncated on failure, and that rollback is gone (see
+// appendBytes): the caller would over-report loss, and Writer.Dropped is the one signal
+// an operator has for "is my ledger complete" — over-reporting teaches them to disbelieve
+// it just as thoroughly as under-reporting hides it.
+//
+// WHAT THE COUNT DOES NOT INCLUDE: a Sync that failed. Those rows ARE in the file and any
+// reader will see them; what is unproven is that they survive the host losing power. That
+// is a durability claim this function cannot make, so it is returned as an error — and
+// Flush and Close exist to hear it — but it is not a lost row and must not be counted as
+// one.
+func writeLinesTo(rows []Row, open func() (dayFile, error)) (int, error) {
 	var buf bytes.Buffer
 	// json.Encoder writes one object per line and terminates each with a newline,
 	// which is exactly the JSON-lines shape readDay decodes.
 	enc := json.NewEncoder(&buf)
+	// ends[i] is the offset just past row i's newline. A write that stored n bytes
+	// therefore stored exactly the rows whose end is <= n; see lostRows.
+	ends := make([]int, 0, len(rows))
 	for _, r := range rows {
 		if err := enc.Encode(r); err != nil {
 			// A Row cannot fail to marshal — no channels, no funcs, no NaN — so this is
 			// unreachable in practice. Returned rather than skipped anyway: reaching it
 			// would mean the schema gained a field JSON cannot express, and silently
 			// dropping that day's rows is not how anyone should find out.
-			return err
+			//
+			// Nothing has been opened yet, let alone written, so every row is lost.
+			return len(rows), err
 		}
+		ends = append(ends, buf.Len())
 	}
 
 	f, err := open()
 	if err != nil {
-		return err
+		// The file could not be opened, so none of them landed.
+		return len(rows), err
 	}
-	werr := appendBytes(f, buf.Bytes())
-	if werr == nil {
+	n, werr := appendBytes(f, buf.Bytes())
+	if n > 0 {
 		// FSYNCED, so a nil error means the bytes are on the device rather than in the
 		// page cache. Without this, Writer.Close's whole reason for existing — "an orderly
 		// stop loses nothing" — was false for a host that lost power seconds after the
@@ -180,12 +215,38 @@ func writeLinesTo(rows []Row, open func() (dayFile, error)) error {
 		// request path. Reported rather than swallowed: a sync that fails is a durability
 		// claim that cannot be made, and Flush and Close are the two callers that exist to
 		// hear it.
-		werr = f.Sync()
+		//
+		// ON A TORN WRITE TOO, which it used to skip. Two reasons it has to run there. The
+		// rows before the tear are exactly the ones this function now reports as NOT lost,
+		// and that claim is about disk, not about the page cache. And the newline fence
+		// appendBytes just appended exists precisely for the crash case — an unterminated
+		// fragment swallowing the next row appended — so leaving the one byte whose whole
+		// purpose is crash-durability unsynced would be self-defeating. The tear stays the
+		// reported error, because it is the one a caller can act on; a Sync failure behind it
+		// only adds that the same device is failing in a second way.
+		if serr := f.Sync(); serr != nil && werr == nil {
+			werr = serr
+		}
 	}
 	if cerr := f.Close(); cerr != nil && werr == nil {
 		werr = cerr
 	}
-	return werr
+	return lostRows(ends, n), werr
+}
+
+// lostRows is how many of the encoded rows a write of n bytes did not store.
+//
+// ends is monotonically increasing, so the first row whose end is past n is the one the
+// tear landed in and everything from there on is missing. A row is counted lost when it
+// is even partly short: a fragment is not a row, and readDay counts it as a skipped line
+// rather than decoding it.
+func lostRows(ends []int, n int) int {
+	for i, end := range ends {
+		if end > n {
+			return len(ends) - i
+		}
+	}
+	return 0
 }
 
 // appendBytes writes b in ONE call and, if that write landed only partly, appends a
@@ -227,10 +288,15 @@ func writeLinesTo(rows []Row, open func() (dayFile, error)) error {
 // cannot do is make each other's TOTALS right — two processes pricing the same traffic
 // would double-count it — but that is a question about who may write a ledger, not
 // about whether a write destroys what is already in it.
-func appendBytes(f io.Writer, b []byte) error {
+//
+// RETURNS THE BYTE COUNT OF b THAT IS NOW IN THE FILE, so the caller can say which rows
+// survived a tear instead of assuming none did. It deliberately does NOT include the
+// fence newline: that byte is damage control, not row data, and adding it would make the
+// row straddling the tear look complete.
+func appendBytes(f io.Writer, b []byte) (int, error) {
 	n, err := f.Write(b)
 	if err == nil {
-		return nil
+		return n, nil
 	}
 	if n > 0 && n < len(b) && b[n-1] != '\n' {
 		// Ended mid-row. A tear that happened to land on a line boundary needs nothing.
@@ -238,11 +304,11 @@ func appendBytes(f io.Writer, b []byte) error {
 			// Reported together with the write that tore, because the consequence outlives
 			// this call: the next row appended to this file is unreadable too, and only the
 			// skipped-line count will show it.
-			return fmt.Errorf("costledger: torn append of %d bytes could not be fenced off with a "+
+			return n, fmt.Errorf("costledger: torn append of %d bytes could not be fenced off with a "+
 				"newline (%v), so the next row appended to this file will be unreadable too: %w", n, ferr, err)
 		}
 	}
-	return err
+	return n, err
 }
 
 // maxLineBytes bounds one line readDay will buffer.

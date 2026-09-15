@@ -688,6 +688,20 @@ func (w *Writer) logDrops() {
 // Close returns. Each of those used to be logged and not counted, so the number
 // answered 0 while a whole minute's spend was gone.
 //
+// WHAT IT COUNTS ON A FAILED APPEND is the rows that did not reach the FILE, not the
+// rows in the batch. A torn write stores its first n bytes and nothing shortens the file
+// afterwards, so the rows that ended before the tear are on disk and readable; counting
+// them would inflate this figure, and being the only completeness signal cuts both ways
+// — an operator taught that it cries wolf stops believing it when it is right. Same for
+// a batch that straddles midnight and fails on one of its two day files. See
+// store.writeLinesTo.
+//
+// WHAT IT DOES NOT COUNT: rows whose fsync failed. They are in the file and every reader
+// will see them; only their survival across power loss is unproven, and that is reported
+// as an error from Flush and Close rather than as a lost row. Nor does it count anything
+// a reader could not decode later — that is SkippedLines and TruncatedDays, which are
+// gauges for the last read rather than a write-path total.
+//
 // Exported so a caller can surface it rather than leaving it in a log line nobody
 // greps: a cost total assembled from a ledger that dropped rows is short by an unknown
 // amount, and that is worth saying out loud.
@@ -767,19 +781,36 @@ func (w *Writer) run() {
 func (w *Writer) write(b batch) {
 	var err error
 	if len(b.rows) > 0 {
-		if err = w.store.append(b.rows); err != nil {
+		var lost int
+		if lost, err = w.store.append(b.rows); err != nil {
 			// COUNTED, not only logged. takeLocked advanced flushedThrough and emptied the
 			// map before this ran — deliberately, because a re-held minute could be written
-			// twice and nothing downstream can detect a double count — so these rows now
-			// exist nowhere at all. An ENOSPC, an EROFS or an EACCES here is a permanent loss
-			// of that minute, and Dropped() answered 0 over it.
+			// twice and nothing downstream can detect a double count — so a row that did not
+			// reach the file exists nowhere at all. An ENOSPC, an EROFS or an EACCES here is a
+			// permanent loss of that minute, and Dropped() answered 0 over it.
 			//
-			// loggedDrops is advanced past this count because the line below already reports
-			// it, with the error attached, which is more use than logDrops' bare total.
-			n := w.dropped.Add(int64(len(b.rows)))
-			w.loggedDrops.Store(n)
-			slog.Warn("costledger: append failed; cost history for this minute is lost",
-				"error", err, "rows", len(b.rows), "droppedRows", n)
+			// THE STORE'S COUNT, NOT len(b.rows). The whole batch used to be counted, on the
+			// reasoning that these rows "now exist nowhere at all" — which was true only while
+			// a failed append truncated itself away. It no longer does (see appendBytes), so a
+			// torn write leaves the rows before the tear durably on disk, and a batch straddling
+			// midnight can fail on one day file while the other lands. Counting the batch
+			// over-reported both, and Dropped() is the one exported "is my cost history
+			// complete" signal: a number that cries wolf trains an operator to disbelieve it as
+			// thoroughly as one that hides loss.
+			//
+			// Zero lost with a non-nil error is possible — an fsync that failed after the bytes
+			// were in the file — and is deliberately not counted as a drop. Those rows are
+			// readable; what cannot be claimed is that they survive power loss, which is what
+			// the error itself says. The Warn fires either way.
+			//
+			// loggedDrops is advanced past the count because the line below already reports it
+			// with the error attached, which is more use than logDrops' bare total.
+			if lost > 0 {
+				w.loggedDrops.Store(w.dropped.Add(int64(lost)))
+			}
+			slog.Warn("costledger: append failed; cost history for this minute may be short",
+				"error", err, "rows", len(b.rows), "lostRows", lost,
+				"droppedRows", w.dropped.Load())
 		}
 	}
 	if !b.pruneAt.IsZero() {

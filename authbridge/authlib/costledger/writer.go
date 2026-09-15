@@ -359,7 +359,11 @@ func (w *Writer) Record(_ string, e *pipeline.SessionEvent) {
 	// event is inference, OR somebody priced it", and spelling the second half out makes
 	// the guard read as that rule instead of as a nest of negations.
 	settledCost := hasCost && ev.Priced()
-	if e.Inference == nil && !settledCost {
+	// A figure that WAS on the wire and was declined. Admitted for the reason the guard
+	// below spells out: it is evidence of priceable traffic, which an unpriced record with
+	// no refusal is not.
+	refusedCost := hasCost && ev.RejectedReason != ""
+	if e.Inference == nil && !settledCost && !refusedCost {
 		// Non-inference traffic the proxy handled — MCP, health checks, tunnels.
 		// Recording it would put every proxied response in the cost denominator,
 		// the mistake that made a correct deployment read "1/10 priced" forever.
@@ -380,6 +384,17 @@ func (w *Writer) Record(_ string, e *pipeline.SessionEvent) {
 		// PRICED, not merely present: a record that exists but priced nothing adds no
 		// dollars, so letting it through would inflate the request count without moving
 		// the money — the denominator mistake above, arriving by a different door.
+		//
+		// OR REFUSED, which is the one exception and is not a weakening of that rule. A
+		// record carrying costevent.RejectedImplausible says a cost figure WAS on the wire
+		// and this proxy declined it (see costing.implausibleUnparsedCost), so it is
+		// evidence of priceable traffic in a way an absent figure never is. That refusal is
+		// published precisely "so the coverage gap stays nameable", and this guard dropped
+		// every one of them: the refusal is gated on a nil inference extension, which is
+		// also the half of this condition it cannot satisfy, so ALL refusals fell out — a
+		// response from an unparsed endpoint claiming $50,000 left nothing whatever in a
+		// file retained for thirty days, while the ring counted the response. Recorded here
+		// as priceable-and-unpriced; see the PriceableRequests assignment below.
 		return
 	}
 
@@ -507,6 +522,35 @@ func (w *Writer) Record(_ string, e *pipeline.SessionEvent) {
 				// PricedRequests and never a sibling of it.
 				r.IncompleteRequests = 1
 			}
+		} else if ev.RejectedReason != "" {
+			// A REFUSED FIGURE IS A COVERAGE GAP, and this is where it becomes visible.
+			//
+			// PriceableRequests without PricedRequests, which is the shape every consumer
+			// already renders: priceable-minus-priced is the gap that "stops a partial total
+			// being presented as a complete one". A cost figure reached this proxy and was
+			// declined, so the request COULD have been priced — usage.Counts.PriceableRequests
+			// is explicit that this is "the count of requests that could have carried a price"
+			// — and nothing priced it. Left at zero, a day whose only unpriced traffic was
+			// refused would report parity and print no caveat at all, which is the exact
+			// failure priced-versus-priceable exists to prevent.
+			//
+			// NO DOLLARS AND NO PricedRequests: the point of the refusal is that there is no
+			// figure. ev.Micros() returns zero for a refused record anyway, so this branch
+			// could not add money even by mistake.
+			//
+			// A DIVERGENCE FROM THE RING, stated here and in the package doc rather than
+			// discovered: usage.Aggregator.costOf goes through costevent.Decode, which reports
+			// no record at all for an unpriced one, so the ring counts a refusal in Requests
+			// and in nothing else. The ledger's denominator is therefore one larger for the
+			// same traffic. That is the right way round — the ring cannot see the refusal and
+			// this file is the surface an operator reads tomorrow — and the dollars, which are
+			// zero in both, still agree.
+			//
+			// A HOSTILE HOST CAN THEREFORE DEGRADE ITS OWN COVERAGE RATIO by claiming
+			// implausible figures. That is the intended reading: something on the wire is
+			// asserting costs this proxy refuses, and an operator should see it. It moves no
+			// money, and the per-minute accumulator caps how many rows it can create.
+			r.PriceableRequests = 1
 		}
 	}
 

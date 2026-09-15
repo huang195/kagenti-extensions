@@ -60,6 +60,16 @@
 //     coverage denominator and not in the ledger's. It is priced in both, so the
 //     dollars match and only the ratio differs.
 //
+//   - A REFUSED FIGURE is counted as priceable here and nowhere in the ring. A record
+//     carrying costevent.RejectedImplausible says a cost was on the wire and this proxy
+//     declined it, and the writer records that as priceable-and-unpriced so the coverage
+//     gap survives to tomorrow. usage.Aggregator.costOf reaches the record through
+//     costevent.Decode, which reports nothing at all for an unpriced one, so the ring
+//     counts the response in Requests and in no other counter. The dollars are zero in
+//     both and only the ratio differs — the same shape as the bullet above, in the
+//     opposite direction. It is deliberate: the refusal exists to keep a coverage gap
+//     nameable, and this is the surface that is still there tomorrow to name it on.
+//
 //   - The token fields read here are the modern ones only. pricing.UsageFromInference
 //     still falls back to InferenceExtension.PromptTokens and CompletionTokens when the
 //     split counters are absent, so a producer emitting only the legacy pair yields a

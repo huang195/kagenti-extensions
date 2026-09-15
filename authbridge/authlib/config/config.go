@@ -14,7 +14,6 @@ import (
 	"github.com/rossoctl/cortex/authbridge/authlib/pipeline"
 	"github.com/rossoctl/cortex/authbridge/authlib/pricing"
 	"github.com/rossoctl/cortex/authbridge/authlib/session"
-	"github.com/rossoctl/cortex/authbridge/authlib/usage"
 	"gopkg.in/yaml.v3"
 )
 
@@ -129,7 +128,18 @@ type CostLedgerConfig struct {
 // window has no files for the missing days either, and answers window:"7d" over however
 // long it has been running. Retention is not what limits that, so it cannot be fixed
 // here — it needs the response to carry the span actually covered.
-const minCostLedgerRetentionDays = usage.Window7dLocalDays
+// A LITERAL, with the agreement enforced by a test rather than by an import. Deriving it
+// as usage.Window7dLocalDays read better and cost a layering inversion: this package is the
+// leaf every binary loads to parse its config, and pointing it at the aggregator to learn a
+// number drags that dependency into every binary — including ones that never aggregate
+// anything. TestMinCostLedgerRetentionDays_MatchesTheWindowItProtects asserts the two are
+// equal, so the protection the derivation bought (a window change that outgrows the floor
+// fails loudly instead of silently admitting a partial week) is kept without the import.
+//
+// A test-only dependency is the right shape for a cross-package invariant that is not a
+// runtime relationship: config does not need to KNOW about windows, it needs to AGREE with
+// them, and agreement is a thing to check rather than to compute.
+const minCostLedgerRetentionDays = 8
 
 // LedgerEnabled reports whether the ledger should run, given the default for this
 // deployment shape.
@@ -153,13 +163,16 @@ func (c *CostLedgerConfig) Validate() error {
 		// Says EIGHT and says why it is not seven: an operator who typed 7 for a seven-day
 		// window is not making a careless mistake, and a message that only quoted the floor
 		// would read as an off-by-one in the software rather than as the rolling span it is.
+		// The numbers are spelled out rather than interpolated from authlib/usage, for the
+		// reason minCostLedgerRetentionDays is a literal: this package must not import the
+		// aggregator. Every one of them is pinned against usage's own constants by
+		// TestMinCostLedgerRetentionDays_MatchesTheWindowItProtects, so a window change
+		// makes this message wrong in a test rather than wrong in front of an operator.
 		return fmt.Errorf("cost_ledger.retention_days must be at least %d, or 0 for the default: "+
-			"the usage API serves window=%s from these day files, and that window is a ROLLING "+
-			"%dx24h, so it reads %d local day files rather than %d — a shorter retention reports "+
+			"the usage API serves window=7d from these day files, and that window is a ROLLING "+
+			"7x24h, so it reads 8 local day files rather than 7 — a shorter retention reports "+
 			"a partial week as a full one, got %d",
-			minCostLedgerRetentionDays, usage.Window7d,
-			int(usage.Window7dSpan/(24*time.Hour)), usage.Window7dLocalDays,
-			int(usage.Window7dSpan/(24*time.Hour)), c.RetentionDays)
+			minCostLedgerRetentionDays, c.RetentionDays)
 	}
 	return nil
 }

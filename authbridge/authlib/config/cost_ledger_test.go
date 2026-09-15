@@ -175,3 +175,39 @@ func TestCostLedgerConfig_TheFloorCoversEveryDayTheWindowTouches(t *testing.T) {
 func dayOfTest(t time.Time) time.Time {
 	return time.Date(t.Year(), t.Month(), t.Day(), 0, 0, 0, 0, t.Location())
 }
+
+// TestMinCostLedgerRetentionDays_MatchesTheWindowItProtects is what lets
+// minCostLedgerRetentionDays be a literal.
+//
+// The floor exists because window=7d is served from these day files, so it has to cover every
+// local date that window can touch. Deriving it as usage.Window7dLocalDays said that in the
+// code, and cost a layering inversion: config is the leaf every binary loads to parse its
+// YAML, and importing the aggregator there drags that dependency into binaries that never
+// aggregate anything.
+//
+// A TEST-ONLY import is the right shape for this. config does not need to KNOW about windows
+// at runtime — it needs to AGREE with them, and agreement is a thing to check rather than to
+// compute. What the derivation bought was that a window change which outgrows the floor fails
+// loudly instead of silently admitting a partial week; that protection lives here now.
+//
+// It also pins the numbers spelled out in Validate's error message, which are literals for the
+// same reason. A window change makes that message wrong in a test rather than wrong in front
+// of an operator.
+func TestMinCostLedgerRetentionDays_MatchesTheWindowItProtects(t *testing.T) {
+	if got, want := minCostLedgerRetentionDays, usage.Window7dLocalDays; got != want {
+		t.Errorf("minCostLedgerRetentionDays = %d, but window=%s touches %d local day files.\n"+
+			"The floor must cover every date the window can open on, or retention_days = %d "+
+			"passes validation and then answers window:%q over a partial week.\n"+
+			"Update the constant AND the numbers spelled out in Validate's message.",
+			got, usage.Window7d, want, got, usage.Window7d)
+	}
+	// The message says "a ROLLING 7x24h, so it reads 8 local day files rather than 7".
+	// Pin both halves so the prose cannot drift from the constants either.
+	if days := int(usage.Window7dSpan / (24 * time.Hour)); days != 7 {
+		t.Errorf("Validate's message says the window is a rolling 7x24h, but it is %dx24h", days)
+	}
+	if usage.Window7dLocalDays != 8 {
+		t.Errorf("Validate's message says the window reads 8 local day files, but it reads %d",
+			usage.Window7dLocalDays)
+	}
+}

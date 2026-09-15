@@ -199,9 +199,26 @@ type spendSummary struct {
 	// sessions table's COST cell and the Usage pane's cost cell all republished exactly
 	// that floor as an exact figure. Carried here so the strip can mark it.
 	Incomplete int64
-	// Saturated reports that an addition into the window's totals reached the int64 ceiling
+	// Clamped reports that an addition into the window's totals reached the int64 ceiling
 	// and was CLAMPED rather than allowed to wrap, so WindowUSD — and the counters beside it —
 	// are FLOORS by an amount nothing in the response can state.
+	//
+	// NOT NAMED "Saturated", after the wire field it carries, and the reason is the guard.
+	// snapshot_consumers_test.go's Counts half matches a selector by field NAME anywhere in
+	// cmd/abctl, because a Counts is read through short-lived locals with no naming convention
+	// and there is no base hint to key on. A view-model field spelled Saturated would therefore
+	// satisfy the guard for usage.Counts.Saturated ALL BY ITSELF — `s.Saturated` in
+	// renderSpendStrip is a selector of that name — and the guard would go on passing after
+	// every genuine read was deleted. MEASURED, not theorised: with all five real reads removed
+	// the guard passed, and renaming this is what makes it fail again. It is the same collision
+	// snapshotBaseHint exists to prevent on the Snapshot half, where `cs.Window` on CostSettings
+	// would otherwise stand in for Snapshot.Window.
+	//
+	// A rename costs nothing here because this struct is a VIEW MODEL, not the schema: Incomplete
+	// above already drops "Requests", WindowUSD is CostMicros divided out, and Unpriced is a
+	// subtraction the wire does not carry. "Clamped" is also the verb the rendering uses
+	// (saturatedNote reads "clamped, figures are floors"), so the field is named after what it
+	// will say.
 	//
 	// A FOURTH claim about the window figure, and the one that is neither coverage, exactness
 	// nor damage. Coverage says how much of the traffic the figure covers, exactness says
@@ -214,7 +231,7 @@ type spendSummary struct {
 	// lives on usage.Counts rather than on the ledger's read: Counts.Add is where the clamp
 	// happens, and the in-memory ring sums with the same method. A field carried for the day
 	// alone would leave the strip's other reading able to publish a clamped figure bare.
-	Saturated bool
+	Clamped bool
 	// HasSnapshot reports that a poll actually answered.
 	//
 	// It is what separates "we looked, and there was no inference traffic" from
@@ -276,10 +293,10 @@ type spendSummary struct {
 	// not by the strip — the strip has no reading to attach it to, and an unattached caveat
 	// on this line is the misattribution moneyFigure exists to end.
 	TodayDegraded *usage.Degraded
-	// TodaySaturated is the day figure's own clamp disclosure, separate from Saturated for the
+	// TodayClamped is the day figure's own clamp disclosure, separate from Clamped for the
 	// reason every other Today* counter is separate from its window twin: it is a different
 	// question about a different span, and one figure must never wear another's qualification.
-	TodaySaturated bool
+	TodayClamped bool
 
 	SavedUSD float64 // set once tool-prune savings are aggregated
 	HasSaved bool
@@ -335,7 +352,7 @@ func (m *model) spendSummary() spendSummary {
 		// Read unconditionally for the same reason, and NOT gated on Priced: a clamp says every
 		// counter in this Counts is a floor, and Requests overflowing is enough on its own —
 		// there need be no dollars involved for the answer to have stopped fitting.
-		Saturated:   snap.Totals.Saturated,
+		Clamped:     snap.Totals.Saturated,
 		HasSnapshot: true,
 	}
 	// A negative total is refused HERE, before anything derives a figure from it, which
@@ -632,7 +649,7 @@ func (m *model) applyTodayFigure(out *spendSummary) {
 	// And the day's own clamp, which is a FOURTH claim and the only one of the four that says
 	// the arithmetic itself ran out of room. A day can be fully covered, wholly exact, read
 	// cleanly, and still be a floor — see usage.Counts.Saturated.
-	out.TodaySaturated = snap.Totals.Saturated
+	out.TodayClamped = snap.Totals.Saturated
 }
 
 // spendTodayTickIsCurrent reports whether a today tick belongs to the live chain.

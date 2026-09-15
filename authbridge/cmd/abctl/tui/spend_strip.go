@@ -353,7 +353,7 @@ func renderSpendStrip(s spendSummary, width int) string {
 		// rendered a figure byte-identical to a clean one — the exact failure
 		// usage.Snapshot.Degraded exists to end, on the strip's headline reading.
 		figures = append(figures, moneyFigure(s.TodayUSD, "today",
-			s.TodayUnpriced, s.TodayPriceable, s.TodayIncomplete, s.TodayDegraded, s.TodaySaturated))
+			s.TodayUnpriced, s.TodayPriceable, s.TodayIncomplete, s.TodayDegraded, s.TodayClamped))
 	}
 	// Guarded on Priced independently of the branch above, which lets !Priced
 	// through whenever HasToday is set. Without this guard that combination — a
@@ -375,7 +375,7 @@ func renderSpendStrip(s spendSummary, width int) string {
 		// Counts, and the ring's Add clamps exactly like the ledger's fold does, so a rolling
 		// window can overflow with no ledger anywhere near it.
 		figures = append(figures, moneyFigure(s.WindowUSD, "/"+s.WindowLabel,
-			s.Unpriced, s.Priceable, s.Incomplete, nil, s.Saturated))
+			s.Unpriced, s.Priceable, s.Incomplete, nil, s.Clamped))
 	} else if s.Unpriced > 0 && s.Priceable > 0 {
 		// The window figure is suppressed because nothing in the window was priced, so
 		// its coverage gap has no figure to ride on. It still has to be stated — this is

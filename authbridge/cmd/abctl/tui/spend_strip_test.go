@@ -1047,11 +1047,11 @@ func TestSpendSummary_CarriesTheClampDisclosureOnBothSpans(t *testing.T) {
 	m.spend.todaySnap = &usage.Snapshot{Window: usage.WindowToday, Totals: clamped, Priced: true}
 
 	out := m.spendSummary()
-	if !out.Saturated {
-		t.Error("Saturated is false; a clamped rolling window reaches no renderer")
+	if !out.Clamped {
+		t.Error("Clamped is false; a clamped rolling window reaches no renderer")
 	}
-	if !out.TodaySaturated {
-		t.Error("TodaySaturated is false; a clamped day reaches no renderer")
+	if !out.TodayClamped {
+		t.Error("TodayClamped is false; a clamped day reaches no renderer")
 	}
 	// And the figures are still published: they are floors, not unknowns, and withholding them
 	// would report measured spend as unavailable.
@@ -1073,9 +1073,9 @@ func TestSpendSummary_ACleanAggregateLeavesTheClampUnset(t *testing.T) {
 	m.spend.todaySnap = &usage.Snapshot{Window: usage.WindowToday, Totals: clean, Priced: true}
 
 	out := m.spendSummary()
-	if out.Saturated || out.TodaySaturated {
-		t.Errorf("Saturated=%v TodaySaturated=%v for an aggregate that never clamped",
-			out.Saturated, out.TodaySaturated)
+	if out.Clamped || out.TodayClamped {
+		t.Errorf("Clamped=%v TodayClamped=%v for an aggregate that never clamped",
+			out.Clamped, out.TodayClamped)
 	}
 }
 
@@ -1291,7 +1291,7 @@ func TestRenderSpendStrip_ADisclosureWithNoCountersStillMarksTheFigure(t *testin
 func TestRenderSpendStrip_AClampedFigureWearsTheShortMarkerOnEitherReading(t *testing.T) {
 	t.Run("the day", func(t *testing.T) {
 		s := spendSummary{
-			TodayUSD: 4.17, HasToday: true, TodayPriceable: 400, TodaySaturated: true,
+			TodayUSD: 4.17, HasToday: true, TodayPriceable: 400, TodayClamped: true,
 			WindowUSD: 1.12, WindowLabel: "1h", Priced: true, HasSnapshot: true, Priceable: 10,
 		}
 		got := renderSpendStrip(s, 200)
@@ -1311,7 +1311,7 @@ func TestRenderSpendStrip_AClampedFigureWearsTheShortMarkerOnEitherReading(t *te
 		s := spendSummary{
 			TodayUSD: 4.17, HasToday: true, TodayPriceable: 400,
 			WindowUSD: 1.12, WindowLabel: "1h", Priced: true, HasSnapshot: true, Priceable: 10,
-			Saturated: true,
+			Clamped: true,
 		}
 		got := renderSpendStrip(s, 200)
 		if !strings.Contains(got, damagedMarker+"$1.1200 /1h") {
@@ -1346,7 +1346,7 @@ func TestRenderSpendStrip_ACleanAggregateCarriesNoClampCaveat(t *testing.T) {
 func TestRenderSpendStrip_TheClampMarkerSurvivesNarrowing(t *testing.T) {
 	s := spendSummary{
 		TodayUSD: 4.17, HasToday: true, TodayPriceable: 400, TodayIncomplete: 7,
-		TodayUnpriced: 100, TodaySaturated: true,
+		TodayUnpriced: 100, TodayClamped: true,
 		HasSnapshot: true,
 	}
 	for w := 1; w <= 200; w++ {
@@ -1394,16 +1394,16 @@ func TestRenderSpendStrip_TheClampCaveatObeysTheWidthContract(t *testing.T) {
 		s    spendSummary
 	}{
 		{"a clamped day beside a clamped hour", spendSummary{
-			TodayUSD: 4.17, HasToday: true, TodayPriceable: 400, TodaySaturated: true,
+			TodayUSD: 4.17, HasToday: true, TodayPriceable: 400, TodayClamped: true,
 			WindowUSD: 1.12, WindowLabel: "1h", BurnPerMin: 0.0187, Priced: true,
-			HasSnapshot: true, Priceable: 318, Saturated: true,
+			HasSnapshot: true, Priceable: 318, Clamped: true,
 		}},
 		{"every caveat a day can carry at once", spendSummary{
 			TodayUSD: 0.0031, HasToday: true, TodayUnpriced: 399, TodayPriceable: 400,
-			TodayIncomplete: 7, TodaySaturated: true,
+			TodayIncomplete: 7, TodayClamped: true,
 			TodayDegraded: &usage.Degraded{SkippedLines: 1_234_567, TruncatedDays: 89},
 			WindowUSD:     1.12, WindowLabel: "過去一時間", BurnPerMin: 0.0187, Priced: true,
-			HasSnapshot: true, Unpriced: 12, Priceable: 318, Incomplete: 3, Saturated: true,
+			HasSnapshot: true, Unpriced: 12, Priceable: 318, Incomplete: 3, Clamped: true,
 			SavedUSD: 0.24, HasSaved: true,
 			Age: 3 * time.Minute, Stale: true,
 		}},

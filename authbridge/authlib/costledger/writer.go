@@ -260,10 +260,7 @@ func agentLabel(c *pipeline.EventClient) string {
 // observability. Neither a failure nor a delay here may become a failed or a slow
 // request. See the type doc for how the hand-off works.
 func (w *Writer) Record(_ string, e *pipeline.SessionEvent) {
-	if e == nil || e.Inference == nil {
-		// Non-inference traffic the proxy handled — MCP, health checks, tunnels.
-		// Recording it would put every proxied response in the cost denominator,
-		// the mistake that made a correct deployment read "1/10 priced" forever.
+	if e == nil {
 		return
 	}
 	// Terminal events only. A request event carries no token counts and no cost, so
@@ -274,7 +271,36 @@ func (w *Writer) Record(_ string, e *pipeline.SessionEvent) {
 	// would give the ledger a smaller priceable denominator than /v1/usage has for
 	// the same traffic, and the two coverage ratios would disagree for no stated
 	// reason.
+	//
+	// HOISTED ABOVE the cost-record lookup below, deliberately: costevent.Record runs a
+	// json.Unmarshal, and this whole method executes under session.Store.Append's write
+	// lock. Decoding a request event's plugin map there would put parsing work in front
+	// of every request to answer a question this guard already settles.
 	if e.Phase != pipeline.SessionResponse && e.Phase != pipeline.SessionDenied {
+		return
+	}
+	ev, hasCost := costevent.Record(e)
+	if e.Inference == nil && !(hasCost && ev.Priced()) {
+		// Non-inference traffic the proxy handled — MCP, health checks, tunnels.
+		// Recording it would put every proxied response in the cost denominator,
+		// the mistake that made a correct deployment read "1/10 priced" forever.
+		//
+		// "HAS A SETTLED COST" IS A DIFFERENT PREDICATE FROM "HAS AN INFERENCE
+		// EXTENSION", and this guard needs both because they disagree on real traffic. A
+		// health check carries neither and still returns here. But inference-parser only
+		// parses six chat/completion paths plus Anthropic Messages, so /v1/embeddings,
+		// /v1/rerank, /v1/moderations and any body it cannot read leave the extension
+		// nil — and it settles those from the gateway's own cost header anyway, because
+		// a header needs no body to be authoritative.
+		//
+		// Keying on the extension alone dropped that spend from the ledger while the ring
+		// counted it, so the same money sat in a 1h window and was absent from
+		// window=today. Both money surfaces DEFAULT to window=today, so the default view
+		// was the wrong one.
+		//
+		// PRICED, not merely present: a record that exists but priced nothing adds no
+		// dollars, so letting it through would inflate the request count without moving
+		// the money — the denominator mistake above, arriving by a different door.
 		return
 	}
 
@@ -298,8 +324,11 @@ func (w *Writer) Record(_ string, e *pipeline.SessionEvent) {
 		// day at its offset. See maxLabelLen for the measurement and the arithmetic.
 		//
 		// Host is the event's field name; endpoint is what it means here. See Row.Endpoint.
+		//
+		// Model is NOT set here. It comes from the extension, which may be nil now that a
+		// gateway-priced response the parser could not read is admitted, so it is assigned
+		// in the nil-checked block below.
 		Endpoint: truncateLabel(e.Host),
-		Model:    truncateLabel(e.Inference.Model),
 		// The calling coding agent, and part of the row KEY — two agents hitting the
 		// same endpoint and model in the same minute are two rows, not one, or a
 		// per-agent breakdown could not be reconstructed from the file at all.
@@ -312,17 +341,29 @@ func (w *Writer) Record(_ string, e *pipeline.SessionEvent) {
 		// at 128, so this is not the unbounded case Model is — but the ring truncates the
 		// same label to maxLabelLen before it becomes a byAgent key, so cutting at 96 here
 		// is what keeps group=agent spelled identically whichever half answers.
-		Agent: truncateLabel(agentLabel(e.Client)),
-		Counts: usage.Counts{
+		Agent:  truncateLabel(agentLabel(e.Client)),
+		Counts: usage.Counts{Requests: 1},
+	}
+	// NIL-SAFE, because the guard above now admits a row with no extension: an endpoint
+	// inference-parser cannot parse still gets its gateway-reported cost settled, and
+	// that event has no token counts and no model to read.
+	//
+	// The row is deliberately thin rather than absent. Model stays "", so labelFor
+	// returns ok=false for group=model and this spend drops out of THAT breakdown while
+	// still counting toward totals — which is honest, because there is no model to
+	// attribute it to. Leaving it out of the totals instead would lose real dollars.
+	if inf := e.Inference; inf != nil {
+		r.Model = truncateLabel(inf.Model)
+		r.Counts = usage.Counts{
 			Requests:         1,
-			InputTokens:      int64(e.Inference.InputTokens),
-			CacheReadTokens:  int64(e.Inference.CacheReadTokens),
-			CacheWriteTokens: int64(e.Inference.CacheWriteTokens),
-			OutputTokens:     int64(e.Inference.OutputTokens),
-			ReasoningTokens:  int64(e.Inference.ReasoningTokens),
-			Tokens:           int64(e.Inference.TotalTokens),
-			PresentKinds:     e.Inference.PresentKinds,
-		},
+			InputTokens:      int64(inf.InputTokens),
+			CacheReadTokens:  int64(inf.CacheReadTokens),
+			CacheWriteTokens: int64(inf.CacheWriteTokens),
+			OutputTokens:     int64(inf.OutputTokens),
+			ReasoningTokens:  int64(inf.ReasoningTokens),
+			Tokens:           int64(inf.TotalTokens),
+			PresentKinds:     inf.PresentKinds,
+		}
 	}
 	if e.StatusCode >= 400 || e.Phase == pipeline.SessionDenied {
 		r.Errors = 1
@@ -334,7 +375,10 @@ func (w *Writer) Record(_ string, e *pipeline.SessionEvent) {
 	}
 	// The figure authlib/costing settled. Record, not Decode: an unpriced record
 	// still exists and carries provenance, and later it carries savings.
-	if ev, ok := costevent.Record(e); ok {
+	//
+	// Reuses the lookup the admission guard above already did rather than unmarshalling
+	// the same plugin map twice under session.Store.Append's write lock.
+	if hasCost {
 		// Truncated for completeness rather than against a known threat: provenance is
 		// authored by this process's own pricing code, not by a caller. It is the fourth
 		// field of the row key, so leaving one of the four uncapped would leave the

@@ -203,15 +203,60 @@ func span(from, to time.Time) (time.Time, time.Time) {
 	return from.Truncate(time.Minute), to.Truncate(time.Minute)
 }
 
-// dayOf truncates to LOCAL midnight. Local, not UTC: "today" means the operator's
-// day, and a laptop that crosses a timezone must not have its day reset
-// mid-afternoon.
+// dayOf is the LEDGER DAY of an instant: the local calendar date it falls on, carried
+// as an instant at dayHour so the date can be formatted and walked. Local, not UTC:
+// "today" means the operator's day, and a laptop that crosses a timezone must not have
+// its day reset mid-afternoon.
 //
-// AddDate on the result is how the day walk advances, and it is DST-correct where a
-// 24h addition is not: on a spring-forward day local midnight plus 24h is 01:00 the
-// next day, which would skip the first hour of that day's file.
+// A DAY IDENTIFIER, NOT A DAY BOUNDARY. Nothing here may treat the result as the first
+// instant of the day: row filtering is done on the caller's own minute bounds (see
+// span), and this function decides only WHICH DAY FILE an instant belongs to.
+//
+// IT USED TO BE LOCAL MIDNIGHT, and that is a date that does not exist in every zone.
+// Where a DST transition falls AT 00:00 — America/Havana, America/Santiago, Asia/Beirut
+// and others — the spring-forward day has no midnight at all, and time.Date resolves a
+// time inside the gap onto the far side of it. Measured:
+//
+//	dayOf(2026-03-08 09:30 America/Havana)   = 2026-03-07 23:00  → the WRONG DATE
+//	dayOf(2026-09-06 09:30 America/Santiago) = 2026-09-05 23:00  → the WRONG DATE
+//
+// Every consequence followed from that one mapping, and all of them were money:
+// store.path named the row's file after the previous day, so the file a reader for that
+// date opens never existed; the day walk below stepped from a normalised midnight and
+// opened 2026-03-07 TWICE, counting a Havana laptop's spend for that day twice over;
+// and in Asia/Beirut, where the normalisation goes the other way, AddDate stepped PAST
+// the transition day so its spend was absent from the answer entirely. A zone whose
+// transition is at 02:00 — America/New_York — was unaffected, which is why every test
+// in this package passed: the only zone in them was a fixed offset, which has no
+// transitions and cannot express any of this. See dst_test.go.
+//
+// AddDate on the result is how the day walk advances, and it is DST-correct where a 24h
+// addition is not: a day is not always 24 hours long, so adding one would drift by the
+// transition's offset and eventually skip or repeat a date.
 func dayOf(t time.Time) time.Time {
-	return time.Date(t.Year(), t.Month(), t.Day(), 0, 0, 0, 0, t.Location())
+	y, m, d := t.Date()
+	return dayNoon(y, m, d, t.Location())
+}
+
+// dayHour is the hour of day every ledger day is represented at.
+//
+// NOON, because it is the hour furthest from both midnights. A zone's DST transition
+// moves the clock by an hour (Australia/Lord_Howe by thirty minutes), so no transition
+// can move noon into a different DATE — it would take a twelve-hour shift, which no zone
+// has. Midnight is the opposite: it sits one hour from the previous day, which is exactly
+// how a midnight inside a DST gap normalised backwards into it.
+//
+// Nothing depends on the value being 12 rather than any other mid-afternoon hour; it
+// depends on it being an hour that EXISTS on every local date, in every zone, forever.
+const dayHour = 12
+
+// dayNoon builds the ledger day for a calendar date in loc.
+//
+// The single place the dayHour convention is applied, so dayOf and store.dayFromName —
+// the two directions of the same mapping, which prune compares against each other —
+// cannot drift.
+func dayNoon(y int, m time.Month, d int, loc *time.Location) time.Time {
+	return time.Date(y, m, d, dayHour, 0, 0, 0, loc)
 }
 
 // Fold sums rows into one total, an optional per-label series, and the cost that

@@ -74,8 +74,12 @@ func newStore(dir string, retainDays int, loc *time.Location) (*store, error) {
 	return &store{dir: dir, retainDays: retainDays, loc: loc}, nil
 }
 
-// dayOf is the package dayOf resolved in the STORE's zone. The one place the day
-// boundary is decided, so path, readDay, prune and Query's day walk cannot disagree.
+// dayOf is the package dayOf resolved in the STORE's zone. The one place the day an
+// instant belongs to is decided, so path, readDay, prune and Query's day walk cannot
+// disagree.
+//
+// The result identifies a day; it is NOT that day's first instant. See the package dayOf
+// for why it is carried at noon and what a local midnight cost.
 func (s *store) dayOf(t time.Time) time.Time {
 	return dayOf(t.In(s.loc))
 }
@@ -86,6 +90,43 @@ func (s *store) dayOf(t time.Time) time.Time {
 // LEDGER DAY of t rather than whatever date t's own zone happens to print.
 func (s *store) path(t time.Time) string {
 	return filepath.Join(s.dir, s.dayOf(t).Format(dayLayout)+".jsonl")
+}
+
+// dayFromName is the inverse of path: the ledger day a day file's NAME spells, in the
+// same representation dayOf produces. Reports false for any name this package did not
+// write, so prune never dates a file it does not understand.
+//
+// PARSED IN UTC AND REBUILT IN s.loc, which is not the same thing as
+// time.ParseInLocation(dayLayout, base, s.loc) and is the whole point of the function
+// existing. ParseInLocation resolves a bare date to that day's LOCAL MIDNIGHT, and in a
+// zone whose DST transition is at 00:00 that instant does not exist — so
+// "2026-03-08.jsonl" in America/Havana came back as 2026-03-07 23:00, thirteen hours
+// before the day prune compares it against.
+//
+// WHAT THAT COSTS, stated exactly, because prune's arithmetic hides part of it. Every
+// comparison prune makes is `Before` a day derived from dayOf, so one side skewed by
+// thirteen hours decides a deletion. MEASURED, with both this and dayOf wrong: retainDays
+// 2 on 2026-03-09 in Havana unlinked the 2026-03-08 file — yesterday, inside the window.
+// With dayOf fixed and only this left wrong, the observable damage is smaller and not
+// zero: `newest` reads a day early, so the retention floor engages on a healthy host and
+// measures retention from midnight rather than from the ledger day, and at retainDays 1
+// that trips the "clock is further ahead than retention could explain" warning on every
+// prune. The reason to fix it anyway is that the two directions of this mapping are
+// compared against each other; leaving them in different representations means the next
+// change to either end is a deletion nobody predicted.
+//
+// The date TEXT has no zone in it, so parsing it in UTC cannot be ambiguous or absent;
+// the zone belongs to the day it names, which is what dayNoon applies.
+func (s *store) dayFromName(name string) (time.Time, bool) {
+	if filepath.Ext(name) != ".jsonl" {
+		return time.Time{}, false
+	}
+	d, err := time.Parse(dayLayout, name[:len(name)-len(".jsonl")])
+	if err != nil {
+		return time.Time{}, false
+	}
+	y, m, day := d.Date()
+	return dayNoon(y, m, day, s.loc), true
 }
 
 // append writes rows to whichever day files they belong to, and reports HOW MANY ROWS
@@ -516,13 +557,12 @@ func (s *store) prune(now time.Time) error {
 			continue
 		}
 		name := e.Name()
-		if filepath.Ext(name) != ".jsonl" {
-			continue
-		}
-		// s.loc, not now's zone: the names were WRITTEN in s.loc, so that is the only
-		// zone they can be read back in without the cutoff comparing two different days.
-		day, perr := time.ParseInLocation(dayLayout, name[:len(name)-len(".jsonl")], s.loc)
-		if perr != nil {
+		// dayFromName, so a name is dated in exactly the representation dayOf produces —
+		// s.loc's ledger day, at dayHour. Both sides of every `Before` below are then the
+		// same kind of instant. It used to be an inline time.ParseInLocation to local
+		// midnight, which is a date that does not exist in every zone; see dayFromName.
+		day, ok := s.dayFromName(name)
+		if !ok {
 			continue
 		}
 		days = append(days, dayEntry{name: name, day: day})

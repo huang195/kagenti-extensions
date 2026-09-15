@@ -20,15 +20,41 @@ import (
 
 // Client is a handle to a session API endpoint. Safe for concurrent use.
 //
-// Two http.Clients share a single Transport: `http` has a 10s timeout for
-// short REST calls, `httpStream` has no timeout for SSE. Sharing the
-// Transport keeps the idle-connection pool warm across reconnects so a
-// long session doesn't leak Transports.
+// Two http.Clients share a single Transport: `http` for short REST calls,
+// `httpStream` for SSE. NEITHER carries an http.Client.Timeout — the CALLER's
+// context deadline is the bound, and getJSON supplies restDefaultTimeout only
+// when the caller passed no deadline at all. Sharing the Transport keeps the
+// idle-connection pool warm across reconnects so a long session doesn't leak
+// Transports.
+//
+// The fixed timeout this used to set was 10s, which SILENTLY PRE-EMPTED any
+// caller that budgeted more: `abctl cost` allows costFetchTimeout (15s) because
+// a symbolic window reads day files off disk, and it could never reach it —
+// http.Client.Timeout and the request context are both hard stops and the
+// shorter one always wins. The comment explaining the 15s therefore described
+// behaviour that could not happen. A per-call default that DEFERS to a deadline
+// the caller set keeps the protection for callers with no deadline (the TUI
+// passes its root context to GetPipeline / GetPluginCatalog / ListSessions /
+// GetSession) without overriding one that does.
 type Client struct {
 	endpoint   string
 	http       *http.Client
 	httpStream *http.Client
 }
+
+// restDefaultTimeout bounds a REST call whose caller supplied NO deadline, so a
+// dead endpoint cannot hang a caller forever. 10s, the value the http.Client
+// carried before, because that is the bound those callers have always had — the
+// TUI's pipeline, catalog and session fetches pass the app's root context, and
+// this change is not the place to lengthen their failure time.
+//
+// A FLOOR, never a ceiling: a caller with its own deadline keeps it, shorter or
+// longer. Callers that set one (every Cost/Usage/spend poll at 5s, `abctl cost` at
+// 15s) are unaffected by this value in either direction.
+//
+// A var rather than a const so a test can shorten it and assert the behaviour in
+// milliseconds. Nothing in production writes it.
+var restDefaultTimeout = 10 * time.Second
 
 // New returns a Client pointed at endpoint (e.g. "http://localhost:9094").
 // Trailing slash is tolerated.
@@ -38,9 +64,11 @@ func New(endpoint string) *Client {
 	transport := http.DefaultTransport.(*http.Transport).Clone()
 	return &Client{
 		endpoint: trimSlash(endpoint),
+		// No Timeout on either: see the type doc. An http.Client.Timeout applies to
+		// every call this Client will ever make, so it cannot be reconciled with
+		// per-call budgets that legitimately differ by 3x.
 		http: &http.Client{
 			Transport: transport,
-			Timeout:   10 * time.Second,
 		},
 		httpStream: &http.Client{
 			Transport: transport,
@@ -171,6 +199,15 @@ func (c *Client) GetPluginCatalog(ctx context.Context) (*PluginCatalog, error) {
 }
 
 func (c *Client) getJSON(ctx context.Context, path string, out any) error {
+	// The caller's deadline governs; this only supplies one where there is none.
+	// Checked rather than applied unconditionally, because context.WithTimeout
+	// SHORTENS but never lengthens: applying it to `abctl cost`'s 15s budget would
+	// reinstate the pre-emption this replaced.
+	if _, ok := ctx.Deadline(); !ok {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, restDefaultTimeout)
+		defer cancel()
+	}
 	req, err := http.NewRequestWithContext(ctx, "GET", c.endpoint+path, nil)
 	if err != nil {
 		return err

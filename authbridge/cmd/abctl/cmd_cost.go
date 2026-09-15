@@ -16,7 +16,17 @@ import (
 
 // costFetchTimeout bounds the one request this command makes. Longer than the
 // TUI's 5s poll because there is no next poll to recover on: a slow answer beats
-// telling a user their proxy is down when it is merely busy.
+// telling a user their proxy is down when it is merely busy — and the slow answer is
+// a real case rather than a hypothetical one, because a symbolic window is served by
+// reading day files off disk instead of a ring out of memory.
+//
+// It is also the bound the request ACTUALLY gets, which it was not. apiclient carried
+// a fixed 10s http.Client.Timeout applying to every call it made; that and a context
+// deadline are both hard stops and the shorter one wins, so every fetch died at 10s
+// and the paragraph above described behaviour that could not happen. The client now
+// sets no timeout of its own and supplies a default only for a caller that passed no
+// deadline (apiclient.restDefaultTimeout), so this figure is what binds. Do not
+// lengthen it much further: a CLI that appears to hang is its own kind of wrong answer.
 const costFetchTimeout = 15 * time.Second
 
 // runCost answers "what did today cost" in a few lines.

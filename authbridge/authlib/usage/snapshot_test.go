@@ -368,6 +368,43 @@ func TestParseWindowSpec_SevenDaysIsRollingNotCalendar(t *testing.T) {
 	}
 }
 
+// A ROLLING WEEK TOUCHES EIGHT DATES, NOT SEVEN, and the difference is a day file the
+// durable ledger has to still hold. The two were confused: the cost ledger's retention
+// floor was the literal 7, so retention_days: 7 loaded cleanly and then answered
+// window:"7d" over a partial week — a figure nothing downstream could tell from a quiet
+// one. Window7dLocalDays is now the single place that says how many days this is, and
+// the floor is derived from it.
+//
+// Every hour of the day is checked, midnight included: the count has to be the same at
+// 00:00 — where the eighth date contributes a single instant, and is still a file to
+// open — as at 15:30, because a floor that holds only for part of the day is not a
+// floor.
+func TestParseWindowSpec_SevenDaysTouchesEightLocalDays(t *testing.T) {
+	for hour := 0; hour < 24; hour++ {
+		now := time.Date(2026, 9, 14, hour, 30, 0, 0, time.Local)
+		if hour == 0 {
+			now = time.Date(2026, 9, 14, 0, 0, 0, 0, time.Local)
+		}
+		spec, err := ParseWindowSpec(Window7d, now)
+		if err != nil {
+			t.Fatalf("ParseWindowSpec(%q) at %v: %v", Window7d, now, err)
+		}
+		// Whole local days from From to To inclusive, which is the walk
+		// costledger.Writer.Query makes over day files.
+		days := 0
+		day := time.Date(spec.From.Year(), spec.From.Month(), spec.From.Day(), 0, 0, 0, 0, spec.From.Location())
+		last := time.Date(spec.To.Year(), spec.To.Month(), spec.To.Day(), 0, 0, 0, 0, spec.To.Location())
+		for ; !day.After(last); day = day.AddDate(0, 0, 1) {
+			days++
+		}
+		if days != Window7dLocalDays {
+			t.Errorf("at %v, window=%q spans %d local days, want Window7dLocalDays = %d — "+
+				"a retention derived from that constant would keep the wrong number of day files",
+				now.Format("15:04"), Window7d, days, Window7dLocalDays)
+		}
+	}
+}
+
 func TestParseWindowSpec_RejectsUnknownWithoutEchoingInput(t *testing.T) {
 	const attack = "<script>alert(1)</script>"
 	_, err := ParseWindowSpec(attack, time.Now())

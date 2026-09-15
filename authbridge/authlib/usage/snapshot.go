@@ -303,6 +303,30 @@ const (
 	Window7d    = "7d"
 )
 
+// Window7dSpan is what "7d" MEANS: a rolling seven times twenty-four hours back from
+// now. Stated once, and read by ParseWindowSpec, so nothing that has to reason about
+// the span can spell it differently.
+const Window7dSpan = 7 * 24 * time.Hour
+
+// Window7dLocalDays is how many distinct LOCAL DAYS a 7d window can touch: EIGHT, not
+// seven.
+//
+// The span is rolling rather than calendar-aligned, so unless it happens to begin at
+// midnight it starts part-way through one date and ends part-way through another —
+// seven days' worth of hours spread across eight dates. Asked at 15:30 it runs from
+// 15:30 seven days ago to 15:30 today and needs a piece of every date in between, both
+// ends included. Asked exactly at midnight it needs the eighth date for one instant,
+// which is still a file to open.
+//
+// It is therefore the number of DAY FILES a durable ledger must still hold to answer
+// this window, which is why config's retention floor is derived from this rather than
+// written as its own literal. They were two constants that had to agree and did not:
+// the floor was 7, so retention_days: 7 passed validation and then answered
+// window:"7d" over a partial week — the exact case the floor exists to refuse.
+// TestParseWindowSpec_SevenDaysTouchesEightLocalDays pins the arithmetic, and
+// TestCostLedgerConfig_TheFloorCoversEveryDayTheWindowTouches pins the agreement.
+const Window7dLocalDays = int(Window7dSpan/(24*time.Hour)) + 1
+
 // Spec is a parsed window request. Either Dur is set (a fixed length the ring can
 // serve) or From/To are (a boundary only the ledger can serve).
 //
@@ -349,7 +373,10 @@ func ParseWindowSpec(s string, now time.Time) (Spec, error) {
 			To:    now,
 		}, nil
 	case Window7d:
-		return Spec{Label: Window7d, From: now.Add(-7 * 24 * time.Hour), To: now}, nil
+		// Window7dSpan rather than a second spelling of 7x24h: the ledger's retention
+		// floor is derived from the same constant, and a span defined twice is how the two
+		// came to disagree. See Window7dLocalDays.
+		return Spec{Label: Window7d, From: now.Add(-Window7dSpan), To: now}, nil
 	}
 	d, err := ParseWindow(s)
 	if err != nil {

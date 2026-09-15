@@ -64,12 +64,24 @@ type Config struct {
 }
 
 // CostLedgerConfig configures the durable cost ledger.
+//
+// NOT HOT-RELOADABLE, unlike most of this file. The reloader swaps the plugin pipeline
+// and per-plugin config in place, but the ledger is constructed once at startup and
+// handed to the session store as a recorder, so a running proxy holds whichever writer
+// it opened. Editing anything here — enabled, dir, retention_days — takes effect on
+// RESTART, and turning it off in a live config leaves the existing writer recording to
+// the old directory until the process ends.
+//
+// Worth stating rather than leaving to be discovered: an operator who edits this to stop
+// writing cost history has every reason to believe it stopped.
 type CostLedgerConfig struct {
 	// Enabled is a POINTER so "unset" and "explicitly false" are different states.
 	// The local default is on, and an operator has to be able to turn it off; with a
 	// plain bool an absent block and `enabled: false` would be the same value, so the
 	// only way to disable it would be to delete the whole block — which also discards
 	// the retention setting beside it.
+	//
+	// Takes effect on restart. See the type doc.
 	Enabled *bool `yaml:"enabled,omitempty" json:"enabled,omitempty"`
 	// Dir is where day files are written. Empty means the caller's default, which for
 	// a local install is ~/.cortex/cost — kept out of this struct so the config does

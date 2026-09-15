@@ -44,8 +44,8 @@ func TestCostLedgerConfig_UnsetAndExplicitFalseDiffer(t *testing.T) {
 	}{
 		{"no block, local default on", "mode: proxy-sidecar\n", true, true},
 		{"no block, cluster default off", "mode: proxy-sidecar\n", false, false},
-		{"block present but enabled unset, local", "mode: proxy-sidecar\ncost_ledger:\n  retention_days: 5\n", true, true},
-		{"block present but enabled unset, cluster", "mode: proxy-sidecar\ncost_ledger:\n  retention_days: 5\n", false, false},
+		{"block present but enabled unset, local", "mode: proxy-sidecar\ncost_ledger:\n  retention_days: 7\n", true, true},
+		{"block present but enabled unset, cluster", "mode: proxy-sidecar\ncost_ledger:\n  retention_days: 7\n", false, false},
 		{"explicit false beats the local default", "mode: proxy-sidecar\ncost_ledger:\n  enabled: false\n", true, false},
 		{"explicit true beats the cluster default", "mode: proxy-sidecar\ncost_ledger:\n  enabled: true\n", false, true},
 	} {
@@ -53,6 +53,15 @@ func TestCostLedgerConfig_UnsetAndExplicitFalseDiffer(t *testing.T) {
 			var c Config
 			if err := yaml.Unmarshal([]byte(tc.yaml), &c); err != nil {
 				t.Fatalf("yaml: %v", err)
+			}
+			// This table reaches LedgerEnabled without going through Validate, so an illegal
+			// value in a fixture would not fail anything — it would just quietly teach a
+			// retention the loader rejects. One of them said retention_days: 5, which stopped
+			// being legal when the 7-day floor landed beside it.
+			if c.CostLedger != nil {
+				if verr := c.CostLedger.Validate(); verr != nil {
+					t.Errorf("fixture is not a config this loader would accept: %v", verr)
+				}
 			}
 			if got := c.CostLedger.LedgerEnabled(tc.defaultOn); got != tc.want {
 				t.Errorf("LedgerEnabled(%v) = %v, want %v", tc.defaultOn, got, tc.want)

@@ -12,6 +12,34 @@ import (
 	"github.com/rossoctl/cortex/authbridge/authlib/pipeline"
 )
 
+// eventKey pins a row to a specific event across rebuilds, so the
+// cursor follows the same event when the underlying slice shifts:
+// FIFO eviction at session.max_events, filter typed, hideInactive
+// toggled. Zero value = unpinned. `at` is UnixNano so struct == is
+// safe against time.Time's monotonic clock and Location pointer.
+type eventKey struct {
+	at        int64
+	direction pipeline.Direction
+	phase     pipeline.SessionPhase
+	requestID string
+}
+
+func keyOf(e *pipeline.SessionEvent) eventKey {
+	if e == nil {
+		return eventKey{}
+	}
+	return eventKey{at: e.At.UnixNano(), direction: e.Direction, phase: e.Phase, requestID: e.RequestID}
+}
+
+func findByKey(rows []eventRow, k eventKey) int {
+	for i, r := range rows {
+		if keyOf(r.event) == k {
+			return i
+		}
+	}
+	return -1
+}
+
 // newEventsTable builds an empty events table. Uses the shared tableStyles
 // (including the Reverse-based Selected highlight) like the other panes —
 // now safe because per-cell ANSI coloring was removed from this table.
@@ -188,9 +216,24 @@ func (m *model) rebuildEventsTable() {
 	// the target row — which on a pane rebuilt by a two-second poll is the common
 	// case, and is what keeps the poll from scrolling the rows out from under a
 	// reader who had arrowed back up from the tail.
+	//
+	// Restore precedence: tail-follow, then identity pin, then prevRow. The pin
+	// resolves to whatever row currently holds the selected event, so the cursor
+	// tracks the event through FIFO eviction at session.max_events.
 	target := prevRow
-	if wasAtEnd {
+	switch {
+	case wasAtEnd:
 		target = len(rows) - 1
+	case m.selectedEventKey != (eventKey{}):
+		if idx := findByKey(m.visibleRows, m.selectedEventKey); idx >= 0 {
+			target = idx
+		} else {
+			// Event evicted — clamp to the oldest surviving row (row 0),
+			// the nearest edge to where the pin was, and drop the stale
+			// key so internal state matches what the operator sees.
+			target = 0
+			m.selectedEventKey = eventKey{}
+		}
 	}
 	setCursorVisible(&m.eventsTbl, target)
 }

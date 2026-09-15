@@ -2,6 +2,7 @@ package tui
 
 import (
 	"encoding/json"
+	"fmt"
 	"testing"
 	"time"
 
@@ -1000,5 +1001,136 @@ func TestRowActionSurfacesTunnelReason(t *testing.T) {
 	action, _ = rowAction(eventRow{event: denied}, invs)
 	if action == tunnelAction {
 		t.Error("a denied CONNECT was relabelled 'tunnel'; the deny must headline")
+	}
+}
+
+// eventSeq builds n events with distinct keys — At and RequestID vary
+// per index so keyOf discriminates one from another.
+func eventSeq(n int, prefix string) []pipeline.SessionEvent {
+	events := make([]pipeline.SessionEvent, n)
+	for i := range events {
+		events[i] = pipeline.SessionEvent{
+			At:        time.Time{}.Add(time.Duration(i) * time.Millisecond),
+			RequestID: fmt.Sprintf("%s%d-req", prefix, i),
+			Direction: pipeline.Outbound,
+			Phase:     pipeline.SessionRequest,
+			Host:      fmt.Sprintf("%s%d", prefix, i),
+			Inference: &pipeline.InferenceExtension{Model: "m"},
+		}
+	}
+	return events
+}
+
+func newEventsPaneModel(events []pipeline.SessionEvent) *model {
+	m := &model{
+		pane: paneEvents, selectedSess: "s", bodyHeight: 12,
+		events: map[string][]pipeline.SessionEvent{"s": events},
+	}
+	m.eventsTbl = newEventsTable()
+	m.rebuildEventsTable()
+	return m
+}
+
+// TestSelectedEventKey_SurvivesEviction locks in the identity restore:
+// after FIFO eviction the cursor follows the pinned event by key.
+func TestSelectedEventKey_SurvivesEviction(t *testing.T) {
+	events := eventSeq(10, "e")
+	m := newEventsPaneModel(events)
+	m.eventsTbl.SetCursor(5)
+	m.selectedEventKey = keyOf(m.selectedEvent())
+	want := m.selectedEvent().Host
+
+	m.events["s"] = append(events[3:], eventSeq(5, "n")...)
+	m.rebuildEventsTable()
+
+	if got := m.selectedEvent().Host; got != want {
+		t.Errorf("selection lost: got %s, want %s", got, want)
+	}
+}
+
+// TestSelectedEventKey_TailWinsOverPin — a cursor at the last row keeps
+// tailing on append, so live sessions keep scrolling.
+func TestSelectedEventKey_TailWinsOverPin(t *testing.T) {
+	events := eventSeq(5, "e")
+	m := newEventsPaneModel(events)
+	m.eventsTbl.SetCursor(4)
+	m.selectedEventKey = keyOf(m.selectedEvent())
+
+	m.events["s"] = append(events, eventSeq(2, "n")...)
+	m.rebuildEventsTable()
+
+	if got, want := m.eventsTbl.Cursor(), len(m.eventsTbl.Rows())-1; got != want {
+		t.Errorf("tail didn't follow: cursor=%d, want %d", got, want)
+	}
+}
+
+// TestSelectedEventKey_EvictedPinClampsToOldestSurvivor — when the
+// pinned event is gone, the cursor lands on the oldest surviving row
+// (the nearest edge to where the pin was) and the stale key clears.
+func TestSelectedEventKey_EvictedPinClampsToOldestSurvivor(t *testing.T) {
+	events := eventSeq(10, "e")
+	m := newEventsPaneModel(events)
+	m.eventsTbl.SetCursor(2)
+	m.selectedEventKey = keyOf(m.selectedEvent())
+
+	m.events["s"] = events[5:] // pinned e2 evicted; e5 is now oldest
+	m.rebuildEventsTable()
+
+	if got := m.eventsTbl.Cursor(); got != 0 {
+		t.Errorf("cursor=%d, want 0 (oldest survivor)", got)
+	}
+	if got := m.selectedEvent().Host; got != "e5" {
+		t.Errorf("cursor's event = %s, want e5 (oldest survivor)", got)
+	}
+	if m.selectedEventKey != (eventKey{}) {
+		t.Errorf("stale pin retained: %+v", m.selectedEventKey)
+	}
+}
+
+// TestSelectedEventKey_UpdatedOnCursorMotion — every cursor-motion
+// keypress refreshes the pin to the new row. Arrow keys and j/k route
+// through handleKey's paneEvents fallback; page keys via pageActivePane.
+func TestSelectedEventKey_UpdatedOnCursorMotion(t *testing.T) {
+	cases := []struct {
+		name string
+		msg  tea.KeyMsg
+	}{
+		{"arrow-down", tea.KeyMsg{Type: tea.KeyDown}},
+		{"j", tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("j")}},
+		{"page-down", tea.KeyMsg{Type: tea.KeyPgDown}},
+		{"f", tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("f")}},
+		{"G", tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("G")}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			m := newEventsPaneModel(eventSeq(10, "e"))
+			// newEventsPaneModel tails to the last row; start at 0 so
+			// KeyDown / PgDn have room to move.
+			m.eventsTbl.SetCursor(0)
+			before := m.eventsTbl.Cursor()
+
+			m2, _ := m.Update(tc.msg)
+			m = m2.(*model)
+
+			if m.eventsTbl.Cursor() == before {
+				t.Fatalf("cursor did not move for %q; test would pass vacuously", tc.name)
+			}
+			if got, want := m.selectedEventKey, keyOf(m.selectedEvent()); got != want {
+				t.Errorf("pin=%+v, want cursor's event %+v", got, want)
+			}
+		})
+	}
+}
+
+// TestKeyOf_SameInstantSameKey — a time.Now() At and its JSON
+// round-tripped form (stripped monotonic + different Location)
+// produce the same eventKey, so findByKey matches under struct ==.
+func TestKeyOf_SameInstantSameKey(t *testing.T) {
+	now := time.Now()
+	roundTripped := now.UTC().Round(0)
+	a := keyOf(&pipeline.SessionEvent{At: now, RequestID: "r"})
+	b := keyOf(&pipeline.SessionEvent{At: roundTripped, RequestID: "r"})
+	if a != b {
+		t.Errorf("keys differ for same instant:\n  a: %+v\n  b: %+v", a, b)
 	}
 }

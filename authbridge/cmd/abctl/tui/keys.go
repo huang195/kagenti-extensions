@@ -565,6 +565,9 @@ func (m *model) handleKey(msg tea.KeyMsg) tea.Cmd {
 						delete(m.events, cached)
 					}
 				}
+				// Clear only on an actual session change, so
+				// re-entering the same session keeps the pin.
+				m.selectedEventKey = eventKey{}
 			}
 			m.selectedSess = id
 			m.pane = paneEvents
@@ -692,6 +695,7 @@ func (m *model) handleKey(msg tea.KeyMsg) tea.Cmd {
 	case paneEvents:
 		var cmd tea.Cmd
 		m.eventsTbl, cmd = m.eventsTbl.Update(msg)
+		m.selectedEventKey = keyOf(m.selectedEvent())
 		return cmd
 	case paneDetail, panePluginDetail:
 		var cmd tea.Cmd
@@ -751,6 +755,7 @@ func (m *model) goTop() {
 		setCursorVisible(&m.sessionsTbl, 0)
 	case paneEvents:
 		setCursorVisible(&m.eventsTbl, 0)
+		m.selectedEventKey = keyOf(m.selectedEvent())
 	case panePipeline:
 		setCursorVisible(&m.pipelineTbl, 0)
 	case paneDetail, panePluginDetail:
@@ -764,6 +769,7 @@ func (m *model) goBottom() {
 		setCursorVisible(&m.sessionsTbl, len(m.sessionsTbl.Rows())-1)
 	case paneEvents:
 		setCursorVisible(&m.eventsTbl, len(m.eventsTbl.Rows())-1)
+		m.selectedEventKey = keyOf(m.selectedEvent())
 	case panePipeline:
 		setCursorVisible(&m.pipelineTbl, len(m.pipelineTbl.Rows())-1)
 	case paneCatalog:
@@ -795,6 +801,7 @@ func (m *model) pageActivePane(msg tea.KeyMsg) tea.Cmd {
 	switch m.pane {
 	case paneEvents:
 		page(&m.eventsTbl)
+		m.selectedEventKey = keyOf(m.selectedEvent())
 	case paneSessions:
 		page(&m.sessionsTbl)
 	case panePipeline:

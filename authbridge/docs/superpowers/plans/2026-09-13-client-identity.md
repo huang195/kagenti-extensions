@@ -34,6 +34,39 @@
 > **Line numbers drift.** Every `file.go:NN` below was accurate when written and many
 > have moved. Read them as "roughly here" and find the symbol by name — Task 2 already
 > tells you to locate the event sites by grep for exactly this reason.
+>
+> ---
+>
+> **SECOND SWEEP, 2026-09-15. The coverage gap above is still open, verified:**
+> `authlib/listener/reverseproxy/server.go` still has four `SessionEvent{` constructions
+> and not one `Client:` or `ClientInfo()` in the package. Every inbound event still carries
+> a nil `Client` and pools under the reserved bucket. Nothing here has been quietly closed.
+>
+> Three things this plan says about the design are no longer accurate:
+>
+> - **Only ONE client is recognised.** The `EventClient` sketch in Task 1 comments its
+>   `Name` field as `"claude-code" | "opencode" | "codex" | "" when unrecognised`, which
+>   reads as three implemented parsers. `knownClients` holds exactly `claude-cli` →
+>   `claude-code`. OpenCode and Codex are deliberately absent, and the code says why: a
+>   wrong guess files one agent silently under another's name, where an unrecognised agent
+>   still reports under its `Raw` value and can be identified from the breakdown. That is
+>   the `Raw`-as-well-as-`Name` argument in Task 1 paying off, not a gap.
+> - **The absent-client question Task 3 Step 1 leaves open was decided, and then made a
+>   compiler problem.** The ledger stores `""` and the aggregator keys on `Label()`; both
+>   reach the same bucket through `pipeline.UnknownClientLabel`, exported by `00d85b14` for
+>   exactly the reason Step 1 worries about — it was a bare literal in two packages,
+>   agreeing only by a comment saying it must, and two spellings would surface as two rows
+>   each holding half the unattributed spend. `costledger.labelFor`'s `GroupAgent` arm is
+>   the one grouping axis that *labels* an absent value rather than dropping the row.
+> - **`Label()`'s doc records an undefended collision** the plan does not anticipate: a
+>   caller sending literally `User-Agent: unknown` lands in the reserved bucket. Not
+>   defended, and the reasoning is worth keeping — the axis is spoofable by construction,
+>   so the same caller could claim `claude-cli/2.1.14` and land in a real agent's row
+>   instead. Reserving the word would buy nothing.
+>
+> Two internal contradictions have been fixed inline below: Task 1 Step 4 still told you to
+> add a `Client` field to `pipeline.Context`, and Task 2 Step 5 still named `pctx.Client` as
+> the line to delete. Both are the design this plan's own Task 1 says it replaced.
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
@@ -271,7 +304,7 @@ Expected: FAIL — `undefined: ParseUserAgent`. The drift guard should **pass** 
 
 Create `client.go` with `maxClientLen = 128` (long enough for any real UA prefix; the cap's reasoning mirrors `usage.maxLabelLen`). Recognise `claude-cli/` → `claude-code`. Keep the recognised set small and add a comment that `toolscan/known.go` already hardcodes Claude Code's built-in tool names, so Claude Code is the only agent with full support today and the others arrive with their own detection work.
 
-Add `Client *EventClient` to `SessionEvent` and `sessionEventWire`, and to both mapping functions. Add `Client *EventClient` to `pipeline.Context`.
+Add `Client *EventClient` to `SessionEvent` and `sessionEventWire`, and to both mapping functions. ~~Add `Client *EventClient` to `pipeline.Context`.~~ **No — that last sentence is the design this task's own redesign note replaced, left standing when the rest of the section was rewritten.** `Context` gets the unexported memo pair from Task 2 Step 3 (`client *EventClient`, `clientParsed bool`) and the `ClientInfo()` accessor. An exported field would be a second source of a truth `Context.Headers` already holds, and ten-odd event sites would each have to remember to fill it.
 
 - [ ] **Step 5: GREEN, then the whole package**
 
@@ -424,7 +457,7 @@ For the one or two sites that build an event from an `*http.Request` with no `pc
 
 Run: `go test ./authlib/pipeline/ ./authlib/listener/... 2>&1 | tail -10`
 
-- [ ] **Step 5: Mutation-check the wiring.** For each event site you edited, delete the `Client: pctx.Client` line, confirm a test fails, restore, and confirm `git diff` shows the file byte-identical. If deleting a site fails nothing, that site is untested — say which in your report rather than leaving it silent. This is the same discipline that caught an unwired `settleCost` call earlier on this branch.
+- [ ] **Step 5: Mutation-check the wiring.** For each event site you edited, delete the `Client: pctx.ClientInfo()` line — `pctx.Client`, as an earlier revision of this step wrote it, is the replaced design and no such field exists — confirm a test fails, restore, and confirm `git diff` shows the file byte-identical. If deleting a site fails nothing, that site is untested — say which in your report rather than leaving it silent. This is the same discipline that caught an unwired `settleCost` call earlier on this branch.
 
 - [ ] **Step 6: Do not commit yet.**
 

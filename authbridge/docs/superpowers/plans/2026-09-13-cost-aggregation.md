@@ -20,8 +20,50 @@
 >   prescribes.
 >
 > **Line numbers drift.** Every `file.go:NN` below was accurate when written; many have
-> moved since — `fold` is at `snapshot.go:345`, not the `:159-210` cited under Global
-> Constraints. Read them as "roughly here" and find the symbol by name.
+> moved since — `fold` is at `snapshot.go:438`, not the `:159-210` cited under Global
+> Constraints, and not the `:345` an earlier revision of this line gave. Read them as
+> "roughly here" and find the symbol by name.
+>
+> ---
+>
+> **SECOND SWEEP, 2026-09-15.** Two more review rounds have landed since the four
+> follow-ups above. Three things this plan *prescribes* are no longer what the tree says,
+> all of them in Task 3's replacement godoc — which matters more than usual, because that
+> task's whole deliverable is documentation, so a stale prescription here is a stale
+> comment there:
+>
+> - **Costing is `authlib/costing`, not `inference-parser`.** `3cc6b790` moved the
+>   attribution: a gateway's cost-header semantics are vendor-specific knowledge with no
+>   place in a provider-shaped body parser, so the decision lives in its own package and
+>   the parser *calls* it at the point the token counters are final. The paragraph this
+>   task tells you to write credits the parser with owning the rule.
+> - **"Cost used to be computed in four places" is two.** `costing`'s own account is
+>   `litellm-budget-track` and the usage aggregator. Four was #972's count, which included
+>   two client-side renderers of a figure someone else published.
+> - **budget-track AMENDS the settled record**, it does not consume it. The distinction is
+>   load-bearing: no settled record meant no enforcement, which is why a body-less priced
+>   response escaped the budget as well as the chart.
+>
+> Also in that task, and in the same class as the `ParseGroup` note the banner already
+> makes: **the `group` parameter line gained `session` and `agent`.** The shipped line is
+> `none (default), model, endpoint, session, agent, status, plugin`. Adding a grouping
+> without extending both that list and the disclosure block is the drift to watch for —
+> the endpoint then answers 400 for a value it does not accept while failing to name one
+> it does, and leaks an axis the block exists to make explicit.
+>
+> **`Counts` has gained a field since**, and the constraint that says every new one must be
+> summed in `Add` held: `IncompleteRequests` (`d82d1a70`, `589615c7`) counts the priced
+> requests whose figure is a floor rather than an exact number, and `Add` sums it
+> *alongside* `PricedRequests` rather than out of it, because it is a subset disclosure and
+> not a deduction. `Snapshot` gained `IncompleteBy` (`47b992f8`), which says which *way*
+> each of those figures is inexact, and `Degraded` (`f5d52045`), which a ledger-backed
+> window uses to admit that its read lost rows. None of that contradicts this plan; it is
+> listed so a reader does not take the field table below for the current one.
+>
+> One small mis-citation, in the `tokens` correction under Global Constraints: the sentence
+> quoted there is real, but it is not on `Counts.Tokens`. `Tokens` carries no godoc of its
+> own; "Tokens is NOT always the sum of the fields below" sits on the four split fields
+> that follow it, which is where this plan's Task 1 Step 3 put them.
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
@@ -711,6 +753,15 @@ Replace the paragraph beginning "costMicros is populated from the per-request fi
 // dollars here. litellm-budget-track now consumes the settled figure to enforce a
 // budget rather than computing one of its own.
 ```
+
+**Do not paste that block as it stands** — three of its claims were corrected by `3c0fe57e`
+and `3cc6b790` and the banner's second sweep gives the reasoning: the settling component is
+`authlib/costing`, which the parser *calls*; cost used to be decided in **two** places, not
+four; and `litellm-budget-track` **amends** the settled record rather than consuming it. The
+`group` line above it is likewise two values short of the shipped one. Left in place because
+the *shape* of the correction — name the component, name what it replaced, say why the old
+answer varied by plugin composition — is the point, and the shipped paragraph is that same
+shape with the right nouns in it.
 
 Extend the disclosure block. Add to the existing bullet list:
 

@@ -123,6 +123,41 @@ func pluginUsesSPIFFEIdentity(p config.PluginEntry) bool {
 	return probe.Identity.Type == spiffeIdentityType
 }
 
+// warnCostLedgerNeedsSessions says out loud that the cost ledger will not run
+// because session tracking is off. Safe to call unconditionally — it checks both
+// settings itself, and stays silent when there is nothing to report.
+//
+// The ledger records by being registered as a Recorder on the session store, and the
+// whole block that constructs it is nested inside `if cfg.Session.SessionEnabled()`.
+// With sessions off it is therefore unreachable rather than merely idle — and it used
+// to be unreachable in complete silence: no error, no warning, not one log line
+// naming the ledger, so an operator whose cost history was empty had to read main.go
+// to find out why.
+//
+// The explicit contradiction (`cost_ledger.enabled: true` with `session.enabled:
+// false`) is refused at load by config.Validate, so it never reaches here. What
+// reaches here is the DEFAULT-ON case: a local install has the ledger on without
+// anyone writing it down, and turning sessions off there is a legitimate choice that
+// still silently costs the cost history. Only this binary knows which default
+// applies, which is why the line is emitted here rather than in the config package.
+//
+// Names both settings, because the fix is a decision between them and a message that
+// named only one would send the reader to the wrong file.
+func warnCostLedgerNeedsSessions(cfg *config.Config, localMode bool, logger *slog.Logger) {
+	if logger == nil {
+		logger = slog.Default()
+	}
+	if cfg.Session.SessionEnabled() || !cfg.CostLedger.LedgerEnabled(localMode) {
+		return
+	}
+	logger.Warn("cost ledger will NOT run — session tracking is disabled",
+		"cost_ledger.enabled", true,
+		"session.enabled", false,
+		"reason", "the ledger records through the session store (registered as a Recorder on it), so with the store off nothing reaches it",
+		"effect", "no durable cost history; window=today and window=7d have nothing to read",
+		"fix", "set session.enabled: true, or cost_ledger.enabled: false to say the ledger is not wanted")
+}
+
 func main() {
 	configPath := flag.String("config", "", "path to config YAML file")
 	showVersion := flag.Bool("version", false, "print version and exit")
@@ -448,6 +483,14 @@ func main() {
 	} else {
 		slog.Info("session tracking disabled")
 	}
+	// Outside the branch on purpose: the ledger block above is nested inside
+	// `if cfg.Session.SessionEnabled()`, so with sessions off it is not merely
+	// disabled but unreachable, and this is the only place that knows which
+	// deployment default applied. The helper decides for itself whether there is
+	// anything to say, so this call is unconditional rather than branch-local —
+	// a warning that only exists down one arm of an if is the shape that produced
+	// the silence in the first place.
+	warnCostLedgerNeedsSessions(cfg, localMode, slog.Default())
 
 	var httpServers []*http.Server
 

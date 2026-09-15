@@ -211,3 +211,65 @@ func TestMinCostLedgerRetentionDays_MatchesTheWindowItProtects(t *testing.T) {
 			usage.Window7dLocalDays)
 	}
 }
+
+// The ledger has no path to an event without the session store: it records by being
+// registered as a Recorder on it, and the block that constructs it in
+// authbridge-proxy's main is nested inside `if cfg.Session.SessionEnabled()`. This
+// pair used to load, validate, report success, and write nothing — with no error, no
+// warning, and no log line naming the ledger anywhere.
+//
+// Refused rather than warned because no deployment decision can make it work: the two
+// settings contradict each other. The message has to name BOTH, since the fix is a
+// choice between them.
+func TestValidate_RefusesTheLedgerWithoutSessions(t *testing.T) {
+	on, off := true, false
+	c := &Config{
+		Mode:       ModeProxySidecar,
+		Listener:   forwardOnlyListener(),
+		Session:    SessionConfig{Enabled: &off},
+		CostLedger: &CostLedgerConfig{Enabled: &on},
+	}
+	err := Validate(c)
+	if err == nil {
+		t.Fatal("cost_ledger.enabled: true with session.enabled: false accepted; " +
+			"the ledger is registered as a Recorder on the session store, so it can never see an event")
+	}
+	for _, want := range []string{"cost_ledger", "session"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("error %q does not name %q — the fix is a choice between the two settings", err, want)
+		}
+	}
+}
+
+// The refusal must be narrow. It fires on an EXPLICIT `enabled: true` only, because an
+// absent `enabled` means "the caller's default" — on for a local install, off in
+// Kubernetes — and failing startup over a default nobody wrote would break a
+// deployment that legitimately runs with sessions off. The default-on case is a Warn
+// at the call site instead (warnCostLedgerNeedsSessions in cmd/authbridge-proxy).
+func TestValidate_TheLedgerSessionRefusalIsNarrow(t *testing.T) {
+	on, off := true, false
+	for _, tc := range []struct {
+		name string
+		cfg  *Config
+	}{
+		{"sessions on, ledger on", &Config{Mode: ModeProxySidecar, Listener: forwardOnlyListener(), Session: SessionConfig{Enabled: &on}, CostLedger: &CostLedgerConfig{Enabled: &on}}},
+		{"sessions unset (defaults on), ledger on", &Config{Mode: ModeProxySidecar, Listener: forwardOnlyListener(), CostLedger: &CostLedgerConfig{Enabled: &on}}},
+		{"sessions off, ledger block present but enabled unset", &Config{Mode: ModeProxySidecar, Listener: forwardOnlyListener(), Session: SessionConfig{Enabled: &off}, CostLedger: &CostLedgerConfig{RetentionDays: 8}}},
+		{"sessions off, ledger explicitly off", &Config{Mode: ModeProxySidecar, Listener: forwardOnlyListener(), Session: SessionConfig{Enabled: &off}, CostLedger: &CostLedgerConfig{Enabled: &off}}},
+		{"sessions off, no ledger block", &Config{Mode: ModeProxySidecar, Listener: forwardOnlyListener(), Session: SessionConfig{Enabled: &off}}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if err := Validate(tc.cfg); err != nil {
+				t.Errorf("rejected a legitimate config: %v", err)
+			}
+		})
+	}
+}
+
+// forwardOnlyListener is the --local listener shape: proxy-sidecar with the forward
+// role only, which is the deployment the cost ledger actually runs in. Spelled here
+// so these fixtures exercise validateCostLedger rather than tripping the reverse
+// role's reverse_proxy_backend requirement first.
+func forwardOnlyListener() ListenerConfig {
+	return ListenerConfig{Roles: []string{RoleForward}}
+}

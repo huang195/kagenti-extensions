@@ -532,6 +532,78 @@ func TestHandleUsage_LedgerBackedWindowGroupsByModel(t *testing.T) {
 	}
 }
 
+// THE SHORTFALL A group=model BREAKDOWN LEAVES HAS TO REACH THE WIRE, or a client
+// summing it cannot tell an incomplete series from a complete one.
+//
+// The ledger keeps a gateway-priced response the inference parser could not read
+// (/v1/embeddings, /v1/rerank) as a row with no model, so it counts toward Totals and
+// cannot be a group=model key. costledger.Fold computes that residual; this pins that
+// ledgerSnapshot carries it out to the JSON.
+func TestHandleUsage_LedgerBackedModelSeriesDisclosesWhatItLeavesOut(t *testing.T) {
+	at := time.Now().Add(-2 * time.Minute)
+	led := ledgerWithOneCostedMinute(t, at, "gw", "opus", 0.10)
+	// A second row in the same minute: priced by the gateway, with no Inference extension
+	// at all. A different composite key, so it is its own row.
+	rec, err := json.Marshal(costevent.Event{
+		CostUSD: 0.25, Settled: true,
+		Source: costevent.SourceGatewayHeader, Provenance: "authoritative",
+	})
+	if err != nil {
+		t.Fatalf("marshal cost record: %v", err)
+	}
+	led.Record("s1", &pipeline.SessionEvent{
+		At: at, Phase: pipeline.SessionResponse, StatusCode: 200, Host: "gw",
+		Plugins: map[string]json.RawMessage{costevent.Key: rec},
+	})
+	if ferr := led.Flush(); ferr != nil {
+		t.Fatalf("Flush: %v", ferr)
+	}
+	ts, _ := newTestServer(t, WithUsage(usage.New()), WithCostLedger(led))
+
+	status, body := fetchUsage(t, ts.URL, "?window=today&group=model")
+	if status != http.StatusOK {
+		t.Fatalf("status = %d, want 200: %s", status, body)
+	}
+	var snap usage.Snapshot
+	if uerr := json.Unmarshal([]byte(body), &snap); uerr != nil {
+		t.Fatalf("decode: %v (%s)", uerr, body)
+	}
+	if snap.Totals.CostMicros != 350_000 {
+		t.Fatalf("Totals.CostMicros = %d, want 350000 — both rows are real spend: %s",
+			snap.Totals.CostMicros, body)
+	}
+	var sum int64
+	for _, b := range snap.Buckets {
+		for _, c := range b.Series {
+			sum += c.CostMicros
+		}
+	}
+	if snap.UngroupedCostMicros == nil {
+		t.Fatalf("no ungroupedCostMicros while the series accounts for %d of %d micros: a client "+
+			"summing the breakdown is short and nothing in the response explains it: %s",
+			sum, snap.Totals.CostMicros, body)
+	}
+	if sum+*snap.UngroupedCostMicros != snap.Totals.CostMicros {
+		t.Errorf("series (%d) + ungrouped (%d) != totals (%d): %s",
+			sum, *snap.UngroupedCostMicros, snap.Totals.CostMicros, body)
+	}
+}
+
+// The other half of the convention: absent, not zero, when the breakdown accounts for
+// every dollar. Same reasoning as TestHandleUsage_ACleanLedgerReadCarriesNoDegradedBlock.
+func TestHandleUsage_ALedgerWindowWithNothingUngroupedOmitsTheField(t *testing.T) {
+	led := ledgerWithOneCostedMinute(t, time.Now().Add(-2*time.Minute), "gw", "opus", 0.25)
+	ts, _ := newTestServer(t, WithUsage(usage.New()), WithCostLedger(led))
+
+	status, body := fetchUsage(t, ts.URL, "?window=today&group=model")
+	if status != http.StatusOK {
+		t.Fatalf("status = %d, want 200: %s", status, body)
+	}
+	if strings.Contains(body, "ungroupedCostMicros") {
+		t.Errorf("a window whose series carries every dollar serialised the residual: %s", body)
+	}
+}
+
 // A symbolic window with session= is refused, not quietly answered with
 // all-sessions data under a session label. See the guard in handleUsage for why the
 // refusal is unconditional.

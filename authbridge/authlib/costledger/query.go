@@ -144,20 +144,38 @@ func dayOf(t time.Time) time.Time {
 	return time.Date(t.Year(), t.Month(), t.Day(), 0, 0, 0, 0, t.Location())
 }
 
-// Fold sums rows into one total plus an optional per-label series, in the shape
-// /v1/usage already serves.
+// Fold sums rows into one total, an optional per-label series, and the cost that
+// series does not account for, in the shape /v1/usage already serves.
 //
 // Returns usage.Counts and a Group-keyed map so an HTTP handler need not branch on
 // whether the data came from the ring or from disk. Summation is Counts.Add, so a
 // field added there is carried here with no edit — the same property that keeps
 // fold() and abctl's (other)-band collapse correct.
-func Fold(rows []Row, group usage.Group) (usage.Counts, map[string]usage.Counts) {
+//
+// The THIRD return is the dollars of every row this grouping had to skip, for
+// usage.Snapshot.UngroupedCostMicros. A row with no value for the requested axis counts
+// toward the total and cannot be a series key — a gateway-priced /v1/embeddings
+// response is stored with Model "" — so summing the series gives a smaller number than
+// the total beside it, and this is the size of that difference. Zero for a group where
+// usage.Group.Reconcilable is false, which is what keeps a group that offers no
+// reconciliation from reporting its whole total as a residual.
+//
+// Counted HERE rather than left to the caller as totals-minus-series, because this is
+// the loop that decides what to skip. A caller deriving it would be re-deriving a
+// number this function already knows exactly, and would get it wrong for any axis whose
+// series is not a partition.
+func Fold(rows []Row, group usage.Group) (usage.Counts, map[string]usage.Counts, int64) {
 	var totals usage.Counts
 	var series map[string]usage.Counts
+	var ungrouped int64
+	reconcilable := group.Reconcilable()
 	for _, r := range rows {
 		totals.Add(r.Counts)
 		label, ok := labelFor(r, group)
 		if !ok {
+			if reconcilable {
+				ungrouped += r.CostMicros
+			}
 			continue
 		}
 		if series == nil {
@@ -167,7 +185,7 @@ func Fold(rows []Row, group usage.Group) (usage.Counts, map[string]usage.Counts)
 		cur.Add(r.Counts)
 		series[label] = cur
 	}
-	return totals, series
+	return totals, series, ungrouped
 }
 
 // unknownAgentLabel is the reserved DISPLAY bucket for traffic that carried no

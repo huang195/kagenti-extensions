@@ -1,6 +1,7 @@
 package usage
 
 import (
+	"encoding/json"
 	"fmt"
 	"strings"
 	"testing"
@@ -41,6 +42,119 @@ func TestSnapshot_GroupModelReturnsTheModelSeries(t *testing.T) {
 	}
 	if got := series["claude-haiku-4-5"].InputTokens; got != 20 {
 		t.Errorf("claude-haiku-4-5 InputTokens = %d, want 20", got)
+	}
+}
+
+// A GATEWAY-PRICED RESPONSE WITH NO MODEL COUNTS TOWARD THE TOTAL AND CANNOT BE A
+// group=model KEY, so a client summing the breakdown got a smaller number than the
+// total beside it with nothing in the response to explain the difference.
+//
+// inference-parser reads six chat/completion paths plus Anthropic Messages, so
+// /v1/embeddings and /v1/rerank arrive with no Inference extension — and costOf still
+// settles them from the gateway's own cost header. foldInto guards byMethod on a
+// non-empty model, so that spend lands in the bucket total and in no series entry. This
+// is the RING half of the claim Snapshot.UngroupedCostMicros makes about both window
+// kinds; TestFold_GatewayPricedRowWithNoModelIsDisclosedAsUngrouped is the ledger half.
+func TestSnapshot_GatewayPricedTrafficWithNoModelIsDisclosedAsUngrouped(t *testing.T) {
+	now := time.Now().Truncate(BucketWidth)
+	a := New(WithClock(func() time.Time { return now }))
+
+	// A model the parser read, priced.
+	a.Record("s1", withCost(t, respEvent(now, 200, time.Second, "claude-opus-5", 1000), 0.10))
+	// And a response it could not: no model, no tokens, a real settled cost.
+	a.Record("s1", withCost(t, respEvent(now, 200, time.Second, "", 0), 0.25))
+
+	snap := a.Snapshot(10*BucketWidth, BucketWidth, "s1", GroupModel)
+
+	if snap.Totals.CostMicros != 350_000 {
+		t.Fatalf("Totals.CostMicros = %d, want 350000 — both responses are real spend", snap.Totals.CostMicros)
+	}
+	series := mergeSeries(snap.Buckets)
+	if got := series["claude-opus-5"].CostMicros; got != 100_000 {
+		t.Errorf("series[claude-opus-5].CostMicros = %d, want 100000; series = %v", got, series)
+	}
+	if snap.UngroupedCostMicros == nil {
+		t.Fatalf("UngroupedCostMicros is absent while the group=model series accounts for only "+
+			"%d of %d micros: a client summing the breakdown is short by 250000 dollars-worth "+
+			"and nothing in the response says so", seriesCost(series), snap.Totals.CostMicros)
+	}
+	if *snap.UngroupedCostMicros != 250_000 {
+		t.Errorf("UngroupedCostMicros = %d, want 250000", *snap.UngroupedCostMicros)
+	}
+	// The arithmetic the field exists to restore, asserted rather than assumed.
+	if sum := seriesCost(series) + *snap.UngroupedCostMicros; sum != snap.Totals.CostMicros {
+		t.Errorf("series (%d) + ungrouped (%d) = %d, want Totals.CostMicros = %d",
+			seriesCost(series), *snap.UngroupedCostMicros, sum, snap.Totals.CostMicros)
+	}
+}
+
+// ABSENT, NOT ZERO, when the breakdown accounts for everything — the Degraded
+// convention. A `"ungroupedCostMicros":0` on every clean response would read as
+// "checked, complete" from paths that check nothing (group=none, group=plugin), which is
+// the same false reassurance as $0.00 over unpriced traffic.
+func TestSnapshot_AWindowWhoseSeriesAccountsForEverythingCarriesNoUngroupedField(t *testing.T) {
+	now := time.Now().Truncate(BucketWidth)
+	a := New(WithClock(func() time.Time { return now }))
+	a.Record("s1", withCost(t, respEvent(now, 200, time.Second, "claude-opus-5", 1000), 0.10))
+
+	snap := a.Snapshot(10*BucketWidth, BucketWidth, "s1", GroupModel)
+
+	if snap.UngroupedCostMicros != nil {
+		t.Errorf("UngroupedCostMicros = %d on a window whose series carries every dollar; "+
+			"absence is how a client tells a complete breakdown from a short one", *snap.UngroupedCostMicros)
+	}
+	body, err := json.Marshal(snap)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	if strings.Contains(string(body), "ungroupedCostMicros") {
+		t.Errorf("a clean window serialised the field: %s", body)
+	}
+}
+
+// The two groups that offer no reconciliation must not report one.
+//
+// group=none asks for no breakdown, so a residual equal to the whole total would appear
+// on the DEFAULT request and read as a fault. group=plugin's series counts one request
+// once per plugin, so totals-minus-series is not a residual there at all — and with one
+// request touching no plugin and another touching two, the shortfall and the duplication
+// cancel to a plausible zero, which is why Group.Reconcilable refuses it rather than
+// clamping it. See that method.
+func TestSnapshot_GroupsThatCannotReconcileReportNoUngroupedCost(t *testing.T) {
+	now := time.Now().Truncate(BucketWidth)
+	a := New(WithClock(func() time.Time { return now }))
+	a.Record("s1", withCost(t, respEvent(now, 200, time.Second, "", 0), 0.25))
+
+	for _, g := range []Group{GroupNone, GroupPlugin} {
+		snap := a.Snapshot(10*BucketWidth, BucketWidth, "s1", g)
+		if snap.UngroupedCostMicros != nil {
+			t.Errorf("group=%s reported ungrouped cost %d; that group has no series to be short of",
+				g, *snap.UngroupedCostMicros)
+		}
+		if g.Reconcilable() {
+			t.Errorf("Group(%s).Reconcilable() = true; it has no reconcilable breakdown", g)
+		}
+	}
+}
+
+// Summed from the RAW buckets, like Totals: a client that asked for coarser bars must
+// get the same residual as one that asked for fine ones, or the reconciliation would
+// hold at one resolution and fail at another.
+func TestSnapshot_UngroupedCostIsUnaffectedByTheRequestedResolution(t *testing.T) {
+	now := time.Now().Truncate(BucketWidth)
+	a := New(WithClock(func() time.Time { return now }))
+	a.Record("s1", withCost(t, respEvent(now, 200, time.Second, "", 0), 0.25))
+
+	fine := a.Snapshot(10*BucketWidth, BucketWidth, "s1", GroupModel)
+	coarse := a.Snapshot(10*BucketWidth, 5*BucketWidth, "s1", GroupModel)
+	if fine.UngroupedCostMicros == nil || coarse.UngroupedCostMicros == nil {
+		t.Fatalf("one of the two windows disclosed nothing: fine = %v, coarse = %v",
+			fine.UngroupedCostMicros, coarse.UngroupedCostMicros)
+	}
+	if *fine.UngroupedCostMicros != *coarse.UngroupedCostMicros {
+		t.Errorf("ungrouped cost = %d at %v resolution and %d at %v: it must be summed from the "+
+			"raw buckets, exactly like Totals", *fine.UngroupedCostMicros, BucketWidth,
+			*coarse.UngroupedCostMicros, 5*BucketWidth)
 	}
 }
 

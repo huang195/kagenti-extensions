@@ -161,6 +161,75 @@ func TestQuery_CorruptLineMidFileSkipsOnlyThatLine(t *testing.T) {
 	if total != 800 {
 		t.Errorf("CostMicros total = %d, want 800 (100 + 300 + 400)", total)
 	}
+	// J4: the skip has to be VISIBLE. It was counted into a local and logged at
+	// slog.Debug, below the default level, so in production this figure was
+	// indistinguishable from a complete one.
+	if got := w.SkippedLines(); got != 1 {
+		t.Errorf("SkippedLines() = %d, want 1; a caller has no other way to tell this "+
+			"800 from a day that really only cost 800", got)
+	}
+	if got := w.TruncatedDays(); got != 0 {
+		t.Errorf("TruncatedDays() = %d, want 0 — the read stepped over the damage and finished", got)
+	}
+}
+
+// A skip and an abandoned tail are different sizes of loss, so they are reported
+// separately: a skip costs the lines it names, and a truncation costs the rest of the
+// file by an amount the file cannot state.
+func TestQuery_AnAbandonedDayIsReportedSeparatelyFromSkippedLines(t *testing.T) {
+	dir := t.TempDir()
+	base := time.Date(2026, 9, 13, 9, 0, 0, 0, time.Local)
+	writeDay(t, dir, base,
+		line(base, "gw", "m", 1, 10, 5, 100),
+		`{"at":"2026-09-13T09:01:00Z"`,                     // one skippable line
+		`{"at":"`+strings.Repeat("x", maxLineBytes+1)+`"}`, // and then the wall
+		line(base.Add(3*time.Minute), "gw", "m", 1, 40, 5, 400),
+	)
+	w := newTestWriter(t, dir, func() time.Time { return base })
+
+	if _, err := w.Query(base, base.Add(time.Hour)); err != nil {
+		t.Fatalf("Query: %v", err)
+	}
+	if got := w.SkippedLines(); got != 1 {
+		t.Errorf("SkippedLines() = %d, want 1", got)
+	}
+	if got := w.TruncatedDays(); got != 1 {
+		t.Errorf("TruncatedDays() = %d, want 1; a day the reader gave up on must not be "+
+			"served as a complete one", got)
+	}
+}
+
+// GAUGES, not counters. A day file with one corrupt line is re-read on every
+// /v1/usage request, so a cumulative count would climb forever over one piece of
+// damage and read as a fault that is getting worse.
+func TestQuery_ReadIssuesReportTheLastReadNotAllOfThem(t *testing.T) {
+	dir := t.TempDir()
+	base := time.Date(2026, 9, 13, 9, 0, 0, 0, time.Local)
+	writeDay(t, dir, base,
+		line(base, "gw", "m", 1, 10, 5, 100),
+		`{"at":"2026-09-13T09:01:00Z"`,
+	)
+	w := newTestWriter(t, dir, func() time.Time { return base })
+
+	for i := 0; i < 3; i++ {
+		if _, err := w.Query(base, base.Add(time.Hour)); err != nil {
+			t.Fatalf("Query %d: %v", i, err)
+		}
+		if got := w.SkippedLines(); got != 1 {
+			t.Fatalf("after read %d SkippedLines() = %d, want 1 — one line of damage must not "+
+				"read as %d lines of damage because it was queried %d times", i+1, got, got, i+1)
+		}
+	}
+
+	// And a clean read clears it, or the gauge would outlive the file it described.
+	clean := base.AddDate(0, 0, -1)
+	writeDay(t, dir, clean, line(clean, "gw", "m", 1, 10, 5, 100))
+	if _, err := w.Query(clean, clean.Add(time.Hour)); err != nil {
+		t.Fatalf("Query: %v", err)
+	}
+	if got := w.SkippedLines(); got != 0 {
+		t.Errorf("SkippedLines() = %d after reading a clean day, want 0", got)
+	}
 }
 
 // The exact byte pattern the old write path produced: a fragment with no trailing
@@ -221,6 +290,12 @@ func TestQuery_LineBeyondTheBufferLimitEndsThatDay(t *testing.T) {
 	}
 	if len(got) != 1 || got[0].CostMicros != 100 {
 		t.Errorf("got %+v, want the one row that preceded the oversized line", got)
+	}
+	// And it must SAY SO. A truncated day served as a complete one is how the short
+	// figure reaches a client as window:"today", priced:true with no caveat.
+	if w.TruncatedDays() != 1 {
+		t.Errorf("TruncatedDays() = %d, want 1 — a day abandoned part-way must be visible "+
+			"to the caller, not only in a log line", w.TruncatedDays())
 	}
 }
 

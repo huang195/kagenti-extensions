@@ -415,6 +415,73 @@ func TestWriter_IOFailureDoesNotPropagate(t *testing.T) {
 	w.Record("s1", costedEvent(t, "gw", "m", 0.25, 100, 50))
 }
 
+// blockDayFile puts a DIRECTORY where the day file for t belongs, so every append to
+// it fails with EISDIR.
+//
+// A directory rather than a 0o500 parent because EISDIR applies to root too: a test
+// that depends on a permission bit passes or fails depending on who runs it, and this
+// one is asserting accounting, not permissions.
+func blockDayFile(t *testing.T, w *Writer, when time.Time) {
+	t.Helper()
+	if err := os.Mkdir(w.store.path(when), 0o700); err != nil {
+		t.Fatalf("mkdir %s: %v", w.store.path(when), err)
+	}
+}
+
+// A failed append is a PERMANENT loss of that minute, because takeLocked advanced
+// flushedThrough and emptied the map before the write ran — deliberately, since a
+// re-held minute could be written twice. So the row exists nowhere afterwards, and
+// Dropped(), the only exported "is my cost history complete" signal, answered 0 over
+// it. TestWriter_IOFailureDoesNotPropagate asserts the error does not reach the
+// request; this asserts the loss is not hidden from the operator.
+func TestWriter_AFailedAppendIsCountedAsADrop(t *testing.T) {
+	dir := t.TempDir()
+	now := at
+	w := newTestWriter(t, dir, func() time.Time { return now })
+	blockDayFile(t, w, at)
+
+	w.Record("s1", costedEvent(t, "gw", "m", 0.25, 100, 50))
+	now = at.Add(time.Minute)
+	if err := w.Flush(); err == nil {
+		t.Fatal("Flush reported success writing to a path that is a directory; " +
+			"the premise of this test is that the append fails")
+	}
+
+	if got := w.Dropped(); got != 1 {
+		t.Errorf("Dropped() = %d after an append that lost one row, want 1; 0 is a ledger "+
+			"reporting itself complete over a minute of spend that no longer exists anywhere", got)
+	}
+	// And the row really is gone from memory too, which is what makes the loss
+	// permanent rather than merely delayed: takeLocked emptied the accumulator before
+	// the write was attempted.
+	if held, open := w.pending(); len(held) != 0 || !open.IsZero() {
+		t.Errorf("the accumulator still holds %d rows (open %v); the row was not lost, so "+
+			"this test is not measuring what it claims", len(held), open)
+	}
+}
+
+// The append can fail for a whole batch, not just one row, and the count is the row
+// count rather than the batch count.
+func TestWriter_AFailedAppendCountsEveryRowInTheBatch(t *testing.T) {
+	dir := t.TempDir()
+	now := at
+	w := newTestWriter(t, dir, func() time.Time { return now })
+	blockDayFile(t, w, at)
+
+	// Three distinct keys in one minute, so the batch carries three rows.
+	for _, model := range []string{"opus", "sonnet", "haiku"} {
+		w.Record("s1", costedEvent(t, "gw", model, 0.25, 100, 50))
+	}
+	now = at.Add(time.Minute)
+	if err := w.Flush(); err == nil {
+		t.Fatal("Flush reported success writing to a path that is a directory")
+	}
+
+	if got := w.Dropped(); got != 3 {
+		t.Errorf("Dropped() = %d, want 3 — the count is rows lost, not batches failed", got)
+	}
+}
+
 // The J6 bound. The model name is request-chosen, so without a cap the accumulator
 // grows to whatever a caller sends — 50,000 keys held for one minute was measured,
 // and every one of them is also copied by takeLocked under mu inside
@@ -564,14 +631,61 @@ func TestWriter_FlushStraddlingMidnightSplitsByDay(t *testing.T) {
 	}
 }
 
+// stalledWriter is a Writer with NO writer goroutine and a queue of the given depth,
+// which is how a unit test stands in for a filesystem that has stopped responding:
+// nothing drains w.ops, so enqueue reaches its default arm for real.
+//
+// Built by hand because New always starts the goroutine, and w.store is deliberately
+// left nil — add, foldLocked and enqueue are pure memory, so a change that started
+// writing from the request path would nil-panic here rather than pass quietly.
+func stalledWriter(depth int, clock func() time.Time) *Writer {
+	return &Writer{
+		now:        clock,
+		rows:       map[key]*Row{},
+		ops:        make(chan batch, depth),
+		quit:       make(chan struct{}),
+		dropNotify: make(chan struct{}, dropNotifyDepth),
+	}
+}
+
 // The property finding 3 is about: a filesystem that has stopped responding must not
 // reach the request path. Record is called under session.Store's write lock, so a
-// blocking hand-off would stall every other request in the proxy.
+// blocking hand-off would stall every other request in the proxy. A blocking
+// implementation hangs here rather than failing.
 //
-// Closing the writer first leaves nothing draining the queue, which is the only way a
-// unit test can stand in for a hung mount. A blocking implementation would hang here
-// rather than fail.
+// The count is asserted EXACTLY. It used to be "not zero", which passed against an
+// implementation that lost 1,024 rows and counted 49.
 func TestRecord_DropsRatherThanBlocksWhenTheWriterCannotKeepUp(t *testing.T) {
+	const depth, events = 4, 20
+	now := at
+	w := stalledWriter(depth, func() time.Time { return now })
+
+	// Each new minute closes the previous one, so this is one queued batch of one row
+	// per event after the first, and the last minute stays in the accumulator.
+	for i := 0; i < events; i++ {
+		now = at.Add(time.Duration(i) * time.Minute)
+		e := costedEvent(t, "gw", "m", 0.25, 100, 50)
+		e.At = now
+		w.Record("s1", e)
+	}
+
+	if got, want := w.Dropped(), int64(events-1-depth); got != want {
+		t.Errorf("Dropped() = %d, want %d (%d rolled minutes, %d of them queued); "+
+			"a drop that is not counted is a cost total short by an unknown amount",
+			got, want, events-1, depth)
+	}
+	// Nothing is unaccounted for: queued + dropped + held == recorded.
+	held, _ := w.pending()
+	if got := int64(len(w.ops)) + w.Dropped() + int64(len(held)); got != events {
+		t.Errorf("accounted for %d rows of %d recorded", got, events)
+	}
+}
+
+// The J2 undercount, measured: after Close the writer goroutine is gone, so a
+// non-blocking send lands in a buffer nobody will ever read again. 1,024 rows sat in
+// w.ops for the life of the process while Dropped() answered 49 — a 21x undercount,
+// and the shutdown warning quoted that same wrong number.
+func TestRecord_AfterCloseIsCountedRatherThanParkedInTheQueue(t *testing.T) {
 	dir := t.TempDir()
 	now := at
 	w := newTestWriter(t, dir, func() time.Time { return now })
@@ -579,17 +693,112 @@ func TestRecord_DropsRatherThanBlocksWhenTheWriterCannotKeepUp(t *testing.T) {
 		t.Fatalf("Close: %v", err)
 	}
 
-	// Each new minute closes the previous one, so this is one queued batch per event.
-	for i := 0; i < opsBuffer+50; i++ {
+	const events = opsBuffer + 50
+	for i := 0; i < events; i++ {
 		now = at.Add(time.Duration(i) * time.Minute)
 		e := costedEvent(t, "gw", "m", 0.25, 100, 50)
 		e.At = now
 		w.Record("s1", e)
 	}
 
-	if w.Dropped() == 0 {
-		t.Error("Dropped() = 0 after overrunning the queue; a drop that is not counted " +
-			"is a cost total that is short by an unknown amount")
+	onDisk := int64(len(readAllRows(t, dir)))
+	held, _ := w.pending()
+	if got, want := w.Dropped()+onDisk+int64(len(held)), int64(events); got != want {
+		t.Errorf("accounted for %d rows of %d recorded (dropped %d, on disk %d, held %d); "+
+			"a row in none of the three is a loss Dropped() denies",
+			got, want, w.Dropped(), onDisk, len(held))
+	}
+	if stuck := len(w.ops); stuck != 0 {
+		t.Errorf("%d batches are parked in the queue with no goroutine to read them", stuck)
+	}
+}
+
+// The other half of J2: a batch that reaches the queue between Close's drain and the
+// point at which enqueue starts counting is unwritable, and so is a row a racing
+// Record folds back into the accumulator after Close's Flush emptied it. Both are
+// hand-seeded here, because the real race is a few instructions wide.
+func TestClose_CountsWhatIsLeftInTheQueueAndTheAccumulator(t *testing.T) {
+	dir := t.TempDir()
+	now := at
+	w, err := New(dir, WithClock(func() time.Time { return now }), WithSettleInterval(0))
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+
+	// Two rows the writer goroutine will never see, exactly as a send landing in the
+	// window Close cannot close would leave them. Queued before Close so the drain
+	// WRITES them; the accumulator row below is the one Close has to count.
+	w.Record("s1", costedEvent(t, "gw", "opus", 0.25, 100, 50))
+	w.Record("s1", costedEvent(t, "gw", "sonnet", 0.25, 100, 50))
+
+	if cerr := w.Close(); cerr != nil {
+		t.Fatalf("Close: %v", cerr)
+	}
+	// Close flushed both, so nothing is lost yet.
+	if got := w.Dropped(); got != 0 {
+		t.Fatalf("Dropped() = %d before anything was lost", got)
+	}
+
+	// Now the two states Close has to account for, seeded directly.
+	w.ops <- batch{rows: []Row{{At: at, Endpoint: "gw", Model: "haiku"}}}
+	w.mu.Lock()
+	w.rows[key{endpoint: "gw", model: "opus"}] = &Row{At: at, Endpoint: "gw", Model: "opus"}
+	w.mu.Unlock()
+
+	// A second Close is a no-op (closeOnce), so drive the accounting directly — this is
+	// the code Close runs after wg.Wait.
+	if lost := w.abandon(); lost != 2 {
+		t.Errorf("abandon() = %d, want 2 (one queued row, one held row)", lost)
+	}
+	if held, _ := w.pending(); len(held) != 0 {
+		t.Errorf("the accumulator still holds %d rows after abandon; they would be counted twice", len(held))
+	}
+}
+
+// N3: closed must be set AFTER the writer goroutine has stopped. While it was set
+// first, submit's inline-write branch and the draining goroutine could both be in
+// writeLines on one day file, each with a rollback size from its own Stat.
+func TestClose_MarksClosedOnlyAfterTheGoroutineHasStopped(t *testing.T) {
+	dir := t.TempDir()
+	now := at
+	w := newTestWriter(t, dir, func() time.Time { return now })
+
+	if w.closed.Load() {
+		t.Fatal("closed before Close was called")
+	}
+	if err := w.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	if !w.closed.Load() {
+		t.Error("not closed after Close returned; submit would queue work to a goroutine that has gone")
+	}
+	// The ordering itself: with closed set before close(quit), a Flush racing the drain
+	// would write inline alongside the goroutine. Asserted through the observable
+	// consequence — Close waits, so by the time it returns the goroutine is done and an
+	// inline write is the ONLY writer.
+	select {
+	case <-w.quit:
+	default:
+		t.Error("quit is still open after Close; the goroutine was never asked to stop")
+	}
+}
+
+// A shutdown path may call Close twice — the second call must not report success over
+// the first call's failure, or a retrying shutdown concludes the ledger was flushed.
+func TestClose_RepeatsTheFirstError(t *testing.T) {
+	dir := t.TempDir()
+	now := at
+	w := newTestWriter(t, dir, func() time.Time { return now })
+	blockDayFile(t, w, at)
+	w.Record("s1", costedEvent(t, "gw", "m", 0.25, 100, 50))
+
+	first := w.Close()
+	if first == nil {
+		t.Fatal("Close over a blocked day file returned nil; the premise of this test is that the flush fails")
+	}
+	if second := w.Close(); second == nil {
+		t.Error("the second Close returned nil over a shutdown that lost a minute; " +
+			"a retrying caller would conclude the ledger was flushed")
 	}
 }
 

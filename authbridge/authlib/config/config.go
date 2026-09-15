@@ -78,8 +78,29 @@ type CostLedgerConfig struct {
 	Dir string `yaml:"dir,omitempty" json:"dir,omitempty"`
 	// RetentionDays is how many day files survive. Zero means the package default of
 	// 30, which is roughly 10 MB.
+	//
+	// A non-zero value must be at least minCostLedgerRetentionDays; see there.
 	RetentionDays int `yaml:"retention_days,omitempty" json:"retention_days,omitempty"`
 }
+
+// minCostLedgerRetentionDays is the floor a NON-ZERO retention_days has to clear.
+//
+// The usage API serves window=7d, and it serves it from these day files. With
+// retention_days: 2, six of the eight local days a 7d window spans have already been
+// deleted, the ledger reads nothing for each of them, and the response still says
+// window:"7d", priced:true over two days of spend. Nothing downstream can tell that
+// figure from a genuinely quiet week — the label is the same, the priced flag is the
+// same, and the number is wrong by however much was pruned.
+//
+// Refused at load rather than clamped, because the operator who chose the number is
+// the one who should learn that the window they will be served does not mean what it
+// says. Zero is untouched by the floor and still means "the package default" (30).
+//
+// This does NOT cover the other half of the same defect: an install younger than 7
+// days has no files for the missing days either, and answers window:"7d" over however
+// long it has been running. Retention is not what limits that, so it cannot be fixed
+// here — it needs the response to carry the span actually covered.
+const minCostLedgerRetentionDays = 7
 
 // LedgerEnabled reports whether the ledger should run, given the default for this
 // deployment shape.
@@ -98,6 +119,12 @@ func (c *CostLedgerConfig) LedgerEnabled(defaultOn bool) bool {
 func (c *CostLedgerConfig) Validate() error {
 	if c.RetentionDays < 0 {
 		return fmt.Errorf("cost_ledger.retention_days must not be negative, got %d", c.RetentionDays)
+	}
+	if c.RetentionDays > 0 && c.RetentionDays < minCostLedgerRetentionDays {
+		return fmt.Errorf("cost_ledger.retention_days must be at least %d, or 0 for the default: "+
+			"the usage API serves window=7d from these day files, so a shorter retention "+
+			"reports a partial week as a full one, got %d",
+			minCostLedgerRetentionDays, c.RetentionDays)
 	}
 	return nil
 }

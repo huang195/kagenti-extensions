@@ -68,16 +68,25 @@ func (w *Writer) Window(from, to time.Time) ([]Row, error) {
 // Reads only what the Writer has flushed — closed minutes. Prefer Window, which
 // adds the open minute; this is the disk half on its own, kept separate so
 // "only closed minutes reach disk" stays directly testable.
+// PUBLISHES WHAT IT COULD NOT READ, on SkippedLines and TruncatedDays. A day file
+// that lost lines, or one whose read was abandoned part-way, otherwise produced
+// exactly the same answer as a clean one — a short total labelled priced:true with no
+// caveat anywhere in it.
 func (w *Writer) Query(from, to time.Time) ([]Row, error) {
 	fromMin, toMin := span(from, to)
 
 	var out []Row
+	var skipped, truncated int64
 	// Walk dates rather than globbing the directory: the read stays bounded by the
 	// span the caller asked for instead of by how long the ledger has been running.
 	for d := dayOf(fromMin); !d.After(dayOf(toMin)); d = d.AddDate(0, 0, 1) {
-		rows, err := w.store.readDay(d)
+		rows, issues, err := w.store.readDay(d)
 		if err != nil {
 			return nil, err
+		}
+		skipped += int64(issues.skippedLines)
+		if issues.truncated {
+			truncated++
 		}
 		for _, r := range rows {
 			if m := r.At.Truncate(time.Minute); m.Before(fromMin) || m.After(toMin) {
@@ -86,6 +95,10 @@ func (w *Writer) Query(from, to time.Time) ([]Row, error) {
 			out = append(out, r)
 		}
 	}
+	// Stored, not added: these are gauges for the read that just happened. See
+	// SkippedLines for why a cumulative counter would be the wrong shape.
+	w.skippedLines.Store(skipped)
+	w.truncatedDays.Store(truncated)
 	return out, nil
 }
 

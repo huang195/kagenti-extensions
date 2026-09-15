@@ -330,6 +330,26 @@ func ParseResolution(s string, window time.Duration) (time.Duration, error) {
 	if d > window {
 		return 0, fmt.Errorf("resolution %s exceeds the %s window", d, window)
 	}
+	// The window must divide by the resolution, or the NEWEST bucket is a lie.
+	//
+	// fold() emits a partial trailing group rather than truncating it — deliberately,
+	// because the still-filling block is the one an operator is watching — but every
+	// bucket is labelled with the same BucketSeconds. So window=10m at resolution=3m
+	// returned four buckets of which the last covered ONE minute while claiming 180
+	// seconds, and a client deriving a burn rate from the newest bar tripled it.
+	//
+	// Rejected here rather than papered over downstream: the caller asked for a slicing
+	// this window cannot express, and serving a differently-sized bucket under the
+	// requested label would be a wrong number wearing a right label. A client that
+	// wants the fine bar picks a window the resolution divides.
+	//
+	// FIXED LITERAL, no interpolation. This endpoint is unauthenticated, so an error
+	// body must never reflect caller-supplied bytes back — see ParseGroup. The messages
+	// above interpolate only a re-stringified time.Duration, which cannot carry
+	// arbitrary bytes; this one needs neither operand to be actionable.
+	if window%d != 0 {
+		return 0, errors.New("resolution does not divide the window evenly (the newest bucket would be shorter than the width reported for it)")
+	}
 	return d, nil
 }
 
@@ -479,6 +499,12 @@ func (a *Aggregator) Snapshot(window, resolution time.Duration, sessionID string
 	// request was a truncated stream must not report "cost unavailable" over a real
 	// non-zero total. Its inexactness is disclosed by Totals.IncompleteRequests, never by
 	// withholding the figure.
+	//
+	// The COUNTER, never CostMicros > 0. A window whose every request was DECLARED FREE
+	// by the gateway — a settled zero — has priced requests and no dollars, and reading
+	// the total would report it "cost unavailable". Those are different truths: false
+	// must render "cost unavailable", a declared-free window must render $0.0000. See
+	// costevent.Event.Settled, and TestPricing_SettledZeroIsNotRePriced, which pins it.
 	out.Priced = out.Totals.PricedRequests > 0
 
 	// Fold last: totals are summed from the raw buckets above and are unaffected

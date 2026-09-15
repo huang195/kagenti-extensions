@@ -283,8 +283,61 @@ func TestPricing_SettledZeroIsNotRePriced(t *testing.T) {
 	if snap.Totals.PricedRequests != 1 {
 		t.Errorf("PricedRequests = %d, want 1 — a settled zero IS priced", snap.Totals.PricedRequests)
 	}
+	// The DECLARED-FREE case for the Priced flag, and the only place it is pinned.
+	//
+	// Snapshot derives Priced from PricedRequests, never from CostMicros: this window
+	// has a settled figure and no dollars, so reading the dollar total would report
+	// "cost unavailable" for traffic the gateway explicitly priced at zero. A client
+	// must render $0.0000 here and "cost unavailable" only when Priced is false — two
+	// different truths that a CostMicros test collapses into one.
+	if !snap.Priced {
+		t.Error("Priced = false for a settled-zero window: a declared-free call is priced, and a client would report cost unavailable for a total the gateway actually stated")
+	}
 	if len(snap.UnpricedBy) != 0 {
 		t.Errorf("UnpricedBy = %v, want empty", snap.UnpricedBy)
+	}
+}
+
+// TestPricing_AbsurdHeaderFigureCannotWrapTheAggregate is the aggregate side of
+// costevent's unbounded conversion.
+//
+// A gateway header of 1e13 became MaxInt64 micros, and Counts.Add is plain int64
+// addition, so TWO such requests wrapped the window total to −2 micros — verified on
+// arm64. Nothing re-derives that total: the ring forgets it in six hours, the durable
+// ledger keeps it thirty days.
+//
+// The figure is refused as a PRICE (costevent.Event.Priced is false for it), so the
+// aggregator falls through to its rate table and reports what the tokens actually cost.
+// That is the point of refusing rather than clamping: the request stays measured, and
+// the number reported is one this code can defend.
+func TestPricing_AbsurdHeaderFigureCannotWrapTheAggregate(t *testing.T) {
+	now := time.Now().Truncate(BucketWidth)
+	a := New(WithClock(func() time.Time { return now }),
+		WithPricing(resolverFor(t, "claude-opus-5", 5.0/1e6, 25.0/1e6)))
+
+	raw, err := json.Marshal(costevent.Event{
+		CostUSD: 1e13, Source: costevent.SourceGatewayHeader,
+		Provenance: "authoritative", Settled: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 2; i++ {
+		ev := pricedRespEvent("gw.internal", "claude-opus-5", 1000, 500)
+		ev.Plugins = map[string]json.RawMessage{costevent.Key: raw}
+		a.Record("s1", ev)
+	}
+
+	snap := snapshotOf(a, now)
+	if snap.Totals.CostMicros < 0 {
+		t.Fatalf("CostMicros = %d: two saturated figures wrapped the aggregate negative", snap.Totals.CostMicros)
+	}
+	// The modelled fallback, twice: 1000*5 + 500*25 = 17500 micros per request.
+	if want := int64(35_000); snap.Totals.CostMicros != want {
+		t.Errorf("CostMicros = %d, want %d — the table's figure, not the header's garbage", snap.Totals.CostMicros, want)
+	}
+	if got := snap.PricedBy["authoritative"]; got != 0 {
+		t.Errorf("PricedBy[authoritative] = %d, want 0 — an out-of-range figure carries no authority", got)
 	}
 }
 

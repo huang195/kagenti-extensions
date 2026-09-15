@@ -8,14 +8,17 @@
 // aggregator — which is the duplication cortex #910 exists to remove.
 //
 // Dependency-light on purpose: the aggregator links this on every build,
-// including the trimmed "lite" images that exclude the plugin entirely.
+// including the trimmed "lite" images that exclude the plugin entirely. authlib/pricing
+// is the one non-pipeline dependency, for the single micros bound both packages must
+// agree on (see Micros); every importer of this package already links it, so nothing
+// grew a new transitive dependency.
 package costevent
 
 import (
 	"encoding/json"
-	"math"
 
 	"github.com/rossoctl/cortex/authbridge/authlib/pipeline"
+	"github.com/rossoctl/cortex/authbridge/authlib/pricing"
 )
 
 // Key is the session-event key the cost record is published under.
@@ -217,7 +220,26 @@ func (e Event) TotalAvoidedUSD() float64 {
 // exact and JSON round-tripping lossless, which float dollars are not. A cost
 // below half a micro rounds to 0 while still counting as priced — a real
 // sub-micro charge, not an unknown one.
-func (e Event) Micros() int64 { return int64(math.Round(e.CostUSD * 1e6)) }
+//
+// BOUNDED, through the same pricing.MicrosFromUSD that prices a token tally. This
+// was `int64(math.Round(e.CostUSD * 1e6))` with no bound at all while pricing.Cost
+// guarded the identical conversion and called the unguarded form "a garbage ledger
+// figure". The header path accepts any finite non-negative float, so a gateway
+// reporting 1e13 saturated to MaxInt64 and two such requests wrapped usage.Counts.Add
+// to −2 micros — an aggregate that then sat in the durable ledger for thirty days
+// with no repair path.
+//
+// Zero for an out-of-range figure, and Priced returns false for the same one, so no
+// consumer reaches this value believing it is a price. NOT clamped to the bound: a
+// clamped figure is a wrong number wearing a right label, and unpriced is the honest
+// answer for a figure this package cannot represent.
+func (e Event) Micros() int64 {
+	m, ok := pricing.MicrosFromUSD(e.CostUSD)
+	if !ok {
+		return 0
+	}
+	return m
+}
 
 // Priced reports whether this record carries a usable dollar figure.
 //
@@ -228,8 +250,17 @@ func (e Event) Micros() int64 { return int64(math.Round(e.CostUSD * 1e6)) }
 // A settled zero is priced: the producer means "this call was free". An unsettled zero is
 // not: it means nobody priced this, and rendering $0.00 for it would report unpriced
 // traffic as free. A negative figure is never a price.
+//
+// Nor is a figure OUT OF RANGE for the micros unit every consumer accumulates in —
+// above pricing.MaxCostMicros, or NaN, or an infinity. This is the validation point:
+// the producer's header path accepts any finite non-negative float, and nothing
+// downstream re-derives a total once a saturated value has been added to it. Unpriced
+// rather than clamped, for the reason in Micros.
 func (e Event) Priced() bool {
 	if e.CostUSD < 0 {
+		return false
+	}
+	if _, ok := pricing.MicrosFromUSD(e.CostUSD); !ok {
 		return false
 	}
 	return e.CostUSD > 0 || e.Settled

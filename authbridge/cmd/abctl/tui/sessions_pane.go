@@ -165,7 +165,20 @@ const costElision = "…"
 // width <= 0 means the caller found no such column — a table whose columns have not been
 // fitted yet. Render the figure: the declared width is 10 and holds everything below five
 // figures of dollars.
+//
+// A NEGATIVE amount renders blank, which in this table means "unpriced / unknown" — the
+// same refusal costTotalSection and sessionCost make, restated at the last step before a
+// figure reaches the screen. formatUSDCell is faithful about the sign, so this cell
+// printed "$-5.0000" and a minus sign in a column of costs reads as a refund nobody
+// issued. sessionCost already declines to return one, which makes this the SECOND layer
+// on purpose: the amount arrives here as a bare float64 with nothing on it to say where
+// it came from, and every other money formatter in the package is reachable from a caller
+// this one cannot see. See negativeCost — the guarantee is upstream and this is defence
+// in depth.
 func fitCostCell(usd float64, inexact bool, width int) string {
+	if usd < 0 {
+		return ""
+	}
 	cell := formatUSDCell(usd)
 	if inexact {
 		cell = inexactMarker + cell

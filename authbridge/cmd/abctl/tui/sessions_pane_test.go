@@ -598,3 +598,56 @@ func TestSessionCost_UnknownCases(t *testing.T) {
 		})
 	}
 }
+
+// TestFitCostCell_ANegativeAmountRendersBlank.
+//
+// The last step before a figure reaches the screen, and the fourth money surface that was
+// inheriting the server's no-negative-cost guarantee without restating it. formatUSDCell
+// is faithful about the sign, so this cell printed "$-5.0000".
+//
+// Blank, not costElision: the ellipsis means "a figure exists and did not fit", which
+// would be a claim that an impossible number is a real one. Blank means unpriced, which is
+// what this is — the same reading sessionCost's priced=false already has in this table.
+//
+// Every width, including the ones where a positive figure of the same magnitude elides:
+// the refusal must not depend on the fitting decision.
+func TestFitCostCell_ANegativeAmountRendersBlank(t *testing.T) {
+	for _, w := range []int{0, 4, 5, 7, 10, 20} {
+		if got := fitCostCell(-5, false, w); got != "" {
+			t.Errorf("fitCostCell(-5, false, %d) = %q, want blank", w, got)
+		}
+		if got := fitCostCell(-5, true, w); got != "" {
+			t.Errorf("fitCostCell(-5, true, %d) = %q, want blank", w, got)
+		}
+	}
+	// The mirror: the same magnitude, priced, still renders. Without it the guard could be
+	// "fixed" by blanking the cell whenever the column is wide enough to notice.
+	if got := fitCostCell(5, false, 10); got != "$5.0000" {
+		t.Errorf("fitCostCell(5, false, 10) = %q, want $5.0000", got)
+	}
+}
+
+// TestRebuildSessionsTable_ANegativeSessionCostLeavesTheCellBlank drives the same refusal
+// through the pane, because that is where the reviewer saw "$-5.0000": in the COST column
+// of a real table, beside sessions whose figures were fine.
+func TestRebuildSessionsTable_ANegativeSessionCostLeavesTheCellBlank(t *testing.T) {
+	m := costSessionsModel()
+	m.sessions = []session.SessionSummary{{ID: "s1", EventCount: 1}}
+	m.spend.snap = &usage.Snapshot{
+		Window: "1h",
+		Totals: usage.Counts{Requests: 1, CostMicros: -5_000_000, PricedRequests: 1, PriceableRequests: 1},
+		Buckets: []usage.Bucket{{Series: map[string]usage.Counts{
+			"s1": {Requests: 1, CostMicros: -5_000_000, PricedRequests: 1},
+		}}},
+		Priced: true,
+	}
+
+	m.rebuildSessionsTable()
+	rows := m.sessionsTbl.Rows()
+	if len(rows) != 1 {
+		t.Fatalf("got %d rows, want 1; test premise is wrong", len(rows))
+	}
+	if got := rows[0][4]; got != "" {
+		t.Errorf("COST cell = %q, want blank — a minus sign here reads as a refund", got)
+	}
+}

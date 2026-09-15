@@ -201,12 +201,28 @@ func writeCostSummary(snap *usage.Snapshot, stdout io.Writer) {
 	t := snap.Totals
 	fmt.Fprintf(stdout, "COST — %s\n", costWindowLabel(snap.Window))
 
+	// A NEGATIVE total is not a total, and gets the headline an unpriced window gets. The
+	// session API refuses to publish one — cost is a sum of per-request figures that are
+	// themselves non-negative — so THE GUARANTEE IS UPSTREAM and this is DEFENCE IN DEPTH:
+	// a refusal to print a figure that contradicts a promise made on the other side of the
+	// wire. The TUI's Cost pane, spend strip, sessions COST cell and Usage pane cell all
+	// make the same refusal (see tui.negativeCost, which is its one spelling there); this
+	// surface printed "$-5.00", which reads as a refund nobody issued. Unavailable rather
+	// than clamped to zero, because $0.00 would assert the traffic was free.
+	negative := snap.Priced && t.CostMicros < 0
 	headline := "cost unavailable"
-	if snap.Priced {
+	if snap.Priced && !negative {
 		headline = costUSD(float64(t.CostMicros) / 1e6)
 	}
 	fmt.Fprintf(stdout, "  %-14s %s requests   %s tokens\n",
 		headline, plainCount(t.Requests), compactTokens(t.Tokens))
+	if negative {
+		// Said out loud, because "cost unavailable" on its own points a reader at pricing
+		// coverage — the ordinary cause — when the real cause is a producer publishing an
+		// impossible figure. Different problem, different fix.
+		fmt.Fprintln(stdout,
+			"  ! the server reported a negative total, which cannot be spend — no figure is shown")
+	}
 
 	if split := tokenSplit(t); split != "" {
 		fmt.Fprintf(stdout, "  %s\n", split)

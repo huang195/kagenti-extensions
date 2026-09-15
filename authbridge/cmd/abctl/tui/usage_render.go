@@ -332,6 +332,27 @@ func renderUsageSummary(snap *usage.Snapshot) string {
 	return "  " + strings.Join(parts, "    ")
 }
 
+// negativeCost reports that a published cost figure cannot be spend, and is the ONE
+// spelling of that test on every money surface in this package.
+//
+// A negative total is not a total. The session API refuses to publish one — cost is a
+// sum of per-request figures that are themselves non-negative — so this can only fire
+// against a broken or hostile producer. THE GUARANTEE IS UPSTREAM, in
+// authlib/sessionapi, and nothing here re-derives it: this is DEFENCE IN DEPTH, a
+// refusal to render a figure that contradicts a promise made on the other side of the
+// wire.
+//
+// It is a function rather than four inline comparisons because it was three inline
+// comparisons short of existing. cost_pane.go restated the guarantee in two places —
+// its TOTAL and its breakdown rows — and "$-5.0000" still reached the spend strip, the
+// sessions table's COST cell and this cell, where a minus sign in a column of costs
+// reads as a refund nobody issued.
+//
+// Every caller treats it as UNPRICED, never as a small or clamped figure. An impossible
+// number is not a number to display, and $0.0000 would assert that the traffic was free
+// — the one claim this whole surface exists to refuse.
+func negativeCost(micros int64) bool { return micros < 0 }
+
 // renderCostSummary is the COST cell, in one of three states.
 //
 // Nothing priced: say so rather than render $0.00, which reads as "this traffic
@@ -355,6 +376,12 @@ func renderCostSummary(snap *usage.Snapshot) string {
 	if !snap.Priced {
 		// Not "$0.0000". A zero cost and an unknown cost are different answers, and
 		// only one of them means the traffic was free.
+		return "COST unavailable"
+	}
+	// A negative total is refused the same way an unpriced one is; see negativeCost.
+	// This cell renders through formatUSDCell, which is faithful about the sign, so
+	// "COST $-5.0000" was what the footer showed the reviewer.
+	if negativeCost(snap.Totals.CostMicros) {
 		return "COST unavailable"
 	}
 	// formatUSDCell, not a bare %.4f. The formatter exists to stop exactly what this line

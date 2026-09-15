@@ -406,3 +406,29 @@ func TestRenderCostSummary_ExactTotalCarriesNoMarker(t *testing.T) {
 		t.Errorf("rendered %q — a caveat with nothing to act on", got)
 	}
 }
+
+// TestRenderCostSummary_ANegativeTotalIsUnavailableNotACredit.
+//
+// The Usage pane's cost cell, a money surface the review did not name and which had the
+// same hole as the two it did: it renders through formatUSDCell, which is faithful about
+// the sign, so the footer read "COST $-5.0000".
+//
+// Unavailable, matching costTotalSection: an impossible figure is not a number to display
+// and certainly not a credit. Leaving one surface unguarded is how the guarantee stops
+// holding — the same reasoning that put negativeCost in one place.
+func TestRenderCostSummary_ANegativeTotalIsUnavailableNotACredit(t *testing.T) {
+	snap := &usage.Snapshot{
+		Window: "1h",
+		Totals: usage.Counts{Requests: 10, CostMicros: -5_000_000,
+			PricedRequests: 10, PriceableRequests: 10},
+		Priced: true,
+	}
+
+	got := renderCostSummary(snap)
+	if strings.Contains(got, "$-") {
+		t.Errorf("cost cell %q renders a negative amount", got)
+	}
+	if !strings.Contains(got, "unavailable") {
+		t.Errorf("cost cell %q neither showed a figure nor declined one", got)
+	}
+}

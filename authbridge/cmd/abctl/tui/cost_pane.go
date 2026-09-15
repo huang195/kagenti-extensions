@@ -667,6 +667,12 @@ func costTotalSection(snap *usage.Snapshot, width int) costSection {
 			add(fmt.Sprintf("%s priceable request%s went through, none of them priced",
 				formatCount(int(gap)), plural(int(gap))))
 		}
+		// Stated on this path TOO, and it is not redundant: "nothing carried a cost" is a
+		// claim about the rows that were READ, and a damaged read may have lost the priced
+		// ones. Without it a corrupt day file renders as a quiet day.
+		if snapshotDamaged(snap.Degraded) {
+			add(costDamagedNote(snap.Degraded))
+		}
 		return sec
 	}
 	// A negative total is not a total. The server refuses negative costs, so this cannot
@@ -679,6 +685,12 @@ func costTotalSection(snap *usage.Snapshot, width int) costSection {
 	// This pane held it alone and three others inherited it without restating it.
 	if negativeCost(snap.Totals.CostMicros) {
 		add("cost unavailable — the server reported a negative total, which cannot be spend")
+		// A refused figure does not make a damaged read stop mattering: the two are
+		// independent facts and an operator with a corrupt day file wants to hear about it
+		// whatever else went wrong in the same answer.
+		if snapshotDamaged(snap.Degraded) {
+			add(costDamagedNote(snap.Degraded))
+		}
 		return sec
 	}
 	// The figure on its own line so the height budget can never cut it, and the
@@ -702,6 +714,18 @@ func costTotalSection(snap *usage.Snapshot, width int) costSection {
 	}
 
 	priced, priceable := snap.Totals.PricedRequests, snap.Totals.PriceableRequests
+	// The damage disclosure leads the caveats, because it is the only one of the three that
+	// says the SUM is incomplete rather than qualifying a figure inside it. Coverage knows
+	// the size of what it excludes and can name the pricing entry that would close it;
+	// exactness knows how many figures are floors. This one cannot state how much is
+	// missing, which makes it both the most serious and the least actionable, and it must
+	// not be merged with either — see snapshotDamaged and usage.Snapshot.Degraded.
+	//
+	// This pane's window defaults to "today" (costPaneWindows[0]), which is the only window
+	// that can populate the field, so this is the default path rather than an edge of one.
+	if snapshotDamaged(snap.Degraded) {
+		add(costDamagedNote(snap.Degraded))
+	}
 	// Against PRICEABLE requests, never all of them. Requests counts every proxied
 	// response — MCP tool calls, health checks — while only inference can ever be
 	// priced, so the wrong denominator left a correctly configured deployment reading
@@ -720,6 +744,44 @@ func costTotalSection(snap *usage.Snapshot, width int) costSection {
 			formatCount(int(inc)), formatCount(int(priced))))
 	}
 	return sec
+}
+
+// costDamagedNote is the Cost pane's spelling of a damaged ledger read: the sentence form,
+// where the strip has room only for damagedNote's three words and a one-cell marker.
+//
+// It says the total is SHORT, names what was lost, and says the shortfall is UNSTATABLE.
+// All three do work. "Incomplete" alone gives an operator nothing to act on, where "1 day
+// file abandoned part-way" names something to go and look at. And the unstatable part is
+// the whole difference from the inexactness caveat below it: that one knows how many
+// figures are floors and which direction the total is wrong in; this one cannot know how
+// much spend is absent, because the rows that would say are the rows that could not be
+// read.
+//
+// A truncated day is called out as worse than a skipped line, because it is worse by an
+// unbounded amount: a line is one request, a file is a day.
+//
+// No counters at all is still a disclosure — see snapshotDamaged for why presence is the
+// claim — and gets the sentence without a number rather than being dropped.
+func costDamagedNote(d *usage.Degraded) string {
+	switch {
+	case d.SkippedLines > 0 && d.TruncatedDays > 0:
+		return fmt.Sprintf("this total is SHORT — the cost ledger skipped %s unreadable line%s "+
+			"and abandoned %s day file%s part-way; that spend happened and is missing from the "+
+			"sum, by an amount nothing here can state",
+			formatCount(int(d.SkippedLines)), plural(int(d.SkippedLines)),
+			formatCount(int(d.TruncatedDays)), plural(int(d.TruncatedDays)))
+	case d.SkippedLines > 0:
+		return fmt.Sprintf("this total is SHORT — the cost ledger skipped %s unreadable line%s; "+
+			"that spend happened and is missing from the sum, by an amount nothing here can state",
+			formatCount(int(d.SkippedLines)), plural(int(d.SkippedLines)))
+	case d.TruncatedDays > 0:
+		return fmt.Sprintf("this total is SHORT — the cost ledger abandoned %s day file%s "+
+			"part-way; a file holds a whole day, so the amount missing from the sum is unbounded",
+			formatCount(int(d.TruncatedDays)), plural(int(d.TruncatedDays)))
+	default:
+		return "this total is SHORT — the cost ledger reported an incomplete read without " +
+			"saying how much it lost; rows are missing from the sum"
+	}
 }
 
 // costPricedBy sanitizes the provenance keys before they reach provenanceNote.

@@ -332,6 +332,36 @@ func renderUsageSummary(snap *usage.Snapshot) string {
 	return "  " + strings.Join(parts, "    ")
 }
 
+// snapshotDamaged reports that the read behind a snapshot's totals was INCOMPLETE — rows
+// the answer needed could not be read at all, so the figures are SHORT by an amount
+// nothing in the response can state.
+//
+// A DIFFERENT CLAIM from usage.Counts.IncompleteRequests, and the two must never be merged
+// or shown under one marker. That counter says a figure the response CARRIES is inexact —
+// a floor from a stream that died before its output count, or a gateway's approximation —
+// and the request is still counted and still priced. This says rows are MISSING FROM THE
+// SUM. One qualifies a number; the other says a number is absent from it.
+// usage.Snapshot.Degraded's own doc draws that line; damagedMarker is the separate glyph it
+// requires.
+//
+// PRESENCE is the claim, not the counters. The field is a pointer precisely so a clean read
+// serialises nothing, so absence means the read was clean and NOTHING may be rendered for
+// it. A present object whose counters are both zero still reports damage: a producer that
+// sent the object is saying it found some, and reading zeros as "checked, fine" is the same
+// class of false reassurance as $0.00 over unpriced traffic.
+//
+// Only a LEDGER-backed window can populate it. The in-memory ring has no lines to fail to
+// decode and no files to abandon, so a duration window leaves it nil and that absence is
+// the truth rather than a gap in the reporting. Which is why two money surfaces do NOT
+// consult it: the sessions COST cell is summed out of the strip's fixed-hour ring window,
+// and renderCostSummary's pane cycles usageWindows, all of which are durations. The strip's
+// TODAY figure, the Cost pane and `abctl cost` are the three that can be ledger-backed, and
+// they are the three that render it.
+//
+// A pointer parameter rather than a *usage.Snapshot, so the strip can ask about the day
+// figure's own disclosure without carrying the whole snapshot into spendSummary.
+func snapshotDamaged(d *usage.Degraded) bool { return d != nil }
+
 // negativeCost reports that a published cost figure cannot be spend, and is the ONE
 // spelling of that test on every money surface in this package.
 //

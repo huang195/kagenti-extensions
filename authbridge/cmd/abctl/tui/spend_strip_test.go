@@ -975,3 +975,253 @@ func TestRenderSpendStrip_NoFigureCarriesAMinusSign(t *testing.T) {
 		t.Errorf("strip %q neither showed a figure nor declined one", got)
 	}
 }
+
+// TestApplyTodayFigure_CarriesTheLedgersDamageDisclosure.
+//
+// The data half of the fix. usage.Snapshot.Degraded had ZERO non-test consumers in
+// cmd/abctl: the server populated it, logged a warning, and nothing downstream read it — so
+// a day that lost rows produced a figure indistinguishable from a clean one.
+//
+// The strip's today poll is the only ledger-backed request the TUI's chrome makes, which
+// makes this the one field on the path that can be populated at all.
+func TestApplyTodayFigure_CarriesTheLedgersDamageDisclosure(t *testing.T) {
+	m := &model{}
+	m.spend.todaySnap = &usage.Snapshot{
+		Window: usage.WindowToday,
+		Totals: usage.Counts{Requests: 400, CostMicros: 4_170_000,
+			PricedRequests: 400, PriceableRequests: 400},
+		Priced:   true,
+		Degraded: &usage.Degraded{SkippedLines: 3, TruncatedDays: 1},
+	}
+
+	var out spendSummary
+	m.applyTodayFigure(&out)
+	if out.TodayDegraded == nil {
+		t.Fatal("TodayDegraded is nil; the ledger's damage disclosure reaches no renderer")
+	}
+	if out.TodayDegraded.SkippedLines != 3 || out.TodayDegraded.TruncatedDays != 1 {
+		t.Errorf("TodayDegraded = %+v, want 3 lines and 1 day", *out.TodayDegraded)
+	}
+	// And the figure is still published: it is short, not unknown.
+	if !out.HasToday || out.TodayUSD != 4.17 {
+		t.Errorf("HasToday=%v TodayUSD=%v; a short figure was withheld rather than qualified",
+			out.HasToday, out.TodayUSD)
+	}
+}
+
+// TestApplyTodayFigure_ACleanReadLeavesNoDisclosure.
+//
+// The pointer's whole point: absence means the read was clean, so nothing may be rendered
+// for it. Zeros in an always-present object would read as "checked, fine" from a producer
+// that never checked.
+func TestApplyTodayFigure_ACleanReadLeavesNoDisclosure(t *testing.T) {
+	m := &model{}
+	m.spend.todaySnap = &usage.Snapshot{
+		Window: usage.WindowToday,
+		Totals: usage.Counts{Requests: 400, CostMicros: 4_170_000,
+			PricedRequests: 400, PriceableRequests: 400},
+		Priced: true,
+	}
+
+	var out spendSummary
+	m.applyTodayFigure(&out)
+	if out.TodayDegraded != nil {
+		t.Errorf("TodayDegraded = %+v for a clean read", *out.TodayDegraded)
+	}
+}
+
+// TestRenderSpendStrip_ADamagedDayWearsItsOwnMarker.
+//
+// The rendered half. The marker rides on the FIGURE, so the fitter can drop the words and
+// never the fact — the discipline partialMarker's own doc sets out. And it is a THIRD glyph:
+// usage.Snapshot.Degraded's doc forbids showing it under the same marker as
+// IncompleteRequests, because one says a figure in the sum is a floor and the other says
+// rows are missing from the sum.
+func TestRenderSpendStrip_ADamagedDayWearsItsOwnMarker(t *testing.T) {
+	s := spendSummary{
+		TodayUSD: 4.17, HasToday: true, TodayPriceable: 400,
+		TodayDegraded: &usage.Degraded{SkippedLines: 3},
+		WindowUSD:     1.12, WindowLabel: "1h", Priced: true, HasSnapshot: true, Priceable: 10,
+	}
+	got := renderSpendStrip(s, 200)
+
+	if !strings.Contains(got, damagedMarker+"$4.1700 today") {
+		t.Errorf("strip %q publishes a short day figure with no marker on it", got)
+	}
+	// The words too, while there is room for them.
+	if !strings.Contains(got, "3 lines lost") {
+		t.Errorf("strip %q does not say what the day lost", got)
+	}
+	// The rolling window figure is ring-backed and cannot be damaged, so it must NOT wear
+	// the marker: a caveat on the wrong figure is a misattribution, which is the defect
+	// moneyFigure was built to end.
+	if strings.Contains(got, damagedMarker+"$1.1200") {
+		t.Errorf("strip %q marks the ring-backed window figure as damaged", got)
+	}
+}
+
+// TestRenderSpendStrip_TheDamageMarkerSurvivesNarrowing.
+//
+// The words are droppable, the marker is not. fitStripFigures gives up every figure's
+// explanation before it gives up a reading, so a narrow terminal loses "3 lines lost" — and
+// if it also lost the "!" the strip would publish a short total as a complete one, the worst
+// outcome available on this line.
+func TestRenderSpendStrip_TheDamageMarkerSurvivesNarrowing(t *testing.T) {
+	s := spendSummary{
+		TodayUSD: 4.17, HasToday: true, TodayPriceable: 400, TodayIncomplete: 7,
+		TodayUnpriced: 100,
+		TodayDegraded: &usage.Degraded{SkippedLines: 3, TruncatedDays: 1},
+		HasSnapshot:   true,
+	}
+	// Every width from the point one whole figure fits. Below that the strip renders ""
+	// rather than clip, which is its documented contract.
+	for w := 1; w <= 200; w++ {
+		got := renderSpendStrip(s, w)
+		if got == "" {
+			continue
+		}
+		if !strings.Contains(got, damagedMarker) {
+			t.Errorf("width %d: %q dropped the damage marker: a short total now reads as complete", w, got)
+		}
+		// All three claims, all one cell each, none crowding out another.
+		if !strings.Contains(got, damagedMarker+inexactMarker+"$4.1700"+partialMarker) {
+			t.Errorf("width %d: %q lost one of the three markers", w, got)
+		}
+	}
+}
+
+// The width matrix again, with the damage caveat live — the newest thing that can break the
+// strip's one-line, within-budget, never-clipped contract. The CJK label is two display
+// columns per rune, so any len()- or rune-based arithmetic in the caveat path renders wider
+// than it claims.
+func TestRenderSpendStrip_TheDamageCaveatObeysTheWidthContract(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		s    spendSummary
+	}{
+		{"damaged day beside a partial hour", spendSummary{
+			TodayUSD: 0.0031, HasToday: true, TodayUnpriced: 399, TodayPriceable: 400,
+			TodayDegraded: &usage.Degraded{SkippedLines: 3},
+			WindowUSD:     1.12, WindowLabel: "1h", BurnPerMin: 0.0187, Priced: true,
+			HasSnapshot: true, Unpriced: 12, Priceable: 318,
+			SavedUSD: 0.24, HasSaved: true,
+		}},
+		{"every caveat the day can carry, plus a stale age", spendSummary{
+			TodayUSD: 0.0031, HasToday: true, TodayUnpriced: 399, TodayPriceable: 400,
+			TodayIncomplete: 7,
+			TodayDegraded:   &usage.Degraded{SkippedLines: 1_234_567, TruncatedDays: 89},
+			WindowUSD:       1.12, WindowLabel: "1h", BurnPerMin: 0.0187, Priced: true,
+			HasSnapshot: true, Unpriced: 12, Priceable: 318, Incomplete: 3,
+			SavedUSD: 0.24, HasSaved: true,
+			Age: 3 * time.Minute, Stale: true,
+		}},
+		{"damaged day under a cjk window label", spendSummary{
+			TodayUSD: 0.0031, HasToday: true, TodayUnpriced: 399, TodayPriceable: 400,
+			TodayDegraded: &usage.Degraded{SkippedLines: 3, TruncatedDays: 1},
+			WindowUSD:     1.12, WindowLabel: "過去一時間", BurnPerMin: 0.0187, Priced: true,
+			HasSnapshot: true, Unpriced: 12, Priceable: 318,
+		}},
+		{"a disclosure carrying no counters", spendSummary{
+			TodayUSD: 4.17, HasToday: true, TodayPriceable: 400,
+			TodayDegraded: &usage.Degraded{},
+			HasSnapshot:   true,
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			for _, w := range []int{40, 60, 80, 96, 120, 200} {
+				assertStripFits(t, tc.s, w)
+			}
+			// Every width from 1 up, because the interesting failures are at the seams where a
+			// form stops fitting.
+			for w := 1; w <= 200; w++ {
+				assertStripFits(t, tc.s, w)
+			}
+		})
+	}
+}
+
+// TestRenderSpendStrip_TheDamageCaveatIsNotWhatDropsAFigure.
+//
+// The words go in the figure's FULL form only, and fitStripFigures tries every figure's
+// compact form before it drops a reading — so a longer caveat can cost an explanation and
+// never a number. Pinned against the same summary with a clean read, which is the only way
+// to tell "the caveat took a figure" from "the terminal was always too narrow".
+func TestRenderSpendStrip_TheDamageCaveatIsNotWhatDropsAFigure(t *testing.T) {
+	clean := spendSummary{
+		TodayUSD: 4.17, HasToday: true, TodayPriceable: 400,
+		WindowUSD: 1.12, WindowLabel: "1h", BurnPerMin: 0.0187, Priced: true,
+		HasSnapshot: true, Priceable: 318,
+	}
+	damaged := clean
+	damaged.TodayDegraded = &usage.Degraded{SkippedLines: 1_234_567, TruncatedDays: 89}
+
+	for w := 1; w <= 200; w++ {
+		gotClean, gotDamaged := renderSpendStrip(clean, w), renderSpendStrip(damaged, w)
+		// Count the readings, not the characters: a figure is a "$" on this line.
+		nClean, nDamaged := strings.Count(gotClean, "$"), strings.Count(gotDamaged, "$")
+		// The marker costs the day figure one column, so the damaged line may hold one fewer
+		// reading at the seams — that is the marker, which is undroppable by design, not the
+		// caveat's words. More than one behind means the words are costing numbers.
+		if nDamaged < nClean-1 {
+			t.Errorf("width %d: damaged line holds %d figures where clean holds %d\n  clean:   %q\n  damaged: %q",
+				w, nDamaged, nClean, gotClean, gotDamaged)
+		}
+	}
+}
+
+// TestMoneyMarkers_AreThreeDistinctOneColumnClaims.
+//
+// usage.Snapshot.Degraded's doc is explicit that its claim must not be merged with
+// usage.Counts.IncompleteRequests', nor shown under one marker; partialMarker is a third
+// claim again. Spelling any two of them the same character would collapse two facts into one
+// glyph WITHOUT A SINGLE RENDER TEST NOTICING — the figure would still carry "a marker", and
+// every assertion phrased in terms of the constants would still hold. That is exactly what
+// happened when this was mutated, which is why the distinctness is pinned directly.
+//
+// One display column each, which is what makes them survivable at every width the strip's
+// fitter and fitTableColumns can produce. Not a rune count and not len(): both lie about a
+// glyph, and the strip's whole budget is expressed in display cells.
+func TestMoneyMarkers_AreThreeDistinctOneColumnClaims(t *testing.T) {
+	for _, m := range []struct{ name, glyph string }{
+		{"damagedMarker", damagedMarker},
+		{"inexactMarker", inexactMarker},
+		{"partialMarker", partialMarker},
+	} {
+		if w := lipgloss.Width(m.glyph); w != 1 {
+			t.Errorf("%s = %q is %d display columns, want 1", m.name, m.glyph, w)
+		}
+	}
+	seen := map[string]string{}
+	for _, m := range []struct{ name, glyph string }{
+		{"damagedMarker", damagedMarker},
+		{"inexactMarker", inexactMarker},
+		{"partialMarker", partialMarker},
+	} {
+		if other, dup := seen[m.glyph]; dup {
+			t.Errorf("%s and %s are both %q — two claims under one marker", m.name, other, m.glyph)
+		}
+		seen[m.glyph] = m.name
+	}
+}
+
+// TestRenderSpendStrip_ADisclosureWithNoCountersStillMarksTheFigure.
+//
+// PRESENCE is the claim, not the counters. usage.Snapshot.Degraded is a pointer precisely so
+// a clean read serialises nothing, so a producer that sent the object is saying it found
+// damage — and reading its zeros as "checked, fine" is the same class of false reassurance
+// as $0.00 over unpriced traffic. Tightening snapshotDamaged to require a non-zero counter
+// survived every other test in this file.
+func TestRenderSpendStrip_ADisclosureWithNoCountersStillMarksTheFigure(t *testing.T) {
+	s := spendSummary{
+		TodayUSD: 4.17, HasToday: true, TodayPriceable: 400,
+		TodayDegraded: &usage.Degraded{},
+		HasSnapshot:   true,
+	}
+	got := renderSpendStrip(s, 200)
+	if !strings.Contains(got, damagedMarker+"$4.1700") {
+		t.Errorf("strip %q reads a counterless disclosure as a clean read", got)
+	}
+	if !strings.Contains(got, "rows lost") {
+		t.Errorf("strip %q says nothing about a disclosure it was sent", got)
+	}
+}

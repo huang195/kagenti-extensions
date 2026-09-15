@@ -6,6 +6,8 @@ import (
 	"time"
 
 	"github.com/charmbracelet/lipgloss"
+
+	"github.com/rossoctl/cortex/authbridge/authlib/usage"
 )
 
 // stripLabel prefixes the line. Kept short: it is spent on every width.
@@ -46,6 +48,32 @@ const inexactMarker = "~"
 // which is what a coverage gap means for a total.
 const partialMarker = "+"
 
+// damagedMarker precedes a dollar figure whose LEDGER READ WAS INCOMPLETE: rows the answer
+// needed could not be read at all — a day file that lost lines, or one whose scan was
+// abandoned part-way — so the figure is SHORT by an amount nothing in the response can
+// state. See usage.Snapshot.Degraded and snapshotDamaged.
+//
+// A THIRD GLYPH, and deliberately not one of the other two. Degraded's own doc is explicit
+// that this is a different claim from usage.Counts.IncompleteRequests and that the two must
+// not be merged or shown under one marker: inexactMarker says a figure the total CARRIES is
+// a floor, this says spend is MISSING FROM THE SUM. partialMarker is closer — the real
+// total is larger either way — but a coverage gap is COUNTED and nameable ("412 requests on
+// api.openai.com gpt-5"), while this shortfall is unstatable, and collapsing them would
+// tell an operator to add a pricing entry for a corrupt file.
+//
+// Prefixed OUTSIDE inexactMarker, so the leftmost cell carries the most serious claim and
+// a figure that is both reads "!~$4.1700+" — three one-column claims, each with its own
+// meaning, rather than one marker doing two jobs badly.
+//
+// One display column, so it survives every width fitStripFigures can produce. It rides on
+// the FIGURE rather than in the words beside it, for the reason partialMarker records: the
+// fitter may shorten a caveat to nothing, but while a figure is on screen its markers are
+// too, so a total that is short can never be published as a complete one. The cost is that
+// each marker widens the figure by a column, which moves the width at which a LATER reading
+// is dropped — accepted, and the same trade the other two already make, because the marker
+// is the fact and the words are the explanation.
+const damagedMarker = "!"
+
 // stripFigure is one reading in the strip, in the two forms it can take.
 //
 // full spells the caveat out; compact keeps the figure and its marker and drops only
@@ -80,6 +108,35 @@ func coverageNote(unpriced, priceable int64) string {
 	return fmt.Sprintf("%d of %d unpriced", unpriced, priceable)
 }
 
+// damagedNote is the strip's spelling of a damaged ledger read: the shortest form that
+// still says WHAT was lost, because "incomplete" on its own gives a reader nothing to act
+// on where "1 day file lost" names something to go and look at.
+//
+// One fact at three verbosities, the same relationship coverageNote has with the Cost
+// pane's "covers N of M priceable requests" and cmd_cost.go's line: costDamagedNote spells
+// it out where there is room for a sentence, this is what a strip can afford.
+//
+// It rides in the figure's FULL form only. damagedMarker is what survives into the compact
+// form, so width pressure costs the explanation and never the fact.
+//
+// "lost", not "skipped": the ledger's own verbs describe what IT did, and the reader of a
+// spend line cares what the number is missing.
+func damagedNote(d *usage.Degraded) string {
+	switch {
+	case d.SkippedLines > 0 && d.TruncatedDays > 0:
+		return fmt.Sprintf("%d lines, %d day file%s lost",
+			d.SkippedLines, d.TruncatedDays, plural(int(d.TruncatedDays)))
+	case d.SkippedLines > 0:
+		return fmt.Sprintf("%d line%s lost", d.SkippedLines, plural(int(d.SkippedLines)))
+	case d.TruncatedDays > 0:
+		return fmt.Sprintf("%d day file%s lost", d.TruncatedDays, plural(int(d.TruncatedDays)))
+	default:
+		// A disclosure carrying no counters. Presence is still the claim — see
+		// snapshotDamaged — and this is the least it can say without inventing a number.
+		return "rows lost"
+	}
+}
+
 // moneyFigure builds one dollar reading together with the caveats that belong to IT.
 //
 // label is the figure's own suffix — "today", "/1h" — and it is why this takes one at
@@ -94,10 +151,22 @@ func coverageNote(unpriced, priceable int64) string {
 // They are stated in that order, matching cmd_cost.go, whose comment records why: the
 // exactness caveat qualifies the dollar figure itself, where coverage qualifies how much
 // of the traffic the figure is about.
-func moneyFigure(usd float64, label string, unpriced, priceable, incomplete int64) stripFigure {
+//
+// degraded is a THIRD claim and it goes first, because it is the only one of the three that
+// says the SUM is incomplete rather than qualifying a figure the sum contains. nil means
+// the read was clean and nothing is rendered for it — see snapshotDamaged, which is where
+// the pointer semantics are argued. Only a ledger-backed figure can carry one, so the
+// window reading passes nil.
+func moneyFigure(usd float64, label string, unpriced, priceable, incomplete int64,
+	degraded *usage.Degraded) stripFigure {
 	amount := formatUSDCell(usd)
 	if incomplete > 0 {
 		amount = inexactMarker + amount
+	}
+	// Outermost, so the leftmost cell is the most serious claim. See damagedMarker for why
+	// it is a third glyph rather than a reuse of either of the other two.
+	if snapshotDamaged(degraded) {
+		amount = damagedMarker + amount
 	}
 	// A gap is only readable with a denominator, and a denominator of zero is not a
 	// gap at all — it is a window with nothing to price, which the caller handles.
@@ -107,6 +176,9 @@ func moneyFigure(usd float64, label string, unpriced, priceable, incomplete int6
 	}
 	fig := plainFigure(amount + " " + label)
 	var caveats []string
+	if snapshotDamaged(degraded) {
+		caveats = append(caveats, damagedNote(degraded))
+	}
 	if incomplete > 0 {
 		// No denominator: spendSummary carries the day's and the window's priced counts
 		// nowhere, and the count alone is what a strip has room for. The Cost pane states
@@ -143,9 +215,9 @@ func moneyFigure(usd float64, label string, unpriced, priceable, incomplete int6
 //     width of the FIRST figure's most compact form and nothing more, because
 //     fitStripFigures drops the LABEL, and then the caveat's words, before it drops a
 //     number: "$1.1200 /1h" is 11 columns and renders bare from width 11 up, so ""
-//     appears only at 10 or below. A figure carrying a marker is one column wider than
-//     the same figure without one, which moves that threshold by exactly one — the
-//     marker is never what gets dropped. (This note said "about 18" — label plus figure
+//     appears only at 10 or below. Each marker a figure carries makes it one column wider,
+//     so a first figure wearing all three (damaged, inexact, partial) moves that threshold
+//     by three — the markers are never what gets dropped. (This note said "about 18" — label plus figure
 //     — which was right before the label-drop fallback below existed and has been wrong
 //     by 7 since.) Accepted rather than
 //     fixed: at that width there is no honest short form, and clipping a number is
@@ -218,8 +290,14 @@ func renderSpendStrip(s spendSummary, width int) string {
 	if s.HasToday {
 		// Today outranks the rolling window when it exists: it is the figure an
 		// operator is accountable for, and the window is context for it.
+		//
+		// TodayDegraded is the ledger's own damage disclosure, and this is the only figure on
+		// the line that can carry one: applyTodayFigure sets it from the window=today reply,
+		// which is the strip's single ledger-backed poll. Without it a day that lost lines
+		// rendered a figure byte-identical to a clean one — the exact failure
+		// usage.Snapshot.Degraded exists to end, on the strip's headline reading.
 		figures = append(figures, moneyFigure(s.TodayUSD, "today",
-			s.TodayUnpriced, s.TodayPriceable, s.TodayIncomplete))
+			s.TodayUnpriced, s.TodayPriceable, s.TodayIncomplete, s.TodayDegraded))
 	}
 	// Guarded on Priced independently of the branch above, which lets !Priced
 	// through whenever HasToday is set. Without this guard that combination — a
@@ -231,8 +309,12 @@ func renderSpendStrip(s spendSummary, width int) string {
 	// chain, so a fresh session can hold a priced day total beside a rolling hour that
 	// has priced nothing yet. The guard is what makes that state render honestly.
 	if s.Priced {
+		// nil degraded, and not because nobody looked: this reading comes from the in-memory
+		// ring, which has no lines to fail to decode and no files to abandon, so a duration
+		// window leaves usage.Snapshot.Degraded nil and that absence is the truth. See
+		// snapshotDamaged.
 		figures = append(figures, moneyFigure(s.WindowUSD, "/"+s.WindowLabel,
-			s.Unpriced, s.Priceable, s.Incomplete))
+			s.Unpriced, s.Priceable, s.Incomplete, nil))
 	} else if s.Unpriced > 0 && s.Priceable > 0 {
 		// The window figure is suppressed because nothing in the window was priced, so
 		// its coverage gap has no figure to ride on. It still has to be stated — this is

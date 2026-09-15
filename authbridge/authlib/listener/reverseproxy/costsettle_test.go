@@ -1,6 +1,7 @@
 package reverseproxy
 
 import (
+	"bufio"
 	"context"
 	"fmt"
 	"io"
@@ -9,6 +10,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/rossoctl/cortex/authbridge/authlib/costevent"
 	"github.com/rossoctl/cortex/authbridge/authlib/costing"
@@ -51,6 +53,10 @@ type costProbe struct {
 	record     bool
 	frames     int
 	lastSeen   bool
+
+	// terminal is signalled once when the terminal frame reaches the plugins. Buffered so
+	// the server goroutine never blocks on a test that has stopped listening.
+	terminal chan struct{}
 }
 
 func (p *costProbe) Name() string { return "cost-probe" }
@@ -78,6 +84,12 @@ func (p *costProbe) OnResponseFrame(_ context.Context, pctx *pipeline.Context, _
 	}
 	p.skips = noBodySkips(pctx)
 	_, p.record = pctx.Extensions.Custom[costevent.Key+pipeline.PluginEventSuffix]
+	if p.terminal != nil {
+		select {
+		case p.terminal <- struct{}{}:
+		default:
+		}
+	}
 	return pipeline.Action{Type: pipeline.Continue}
 }
 
@@ -467,5 +479,91 @@ func TestReverseProxy_BufferedAnthropicEnvelopeToStreamRequest(t *testing.T) {
 	}
 	if skips != 0 {
 		t.Errorf("no_response_body Skip rows = %d, want 0 — the response carried a body", skips)
+	}
+}
+
+// TestReverseProxy_ClientDisconnectMidStreamStillSettles is finding 4.
+//
+// A client that hangs up mid-stream is a normal event — a cancelled turn, a closed tab, a
+// timeout — and the tokens the model already reported are real spend. The terminal
+// last=true dispatch is the only thing that turns folded state into a settled cost, and it
+// used to run on the REQUEST's context: cancelled by the disconnect, so
+// pipeline.RunResponseFrame returned Deny("pipeline.cancelled") before calling any plugin
+// (pipeline.go:203) and the charge was dropped on the floor. forwardproxy detaches the
+// finalization context for exactly this reason (server.go:958).
+//
+// The Anthropic shape is what makes this cost money rather than telemetry: message_start
+// carries the whole prompt split, including cache reads, so the expensive half of a long
+// agent turn is already on the wire before the client goes away.
+func TestReverseProxy_ClientDisconnectMidStreamStillSettles(t *testing.T) {
+	released := make(chan struct{})
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		flusher := w.(http.Flusher)
+		fmt.Fprint(w, "data: {\"type\":\"message_start\",\"message\":{\"usage\":"+
+			"{\"input_tokens\":1000,\"cache_read_input_tokens\":30000,\"output_tokens\":1}}}\n\n")
+		flusher.Flush()
+		// Never send message_stop: the turn is still generating when the client leaves.
+		<-released
+	}))
+	defer backend.Close()
+
+	probe := &costProbe{terminal: make(chan struct{}, 1)}
+	srv, err := NewServer(costPipeline(t, probe), nil, backend.URL, nil)
+	if err != nil {
+		t.Fatalf("NewServer: %v", err)
+	}
+	proxy := httptest.NewServer(srv.Handler())
+	defer proxy.Close()
+	// Registered LAST so it runs FIRST: httptest.Server.Close waits for in-flight handlers,
+	// and this test deliberately leaves one parked mid-stream.
+	defer close(released)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, proxy.URL+"/v1/messages",
+		strings.NewReader(`{"model":"claude-opus-5","stream":true,"messages":[{"role":"user","content":"hi"}]}`))
+	if err != nil {
+		t.Fatalf("NewRequest: %v", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("Do: %v", err)
+	}
+
+	// Wait until the first event is downstream, so the fold has definitely happened, then
+	// hang up exactly as a real client does.
+	br := bufio.NewReader(resp.Body)
+	for {
+		line, err := br.ReadString('\n')
+		if err != nil {
+			t.Fatalf("reading first event: %v", err)
+		}
+		if strings.HasPrefix(line, "data:") {
+			break
+		}
+	}
+	cancel()
+	resp.Body.Close()
+
+	select {
+	case <-probe.terminal:
+	case <-time.After(5 * time.Second):
+		t.Fatal("no terminal frame reached the plugins within 5s: the disconnect cancelled the context the finalization dispatch runs on, so RunResponseFrame denied it and nothing settled")
+	}
+
+	settled, loaded, prompt, _, _ := probe.snapshotCost()
+	if !loaded {
+		t.Fatal("no Settled stored on the terminal frame")
+	}
+	if prompt != 31000 {
+		t.Errorf("PromptTokens = %d, want 31000: the counts message_start already reported were folded and then lost", prompt)
+	}
+	if !settled.Priced {
+		t.Fatalf("settled = %+v; want the prompt-side spend charged — the client leaving does not refund the tokens the model already read", settled)
+	}
+	if !settled.Incomplete {
+		t.Error("Incomplete = false; a stream that died before its output count must say the figure is a floor")
 	}
 }

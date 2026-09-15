@@ -21,9 +21,10 @@ import (
 // see enqueue.
 const opsBuffer = 1024
 
-// dropLogEvery rate-limits the drop warning after the first one. A hung mount would
-// otherwise put a line in the log for every inference response.
-const dropLogEvery = 100
+// dropNotifyDepth is the depth of the channel that wakes the writer goroutine to log
+// a drop. One is enough: the NUMBER lives in w.dropped, so a wake that coalesces with
+// another loses nothing and the goroutine reports the running total.
+const dropNotifyDepth = 1
 
 // defaultSettleInterval is how often the writer checks whether the held minute has
 // ended. See settleClosedMinute.
@@ -103,12 +104,31 @@ type Writer struct {
 	ops  chan batch
 	quit chan struct{}
 	wg   sync.WaitGroup
-	// closed reports that the writer goroutine has been asked to stop, so submit
-	// writes inline instead of queueing work nobody will collect.
-	closed    atomic.Bool
+	// closed reports that the writer goroutine has STOPPED, so submit writes inline
+	// and enqueue counts instead of queueing work nobody will collect.
+	//
+	// Set after wg.Wait, never before. It used to be set before close(quit), which
+	// armed submit's inline-write branch while the goroutine was still draining: two
+	// writeLines on one day file, each holding a size from its own Stat, so a partial
+	// write in one rolled the file back over rows the other had just appended.
+	closed atomic.Bool
+	// closeOnce guards the shutdown, and closeErr carries its result to every later
+	// caller. A shutdown path that retries Close must not be told nil the second time
+	// after a real failure the first.
 	closeOnce sync.Once
-	// dropped counts rows lost to a full queue. Read by Dropped.
+	closeErr  error
+	// dropped counts rows that will never reach disk: a full queue, a failed append, a
+	// send that raced Close. Read by Dropped.
 	dropped atomic.Int64
+	// dropNotify wakes the writer goroutine to LOG a drop. See drop.
+	dropNotify chan struct{}
+	// loggedDrops is the cumulative drop count already reported. Atomic only because
+	// submit's post-Close inline path can reach write from a caller's goroutine.
+	loggedDrops atomic.Int64
+	// skippedLines and truncatedDays report what the MOST RECENT Query could not read.
+	// See SkippedLines.
+	skippedLines  atomic.Int64
+	truncatedDays atomic.Int64
 
 	mu sync.Mutex
 	// open is the minute currently accumulating, truncated to the minute.
@@ -160,11 +180,12 @@ func WithSettleInterval(d time.Duration) Option {
 // later prune goes through the writer goroutine instead.
 func New(dir string, opts ...Option) (*Writer, error) {
 	w := &Writer{
-		now:    time.Now,
-		rows:   map[key]*Row{},
-		settle: defaultSettleInterval,
-		ops:    make(chan batch, opsBuffer),
-		quit:   make(chan struct{}),
+		now:        time.Now,
+		rows:       map[key]*Row{},
+		settle:     defaultSettleInterval,
+		ops:        make(chan batch, opsBuffer),
+		quit:       make(chan struct{}),
+		dropNotify: make(chan struct{}, dropNotifyDepth),
 	}
 	for _, o := range opts {
 		o(w)
@@ -503,32 +524,115 @@ func (w *Writer) pending() ([]Row, time.Time) {
 // the wrong trade here: the only way to fill a buffer this deep is a filesystem that
 // has stopped keeping up, and the alternative to dropping a minute of cost history is
 // stalling every request in the proxy until the disk comes back. Not silent, though —
-// drops are counted, warned about on the first one and every dropLogEvery after, and
-// totalled again at Close, because an undisclosed drop is how a total quietly becomes
-// wrong.
+// every drop is counted into Dropped(), warned about from the writer goroutine (see
+// drop and logDrops, and note that the warning is NOT emitted here, on the request
+// path) and totalled again at Close, because an undisclosed drop is how a total
+// quietly becomes wrong.
 func (w *Writer) enqueue(b batch) {
 	if len(b.rows) == 0 && b.pruneAt.IsZero() {
+		return
+	}
+	if w.closed.Load() {
+		// The writer goroutine has GONE. A send here would land in a buffer nobody will
+		// ever read again — measured at 1,024 rows parked in w.ops for the life of the
+		// process while Dropped() answered 49, a 21x undercount that also made the
+		// shutdown warning quote the wrong number. Counted as the loss it is.
+		//
+		// A send can still be lost in the window between this load and Close's final
+		// drain-and-count: that is inherent to a non-blocking hand-off, and Record is on
+		// the request path so it cannot take the lock that would close it. Close narrows
+		// the window to the few instructions between its drain and its store, and a
+		// caller recording after Close has returned lands here instead.
+		w.drop(len(b.rows))
 		return
 	}
 	select {
 	case w.ops <- b:
 	default:
-		n := w.dropped.Add(int64(len(b.rows)))
-		if n == 1 || n%dropLogEvery == 0 {
-			slog.Warn("costledger: writer queue full; dropping cost rows",
-				"droppedRows", n, "queueDepth", cap(w.ops),
-				"cause", "the ledger directory is not keeping up",
-				"effect", "cost history is missing those minutes; the proxy is unaffected")
-		}
+		w.drop(len(b.rows))
 	}
 }
 
-// Dropped is how many rows have been dropped because the writer could not keep up.
+// drop counts rows that will never reach disk and asks the writer goroutine to say so.
 //
-// Exported so a caller can surface the number rather than leaving it in a log line
-// nobody greps: a cost total assembled from a ledger that dropped rows is short by an
-// unknown amount, and that is worth saying out loud.
+// NO FORMATTING AND NO IO, because this is reached from Record — inside
+// session.Store.Append's write lock, with every other request in the proxy waiting.
+// The slog.Warn that used to be here ran exactly there: slog's default handler
+// serializes on its own mutex and writes to stderr, so the drop path put a lock and a
+// possibly-slow fd in front of every proxied request. That is the property this
+// package claims to have removed, so the request path now stores a number and rings a
+// bell, and logDrops does the rest on the writer goroutine.
+func (w *Writer) drop(rows int) {
+	if rows == 0 {
+		return
+	}
+	w.dropped.Add(int64(rows))
+	select {
+	case w.dropNotify <- struct{}{}:
+	default:
+		// A wake is already pending. It will report the total including this drop.
+	}
+}
+
+// logDrops reports the cumulative drop count, on the writer goroutine.
+//
+// Rate limiting is free here rather than counted: wakes coalesce into the depth-1
+// dropNotify channel, so a hung mount shedding thousands of rows produces a handful of
+// lines quoting the running total instead of one line per inference response. That
+// replaces an explicit every-Nth test, which had to be evaluated on the request path
+// to work at all.
+func (w *Writer) logDrops() {
+	n := w.dropped.Load()
+	if n <= w.loggedDrops.Load() {
+		return
+	}
+	w.loggedDrops.Store(n)
+	slog.Warn("costledger: dropping cost rows",
+		"droppedRows", n, "queueDepth", cap(w.ops),
+		"cause", "the ledger directory is not keeping up, or the writer has stopped",
+		"effect", "cost history is missing those minutes; the proxy is unaffected")
+}
+
+// Dropped is how many rows will never reach disk.
+//
+// THE ONLY EXPORTED "is my cost history complete" SIGNAL, which is why it counts every
+// path that loses a row and not just the one it was named for: a full queue, an append
+// that failed (ENOSPC, EROFS, EACCES — takeLocked has already emptied the map by then,
+// so the minute exists nowhere else), a send that raced Close, and rows still held when
+// Close returns. Each of those used to be logged and not counted, so the number
+// answered 0 while a whole minute's spend was gone.
+//
+// Exported so a caller can surface it rather than leaving it in a log line nobody
+// greps: a cost total assembled from a ledger that dropped rows is short by an unknown
+// amount, and that is worth saying out loud.
 func (w *Writer) Dropped() int64 { return w.dropped.Load() }
+
+// SkippedLines is how many lines the MOST RECENT Query or Window could not decode.
+//
+// A GAUGE, NOT A COUNTER, and deliberately: a day file with one corrupt line is
+// re-read on every /v1/usage request, so a cumulative count would climb forever over
+// one piece of damage and read as an escalating fault. The last read's figure answers
+// the question a caller actually has — "is the number you just gave me complete".
+//
+// Skips were previously counted into a local and logged at slog.Debug, below the
+// default level, so a day quietly losing lines was indistinguishable in production
+// from a clean one.
+func (w *Writer) SkippedLines() int64 { return w.skippedLines.Load() }
+
+// TruncatedDays is how many day files the MOST RECENT Query or Window ABANDONED
+// part-way through — an IO error, or a line past maxLineBytes that a scanner cannot
+// step over.
+//
+// Worse than a skipped line by an unknown amount: everything after that offset is
+// missing from the answer and the file gives no way to say how much. A non-zero value
+// means the total just returned is short, and a caller that reports a figure without
+// checking it is serving a truncated day as a complete one.
+//
+// Same gauge semantics as SkippedLines. NOT yet reflected in the /v1/usage response
+// shape — that is authlib/sessionapi's to add, and until it does, a client reading
+// only the JSON still cannot see this. Exported here so it is available rather than
+// discarded.
+func (w *Writer) TruncatedDays() int64 { return w.truncatedDays.Load() }
 
 // run is the ONLY goroutine that touches the filesystem after construction.
 //
@@ -549,6 +653,10 @@ func (w *Writer) run() {
 		select {
 		case b := <-w.ops:
 			w.write(b)
+		case <-w.dropNotify:
+			// The drop itself was detected on the request path, which only counted it. The
+			// log line belongs here, off that path entirely. See drop.
+			w.logDrops()
 		case <-tick:
 			w.settleClosedMinute()
 		case <-w.quit:
@@ -574,8 +682,18 @@ func (w *Writer) write(b batch) {
 	var err error
 	if len(b.rows) > 0 {
 		if err = w.store.append(b.rows); err != nil {
+			// COUNTED, not only logged. takeLocked advanced flushedThrough and emptied the
+			// map before this ran — deliberately, because a re-held minute could be written
+			// twice and nothing downstream can detect a double count — so these rows now
+			// exist nowhere at all. An ENOSPC, an EROFS or an EACCES here is a permanent loss
+			// of that minute, and Dropped() answered 0 over it.
+			//
+			// loggedDrops is advanced past this count because the line below already reports
+			// it, with the error attached, which is more use than logDrops' bare total.
+			n := w.dropped.Add(int64(len(b.rows)))
+			w.loggedDrops.Store(n)
 			slog.Warn("costledger: append failed; cost history for this minute is lost",
-				"error", err, "rows", len(b.rows))
+				"error", err, "rows", len(b.rows), "droppedRows", n)
 		}
 	}
 	if !b.pruneAt.IsZero() {
@@ -701,31 +819,78 @@ var errClosedWhileFlushing = errors.New("costledger: closed while flushing; the 
 // it is what turns "a restart loses up to 60 seconds" into "an orderly stop loses
 // nothing".
 //
-// Idempotent, and safe to call on a Writer whose goroutine has already gone.
+// Idempotent, and safe to call on a Writer whose goroutine has already gone. Every
+// call after the first returns the FIRST call's error rather than nil: a shutdown path
+// that retries Close must not be told the flush succeeded because it already ran.
 func (w *Writer) Close() error {
-	var err error
 	w.closeOnce.Do(func() {
 		// Before the goroutine stops, so this batch is ordered behind everything already
 		// queued rather than racing the drain.
-		err = w.Flush()
-		w.closed.Store(true)
+		w.closeErr = w.Flush()
 		close(w.quit)
 		w.wg.Wait()
 
 		// The goroutine is gone and nothing else writes, so anything still queued —
 		// a Record that raced this shutdown — is written here.
-		for {
-			select {
-			case b := <-w.ops:
-				w.write(b)
-			default:
-				if n := w.dropped.Load(); n > 0 {
-					slog.Warn("costledger: rows were dropped during this run; the cost history is short",
-						"droppedRows", n)
-				}
-				return
-			}
+		w.drainAndWrite()
+
+		// AFTER wg.Wait AND after the drain above. Setting it earlier armed submit's
+		// inline-write branch while the goroutine was still draining, so two writeLines
+		// could run on one day file, each with a size from its own Stat — and a partial
+		// write in either rolled the file back over the other's rows.
+		w.closed.Store(true)
+
+		// From here nothing can reach disk, so whatever is left is LOST and has to be
+		// counted: a batch that landed in ops between the drain and the store above, and
+		// any row a racing Record folded back into the accumulator after Flush emptied it.
+		// Both were previously invisible — the first was the 21x undercount, and this
+		// warning quoted the wrong total because of it.
+		if lost := w.abandon(); lost > 0 {
+			w.dropped.Add(lost)
+		}
+		if n := w.dropped.Load(); n > 0 {
+			slog.Warn("costledger: rows were dropped during this run; the cost history is short",
+				"droppedRows", n)
 		}
 	})
-	return err
+	return w.closeErr
+}
+
+// drainAndWrite writes every batch currently queued and returns when the queue is
+// empty.
+//
+// The writer goroutine must already have STOPPED. Two goroutines in writeLines on one
+// day file each take their rollback size from their own Stat, so a partial write in
+// one truncates away rows the other appended.
+func (w *Writer) drainAndWrite() {
+	for {
+		select {
+		case b := <-w.ops:
+			w.write(b)
+		default:
+			return
+		}
+	}
+}
+
+// abandon counts every row that can no longer reach disk and empties both places one
+// can be: the queue and the accumulator. For Close, after w.closed is set.
+//
+// The accumulator is cleared rather than left in place so the rows are counted exactly
+// once — a later Flush on a closed Writer still works, and must write only what was
+// recorded after this point.
+func (w *Writer) abandon() int64 {
+	var lost int64
+	for {
+		select {
+		case b := <-w.ops:
+			lost += int64(len(b.rows))
+		default:
+			w.mu.Lock()
+			lost += int64(len(w.rows))
+			w.rows = map[key]*Row{}
+			w.mu.Unlock()
+			return lost
+		}
+	}
 }

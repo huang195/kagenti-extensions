@@ -1,6 +1,7 @@
 package config
 
 import (
+	"strings"
 	"testing"
 
 	"gopkg.in/yaml.v3"
@@ -64,5 +65,36 @@ func TestCostLedgerConfig_RejectsNegativeRetention(t *testing.T) {
 	c := &CostLedgerConfig{RetentionDays: -1}
 	if err := c.Validate(); err == nil {
 		t.Error("negative retention_days accepted")
+	}
+}
+
+// A retention shorter than the longest window the API serves makes that window lie.
+// window=7d is answered from these day files, so with retention_days: 2 six of the
+// eight local days a 7d window spans have been deleted, and the response still says
+// window:"7d", priced:true over two days of spend — indistinguishable downstream from
+// a genuinely quiet week.
+func TestCostLedgerConfig_RejectsARetentionShorterThanTheLongestWindow(t *testing.T) {
+	for _, days := range []int{1, 2, 6} {
+		c := &CostLedgerConfig{RetentionDays: days}
+		err := c.Validate()
+		if err == nil {
+			t.Errorf("retention_days: %d accepted; window=7d would report a partial week as a full one", days)
+			continue
+		}
+		// The operator who chose the number is the one who reads this, so it has to say
+		// why rather than only that.
+		if !strings.Contains(err.Error(), "7d") {
+			t.Errorf("retention_days: %d rejected with %q, which does not say which window it breaks", days, err)
+		}
+	}
+}
+
+// Zero still means "the package default", so the floor must not turn an absent
+// setting into a load failure — that would refuse every config that omits the field.
+func TestCostLedgerConfig_ZeroRetentionIsStillTheDefault(t *testing.T) {
+	for _, days := range []int{0, minCostLedgerRetentionDays, 30} {
+		if err := (&CostLedgerConfig{RetentionDays: days}).Validate(); err != nil {
+			t.Errorf("retention_days: %d rejected: %v", days, err)
+		}
 	}
 }

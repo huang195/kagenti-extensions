@@ -208,21 +208,24 @@ const maxLineBytes = 1 << 20
 // append concatenated onto it, guaranteeing a syntax error mid-file. Both halves are
 // fixed; this half is the one that keeps an already-damaged file readable.
 //
-// Skips are COUNTED and logged. A silent skip and a silent stop are the same kind of
-// mistake — a number quietly missing rows — and the count is what lets an operator
-// tell "my ledger is fine" from "my ledger is losing lines".
-func (s *store) readDay(day time.Time) ([]Row, error) {
+// Skips are COUNTED, RETURNED and logged at Warn. An earlier version counted them
+// into a local and logged that at slog.Debug — below the default level, so in
+// production a day quietly losing lines was indistinguishable from a clean one, and
+// the count reached no caller, no exported counter and no API response. The count is
+// what lets an operator tell "my ledger is fine" from "my ledger is losing lines", so
+// it has to leave this function. See dayIssues and Writer.SkippedLines.
+func (s *store) readDay(day time.Time) ([]Row, dayIssues, error) {
 	f, err := os.Open(s.path(day))
 	if os.IsNotExist(err) {
-		return nil, nil
+		return nil, dayIssues{}, nil
 	}
 	if err != nil {
-		return nil, err
+		return nil, dayIssues{}, err
 	}
 	defer func() { _ = f.Close() }()
 
 	var out []Row
-	var skipped int
+	var issues dayIssues
 	sc := bufio.NewScanner(f)
 	sc.Buffer(make([]byte, 0, 64*1024), maxLineBytes)
 	for sc.Scan() {
@@ -234,7 +237,7 @@ func (s *store) readDay(day time.Time) ([]Row, error) {
 		if derr := json.Unmarshal(b, &r); derr != nil {
 			// No offset in the message and no bytes from the line: a corrupt ledger line
 			// could contain anything, and this text reaches a log an operator pastes.
-			skipped++
+			issues.skippedLines++
 			continue
 		}
 		out = append(out, r)
@@ -242,16 +245,36 @@ func (s *store) readDay(day time.Time) ([]Row, error) {
 	if serr := sc.Err(); serr != nil {
 		// Only ever an IO error or a line past maxLineBytes. Either ends the day's read,
 		// so it is a warning rather than a debug line: the figure that follows is short
-		// by however much came after this point.
-		slog.Warn("costledger: stopped part-way through a day file",
-			"day", day.Format(dayLayout), "rowsRead", len(out), "linesSkipped", skipped, "error", serr)
-		return out, nil
+		// by however much came after this point, and by an amount the file cannot say.
+		issues.truncated = true
+		slog.Warn("costledger: stopped part-way through a day file; the total for it is short",
+			"day", day.Format(dayLayout), "rowsRead", len(out),
+			"linesSkipped", issues.skippedLines, "error", serr)
+		return out, issues, nil
 	}
-	if skipped > 0 {
-		slog.Debug("costledger: skipped undecodable lines",
-			"day", day.Format(dayLayout), "rowsRead", len(out), "linesSkipped", skipped)
+	if issues.skippedLines > 0 {
+		// WARN, not Debug. A number missing rows is exactly what an operator has to be
+		// able to see, and the default level does not carry Debug.
+		slog.Warn("costledger: skipped undecodable lines; the total for this day is short",
+			"day", day.Format(dayLayout), "rowsRead", len(out), "linesSkipped", issues.skippedLines)
 	}
-	return out, nil
+	return out, issues, nil
+}
+
+// dayIssues is what one day file's read could not use.
+//
+// Returned rather than only logged, because the caller is what turns it into something
+// an operator can see: Query publishes it on Writer.SkippedLines and
+// Writer.TruncatedDays. Without that, a day file that lost half its lines produced the
+// same API response as a clean one — window:"today", priced:true, no caveat.
+type dayIssues struct {
+	// skippedLines is undecodable lines stepped over. The rows around them survive, so
+	// the loss is bounded by this count.
+	skippedLines int
+	// truncated reports that the read STOPPED before the end of the file. Everything
+	// after that offset is missing from the answer and nothing says how much, which is
+	// why it is tracked separately from a skip rather than added to it.
+	truncated bool
 }
 
 // prune deletes day files older than the retention window, measured back from

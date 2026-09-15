@@ -14,6 +14,7 @@ import (
 
 	"github.com/rossoctl/cortex/authbridge/authlib/costevent"
 	"github.com/rossoctl/cortex/authbridge/authlib/pipeline"
+	"github.com/rossoctl/cortex/authbridge/authlib/usage"
 )
 
 // at is a fixed clock instant used across these tests. Deliberately not UTC
@@ -459,6 +460,49 @@ func TestWriter_AFailedAppendIsCountedAsADrop(t *testing.T) {
 	if held, open := w.pending(); len(held) != 0 || !open.IsZero() {
 		t.Errorf("the accumulator still holds %d rows (open %v); the row was not lost, so "+
 			"this test is not measuring what it claims", len(held), open)
+	}
+}
+
+// THE COUNT IS WHAT THE STORE COULD NOT WRITE, NOT THE SIZE OF THE BATCH.
+//
+// It used to be len(b.rows), which over-reports in both of the ways a partly-failed
+// append can happen: a torn write leaves the rows before the tear durably on disk (see
+// TestWriteLines_ATornAppendCountsOnlyTheRowsItLost), and store.append writes one file per
+// day, so a batch spanning two of them can fail on one and land the other. Dropped() is
+// the only exported "is my cost history complete" signal, and over-reporting trains an
+// operator to disbelieve it exactly as thoroughly as under-reporting hides loss.
+//
+// write() is driven DIRECTLY here. Record cannot produce a two-day batch today — the
+// accumulator holds one minute — so going through it would assert nothing about this
+// arithmetic; the torn-append test covers the instance a real deployment reaches, and
+// this one pins the accounting in write() that both instances flow through.
+func TestWriter_AFailedAppendCountsOnlyWhatTheStoreCouldNotWrite(t *testing.T) {
+	dir := t.TempDir()
+	midnight := time.Date(2026, 9, 14, 0, 0, 0, 0, testZone)
+	before := midnight.Add(-time.Minute)
+	w := newTestWriter(t, dir, func() time.Time { return midnight })
+	// Only the SECOND day's file is unwritable. The first has to land, which is the whole
+	// point: one row is lost and one is readable back.
+	blockDayFile(t, w, midnight)
+
+	w.write(batch{rows: []Row{
+		{At: before, Endpoint: "gw", Model: "writable", Counts: usage.Counts{Requests: 1}},
+		{At: midnight, Endpoint: "gw", Model: "blocked", Counts: usage.Counts{Requests: 1}},
+	}})
+
+	if got := w.Dropped(); got != 1 {
+		t.Errorf("Dropped() = %d, want 1: the batch carried two rows and only the one destined "+
+			"for the unwritable day was lost — the other is on disk, and counting it reports a "+
+			"row the ledger can read back as missing", got)
+	}
+	// And it really is on disk, or this test is asserting the wrong number.
+	rows, issues, rerr := w.store.readDay(before)
+	if rerr != nil {
+		t.Fatalf("readDay: %v", rerr)
+	}
+	if len(rows) != 1 || issues.skippedLines != 0 {
+		t.Errorf("the writable day holds %d rows with %d skipped lines, want 1 and 0",
+			len(rows), issues.skippedLines)
 	}
 }
 
@@ -1356,11 +1400,20 @@ func (s *shortWriter) Write(b []byte) (int, error) {
 
 // A torn append has to be REPORTED, whatever it did to the file: the writer counts the
 // minute as lost and warns, and a caller reading Dropped() is how anyone finds out.
+// It also has to report HOW MUCH landed, because that is what tells its caller which rows
+// are on disk and therefore not lost. The count excludes the fence newline: that byte is
+// damage control rather than row data, and counting it would make the row the tear landed
+// in look complete.
 func TestAppendBytes_ATornWriteIsReported(t *testing.T) {
 	f := &shortWriter{limit: 7}
 
-	if err := appendBytes(f, []byte(`{"at":"2026-09-13T09:14:00Z"}`+"\n")); err == nil {
+	n, err := appendBytes(f, []byte(`{"at":"2026-09-13T09:14:00Z"}`+"\n"))
+	if err == nil {
 		t.Fatal("appendBytes swallowed a torn write; the caller has to be able to log it")
+	}
+	if n != 7 {
+		t.Errorf("appendBytes reported %d bytes stored, want 7 — its caller derives which rows "+
+			"survived from this number, and the fence byte is not one of them", n)
 	}
 }
 
@@ -1369,8 +1422,12 @@ func TestAppendBytes_ATornWriteIsReported(t *testing.T) {
 func TestAppendBytes_FailureBeforeAnyByteWritesNothingFurther(t *testing.T) {
 	f := &shortWriter{limit: 0}
 
-	if err := appendBytes(f, []byte("{}\n")); err == nil {
+	n, err := appendBytes(f, []byte("{}\n"))
+	if err == nil {
 		t.Fatal("appendBytes reported success for a write that wrote nothing")
+	}
+	if n != 0 {
+		t.Errorf("appendBytes reported %d bytes stored by a write that accepted none", n)
 	}
 	if len(f.written) != 0 {
 		t.Errorf("wrote %q to a file that accepted no bytes", f.written)
@@ -1393,6 +1450,10 @@ type tornFile struct {
 	// writer: it is what lands rows in the window between everything this writer did on
 	// the way in and the write that tears.
 	beforeWrite func()
+	// syncs counts Sync calls, so a test can assert that what landed was pushed to the
+	// device rather than left in the page cache. See
+	// TestWriteLines_ATornAppendStillSyncsWhatLanded.
+	syncs int
 }
 
 func (t *tornFile) Write(b []byte) (int, error) {
@@ -1410,6 +1471,28 @@ func (t *tornFile) Write(b []byte) (int, error) {
 		return n, err
 	}
 	return n, io.ErrShortWrite
+}
+
+// Sync counts and delegates. Declared explicitly rather than inherited from the embedded
+// *os.File so the call is observable; a real fsync still happens, because these tests
+// assert against the file on disk.
+func (t *tornFile) Sync() error {
+	t.syncs++
+	return t.File.Sync()
+}
+
+// encodedLen is how many bytes one row occupies in a day file, newline included.
+//
+// Derived from the encoder rather than hard-coded: the tests below place a tear at an
+// exact offset relative to a row boundary, and a literal would silently stop meaning
+// "just inside the second row" the next time Row gains a field.
+func encodedLen(t *testing.T, r Row) int {
+	t.Helper()
+	b, err := json.Marshal(r)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	return len(b) + 1 // json.Encoder terminates each object with a newline
 }
 
 // tornRows is a row per name, all in one minute of one day.
@@ -1463,14 +1546,14 @@ func TestWriteLines_ATornAppendDoesNotRollBackAnotherWritersRows(t *testing.T) {
 			// Well inside the first row, so the tear is mid-line — the damaging case.
 			limit: 20,
 			beforeWrite: func() {
-				if werr := writeLines(path, tornRows("committed-1", "committed-2")); werr != nil {
+				if _, werr := writeLines(path, tornRows("committed-1", "committed-2")); werr != nil {
 					t.Fatalf("the other writer's append failed, so this test proves nothing: %v", werr)
 				}
 			},
 		}, nil
 	}
 
-	if werr := writeLinesTo(tornRows("mine-1", "mine-2"), open); werr == nil {
+	if _, werr := writeLinesTo(tornRows("mine-1", "mine-2"), open); werr == nil {
 		t.Fatal("a torn append reported success; the premise of this test is that it fails")
 	}
 
@@ -1506,12 +1589,12 @@ func TestWriteLines_ATornAppendDoesNotSwallowTheNextRowAppended(t *testing.T) {
 		}
 		return &tornFile{File: f, limit: 20}, nil
 	}
-	if werr := writeLinesTo(tornRows("torn"), open); werr == nil {
+	if _, werr := writeLinesTo(tornRows("torn"), open); werr == nil {
 		t.Fatal("a torn append reported success; the premise of this test is that it fails")
 	}
 
 	// The next minute, written normally by whoever gets there first.
-	if werr := writeLines(path, tornRows("after-1", "after-2")); werr != nil {
+	if _, werr := writeLines(path, tornRows("after-1", "after-2")); werr != nil {
 		t.Fatalf("writeLines after a torn append: %v", werr)
 	}
 
@@ -1524,6 +1607,99 @@ func TestWriteLines_ATornAppendDoesNotSwallowTheNextRowAppended(t *testing.T) {
 	}
 	if issues.skippedLines != 1 {
 		t.Errorf("skippedLines = %d, want 1 — only the fragment itself", issues.skippedLines)
+	}
+}
+
+// A TORN APPEND LOSES THE ROW IT TORE AND THE ONES AFTER IT — NOT THE WHOLE BATCH, which
+// is what the count used to say.
+//
+// Counting the batch was correct only while a failed append truncated itself away, and
+// that rollback is gone: the bytes a short write stored are in the file and nothing
+// shortens it afterwards, so every row that ended before the tear is on disk and
+// readable. Writer.Dropped is the only exported "is my cost history complete" signal, and
+// over-reporting it is not a safe direction to be wrong in — an operator who learns it
+// cries wolf stops believing it when it is right.
+func TestWriteLines_ATornAppendCountsOnlyTheRowsItLost(t *testing.T) {
+	dir := t.TempDir()
+	s, err := newStore(dir, 30, time.Local)
+	if err != nil {
+		t.Fatalf("newStore: %v", err)
+	}
+	path := s.path(at)
+	rows := tornRows("landed", "torn", "never-written")
+	// A few bytes INTO the second row: the first is whole on disk, the second is a
+	// fragment, the third never left the buffer.
+	limit := encodedLen(t, rows[0]) + 5
+
+	open := func() (dayFile, error) {
+		f, oerr := os.OpenFile(path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, fileMode)
+		if oerr != nil {
+			return nil, oerr
+		}
+		return &tornFile{File: f, limit: limit}, nil
+	}
+
+	lost, werr := writeLinesTo(rows, open)
+	if werr == nil {
+		t.Fatal("a torn append reported success; the premise of this test is that it fails")
+	}
+	if lost != 2 {
+		t.Errorf("writeLinesTo reported %d rows lost, want 2 — the first row is durably on disk, "+
+			"and counting it makes Dropped() report a row it can read back as missing", lost)
+	}
+	got, issues := modelsOnDisk(t, s)
+	if !got["landed"] {
+		t.Error("row \"landed\" is not readable, so the count above is measuring the wrong thing: " +
+			"the rows before a tear are the ones this reports as NOT lost")
+	}
+	for _, gone := range []string{"torn", "never-written"} {
+		if got[gone] {
+			t.Errorf("row %q is readable; it was reported lost", gone)
+		}
+	}
+	// The fragment, fenced off and counted — the bound on what a tear costs.
+	if issues.skippedLines != 1 {
+		t.Errorf("skippedLines = %d, want 1", issues.skippedLines)
+	}
+}
+
+// THE FENCE HAS TO BE FSYNCED, and on the torn path the sync used to be skipped
+// altogether.
+//
+// Two claims rest on it. The rows before the tear are exactly the ones writeLinesTo now
+// reports as not lost, and that is a claim about the device rather than about the page
+// cache. And the newline appendBytes appends after a tear exists purely for the crash
+// case — an unterminated fragment swallowing the next row appended — so leaving the one
+// byte whose whole purpose is crash-durability unsynced defeats the purpose of writing it.
+func TestWriteLines_ATornAppendStillSyncsWhatLanded(t *testing.T) {
+	dir := t.TempDir()
+	s, err := newStore(dir, 30, time.Local)
+	if err != nil {
+		t.Fatalf("newStore: %v", err)
+	}
+	path := s.path(at)
+	rows := tornRows("landed", "torn")
+
+	var tf *tornFile
+	open := func() (dayFile, error) {
+		f, oerr := os.OpenFile(path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, fileMode)
+		if oerr != nil {
+			return nil, oerr
+		}
+		tf = &tornFile{File: f, limit: encodedLen(t, rows[0]) + 5}
+		return tf, nil
+	}
+
+	if _, werr := writeLinesTo(rows, open); werr == nil {
+		t.Fatal("a torn append reported success; the premise of this test is that it fails")
+	}
+	if tf == nil {
+		t.Fatal("the day file was never opened")
+	}
+	if tf.syncs != 1 {
+		t.Errorf("Sync was called %d times after a torn append, want 1: the surviving rows are "+
+			"reported as durable and the fence exists for the crash case, so neither may be left "+
+			"in the page cache", tf.syncs)
 	}
 }
 
@@ -1550,7 +1726,7 @@ func TestWriteLines_ConcurrentWritersDoNotLoseEachOthersRows(t *testing.T) {
 		go func(w int) {
 			defer wg.Done()
 			for j := 0; j < perWriter; j++ {
-				if werr := writeLines(path, tornRows(fmt.Sprintf("w%d-r%d", w, j))); werr != nil {
+				if _, werr := writeLines(path, tornRows(fmt.Sprintf("w%d-r%d", w, j))); werr != nil {
 					errs <- werr
 					return
 				}
@@ -1586,7 +1762,7 @@ func TestWriteLines_EveryLineEndsWithANewline(t *testing.T) {
 		{At: at, Endpoint: "gw", Model: "opus"},
 		{At: at, Endpoint: "gw", Model: "haiku"},
 	}
-	if err := writeLines(path, rows); err != nil {
+	if _, err := writeLines(path, rows); err != nil {
 		t.Fatalf("writeLines: %v", err)
 	}
 	b, err := os.ReadFile(path)

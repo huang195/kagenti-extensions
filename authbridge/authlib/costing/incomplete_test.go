@@ -54,8 +54,12 @@ func TestSettle_TruncatedStreamIsDisclosedInexact(t *testing.T) {
 	}
 	// DISCLOSURE, not adjustment: the figure itself is untouched. Estimating the missing
 	// completion would be worse than reporting a known-low number and saying it is low.
-	if s.CostUSD != 0.001 {
-		t.Errorf("CostUSD = %v, want 0.001 (1000 prompt tokens at 1e-6) — the figure must not be adjusted", s.CostUSD)
+	//
+	// Priced at the INPUT tier's rate, not at a flat per-token one — the fixture's 1,000
+	// tokens are uncached input, and a floor charged off the wrong tier would be a second
+	// error hiding inside a disclosed one.
+	if want := fallbackUSD(1000, 0); s.CostUSD != want {
+		t.Errorf("CostUSD = %v, want %v (1000 uncached prompt tokens at the input rate) — the figure must not be adjusted", s.CostUSD, want)
 	}
 }
 

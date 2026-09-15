@@ -28,9 +28,30 @@ const MaxCostMicros = 1 << 53
 // MaxCostMicros. A caller must treat that as UNPRICED and not as a large number: a
 // clamped figure is a wrong number wearing a right label, and the ring forgets it in
 // six hours while the durable ledger keeps it for thirty days with no repair path.
+//
+// The SIGN IS CHECKED ON THE INPUT, before rounding, because it does not survive the
+// rounding. math.Round(-1e-07 * 1e6) is math.Round(-0.1), which is NEGATIVE ZERO, and
+// `-0.0 < 0` is false in Go — so this returned (0, true) for every figure in
+// (-5e-07, 0), calling a wrong-signed figure a priced zero and contradicting the
+// paragraph above. Anything at or beyond -5e-07 rounded to -1 and was caught, which
+// is why the hole was only ever the tiny end.
+//
+// An input of exactly -0.0 IS ZERO and stays priced: `-0.0 < 0` is false here too, and
+// that is correct rather than incidental — negative zero is a value of zero, a settled
+// zero is a producer saying the call was free, and refusing it would report a genuine
+// free call as unpriced traffic.
+//
+// NaN does not reach this guard (every comparison against NaN is false) and is still
+// caught below, where it always was.
 func MicrosFromUSD(usd float64) (int64, bool) {
+	if usd < 0 {
+		return 0, false
+	}
 	micros := math.Round(usd * 1e6)
-	if math.IsNaN(micros) || math.IsInf(micros, 0) || micros > MaxCostMicros || micros < 0 {
+	// No `micros < 0` check: a non-negative input cannot round to a negative figure,
+	// so the input guard above subsumes it. Keeping both would leave the impression
+	// that the rounded sign is load-bearing, which is the belief that produced the bug.
+	if math.IsNaN(micros) || math.IsInf(micros, 0) || micros > MaxCostMicros {
 		return 0, false
 	}
 	return int64(micros), true

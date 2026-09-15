@@ -438,3 +438,52 @@ func TestRunCost_DefaultsToToday(t *testing.T) {
 		t.Errorf("server saw window=%q, want \"today\"", gotWindow)
 	}
 }
+
+// TestRunCost_ANegativeTotalIsNotPrintedAsARefund.
+//
+// The CLI is a money surface too, and it had the hole the TUI's Cost pane closed in two
+// places: costUSD is faithful about the sign, so a negative total printed "$-5.00" in the
+// headline. The session API refuses to publish one, so this can only be a broken producer
+// — and inheriting a guarantee silently is how it stops holding.
+//
+// "cost unavailable" plus a line naming the real cause. The headline on its own points a
+// reader at pricing coverage, which is the ordinary reason for that string and the wrong
+// place to look here.
+func TestRunCost_ANegativeTotalIsNotPrintedAsARefund(t *testing.T) {
+	srv := fakeUsageServer(t, `{"window":"today","totals":{"requests":318,`+
+		`"costMicros":-5000000,"pricedRequests":318,"priceableRequests":318},"priced":true}`)
+	defer srv.Close()
+
+	var out, errOut strings.Builder
+	if code := runCost([]string{"--endpoint", srv.URL}, &out, &errOut); code != 0 {
+		t.Fatalf("exit = %d, want 0; stderr = %s", code, errOut.String())
+	}
+	got := out.String()
+	if strings.Contains(got, "$-") {
+		t.Errorf("output prints a negative total as an amount:\n%s", got)
+	}
+	if !strings.Contains(got, "cost unavailable") {
+		t.Errorf("output neither showed a figure nor declined one:\n%s", got)
+	}
+	if !strings.Contains(got, "negative") {
+		t.Errorf("output does not name the reason there is no figure:\n%s", got)
+	}
+}
+
+// TestRunCost_APositiveTotalStillPrints is the mirror. Without it the guard above could be
+// satisfied by never printing a figure at all.
+func TestRunCost_APositiveTotalStillPrints(t *testing.T) {
+	srv := fakeUsageServer(t, `{"window":"today","totals":{"requests":318,`+
+		`"costMicros":4170000,"pricedRequests":318,"priceableRequests":318},"priced":true}`)
+	defer srv.Close()
+
+	var out, errOut strings.Builder
+	runCost([]string{"--endpoint", srv.URL}, &out, &errOut)
+	got := out.String()
+	if !strings.Contains(got, "$4.17") {
+		t.Errorf("output lost a legitimate figure:\n%s", got)
+	}
+	if strings.Contains(got, "negative") {
+		t.Errorf("output carries a caveat with nothing to act on:\n%s", got)
+	}
+}

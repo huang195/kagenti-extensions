@@ -293,6 +293,15 @@ func (m *model) spendSummary() spendSummary {
 		Incomplete:  snap.Totals.IncompleteRequests,
 		HasSnapshot: true,
 	}
+	// A negative total is refused HERE, before anything derives a figure from it, which
+	// is what makes one guard cover the amount and the burn rate at once. See
+	// negativeCost: the guarantee is upstream in authlib/sessionapi and this is defence
+	// in depth. Reported as UNPRICED rather than clamped, so the strip renders "cost
+	// unavailable" — the same treatment the Cost pane already chose, because "$-5.0000
+	// /1h" on the strip reads as a refund nobody issued.
+	if negativeCost(snap.Totals.CostMicros) {
+		out.Priced = false
+	}
 	// Priceable minus priced, NOT requests minus priced. Requests counts every
 	// proxied response — MCP calls, health checks — while only inference can ever
 	// be priced, so the wrong denominator left a correctly configured deployment
@@ -324,7 +333,10 @@ func (m *model) spendSummary() spendSummary {
 		}
 	}
 	m.applyTodayFigure(&out)
-	if snap.Priced {
+	// out.Priced, not snap.Priced: the negative-total refusal above lives in out, and
+	// reading the wire flag here would hand the renderer a figure the summary has
+	// already declined to publish.
+	if out.Priced {
 		out.WindowUSD = float64(snap.Totals.CostMicros) / 1e6
 		// Suppressed, not approximated, when the span is unknown. A rate is a
 		// quotient: without a trustworthy denominator there is no honest figure to
@@ -379,7 +391,17 @@ func (m *model) sessionCost(id string) (usd float64, priced, inexact bool) {
 		pricedReqs += c.PricedRequests
 		incompleteReqs += c.IncompleteRequests
 	}
-	if pricedReqs == 0 {
+	// A session whose summed figure is negative is UNPRICED, not cheap. The COST cell
+	// renders priced=false as blank, which already means "nobody knows what this cost" in
+	// this table — the honest answer for an impossible number, and the same treatment
+	// costTotalSection chose. Without it the cell printed "$-5.0000", a credit nobody
+	// issued, in a column a reader scans for the expensive row.
+	//
+	// Summed rather than per-bucket, because that is the figure the cell publishes: a
+	// positive bucket and a negative one can cancel to something plausible, and it is the
+	// PUBLISHED total that has to be refusable. See negativeCost — the guarantee is
+	// upstream and this is defence in depth.
+	if pricedReqs == 0 || negativeCost(micros) {
 		return 0, false, false
 	}
 	return float64(micros) / 1e6, true, incompleteReqs > 0
@@ -529,6 +551,14 @@ func (m *model) applyTodayFigure(out *spendSummary) {
 		return
 	}
 	if !snap.Priced {
+		return
+	}
+	// And it must not be NEGATIVE. Declined by leaving HasToday unset, which is this
+	// field's own spelling of "no figure" and the same treatment the window figure and the
+	// Cost pane give an impossible number — the strip then falls back to its rolling
+	// figure rather than printing "$-5.0000 today". See negativeCost: the guarantee is
+	// upstream in authlib/sessionapi, and this is defence in depth.
+	if negativeCost(snap.Totals.CostMicros) {
 		return
 	}
 	out.TodayUSD = float64(snap.Totals.CostMicros) / 1e6

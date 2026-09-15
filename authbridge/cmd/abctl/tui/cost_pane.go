@@ -674,7 +674,10 @@ func costTotalSection(snap *usage.Snapshot, width int) costSection {
 	// when the reviewer made it happen: the guarantee lived entirely on the other side of
 	// the wire and this side never restated it. Treated as unpriced, because that is what
 	// an impossible figure is: not a number to display, and certainly not a credit.
-	if snap.Totals.CostMicros < 0 {
+	//
+	// Through negativeCost, which is now that test's one spelling on every money surface.
+	// This pane held it alone and three others inherited it without restating it.
+	if negativeCost(snap.Totals.CostMicros) {
 		add("cost unavailable — the server reported a negative total, which cannot be spend")
 		return sec
 	}
@@ -832,7 +835,7 @@ func costBreakdownSection(snap *usage.Snapshot, group usage.Group, width int) co
 		// A negative figure counts as unpriced, not as a small one: see costTotalSection
 		// for why the pane restates a guarantee the server already makes. "$-5.0000" in a
 		// column of costs reads as a refund nobody issued.
-		if c.PricedRequests == 0 || c.CostMicros < 0 {
+		if c.PricedRequests == 0 || negativeCost(c.CostMicros) {
 			row.right = "cost unavailable"
 			rows = append(rows, row)
 			continue

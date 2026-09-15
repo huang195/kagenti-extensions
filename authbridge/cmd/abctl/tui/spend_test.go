@@ -866,3 +866,97 @@ func TestSpendTodayPollInterval_IsMuchSlowerThanTheWindowPoll(t *testing.T) {
 			spendTodayPollInterval)
 	}
 }
+
+// TestSpendSummary_ANegativeWindowTotalIsUnpricedNotARefund.
+//
+// The fixture the reviewer used, on the surface that had no guard. cost_pane.go refused a
+// negative CostMicros in two places and nothing else did, so the strip republished it as a
+// dollar amount: "SPEND  $-5.0000 /1h", a credit nobody issued, on the always-on line.
+//
+// Refused in spendSummary rather than in the renderer so ONE guard covers every figure
+// derived from the total — the amount and the burn rate — and so the summary never carries
+// a number the strip is forbidden to draw.
+func TestSpendSummary_ANegativeWindowTotalIsUnpricedNotARefund(t *testing.T) {
+	m := &model{}
+	m.spend.snap = &usage.Snapshot{
+		Window: "1h",
+		Totals: usage.Counts{
+			Requests: 10, CostMicros: -5_000_000,
+			PricedRequests: 10, PriceableRequests: 10,
+		},
+		Priced: true,
+	}
+
+	s := m.spendSummary()
+	if s.Priced {
+		t.Error("Priced is true for a total that cannot be spend")
+	}
+	if s.WindowUSD != 0 {
+		t.Errorf("WindowUSD = %v, want 0 — an impossible figure is not a figure", s.WindowUSD)
+	}
+	if s.BurnPerMin != 0 {
+		t.Errorf("BurnPerMin = %v, want 0 — a rate off an impossible total is impossible too",
+			s.BurnPerMin)
+	}
+	// And the counters survive, because the traffic is real even where the price is not.
+	if s.Priceable != 10 {
+		t.Errorf("Priceable = %d, want 10; the refusal dropped the coverage denominator", s.Priceable)
+	}
+}
+
+// TestApplyTodayFigure_ANegativeDayTotalLeavesHasTodayFalse.
+//
+// The today figure is the headline of this branch and reaches the strip by a different
+// path from the window figure, so it needed its own refusal: without it the strip printed
+// "SPEND  $-5.0000 today". HasToday false is this field's own spelling of "no figure",
+// which is what an impossible number is.
+func TestApplyTodayFigure_ANegativeDayTotalLeavesHasTodayFalse(t *testing.T) {
+	m := &model{}
+	m.spend.todaySnap = &usage.Snapshot{
+		Window: usage.WindowToday,
+		Totals: usage.Counts{
+			Requests: 400, CostMicros: -5_000_000,
+			PricedRequests: 400, PriceableRequests: 400,
+		},
+		Priced: true,
+	}
+
+	var out spendSummary
+	m.applyTodayFigure(&out)
+	if out.HasToday {
+		t.Error("HasToday is true for a day total that cannot be spend")
+	}
+	if out.TodayUSD != 0 {
+		t.Errorf("TodayUSD = %v, want 0", out.TodayUSD)
+	}
+}
+
+// TestSessionCost_ANegativeSessionTotalIsUnpriced.
+//
+// The sessions table's COST cell renders priced=false as blank, which already means
+// "nobody knows what this cost" in that table. A negative sum has to arrive as that rather
+// than as a figure, or the cell prints "$-5.0000" in a column a reader scans for the
+// expensive row.
+//
+// The SUM is what is refused, not each bucket: a positive bucket and a negative one can
+// cancel to something plausible, and it is the published figure that has to be refusable.
+func TestSessionCost_ANegativeSessionTotalIsUnpriced(t *testing.T) {
+	m := &model{}
+	m.spend.snap = &usage.Snapshot{
+		Window: "1h",
+		Totals: usage.Counts{Requests: 4, CostMicros: 1_000_000, PricedRequests: 4, PriceableRequests: 4},
+		Buckets: []usage.Bucket{
+			{Series: map[string]usage.Counts{"s1": {Requests: 1, CostMicros: 2_000_000, PricedRequests: 1}}},
+			{Series: map[string]usage.Counts{"s1": {Requests: 1, CostMicros: -7_000_000, PricedRequests: 1}}},
+		},
+		Priced: true,
+	}
+
+	usd, priced, _ := m.sessionCost("s1")
+	if priced {
+		t.Errorf("priced = true for a session summing to %v; the cell will print a refund", usd)
+	}
+	if usd != 0 {
+		t.Errorf("usd = %v, want 0", usd)
+	}
+}

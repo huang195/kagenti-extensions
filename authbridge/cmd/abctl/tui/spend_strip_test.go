@@ -940,3 +940,38 @@ func TestRenderSpendStrip_TodayWithAPricedWindowKeepsBoth(t *testing.T) {
 		t.Errorf("strip %q lost the priced window figure", got)
 	}
 }
+
+// TestRenderSpendStrip_NoFigureCarriesAMinusSign.
+//
+// The rendered end of the negative-total refusal, on the line that is always on screen.
+// Both figure paths at once, because they reach the strip through different code: the
+// window figure through spendSummary and the day figure through applyTodayFigure.
+//
+// "$-5.0000" is not a smaller number, it is a claim that money came back. The strip says
+// "cost unavailable" instead, which is its established spelling for a figure nobody can
+// vouch for.
+func TestRenderSpendStrip_NoFigureCarriesAMinusSign(t *testing.T) {
+	m := &model{}
+	m.spend.snap = &usage.Snapshot{
+		Window: "1h",
+		Totals: usage.Counts{Requests: 10, CostMicros: -5_000_000,
+			PricedRequests: 10, PriceableRequests: 10},
+		Priced: true,
+	}
+	m.spend.todaySnap = &usage.Snapshot{
+		Window: usage.WindowToday,
+		Totals: usage.Counts{Requests: 400, CostMicros: -5_000_000,
+			PricedRequests: 400, PriceableRequests: 400},
+		Priced: true,
+	}
+
+	got := renderSpendStrip(m.spendSummary(), 200)
+	if strings.Contains(got, "$-") {
+		t.Errorf("strip %q renders a negative amount — a refund nobody issued", got)
+	}
+	// And it is not silence either: the row is reserved on height alone, so a blank line
+	// above the footer is the one outcome worse than saying "unavailable".
+	if !strings.Contains(got, "cost unavailable") {
+		t.Errorf("strip %q neither showed a figure nor declined one", got)
+	}
+}

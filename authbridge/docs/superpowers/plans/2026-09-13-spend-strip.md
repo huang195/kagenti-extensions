@@ -1,7 +1,18 @@
 # Spend Strip Implementation Plan (commit 4)
 
-> **STATUS: implemented.** Landed as `49279b22`. The SPAN column it specifies was
-> subsequently removed and ACTIVE moved last (`8e6ffd8e`) — see that commit for why.
+<!-- Commit references in this document point into TWO pull requests, not one. The work was
+     reviewed as a single branch and then split: authlib and the proxy binary into the
+     aggregate/ledger PR, the abctl surfaces into the PR stacked on it, and these documents
+     into a third. Every SHA below was repointed after that split and verified to resolve.
+     Four commits were split in half and are cited as `<one-half>` / `<other-half>`, labelled
+     (core) and (abctl), so either PR can be reached from here.
+
+     THREE SHAs ARE DELIBERATELY UNREACHABLE: cbe34bbc, c5b1f596 and 4765644f appear in text
+     explaining that an earlier banner pointed at them wrongly. They are commits from an
+     abandoned branch, and rewriting them would delete the correction they exist to record. -->
+
+> **STATUS: implemented.** Landed as `b97dbc29` (abctl) / `003a30f8` (core). The SPAN column it specifies was
+> subsequently removed and ACTIVE moved last (`2f4c5d57`) — see that commit for why.
 >
 > An earlier revision of this banner cited `c5b1f596`, which is not an ancestor of this
 > branch: it is the same change on an abandoned branch that was never merged. A banner
@@ -13,7 +24,7 @@
 >
 > - **No wall-time column, under any name.** The File Structure table calls it `AGE`;
 >   Task 4 calls it `SPAN`. No column called `AGE` ever existed — `SPAN` is what was
->   built, and `8e6ffd8e` removed it. The shipped columns are
+>   built, and `2f4c5d57` removed it. The shipped columns are
 >   `ID / UPDATED / EVENTS / TOKENS / COST / ACTIVE`. `UPDATED` is last-event age via
 >   `relTime`, not wall time, and that is precisely why `SPAN` went: `SPAN` measured
 >   `UpdatedAt - CreatedAt`, so an idle session reported the length of its idleness and
@@ -25,9 +36,9 @@
 >   test comment that said otherwise was corrected to "yields its row"; this plan was
 >   not.
 >
-> Also superseded: `49279b22` closed a latent bug the plan does not mention (the window
+> Also superseded: `b97dbc29` (abctl) / `003a30f8` (core) closed a latent bug the plan does not mention (the window
 > figure was rendered whenever a today figure existed, even for a window that priced
-> nothing) and `90fe5ff7` supplied the "today" figure Task 4 Step 5 sets up.
+> nothing) and `6c7c7fe0` (core) / `9f0e35b0` (abctl) supplied the "today" figure Task 4 Step 5 sets up.
 >
 > **Line numbers drift.** Every `file.go:NN` below was accurate when written and many
 > have moved. Read them as "roughly here" and find the symbol by name.
@@ -55,26 +66,26 @@
 > - **Every money figure wears up to three one-column markers**, composed as
 >   `!~$4.1700+`: `!` the ledger read lost rows, `~` at least one figure in this total is
 >   inexact rather than exact, `+` the figure covers only part of the priceable traffic.
->   `moneyFigure` is the one place they go on, and `5c8638d7` made the fourth refusal —
+>   `moneyFigure` is the one place they go on, and `7789f8f0` made the fourth refusal —
 >   a negative total is never rendered as money — cover all six money surfaces rather than
 >   two. Markers are never what a narrow terminal drops; that is why dropping the caveat's
 >   words is safe.
-> - **A fifth figure was added** (`3235b47d`): how long ago the strip last polled, shown
+> - **A fifth figure was added** (`a529c66f`): how long ago the strip last polled, shown
 >   only when that answer is stale. A wedged figure that looks live is worse than a dated
 >   one.
 > - **`spendSummary` gained eight fields.** `HasSnapshot` and `Failed` separate "no poll
 >   has answered yet" from "the poll failed"; `Incomplete` carries the exactness caveat;
 >   and `TodayUnpriced`, `TodayPriceable`, `TodayIncomplete`, `TodayDegraded` exist because
->   `21afbb4b` found the two figures sharing one set of caveats — the window's coverage gap
+>   `f80c4248` found the two figures sharing one set of caveats — the window's coverage gap
 >   was qualifying the day's total and vice versa. Task 1's struct is a strict subset of
 >   the shipped one; its *optional-fields* premise is what made all of that additive, which
 >   is the thing to keep.
 >
 > Two smaller ones on the sessions list: the `COST` column's title is now the dynamic
-> `COST/<window>` (`3235b47d`), found by prefix so the span can change without breaking
+> `COST/<window>` (`a529c66f`), found by prefix so the span can change without breaking
 > lookups; and a cell too narrow for its figure renders `…` rather than blank
-> (`f01a003c`), because blank already means "unpriced" and the two must not collide.
-> `858fc445` rebuilds the rows on a resize, not only the columns.
+> (`722da202`), because blank already means "unpriced" and the two must not collide.
+> `a5a7e07b` rebuilds the rows on a resize, not only the columns.
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
@@ -984,7 +995,7 @@ A render call nothing asserts on is the failure mode here. Verify by deletion: c
 - Consumes: `spendState.snap` (Task 1), `usage.Snapshot.Buckets[].Series` keyed by session id.
 - Produces: `usage.GroupSession Group = "session"`; `(*model).sessionCost(id string) (usd float64, priced bool)` and `(*model).sessionSpan(id string) time.Duration`.
 
-`sessionCost` shipped. **`sessionSpan` was never written**, because the column it would have fed never needed a method: `SPAN` was `UpdatedAt - CreatedAt` read straight off the session row, and `8e6ffd8e` then removed the column. Nothing computes a session span in abctl today. Recorded because a reader looking for the helper should learn it is absent by design, not go looking for a deletion.
+`sessionCost` shipped. **`sessionSpan` was never written**, because the column it would have fed never needed a method: `SPAN` was `UpdatedAt - CreatedAt` read straight off the session row, and `2f4c5d57` then removed the column. Nothing computes a session span in abctl today. Recorded because a reader looking for the helper should learn it is absent by design, not go looking for a deletion.
 
 **Why this reverses an earlier decision:** the plan for commit 3 (`2026-09-13-cost-aggregation.md`) deferred `GroupSession`, reasoning that the grouping is only meaningful once #949 can tell concurrent agent sessions apart. That reasoning was about *interpretation*, and it was wrong to apply it to the *mechanism*: the sessions pane needs per-session cost now, and a `bySession` label map on the all-sessions ring is what makes it one request instead of N. The #949 caveat still holds for what the numbers *mean* on a laptop — several agents may share the `"default"` bucket — and that limitation belongs in the docs, not in a missing feature.
 
@@ -1223,7 +1234,7 @@ Assisted-By: Claude (Anthropic AI) <noreply@anthropic.com>"
 
 **Spec coverage for commit 4:** always-on strip in the chrome (Tasks 2–3) ✓; header placement above the body (Task 3) ✓; degradation by whole figures (Task 2) ✓; never `$0.00` for unknown (Tasks 2, 4) ✓; ~~fold below 20 rows (Task 3) ✓~~; sessions pane `COST` + wall time (Task 4) — `COST` ✓, wall time ✗.
 
-**Two ticks corrected.** *Fold below 20 rows*: the row is yielded, which is the half of that requirement that carries the terminal-height argument; the today figure is NOT carried into the title bar, so the headline is lost rather than preserved. *Wall time*: `SPAN` shipped and `8e6ffd8e` removed it as near-redundant with `UPDATED`, so no wall-time figure is on the sessions list at all. Both were ticked because the task was done as written; neither was checked against what the spec asked the task to achieve. That gap — tick the step, not the requirement — is what let a plan marked implemented overstate two deliverables at once.
+**Two ticks corrected.** *Fold below 20 rows*: the row is yielded, which is the half of that requirement that carries the terminal-height argument; the today figure is NOT carried into the title bar, so the headline is lost rather than preserved. *Wall time*: `SPAN` shipped and `2f4c5d57` removed it as near-redundant with `UPDATED`, so no wall-time figure is on the sessions list at all. Both were ticked because the task was done as written; neither was checked against what the spec asked the task to achieve. That gap — tick the step, not the requirement — is what let a plan marked implemented overstate two deliverables at once.
 
 **Deliberately not in this commit, and not faked:** the "today" headline (needs commit 5's ledger) and the "saved" figure (needs commit 7's `Avoided`). Task 1's struct carries both fields and Task 2 has passing tests for both render paths, so the later commits supply data only.
 

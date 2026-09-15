@@ -1,6 +1,17 @@
 # Client Identity Implementation Plan (commit 6)
 
-> **STATUS: implemented.** Landed as `80b3f38d`: `pipeline.EventClient`,
+<!-- Commit references in this document point into TWO pull requests, not one. The work was
+     reviewed as a single branch and then split: authlib and the proxy binary into the
+     aggregate/ledger PR, the abctl surfaces into the PR stacked on it, and these documents
+     into a third. Every SHA below was repointed after that split and verified to resolve.
+     Four commits were split in half and are cited as `<one-half>` / `<other-half>`, labelled
+     (core) and (abctl), so either PR can be reached from here.
+
+     THREE SHAs ARE DELIBERATELY UNREACHABLE: cbe34bbc, c5b1f596 and 4765644f appear in text
+     explaining that an earlier banner pointed at them wrongly. They are commits from an
+     abandoned branch, and rewriting them would delete the correction they exist to record. -->
+
+> **STATUS: implemented.** Landed as `6870ad3b`: `pipeline.EventClient`,
 > `usage.GroupAgent` with its `byAgent` accumulator, and the cost ledger's `agent`
 > column populated and part of the row key. An earlier revision of this banner said
 > none of it existed; that was true when written and stopped being true one commit
@@ -53,7 +64,7 @@
 >   the `Raw`-as-well-as-`Name` argument in Task 1 paying off, not a gap.
 > - **The absent-client question Task 3 Step 1 leaves open was decided, and then made a
 >   compiler problem.** The ledger stores `""` and the aggregator keys on `Label()`; both
->   reach the same bucket through `pipeline.UnknownClientLabel`, exported by `00d85b14` for
+>   reach the same bucket through `pipeline.UnknownClientLabel`, exported by `c3eeb22f` (abctl) / `8e4df70d` (core) for
 >   exactly the reason Step 1 worries about — it was a bare literal in two packages,
 >   agreeing only by a comment saying it must, and two spellings would surface as two rows
 >   each holding half the unattributed spend. `costledger.labelFor`'s `GroupAgent` arm is

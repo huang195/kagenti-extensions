@@ -1,7 +1,7 @@
 # Cost Aggregation Implementation Plan (commit 3)
 
-> **STATUS: implemented.** Landed as `f974d3db`, plus four follow-ups — `c0eadaa1`,
-> `4437a310`, `ce287f27` and `41815a73`.
+> **STATUS: implemented.** Landed as `cf74f28a`, plus four follow-ups — `3c0fe57e`,
+> `08d350d1`, `80e4b679` and `3cc6b790`.
 >
 > An earlier revision of this banner cited `cbe34bbc`, which is not an ancestor of this
 > branch: it is the same change on an abandoned branch that was never merged. A banner
@@ -13,9 +13,9 @@
 > aggregator was wrong. Each is noted again where this plan states the thing that
 > changed:
 >
-> - `GroupSession` was deferred here and landed in `b23bb152`, which also added the
+> - `GroupSession` was deferred here and landed in `49279b22`, which also added the
 >   `bucket.bySession` accumulator this plan says was not needed.
-> - `GroupAgent` was deferred here and landed in `fc1a8271`, along with `byAgent`.
+> - `GroupAgent` was deferred here and landed in `80b3f38d`, along with `byAgent`.
 > - `ParseGroup`'s error string therefore names two more values than the one this plan
 >   prescribes.
 >
@@ -48,7 +48,7 @@
 - **The unauthenticated endpoint must not echo query input** into an error body (`sessionapi/usage.go:110-116`). `ParseGroup` deliberately names the valid set instead of quoting what it got; keep that.
 - **Do not run `make lint`** — it fails on pre-existing errors elsewhere and rewrites unrelated files. Use `go vet` and `golangci-lint run --new-from-rev=main` on changed packages.
 - **Do not run `gofmt -w .` at the module root.** Format only files you touched.
-- **Known pre-existing failure on this machine:** `cmd/abctl`'s `TestRunExec_BeforeFirstStartRunsAndSaysWhatIsLost` fails for a missing `~/.cortex/ca/bundle.crt`. It fails on `main` too. Do not chase it; do not let it mask a real failure.
+- **Known pre-existing failure on this machine:** `cmd/abctl`'s `TestRunExec_BeforeFirstStartRunsAndSaysWhatIsLost` fails for a TEST-ISOLATION BUG: the fixture is deliberately bundle-less, but the machine's own `~/.cortex/ca/bundle.crt` leaks through. It fails on `main` too. It is a REAL bug rather than an environment quirk, out of scope for this branch; do not let it mask a real failure.
 - **Comment register:** long comments that explain *why*, naming the bug the code prevents. `authlib/usage/usage.go` is the model.
 
 ---
@@ -543,8 +543,8 @@ Add cases for `GroupModel` and `GroupEndpoint` alongside the existing ones, and 
 ```
 
 That is the string this commit wrote. **It is not the string in the tree**, because two later
-commits added values and each extended the message with them — `session` in `b23bb152` and
-`agent` in `fc1a8271`. The shipped string names both. Adding a `ParseGroup` case without
+commits added values and each extended the message with them — `session` in `49279b22` and
+`agent` in `80b3f38d`. The shipped string names both. Adding a `ParseGroup` case without
 extending this message is the drift to watch for: the endpoint answers 400 for a value it
 does not accept and then fails to name a value it does.
 
@@ -731,7 +731,7 @@ Expected: PASS.
 - [ ] **Step 5: Full suite, vet, lint**
 
 Run: `go test ./authlib/... ./cmd/abctl/... 2>&1 | grep -v "^ok\|no test files" | head -20`
-Expected: no output except possibly the known `cmd/abctl` `TestRunExec_BeforeFirstStartRunsAndSaysWhatIsLost` failure (missing `~/.cortex/ca/bundle.crt`, fails on `main` too).
+Expected: no output except possibly the known `cmd/abctl` `TestRunExec_BeforeFirstStartRunsAndSaysWhatIsLost` failure (a TEST-ISOLATION BUG: the fixture is deliberately bundle-less, but the machine's own `~/.cortex/ca/bundle.crt` leaks through, fails on `main` too).
 
 Run: `go vet ./authlib/... && golangci-lint run --new-from-rev=main ./authlib/usage/... ./authlib/sessionapi/... 2>&1 | tail -15`
 Expected: clean.
@@ -794,7 +794,7 @@ Assisted-By: Claude (Anthropic AI) <noreply@anthropic.com>"
 **Deferred by design:** `GroupAgent` needs `EventClient`, which is commit 6. `GroupSession` needs no new accumulator — the aggregator already keys per-session rings — but the *grouping* value is only meaningful once #949 lands, so it is not added here; `series()` is where it would go.
 
 **Both deferrals were subsequently reversed, and the second sentence above is wrong.**
-`GroupSession` landed in `b23bb152` and `GroupAgent` in `fc1a8271`. The reversal of the
+`GroupSession` landed in `49279b22` and `GroupAgent` in `80b3f38d`. The reversal of the
 *timing* is argued in the spend-strip plan's Task 4: the reasoning here was about what the
 numbers would *mean* on a laptop, and applying an interpretation caveat to the mechanism was
 the mistake — the sessions pane needs per-session cost now, and the #949 caveat belongs in the
@@ -803,7 +803,7 @@ docs rather than in a missing feature.
 The claim that it needs **no new accumulator is simply false**, and the per-session rings are
 why it looks true. A per-session ring answers "what did session X cost" when you ask for that
 session; it cannot answer "break the all-sessions window down BY session", which is what a
-sessions list needs in one request instead of one per row. `b23bb152` therefore added
+sessions list needs in one request instead of one per row. `49279b22` therefore added
 `bucket.bySession` *and* a `sessionID` parameter on `foldInto` to feed it — the first change to
 that signature since the coverage-counter fix. The lesson generalises: the aggregator holds
 marginals, and "there is already a ring keyed on it" is never evidence that a breakdown by it

@@ -32,13 +32,17 @@ const stripGap = "   "
 //
 //  1. No poll has answered yet (!HasSnapshot). "We have not looked" is honest and
 //     self-corrects within one poll interval.
-//  2. The terminal is too narrow for even one WHOLE figure — under about 18
-//     columns. Accepted rather than fixed: at that width there is no honest short
-//     form, and clipping a number is forbidden. The row stays reserved, because
-//     making the reservation depend on the rendered result would mean re-running
-//     layout() outside WindowSizeMsg and resizing every table as data came and
-//     went, which is worse than a blank line in a terminal too narrow to show a
-//     dollar figure at all.
+//  2. The terminal is too narrow for even one WHOLE figure. That threshold is the
+//     width of the widest SINGLE figure and nothing more, because fitStripFigures
+//     drops the LABEL before it drops a number: "$1.1200 /1h" is 11 columns and
+//     renders bare from width 11 up, so "" appears only at 10 or below. (This note
+//     said "about 18" — label plus figure — which was right before the label-drop
+//     fallback below existed and has been wrong by 7 since.) Accepted rather than
+//     fixed: at that width there is no honest short form, and clipping a number is
+//     forbidden. The row stays reserved, because making the reservation depend on
+//     the rendered result would mean re-running layout() outside WindowSizeMsg and
+//     resizing every table as data came and went, which is worse than a blank line
+//     in a terminal too narrow to show a dollar figure at all.
 //
 // Every OTHER state says something: a failed poll says "cost unavailable", an
 // unpriced window says so with its coverage, and a window with no priceable

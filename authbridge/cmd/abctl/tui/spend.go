@@ -214,7 +214,16 @@ func (m *model) spendSummary() spendSummary {
 		return out
 	}
 	out := spendSummary{
-		WindowLabel: snap.Window,
+		// sanitizeLabel, because snap.Window is server-supplied JSON that reaches the
+		// terminal verbatim whenever parseWindowSpan below cannot read it as a duration.
+		// Sanitised at the boundary rather than guarded at each use: the strip's whole
+		// width guarantee is expressed in lipgloss.Width, and lipgloss.Width("abc\nabcdef")
+		// is 6 — it measures the WIDEST LINE. So a label carrying a newline passes
+		// fitStripFigures' budget check and renderSpendStrip returns a TWO-LINE string,
+		// which costs a row of the table below it: the precise failure the strip's own
+		// godoc opens with. Control characters and DEL become U+FFFD (one column, so the
+		// arithmetic still holds) rather than being dropped, so tampering shows.
+		WindowLabel: sanitizeLabel(snap.Window),
 		Priced:      snap.Priced,
 		Priceable:   snap.Totals.PriceableRequests,
 		HasSnapshot: true,

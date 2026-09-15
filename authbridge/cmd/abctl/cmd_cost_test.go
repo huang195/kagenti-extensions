@@ -180,6 +180,38 @@ func TestRunCost_JSONUsesTheCountsFieldNames(t *testing.T) {
 	}
 }
 
+// costJSON.Window claims to be what the SERVER served, so "a script learns it got six hours
+// rather than a day without having to ask a second question". Nothing tested that claim:
+// TestRunCost_JSONUsesTheCountsFieldNames asks for "today" against a fixture that also
+// answers "today", so it cannot tell reporting the answer from echoing the request —
+// hardcoding costJSON{Window: "today"} passed the entire suite. The human path had the
+// equivalent check (TestRunCost_NoLedgerServesAShorterWindowAndSaysSo); the machine path did
+// not, and the machine path is the one nobody eyeballs.
+//
+// A proxy with no durable cost ledger — Kubernetes by design — is where this happens.
+func TestRunCost_JSONReportsTheWindowServedNotTheOneRequested(t *testing.T) {
+	srv := fakeUsageServer(t, `{"window":"6h0m0s","totals":{"requests":5,`+
+		`"costMicros":100000,"pricedRequests":5,"priceableRequests":5},"priced":true}`)
+	defer srv.Close()
+
+	var out, errOut strings.Builder
+	if code := runCost([]string{"--endpoint", srv.URL, "--window", "today", "--json"}, &out, &errOut); code != 0 {
+		t.Fatalf("exit = %d, want 0; stderr = %s", code, errOut.String())
+	}
+	var decoded map[string]any
+	if err := json.Unmarshal([]byte(out.String()), &decoded); err != nil {
+		t.Fatalf("--json output is not valid JSON: %v\n%s", err, out.String())
+	}
+	if decoded["window"] != "6h0m0s" {
+		t.Errorf("window = %v, want \"6h0m0s\": the span the server served, not the \"today\" that was asked for", decoded["window"])
+	}
+	// And it must not be the request under any spelling — "today" appearing anywhere in the
+	// window field would mean the request leaked into the answer.
+	if w, _ := decoded["window"].(string); strings.Contains(w, "today") {
+		t.Errorf("window = %q echoes the requested window; a script would report a six-hour figure as a day's spend", w)
+	}
+}
+
 func TestRunCost_UnreachableProxyExitsNonZeroAndSaysWhatToRun(t *testing.T) {
 	var out, errOut strings.Builder
 	code := runCost([]string{"--endpoint", "http://127.0.0.1:1"}, &out, &errOut)

@@ -1,7 +1,7 @@
 # Spend Strip Implementation Plan (commit 4)
 
-> **STATUS: implemented.** Landed as `b23bb152`. The SPAN column it specifies was
-> subsequently removed and ACTIVE moved last (`daa0bf04`) — see that commit for why.
+> **STATUS: implemented.** Landed as `49279b22`. The SPAN column it specifies was
+> subsequently removed and ACTIVE moved last (`8e6ffd8e`) — see that commit for why.
 >
 > An earlier revision of this banner cited `c5b1f596`, which is not an ancestor of this
 > branch: it is the same change on an abandoned branch that was never merged. A banner
@@ -13,7 +13,7 @@
 >
 > - **No wall-time column, under any name.** The File Structure table calls it `AGE`;
 >   Task 4 calls it `SPAN`. No column called `AGE` ever existed — `SPAN` is what was
->   built, and `daa0bf04` removed it. The shipped columns are
+>   built, and `8e6ffd8e` removed it. The shipped columns are
 >   `ID / UPDATED / EVENTS / TOKENS / COST / ACTIVE`. `UPDATED` is last-event age via
 >   `relTime`, not wall time, and that is precisely why `SPAN` went: `SPAN` measured
 >   `UpdatedAt - CreatedAt`, so an idle session reported the length of its idleness and
@@ -25,9 +25,9 @@
 >   test comment that said otherwise was corrected to "yields its row"; this plan was
 >   not.
 >
-> Also superseded: `b23bb152` closed a latent bug the plan does not mention (the window
+> Also superseded: `49279b22` closed a latent bug the plan does not mention (the window
 > figure was rendered whenever a today figure existed, even for a window that priced
-> nothing) and `8bdb9c55` supplied the "today" figure Task 4 Step 5 sets up.
+> nothing) and `90fe5ff7` supplied the "today" figure Task 4 Step 5 sets up.
 >
 > **Line numbers drift.** Every `file.go:NN` below was accurate when written and many
 > have moved. Read them as "roughly here" and find the symbol by name.
@@ -53,7 +53,7 @@
 - **The strip must not disturb the events pane.** No shared state with `eventsTbl`'s cursor, filter or scroll position.
 - **Reuse the generation-guard pattern** from `usage_pane.go:64-79` for any new poll chain: stale replies and stale ticks dropped by sequence number. That comment records a real bug — a quick exit and re-entry left two chains alive, each rescheduling the other's successor and doubling the request rate.
 - Do NOT run `make lint`. Do NOT run `gofmt -w .` at the module root — format only files you touched.
-- Known pre-existing failure on this machine: `cmd/abctl`'s `TestRunExec_BeforeFirstStartRunsAndSaysWhatIsLost` fails for a missing `~/.cortex/ca/bundle.crt`; it fails on `main` too.
+- Known pre-existing failure on this machine: `cmd/abctl`'s `TestRunExec_BeforeFirstStartRunsAndSaysWhatIsLost` fails for a TEST-ISOLATION BUG: the fixture is deliberately bundle-less, but the machine's own `~/.cortex/ca/bundle.crt` leaks through; it fails on `main` too.
 - Comment register: long comments explaining *why*, naming the bug the code prevents.
 
 ## Scope note: what this commit does NOT show
@@ -940,7 +940,7 @@ A render call nothing asserts on is the failure mode here. Verify by deletion: c
 - Consumes: `spendState.snap` (Task 1), `usage.Snapshot.Buckets[].Series` keyed by session id.
 - Produces: `usage.GroupSession Group = "session"`; `(*model).sessionCost(id string) (usd float64, priced bool)` and `(*model).sessionSpan(id string) time.Duration`.
 
-`sessionCost` shipped. **`sessionSpan` was never written**, because the column it would have fed never needed a method: `SPAN` was `UpdatedAt - CreatedAt` read straight off the session row, and `daa0bf04` then removed the column. Nothing computes a session span in abctl today. Recorded because a reader looking for the helper should learn it is absent by design, not go looking for a deletion.
+`sessionCost` shipped. **`sessionSpan` was never written**, because the column it would have fed never needed a method: `SPAN` was `UpdatedAt - CreatedAt` read straight off the session row, and `8e6ffd8e` then removed the column. Nothing computes a session span in abctl today. Recorded because a reader looking for the helper should learn it is absent by design, not go looking for a deletion.
 
 **Why this reverses an earlier decision:** the plan for commit 3 (`2026-09-13-cost-aggregation.md`) deferred `GroupSession`, reasoning that the grouping is only meaningful once #949 can tell concurrent agent sessions apart. That reasoning was about *interpretation*, and it was wrong to apply it to the *mechanism*: the sessions pane needs per-session cost now, and a `bySession` label map on the all-sessions ring is what makes it one request instead of N. The #949 caveat still holds for what the numbers *mean* on a laptop — several agents may share the `"default"` bucket — and that limitation belongs in the docs, not in a missing feature.
 
@@ -1179,7 +1179,7 @@ Assisted-By: Claude (Anthropic AI) <noreply@anthropic.com>"
 
 **Spec coverage for commit 4:** always-on strip in the chrome (Tasks 2–3) ✓; header placement above the body (Task 3) ✓; degradation by whole figures (Task 2) ✓; never `$0.00` for unknown (Tasks 2, 4) ✓; ~~fold below 20 rows (Task 3) ✓~~; sessions pane `COST` + wall time (Task 4) — `COST` ✓, wall time ✗.
 
-**Two ticks corrected.** *Fold below 20 rows*: the row is yielded, which is the half of that requirement that carries the terminal-height argument; the today figure is NOT carried into the title bar, so the headline is lost rather than preserved. *Wall time*: `SPAN` shipped and `daa0bf04` removed it as near-redundant with `UPDATED`, so no wall-time figure is on the sessions list at all. Both were ticked because the task was done as written; neither was checked against what the spec asked the task to achieve. That gap — tick the step, not the requirement — is what let a plan marked implemented overstate two deliverables at once.
+**Two ticks corrected.** *Fold below 20 rows*: the row is yielded, which is the half of that requirement that carries the terminal-height argument; the today figure is NOT carried into the title bar, so the headline is lost rather than preserved. *Wall time*: `SPAN` shipped and `8e6ffd8e` removed it as near-redundant with `UPDATED`, so no wall-time figure is on the sessions list at all. Both were ticked because the task was done as written; neither was checked against what the spec asked the task to achieve. That gap — tick the step, not the requirement — is what let a plan marked implemented overstate two deliverables at once.
 
 **Deliberately not in this commit, and not faked:** the "today" headline (needs commit 5's ledger) and the "saved" figure (needs commit 7's `Avoided`). Task 1's struct carries both fields and Task 2 has passing tests for both render paths, so the later commits supply data only.
 

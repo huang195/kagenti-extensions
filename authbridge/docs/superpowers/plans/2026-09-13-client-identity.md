@@ -1,6 +1,6 @@
 # Client Identity Implementation Plan (commit 6)
 
-> **STATUS: implemented.** Landed as `fc1a8271`: `pipeline.EventClient`,
+> **STATUS: implemented.** Landed as `80b3f38d`: `pipeline.EventClient`,
 > `usage.GroupAgent` with its `byAgent` accumulator, and the cost ledger's `agent`
 > column populated and part of the row key. An earlier revision of this banner said
 > none of it existed; that was true when written and stopped being true one commit
@@ -55,7 +55,7 @@
 - **`presentKinds`-style honesty:** an absent User-Agent is "unknown", not a blank row. Distinguish "no UA sent" from "UA sent but unrecognised" — the raw value is kept for the second case.
 - **Large test files in SEVERAL SMALL tool calls**, never one big `Write`. A single oversized write exceeds this environment's stream watchdog and kills the agent deterministically; it already killed one dispatch on this branch.
 - Do NOT run `make lint`. Do NOT `gofmt -w .` at the module root.
-- Known pre-existing failure on this machine: `cmd/abctl`'s `TestRunExec_BeforeFirstStartRunsAndSaysWhatIsLost` (missing `~/.cortex/ca/bundle.crt`); fails on `main` too.
+- Known pre-existing failure on this machine: `cmd/abctl`'s `TestRunExec_BeforeFirstStartRunsAndSaysWhatIsLost` — a TEST-ISOLATION BUG: the fixture is deliberately bundle-less, but the machine's own `~/.cortex/ca/bundle.crt` leaks through; fails on `main` too.
 - Comment register: long comments explaining *why*, naming the bug the code prevents.
 
 ## The hazard this commit has to survive

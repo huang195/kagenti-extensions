@@ -1,6 +1,27 @@
 # Cost Aggregation Implementation Plan (commit 3)
 
-> **STATUS: implemented.** Landed as `cbe34bbc` plus three follow-ups.
+> **STATUS: implemented.** Landed as `f974d3db`, plus four follow-ups — `c0eadaa1`,
+> `4437a310`, `ce287f27` and `41815a73`.
+>
+> An earlier revision of this banner cited `cbe34bbc`, which is not an ancestor of this
+> branch: it is the same change on an abandoned branch that was never merged. A banner
+> pointing at an unreachable commit is worse than no banner, because a reviewer who
+> looks it up concludes the doc is describing someone else's tree.
+>
+> **Superseded by later commits on this branch.** Nothing this commit built was undone;
+> what was reversed is two of its *deferrals*, and one sentence it wrote about the
+> aggregator was wrong. Each is noted again where this plan states the thing that
+> changed:
+>
+> - `GroupSession` was deferred here and landed in `b23bb152`, which also added the
+>   `bucket.bySession` accumulator this plan says was not needed.
+> - `GroupAgent` was deferred here and landed in `fc1a8271`, along with `byAgent`.
+> - `ParseGroup`'s error string therefore names two more values than the one this plan
+>   prescribes.
+>
+> **Line numbers drift.** Every `file.go:NN` below was accurate when written; many have
+> moved since — `fold` is at `snapshot.go:345`, not the `:159-210` cited under Global
+> Constraints. Read them as "roughly here" and find the symbol by name.
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
@@ -19,7 +40,9 @@
 - **`git commit -s` is mandatory** (DCO; a `commit-msg` hook enforces it).
 - **Attribution trailer is `Assisted-By: Claude (Anthropic AI) <noreply@anthropic.com>`.** Never `Co-Authored-By` — the hook rejects it.
 - **Field names come from the wire event, not invented here.** The spec's rule is one vocabulary end to end: `inputTokens`, `cacheReadTokens`, `cacheWriteTokens`, `outputTokens`, `reasoningTokens`, `presentKinds` — exactly as `pipeline.InferenceExtension` spells them (`authlib/pipeline/extensions.go:184-195`).
-- **`/v1/usage` changes must be purely additive.** Existing clients keep working: `tokens` stays as the sum, `group=method` keeps returning what it returns today.
+- **`/v1/usage` changes must be purely additive.** Existing clients keep working: `tokens` keeps meaning what it meant, `group=method` keeps returning what it returns today.
+
+  **"`tokens` stays as the sum" was the wrong way to say that, and `Counts.Tokens`' own godoc now says so:** "Tokens is NOT always the sum of the fields below." `parsercommon.Fill` prefers the provider's `total_tokens` when one was reported and only falls back to summing the split, so a gateway reporting a total with prompt and completion absent yields a non-zero `tokens` over an all-zero split. The additivity requirement is unaffected — no existing client's reading of `tokens` changed — but a *new* client normalising a stacked bar against it would be wrong on exactly those gateways. `presentKinds` is the field that keeps that legible: no bits set means nothing reported a breakdown at all, which is a different answer from a breakdown that was genuinely zero.
 - **`reasoningTokens` is a SUBSET of `outputTokens`.** Never add the two.
 - **Every new `Counts` field must be summed in `Counts.Add`.** `fold` (`snapshot.go:159-210`) and abctl's `(other)`-band collapse (`tui/usage_stacked.go:86,93`) both delegate to it, so a field omitted there is silently wrong at every resolution but the storage one. That exact bug already happened to `PricedRequests` and is why `Add` is exported.
 - **The unauthenticated endpoint must not echo query input** into an error body (`sessionapi/usage.go:110-116`). `ParseGroup` deliberately names the valid set instead of quoting what it got; keep that.
@@ -519,6 +542,12 @@ Add cases for `GroupModel` and `GroupEndpoint` alongside the existing ones, and 
 	return "", errors.New("unknown group (want none, model, endpoint, status, plugin; method is accepted as an alias for model)")
 ```
 
+That is the string this commit wrote. **It is not the string in the tree**, because two later
+commits added values and each extended the message with them — `session` in `b23bb152` and
+`agent` in `fc1a8271`. The shipped string names both. Adding a `ParseGroup` case without
+extending this message is the drift to watch for: the endpoint answers 400 for a value it
+does not accept and then fails to name a value it does.
+
 - [ ] **Step 5: Map both names in `bucket.series`, and add the endpoint arm**
 
 ```go
@@ -763,6 +792,22 @@ Assisted-By: Claude (Anthropic AI) <noreply@anthropic.com>"
 **Spec coverage for commit 3:** four-way token split in `Counts` (Task 1) ✓; `reasoningTokens` as a subset (Task 1) ✓; `presentKinds` OR-folded (Task 1) ✓; `GroupModel` (Task 2, as a rename — spec corrected) ✓; `GroupEndpoint` (Task 2) ✓; `/v1/usage` purely additive (Task 3) ✓; one vocabulary shared with the wire event (Task 1, enforced by `TestHandleUsage_SplitFieldsAppearOnTheWire`) ✓.
 
 **Deferred by design:** `GroupAgent` needs `EventClient`, which is commit 6. `GroupSession` needs no new accumulator — the aggregator already keys per-session rings — but the *grouping* value is only meaningful once #949 lands, so it is not added here; `series()` is where it would go.
+
+**Both deferrals were subsequently reversed, and the second sentence above is wrong.**
+`GroupSession` landed in `b23bb152` and `GroupAgent` in `fc1a8271`. The reversal of the
+*timing* is argued in the spend-strip plan's Task 4: the reasoning here was about what the
+numbers would *mean* on a laptop, and applying an interpretation caveat to the mechanism was
+the mistake — the sessions pane needs per-session cost now, and the #949 caveat belongs in the
+docs rather than in a missing feature.
+
+The claim that it needs **no new accumulator is simply false**, and the per-session rings are
+why it looks true. A per-session ring answers "what did session X cost" when you ask for that
+session; it cannot answer "break the all-sessions window down BY session", which is what a
+sessions list needs in one request instead of one per row. `b23bb152` therefore added
+`bucket.bySession` *and* a `sessionID` parameter on `foldInto` to feed it — the first change to
+that signature since the coverage-counter fix. The lesson generalises: the aggregator holds
+marginals, and "there is already a ring keyed on it" is never evidence that a breakdown by it
+exists.
 
 **Type consistency check:** `Counts` fields are `int64` to match the existing `Tokens`/`CostMicros`; `PresentKinds` is `uint8` to match `pipeline.InferenceExtension.PresentKinds`. `e.Inference.*Tokens` are `int` on the extension, so every assignment is an explicit `int64(...)` conversion — Task 1 Step 5 writes them that way.
 

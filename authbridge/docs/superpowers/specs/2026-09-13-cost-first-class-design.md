@@ -25,6 +25,28 @@
 > pricing multipliers this design did not know about, without which every figure
 > here would have been vendor list price.
 >
+> The last two of those arrived late, and a reader of an earlier revision of this
+> banner was told they were missing: the Cost pane landed in `ddb93fbd` and the
+> `agent` grouping — `usage.GroupAgent`, `pipeline.EventClient`, the ledger's
+> `agent` column — in `fc1a8271`. Both are in the tree. A banner that understates
+> what shipped defeats this convention exactly as thoroughly as one that overstates
+> it, so this is recorded rather than quietly corrected.
+>
+> **The one rule this design is built around is NOT achieved on this branch.**
+> "Exactly one component turns tokens into dollars" (see *Architecture*) remains an
+> aspiration, and the code says so in its own godoc rather than leaving a reader to
+> find out by comparing two totals. `usage.Aggregator.costOf` still resolves a rate
+> itself for any request that carries a model and tokens but arrives with no settled
+> record. Three places say it in as many words: `authlib/usage/usage.go`'s
+> `eventCost` doc ("This package is NOT rate-free, which this comment previously
+> claimed"), `authlib/sessionapi/usage.go`'s handler doc ("cost is NOT
+> single-sourced … do not write here that cost is computed in exactly one place,
+> because it is not") and `authlib/costledger/row.go`'s divergence paragraph, which
+> enumerates the three differences that follow. So there are two sources — a
+> published figure preferred, a modelled one as fallback — and they can answer
+> differently about the same request. Of the four sites #972 names, `costOf` is
+> still one of them.
+>
 > Two of its findings turned out to be bugs upstream still had, and are fixed on
 > this branch: a positive gateway cost header on a body-less response was charged
 > nowhere, and a truncated stream's floor was published as an exact total.
@@ -32,6 +54,11 @@
 > Kept rather than rewritten, because the reasoning is why the code looks the way
 > it does — including the parts that were wrong. Where it disagrees with the code,
 > the code is right.
+>
+> **Line numbers drift.** Every `file.go:NN` citation below was accurate against the
+> tree it was written against, and many have since moved — `fold` alone has travelled
+> from `snapshot.go:159` to `:345`. Read them as "roughly here"; find the symbol by
+> name.
 
 ## Why
 
@@ -91,6 +118,16 @@ strip, the row and `/v1/usage` then agree by construction rather than by discipl
 
 This is #972's design, adopted whole. The four sites it names — `litellm_budgettrack`,
 `usage.costOf`, `tui/cost_event.go`, `tui/prune_saving.go` — collapse to one.
+
+**They collapsed to two.** `usage.Aggregator.costOf` survives and still resolves rates: it
+prices any request that carries a model and tokens but arrives with no settled record. The
+rule above is the design this work aimed at and the reason the rest of the shape is what it
+is, so it stays stated as a rule rather than softened — but a reader must not take it as a
+description of the branch. `authlib/usage/usage.go`'s `eventCost` doc, `sessionapi/usage.go`'s
+handler doc and `costledger/row.go`'s divergence paragraph each say so where the code lives,
+and `row.go` enumerates the three ways the two sources can disagree about the same window.
+Closing it properly means teaching `costOf` to stop pricing, which is a change to what a
+deployment without `inference-parser` reports and therefore its own piece of work.
 
 ### Layers
 
@@ -199,12 +236,28 @@ there is one vocabulary from parser to ledger to collector, rather than aggregat
 | `outputTokens` | generated tokens |
 | `reasoningTokens` | **a subset of `outputTokens`**, never added to it |
 | `presentKinds` | OR-folded across the window |
-| `avoidedTokens` | counterfactual tokens |
-| `avoidedMicros` | counterfactual dollars, in millionths |
-| `avoidedRequests` | requests that avoided something |
-| `prunableRequests` | requests that **had a tool inventory to prune** |
+| `avoidedTokens` | counterfactual tokens — **designed, not implemented** |
+| `avoidedMicros` | counterfactual dollars, in millionths — **designed, not implemented** |
+| `avoidedRequests` | requests that avoided something — **designed, not implemented** |
+| `prunableRequests` | requests that **had a tool inventory to prune** — **designed, not implemented** |
 
-`tokens` stays as the sum, so today's consumers keep working.
+**The last four do not exist.** They are in neither `usage.Counts` nor `Counts.Add` on this
+branch, and no on-disk ledger row carries them — including the example row further down, which
+still shows all four and is therefore a picture of the design rather than of a real line. The
+savings work they belong to (commit 7 / #952) did not land, and the Cost pane records their
+absence where a reader would look for it rather than drawing an `AVOIDED` section over nothing.
+Nothing here needs revising when they arrive: `Counts.Add` sums whatever `Counts` holds, and the
+ledger's `Row` embeds `Counts`, so the storage side follows for free. What is missing is the
+aggregation, not the schema.
+
+`tokens` stays as the sum — **except that it does not always, and `Counts.Tokens`' own godoc is
+where that is stated.** `parsercommon.Fill` prefers the provider's `total_tokens` when one was
+reported and falls back to summing the split otherwise, so a gateway reporting only a total
+yields a non-zero `tokens` with every split field at 0. Old consumers do keep working, which was
+the point of the sentence; what they cannot do is normalise a stacked bar against `tokens` and
+expect the parts to add up. `presentKinds` is what makes the difference legible — no bits set
+means nothing reported a breakdown at all, which is a different answer from a breakdown that was
+genuinely zero.
 
 Two entries need justifying:
 
@@ -270,6 +323,11 @@ field names verbatim:
  "prunableRequests":12}
 ```
 
+The last four keys are **not on a real row** — see the schema table above for why. A shipped line
+is the same shape without them, plus `incompleteRequests` when any of the minute's figures is a
+floor rather than an exact total, which is a field this design did not anticipate and which exists
+so that caveat survives a restart instead of being the one thing a persisted total silently loses.
+
 `provenance` is part of the row key, not a row field: a single minute can mix a gateway's own
 figures with modelled ones, and one `provenance` per row would have to pick a winner. Keying on
 it keeps `PricedBy` reconstructible from the ledger exactly as `/v1/usage` reports it today.
@@ -283,12 +341,32 @@ watching the same traffic would see different histories.
 
 Four properties:
 
-- **The ring and the ledger never both own a minute.** The ledger holds only *closed* minutes;
-  the ring supplies the open one. `Query(from, to, group)` is the single function that stitches
-  them, so there is no second place for them to disagree. A restart mid-minute loses ≤60s of
-  cost — stated in the docs, not hidden.
-- **Windows ≤6h read the ring; `today` and `7d` read the ledger.** Same returned shape either
-  way, so the Cost pane does not branch on window.
+- **The ring and the ledger never both own a minute.** The ledger holds only *closed* minutes.
+  A restart mid-minute loses ≤60s of cost — stated in the docs, not hidden.
+
+  **The ring does not supply the open minute, and no single function stitches.** Both halves of
+  that sentence were wrong and the code corrects them. The open minute comes from the ledger's own
+  `Writer.pending()`, for four reasons `costledger`'s package doc spells out — the ring prices
+  independently, its request denominator counts non-inference traffic, it is only 6h deep so an
+  idle night rotates the minute out, and reading it would make ownership a timing question rather
+  than a provable boundary. And the work is split across three functions, not one:
+  `Window(from, to)` stitches disk and open minute (and is what a reader calls), `Query(from, to)`
+  is the disk half alone — its own doc says "Reads only what the Writer has flushed … Prefer
+  `Window`" — and `Fold(rows, group)` does the grouping, which is why neither signature carries a
+  `group` parameter. Splitting them is what makes "only closed minutes reach disk" directly
+  testable.
+- **Windows ≤6h read the ring; `today` and `7d` read the ledger.**
+
+  **Not the same returned shape, and a client must branch.** A ledger-backed window returns exactly
+  ONE bucket spanning the whole span rather than a series, and omits `unpricedBy` and `pricedBy` —
+  `unpricedBy` needs the endpoint-and-model pair of requests that could *not* be priced, which a row
+  carrying only its own labels cannot distinguish from a priced one of the same pair, and emitting
+  one map without the other would read as "no pricing gaps here". `Snapshot.BucketSeconds` is the
+  discriminator and its godoc says so in those words: "Reading this field is how a client tells the
+  two apart." abctl duly branches — `applyTodayFigure` refuses the figure unless `snap.Window` is
+  really `today`, because a proxy with no ledger answers `window=today` from the ring's maximum span
+  and reports *that* as the window it served, so trusting the request would label six hours of spend
+  as a day's.
 - **No prompt content.** Hosts, model names, counts, dollars. Documented explicitly, because it
   is a new on-disk artifact.
 - **On by default for `--local`, off in Kubernetes.** Writing files inside a pod is wrong and
@@ -309,7 +387,14 @@ An active 8h day writes roughly 480 active minutes × a few label combinations �
 
 ### The spend strip
 
-One row, directly under the title bar, above every pane.
+One row, directly under the title bar, above every pane — **except the two pickers.**
+`spendStripVisible` returns false on `paneNamespaces` and `panePods`: those run before a
+connection exists, so there is no spend to report and nothing to put in the row. Note the
+asymmetry the code documents at the reservation site: `layout()` reserves the row on HEIGHT
+alone and is blind to the pane, because it runs only on `WindowSizeMsg` and a pane-aware
+reservation would go stale on the next pane change. So a picker renders one row shorter than
+it needs, which is invisible, rather than an events table rendering one row too long, which
+pushes the footer off screen.
 
 ```
 ┌─ abctl ── localhost:9094 ── ● live ─────────────── [Sessions] Pipeline ─┐
@@ -332,8 +417,17 @@ truncated numbers", and a strip that truncates mid-figure is worse than one that
 32 cols  SPEND  $4.17 today
 ```
 
-Below 20 rows tall the strip folds into the title bar, carrying the today figure only, so a short
-terminal gives the row back to the table without losing the headline.
+Below 20 rows tall the strip gives its row back to the table.
+
+**It does not fold into the title bar, and the headline is lost.** Below `spendStripMinHeight`
+the strip is simply not drawn and the header stays a bare `styleTitle.Render(title)` with no
+figure in it. The fold was designed and never built: carrying a figure into the title means
+budgeting title width against a pane name and an endpoint that are already competing for it,
+which is a second degradation ladder rather than a reuse of this one. What shipped is the honest
+subset — the row is worth more to the table at that height than to the chrome — and the code's
+own test comment was corrected to say the strip "yields its row". Recorded rather than deleted
+because a reader who wants the headline on a 19-row terminal should find out that it was asked
+for and not delivered, not that nobody thought of it.
 
 "Today" means **local midnight to now**, in the machine's timezone. Stated because a laptop
 crosses timezones and a UTC day would silently reset mid-afternoon.
@@ -411,10 +505,26 @@ follow-on but is not required by this work.
 
 | surface | change |
 |---|---|
-| sessions pane | gains `COST` and wall time beside the existing `TOKENS` |
+| sessions pane | gains `COST`. **No wall-time column shipped** — see below |
 | events pane | `COST` populated on a default install — the settled figure, no client arithmetic |
 | help overlay | new `$` entry. `TestPaneKeysCoverAllPanes` fails until it is documented, which is how `paneUsage` shipped reachable but invisible |
-| `abctl cost [--json]` | non-TUI one-liner over the same `Query`. #950 asks the schema serve unattended workloads; #955 is headless runs |
+| `abctl cost [--json]` | non-TUI one-liner over `/v1/usage`, **not over `Query`** — see below |
+
+Two corrections to that table:
+
+- **Wall time was tried and removed.** A `SPAN` column (`UpdatedAt - CreatedAt`) shipped and was
+  taken out again: it measured *elapsed* time, so a session idle for an hour reported an hour,
+  which made it nearly redundant with `UPDATED` two columns to its left — and it was always blank
+  on cached-only rows and the first column the fitter dropped, so it cost width on every terminal
+  and showed on few. The shipped columns are `ID / UPDATED / EVENTS / TOKENS / COST / ACTIVE`, and
+  `UPDATED` is last-event age via `relTime`. The design quantity — wall time on the session summary
+  as first-event / last-event, per the Schema section — is still the right shape; a column was the
+  wrong surface for it.
+- **`abctl cost` does not touch `Query`.** It goes over HTTP, through
+  `apiclient.GetUsageWindow(ctx, window, …)`, exactly as the TUI does. That is better than the
+  design said and is the reason to note it: the CLI and the pane agree by construction because they
+  ask the same server the same question, where a CLI reading the ledger directly would have been a
+  second answer that only works on the host holding the files.
 
 ## Savings, honestly
 
@@ -444,13 +554,17 @@ Two debts are stated rather than papered over:
   `remove: []`; assert the response event carries a cost. This is the test whose absence let the
   blank `COST` column ship.
 - **Counterfactual invariant** — `Totals.CostMicros` and `PricedRequests` are unchanged by any
-  number of `Avoided` entries.
+  number of `Avoided` entries. *Vacuously true on this branch: nothing aggregates `Avoided` into
+  `Counts`, so there is nothing that could perturb them. Still the test to write when the savings
+  work lands.*
 - **One owner** — one golden request; the row figure, the `/v1/usage` total and the ledger line
   quote the same `costMicros`.
 - **`presentKinds` fold** — a model that wrote no cache renders differently from a provider that
   does not report cache.
 - **Honest zero** — an agent with no tool inventory yields `prunableRequests: 0` and renders `—`,
-  not `$0.00`.
+  not `$0.00`. *Unwritten: `prunableRequests` does not exist (see Schema). The rule it tests is
+  covered instead by `usage.Counts.PricedRequests` against `PriceableRequests`, which the strip and
+  the Cost pane both render as a coverage gap rather than as a zero.*
 - **Restart continuity** — "today" is continuous across `abctl service restart`.
 - **Strip width** — golden renders at 80 / 64 / 48 / 32 columns assert no clipped number.
   `footer_fit_test.go` is the precedent.
@@ -462,6 +576,14 @@ Two debts are stated rather than papered over:
 
 One PR, seven signed commits, reviewable in order. Visible wins land early rather than all at the
 end.
+
+**What actually landed:** one PR, but more commits than seven, because several of these were
+followed by their own fixes — the writer coming off the request path, the open minute being
+supplied at all, a corrupt ledger line no longer discarding the rest of its day. Rows 1, 2 and 7
+did not land in this form: 1 and 2 were superseded upstream (see the banner), and 7 — tool-prune's
+resolver, `Avoided` end to end — did not land at all, which is why the `avoided*` fields are absent
+and why the Cost pane has no `AVOIDED` section. Rows 3, 4, 5 and 6 map to `f974d3db`, `b23bb152`,
+`8bdb9c55` and `fc1a8271`; the Cost pane is `ddb93fbd`, an eighth commit this table does not list.
 
 | commit | content | effect |
 |---|---|---|

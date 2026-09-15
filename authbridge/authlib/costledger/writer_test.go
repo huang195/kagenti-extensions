@@ -7,6 +7,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -817,10 +818,12 @@ func TestAbandon_CountsTheQueueAndTheAccumulator(t *testing.T) {
 }
 
 // N3: closed must be set AFTER the writer goroutine has stopped. While it was set
-// before close(quit), submit's inline-write branch was armed while the goroutine was
-// still draining, so two writeLines could run on one day file — each taking its
-// rollback size from its own Stat, so a partial write in either truncates away the
-// other's rows.
+// before close(quit), every Record racing the shutdown was counted as dropped although
+// its rows could still have been written, and submit's inline-write branch was armed
+// while the goroutine was still draining, so two writeLines could run on one day file.
+// The second half no longer destroys rows — appendBytes never shortens a file, see
+// TestWriteLines_ATornAppendDoesNotRollBackAnotherWritersRows — but the ordering is what
+// keeps one writer doing this Writer's IO, which is the invariant run() rests on.
 //
 // THE ORDERING ITSELF IS ASSERTED, not a consequence of it, because the consequence
 // needs a concurrent partial write to become damage and a unit test cannot arrange
@@ -876,9 +879,10 @@ func TestClose_MarksClosedOnlyAfterTheGoroutineHasStopped(t *testing.T) {
 		t.Fatalf("Close: %v", cerr)
 	}
 	if sawClosedWhileRunning.Load() {
-		t.Error("closed was set while the writer goroutine was still running: submit's " +
-			"inline write and the draining goroutine can then be in writeLines on one day " +
-			"file at once, and each rolls back to a size the other has already moved")
+		t.Error("closed was set while the writer goroutine was still running: rows recorded " +
+			"during the shutdown are counted as dropped although they could still be written, " +
+			"and submit's inline write and the draining goroutine can both be in writeLines " +
+			"on one day file at once")
 	}
 	if !w.closed.Load() {
 		t.Error("not closed after Close returned; submit would queue work to a goroutine that has gone")
@@ -1056,6 +1060,52 @@ func TestPrune_KeepsExactlyRetainDaysFiles(t *testing.T) {
 	}
 }
 
+// A HOST CLOCK THAT STEPS FORWARD USED TO DELETE THE WHOLE LEDGER, TODAY INCLUDED.
+// The cutoff was today-minus-retention with no floor under it, so a clock that jumped
+// — NTP correcting after a resume, a restored VM, a dead CMOS battery — put every
+// existing file behind the cutoff and prune unlinked all of them. It runs
+// synchronously in New, which is exactly when a laptop's clock is least trustworthy.
+//
+// Four years is not the interesting number; any step past the retention window has the
+// same effect, and a year-scale one is what a dead battery actually produces.
+func TestPrune_AForwardClockStepDoesNotDeleteTheLedger(t *testing.T) {
+	dir := t.TempDir()
+	const retain = 30
+	s, err := newStore(dir, retain, time.Local)
+	if err != nil {
+		t.Fatalf("newStore: %v", err)
+	}
+	seed := func(d time.Time) string {
+		p := s.path(d)
+		if werr := os.WriteFile(p, []byte("{}\n"), 0o600); werr != nil {
+			t.Fatalf("seed: %v", werr)
+		}
+		return p
+	}
+	// Three days of real history. The newest is "today" by the clock that wrote it.
+	live := []string{seed(at), seed(at.AddDate(0, 0, -1)), seed(at.AddDate(0, 0, -2))}
+	// And one file that is past the window by the ledger's OWN newest day, so this also
+	// pins that the floor is not "never prune again".
+	stale := seed(at.AddDate(0, 0, -(retain + 10)))
+
+	if perr := s.prune(at.AddDate(4, 0, 0)); perr != nil {
+		t.Fatalf("prune: %v", perr)
+	}
+
+	for _, p := range live {
+		if _, serr := os.Stat(p); serr != nil {
+			t.Errorf("%s was deleted by a prune run on a clock four years ahead of it: %v — "+
+				"a clock step must never cost a user their cost history, today's least of all",
+				filepath.Base(p), serr)
+		}
+	}
+	if _, serr := os.Stat(stale); !os.IsNotExist(serr) {
+		t.Errorf("%s survived: it is %d days behind the newest day file, so it is past the "+
+			"window on any reading of the clock and retention still has to reclaim it",
+			filepath.Base(stale), retain+10)
+	}
+}
+
 // N7: the day a row is FILED under and the day a reader LOOKS in have to be decided by
 // one zone. path() named the file from the row's own zone while the day walk used the
 // caller's, and they agreed only because nothing in the pipeline calls .UTC(). One that
@@ -1198,9 +1248,8 @@ func TestFlush_AfterCloseStillWrites(t *testing.T) {
 // shortWriter accepts limit bytes and then fails, the way a file on a filesystem
 // that has just run out of space does.
 type shortWriter struct {
-	limit     int
-	written   []byte
-	truncated []int64
+	limit   int
+	written []byte
 }
 
 func (s *shortWriter) Write(b []byte) (int, error) {
@@ -1209,41 +1258,233 @@ func (s *shortWriter) Write(b []byte) (int, error) {
 		n = s.limit
 	}
 	s.written = append(s.written, b[:n]...)
+	if n < len(b) {
+		return n, io.ErrShortWrite
+	}
+	// Reached by the one-byte fence write, which is small enough to fit under the limit.
+	// It must be allowed to land, or this fake cannot tell the two failures apart.
+	return n, nil
+}
+
+// A torn append has to be REPORTED, whatever it did to the file: the writer counts the
+// minute as lost and warns, and a caller reading Dropped() is how anyone finds out.
+func TestAppendBytes_ATornWriteIsReported(t *testing.T) {
+	f := &shortWriter{limit: 7}
+
+	if err := appendBytes(f, []byte(`{"at":"2026-09-13T09:14:00Z"}`+"\n")); err == nil {
+		t.Fatal("appendBytes swallowed a torn write; the caller has to be able to log it")
+	}
+}
+
+// Nothing landed, so there is no fragment to fence: a file we have just been told we
+// cannot write to should not be written to again on the way out.
+func TestAppendBytes_FailureBeforeAnyByteWritesNothingFurther(t *testing.T) {
+	f := &shortWriter{limit: 0}
+
+	if err := appendBytes(f, []byte("{}\n")); err == nil {
+		t.Fatal("appendBytes reported success for a write that wrote nothing")
+	}
+	if len(f.written) != 0 {
+		t.Errorf("wrote %q to a file that accepted no bytes", f.written)
+	}
+}
+
+// tornFile is a day file whose first write lands only partly, the way a write to a
+// filesystem that has just run out of space does. The bytes that "landed" go to a REAL
+// file underneath, so what the test inspects afterwards is the state a real ENOSPC
+// leaves on disk rather than a fake's idea of it.
+//
+// *os.File is EMBEDDED rather than wrapped method by method so this satisfies whatever
+// interface writeLinesTo asks of a day file — including a Stat/Truncate pair, if an edit
+// ever reintroduces the rollback these tests exist to forbid. The test then fails on
+// behaviour instead of failing to compile.
+type tornFile struct {
+	*os.File
+	limit int
+	// beforeWrite runs once, immediately before the torn write. The seam for the other
+	// writer: it is what lands rows in the window between everything this writer did on
+	// the way in and the write that tears.
+	beforeWrite func()
+}
+
+func (t *tornFile) Write(b []byte) (int, error) {
+	if t.beforeWrite != nil {
+		hook := t.beforeWrite
+		t.beforeWrite = nil
+		hook()
+	}
+	if len(b) <= t.limit {
+		// The one-byte fence. It must reach the real file.
+		return t.File.Write(b)
+	}
+	n, err := t.File.Write(b[:t.limit])
+	if err != nil {
+		return n, err
+	}
 	return n, io.ErrShortWrite
 }
 
-func (s *shortWriter) Truncate(size int64) error {
-	s.truncated = append(s.truncated, size)
-	return nil
+// tornRows is a row per name, all in one minute of one day.
+func tornRows(names ...string) []Row {
+	out := make([]Row, 0, len(names))
+	for _, n := range names {
+		out = append(out, Row{At: at, Endpoint: "gw", Model: n})
+	}
+	return out
 }
 
-// The reachability argument for the whole corrupt-line problem: a short write leaves
-// a fragment with no trailing newline, and the NEXT append concatenates onto it,
-// guaranteeing a syntax error mid-file. Rolling back to where the file started costs
-// this one minute and leaves the day readable.
-func TestAppendBytes_ShortWriteIsRolledBack(t *testing.T) {
-	f := &shortWriter{limit: 7}
-
-	err := appendBytes(f, 4096, []byte(`{"at":"2026-09-13T09:14:00Z"}`+"\n"))
-
-	if err == nil {
-		t.Fatal("appendBytes swallowed a short write; the caller has to be able to log it")
+// modelsOnDisk is which rows a day file can still be read back as.
+func modelsOnDisk(t *testing.T, s *store) (map[string]bool, dayIssues) {
+	t.Helper()
+	rows, issues, err := s.readDay(at)
+	if err != nil {
+		t.Fatalf("readDay: %v", err)
 	}
-	if len(f.truncated) != 1 || f.truncated[0] != 4096 {
-		t.Errorf("truncated = %v, want one rollback to the pre-write size 4096", f.truncated)
+	got := map[string]bool{}
+	for _, r := range rows {
+		got[r.Model] = true
+	}
+	return got, issues
+}
+
+// THE ROLLBACK USED TO DESTROY ROWS IT DID NOT WRITE. writeLines took the file's size
+// before its write and truncated back to it if that write tore, so anything appended in
+// between — by a second proxy sharing the default ~/.cortex/cost, or by this process's
+// own Close draining while a Flush wrote inline — was inside the range being unlinked.
+// The failure mode was "one bad minute wipes the day file", silently: no error names it
+// and nothing is left in the file to show it happened.
+//
+// The interleaving is driven deterministically rather than with goroutines: the other
+// writer commits its rows from inside this writer's Write call, which is exactly the
+// window the old code left open.
+func TestWriteLines_ATornAppendDoesNotRollBackAnotherWritersRows(t *testing.T) {
+	dir := t.TempDir()
+	s, err := newStore(dir, 30, time.Local)
+	if err != nil {
+		t.Fatalf("newStore: %v", err)
+	}
+	path := s.path(at)
+
+	open := func() (dayFile, error) {
+		f, oerr := os.OpenFile(path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, fileMode)
+		if oerr != nil {
+			return nil, oerr
+		}
+		return &tornFile{
+			File: f,
+			// Well inside the first row, so the tear is mid-line — the damaging case.
+			limit: 20,
+			beforeWrite: func() {
+				if werr := writeLines(path, tornRows("committed-1", "committed-2")); werr != nil {
+					t.Fatalf("the other writer's append failed, so this test proves nothing: %v", werr)
+				}
+			},
+		}, nil
+	}
+
+	if werr := writeLinesTo(tornRows("mine-1", "mine-2"), open); werr == nil {
+		t.Fatal("a torn append reported success; the premise of this test is that it fails")
+	}
+
+	got, issues := modelsOnDisk(t, s)
+	for _, want := range []string{"committed-1", "committed-2"} {
+		if !got[want] {
+			t.Errorf("row %q is gone: a torn append rolled the day file back over rows another "+
+				"writer had already committed, which loses history no error reports", want)
+		}
+	}
+	if issues.skippedLines != 1 {
+		t.Errorf("skippedLines = %d, want 1 — the loss from a torn append has to be bounded to "+
+			"its own fragment AND counted, since that count is the only thing that tells an "+
+			"operator the total is short", issues.skippedLines)
 	}
 }
 
-// Nothing was written, so nothing needs undoing — and truncating anyway would be a
-// pointless write against a file we have just been told we cannot write to.
-func TestAppendBytes_FailureBeforeAnyByteDoesNotTruncate(t *testing.T) {
-	f := &shortWriter{limit: 0}
-
-	if err := appendBytes(f, 4096, []byte("{}\n")); err == nil {
-		t.Fatal("appendBytes reported success for a write that wrote nothing")
+// The fence: a torn append ends mid-row, and with no terminator the next append
+// concatenates onto the fragment and makes ITS first row unreadable too. One byte keeps
+// the damage to the fragment.
+func TestWriteLines_ATornAppendDoesNotSwallowTheNextRowAppended(t *testing.T) {
+	dir := t.TempDir()
+	s, err := newStore(dir, 30, time.Local)
+	if err != nil {
+		t.Fatalf("newStore: %v", err)
 	}
-	if len(f.truncated) != 0 {
-		t.Errorf("truncated = %v, want no rollback when no bytes landed", f.truncated)
+	path := s.path(at)
+
+	open := func() (dayFile, error) {
+		f, oerr := os.OpenFile(path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, fileMode)
+		if oerr != nil {
+			return nil, oerr
+		}
+		return &tornFile{File: f, limit: 20}, nil
+	}
+	if werr := writeLinesTo(tornRows("torn"), open); werr == nil {
+		t.Fatal("a torn append reported success; the premise of this test is that it fails")
+	}
+
+	// The next minute, written normally by whoever gets there first.
+	if werr := writeLines(path, tornRows("after-1", "after-2")); werr != nil {
+		t.Fatalf("writeLines after a torn append: %v", werr)
+	}
+
+	got, issues := modelsOnDisk(t, s)
+	for _, want := range []string{"after-1", "after-2"} {
+		if !got[want] {
+			t.Errorf("row %q is unreadable: it was appended onto an unterminated fragment, so a "+
+				"failed minute cost a later one too", want)
+		}
+	}
+	if issues.skippedLines != 1 {
+		t.Errorf("skippedLines = %d, want 1 — only the fragment itself", issues.skippedLines)
+	}
+}
+
+// Two writers on one day file, which ~/.cortex/cost being a fixed default makes
+// ordinary: a spare proxy on another port, or an overlapping restart. With nothing on
+// the write path that shortens a file, they can only append — every row lands whole and
+// nothing rolls anything back.
+//
+// A property test, not a bug reproduction: it is what would catch a return to per-row
+// encoding into the file, a handle without O_APPEND, or a new rollback.
+func TestWriteLines_ConcurrentWritersDoNotLoseEachOthersRows(t *testing.T) {
+	dir := t.TempDir()
+	s, err := newStore(dir, 30, time.Local)
+	if err != nil {
+		t.Fatalf("newStore: %v", err)
+	}
+	path := s.path(at)
+
+	const writers, perWriter = 8, 25
+	var wg sync.WaitGroup
+	errs := make(chan error, writers)
+	for i := 0; i < writers; i++ {
+		wg.Add(1)
+		go func(w int) {
+			defer wg.Done()
+			for j := 0; j < perWriter; j++ {
+				if werr := writeLines(path, tornRows(fmt.Sprintf("w%d-r%d", w, j))); werr != nil {
+					errs <- werr
+					return
+				}
+			}
+		}(i)
+	}
+	wg.Wait()
+	close(errs)
+	for werr := range errs {
+		t.Fatalf("writeLines: %v", werr)
+	}
+
+	got, issues := modelsOnDisk(t, s)
+	if issues.skippedLines != 0 || issues.truncated {
+		t.Errorf("issues = %+v, want none: concurrent appends must not corrupt a line", issues)
+	}
+	for i := 0; i < writers; i++ {
+		for j := 0; j < perWriter; j++ {
+			if want := fmt.Sprintf("w%d-r%d", i, j); !got[want] {
+				t.Errorf("row %q is missing; a concurrent writer destroyed it", want)
+			}
+		}
 	}
 }
 

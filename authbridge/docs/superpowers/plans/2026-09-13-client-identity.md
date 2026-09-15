@@ -1,8 +1,39 @@
 # Client Identity Implementation Plan (commit 6)
 
-> **STATUS: NOT YET IMPLEMENTED.** Nothing described here exists in the tree. There is
-> no `EventClient`, no `GroupAgent`, and the cost ledger's `agent` column ships empty.
-> Do not read this as documentation of behaviour.
+> **STATUS: implemented.** Landed as `fc1a8271`: `pipeline.EventClient`,
+> `usage.GroupAgent` with its `byAgent` accumulator, and the cost ledger's `agent`
+> column populated and part of the row key. An earlier revision of this banner said
+> none of it existed; that was true when written and stopped being true one commit
+> later, which is the same class of defect as a banner that overstates.
+>
+> **The design this plan replaced mid-flight is the one that shipped**, and Task 1's
+> "This replaces the plan's original design" note is where it is argued: a memoized
+> `Context.ClientInfo()` accessor, derived on demand from the headers `Context`
+> already holds, rather than a `Context.Client` field each listener assigns at request
+> entry. So no listener gained request-entry wiring; the event-construction sites gained
+> one line each.
+>
+> **COVERAGE GAP, deliberate and not recorded anywhere else.** Task 2 names
+> `forwardproxy` and `extproc` only, and only those were wired — ten
+> `SessionEvent{...}` sites, each mutation-checked. `authlib/listener/reverseproxy`
+> has **four more event sites and none of them was touched**, so every event from the
+> INBOUND path carries a nil `Client`, which `Label()` renders as the reserved
+> `"unknown"` bucket. Consequences a reader has to know:
+>
+> - `group=agent` attributes outbound traffic and silently pools all inbound traffic
+>   under one row. That row is not an agent and must not be read as one.
+> - A deployment whose traffic is mostly inbound gets a breakdown that looks empty
+>   rather than one that says it cannot answer.
+> - The fix is four one-line additions of the same `Client: pctx.ClientInfo()` — the
+>   accessor is nil-safe and needs nothing from the listener — plus the mutation check
+>   Task 2 Step 5 prescribes. It is small; it is just not done.
+>
+> Nothing about the parsing, the caps or the wire mapping is inbound-specific, so this
+> is coverage rather than a design limit.
+>
+> **Line numbers drift.** Every `file.go:NN` below was accurate when written and many
+> have moved. Read them as "roughly here" and find the symbol by name — Task 2 already
+> tells you to locate the event sites by grep for exactly this reason.
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
@@ -44,7 +75,7 @@ This is exactly the class of bug that has already cost this branch two fix round
 | `authlib/pipeline/session.go` | `SessionEvent.Client`, wire mapping, drift guard | 1 |
 | `authlib/pipeline/session_test.go` | round-trip + the reflection guard | 1 |
 | `authlib/pipeline/context.go` | `Context.ClientInfo()` + memo field | 1 |
-| `authlib/listener/forwardproxy/*.go`, `extproc/server.go` | populate at request entry and on each event | 2 |
+| `authlib/listener/forwardproxy/*.go`, `extproc/server.go` | populate on each event (**not** at request entry — see Task 1's redesign). `reverseproxy` is missing from this row and stayed unwired | 2 |
 | `authlib/usage/usage.go`, `snapshot.go` | `byAgent`, `GroupAgent` | 3 |
 | `authlib/costledger/writer.go` | populate the `agent` column | 3 |
 | `authlib/sessionapi/usage.go` | disclosure block + parameter list | 3 |
@@ -256,6 +287,8 @@ Run: `go test ./authlib/pipeline/ 2>&1 | tail -5`
 
 **What this task is, after the redesign above:** add `Client: pctx.ClientInfo()` at each `pipeline.SessionEvent{...}` construction site. There are 6+ across the two listeners — `extproc/server.go:240,279,333,373,402,450`, `forwardproxy/server.go:352,745,1054`, `transparent.go:190` — and they already read `pctx.Host` the same way, so each is a one-line addition alongside an existing field.
 
+**Ten sites were wired, and `reverseproxy`'s four were not.** The list above names two listeners and the grep in the reference section names the same three files, so a third listener's event sites were never in scope — `authlib/listener/reverseproxy/server.go` has four `SessionEvent` constructions and none carries a `Client`. Every INBOUND event therefore has a nil client, which `Label()` renders as the reserved `"unknown"` bucket, so `group=agent` pools all inbound traffic into one row that is not an agent. Left as a gap rather than quietly closed here because it needs the same mutation check Step 5 prescribes; the change itself is four lines. Note the shape of the mistake: the enumeration was correct about the sites it listed and the mutation check proved each of them, and neither of those can detect a listener that was never enumerated. Grep the whole `authlib/listener/` tree, not the files a plan names.
+
 Two sites build events from an `*http.Request` at request entry rather than from a `pctx` (`forwardproxy/server.go:265,1089`). Check whether those construct a `SessionEvent` at all or only a `Context`; if they do build an event and have no `pctx` in scope, parse from `r.Header.Get("User-Agent")` there via the same exported `ParseUserAgent`, and note it — do not invent a second parser.
 
 **No request-entry wiring is needed** and no listener needs a new assignment: `ClientInfo()` reads headers the `Context` already holds. If you find yourself adding a field for a listener to populate, stop — that is the design this plan replaced.
@@ -382,6 +415,8 @@ func (c *Context) ClientInfo() *EventClient {
 Not goroutine-safe, and that is correct: a `Context` belongs to one request and the pipeline runs its phases sequentially. Say so in the comment, because the surrounding type has fields that other goroutines do read.
 
 Then add `Client: pctx.ClientInfo()` at each `pipeline.SessionEvent{…}` construction site. Locate them by grep, not by the line numbers in this plan — `grep -n 'SessionEvent{' authlib/listener/*/*.go authlib/pipeline/*.go`. Expect roughly ten across `extproc/server.go`, `forwardproxy/server.go` and `transparent.go`.
+
+That grep reaches `reverseproxy/server.go` too, and its **four sites were left unwired** — see the banner and Task 2's opening for the consequence. "Roughly ten across these three files" is the sentence that made a fourth file invisible: the number came from the files, so counting them back could never disagree with it.
 
 For the one or two sites that build an event from an `*http.Request` with no `pctx` in scope, call `ParseUserAgent(r.Header.Get("User-Agent"))` directly — the same exported parser, never a second implementation — and note which sites those were.
 
@@ -569,10 +604,14 @@ Run: `go test ./authlib/usage/ ./authlib/costledger/ ./authlib/sessionapi/ 2>&1 
 
 ## Self-Review
 
-**Spec coverage:** `EventClient{Name, Version, Raw}` on the event (Task 1) ✓; populated from the request's User-Agent (Task 2) ✓; documented as a display axis, not a security boundary (Tasks 1, 3) ✓; `GroupAgent` (Task 3) ✓; ledger `agent` column populated (Task 3) ✓; unrecognised agents still nameable (Task 1, via `Raw`) ✓; absent vs unrecognised distinguishable (Task 1) ✓.
+**Spec coverage:** `EventClient{Name, Version, Raw}` on the event (Task 1) ✓; populated from the request's User-Agent (Task 2) — **outbound only**, see below; documented as a display axis, not a security boundary (Tasks 1, 3) ✓; `GroupAgent` (Task 3) ✓; ledger `agent` column populated (Task 3) ✓; unrecognised agents still nameable (Task 1, via `Raw`) ✓; absent vs unrecognised distinguishable (Task 1) ✓.
+
+**The one partial tick.** `forwardproxy` and `extproc` carry the client; `reverseproxy` does not, so every inbound event has a nil `Client` and pools under `"unknown"`. Ticked as done because every site the plan enumerated was wired and mutation-checked — which is exactly why the tick is worth keeping visible rather than editing to `✓`: coverage of an enumeration proves nothing about the enumeration.
 
 **Beyond the spec, and why:** the reflection drift guard. The spec says only "the listener gains one fact"; it does not say that adding a field to `SessionEvent` has four edit sites and fails silently if you miss one. Adding the field without the guard would leave the next person the same trap.
 
 **Type consistency:** `EventClient` is a pointer on both `Context` and `SessionEvent`, nil meaning "no User-Agent sent". `Label()` is nil-safe and returns `"unknown"` — every consumer (aggregator, ledger) calls it without a nil check, which is the point.
 
 **Risk:** Task 2 touches ~10 construction sites across two listeners. The mutation check in Task 2 Step 5 is what turns "I edited them all" from a claim into evidence.
+
+It did: all ten were mutation-checked, and deleting the `Client` line at any one of them fails a named test. It also proved nothing about the third listener, whose four sites this plan never names. Both halves of that sentence are the finding.

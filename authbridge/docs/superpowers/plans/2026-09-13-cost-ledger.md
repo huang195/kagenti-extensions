@@ -1,6 +1,31 @@
 # Cost Ledger Implementation Plan (commit 5)
 
-> **STATUS: implemented.** Landed as `4765644f`.
+> **STATUS: implemented.** Landed as `8bdb9c55`.
+>
+> An earlier revision of this banner cited `4765644f`, which is not an ancestor of this
+> branch: it is the same change on an abandoned branch that was never merged. A banner
+> pointing at an unreachable commit is worse than no banner, because a reviewer who
+> looks it up concludes the doc is describing someone else's tree.
+>
+> **Five later commits changed what this plan describes.** Each is noted again at the
+> place where this plan says the thing that changed:
+>
+> - `d181d00a` — the open minute. This plan says the in-memory usage ring supplies it.
+>   It does not and could not; `Writer.pending()` does, and `Window()` stitches. Until
+>   that commit `window=today` under-reported, silently and indefinitely once traffic
+>   stopped. `costledger/row.go`'s package doc names this plan's claim as the error an
+>   earlier draft made and gives four reasons the ring cannot be the source.
+> - `e1b86747` — `Record` was taken off the request path entirely. No IO at all now,
+>   not "one append per minute roll".
+> - `d3e771fd` — a corrupt ledger line is skipped and reading continues, rather than
+>   ending the day's read at that point.
+> - `fc1a8271` — the `agent` column, which this plan deliberately ships empty, is
+>   populated and part of the row key.
+> - `df0e7a6a` — the ring-versus-ledger difference this plan treats as an internal
+>   detail became a user-visible disclosure on `/v1/usage` and in `costledger`'s doc.
+>
+> **Line numbers drift.** Every `file.go:NN` below was accurate when written and many
+> have moved. Read them as "roughly here" and find the symbol by name.
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
@@ -18,7 +43,9 @@
 - **`git commit -s` mandatory.** Trailer `Assisted-By: Claude (Anthropic AI) <noreply@anthropic.com>`; never `Co-Authored-By`.
 - **Field names come from `usage.Counts`**, verbatim, so the ledger, `/v1/usage` and the future collector share one vocabulary. Do not invent ledger-side spellings.
 - **The ledger holds NO prompt content.** Hosts, model names, counts, dollars, timestamps. Nothing else, ever. This is a user-facing promise in the docs.
-- **The ring and the ledger must never both own a minute.** The ledger holds only *closed* minutes; the in-memory ring supplies the open one. A restart mid-minute loses ≤60s and that is documented, not hidden.
+- **The ring and the ledger must never both own a minute.** The ledger holds only *closed* minutes on disk. A restart mid-minute loses ≤60s and that is documented, not hidden.
+
+  **The second half of this constraint as originally written — "the in-memory ring supplies the open one" — is wrong, and following it is what produced the defect `d181d00a` fixed.** The open minute comes from THIS package's own accumulator: `Writer.pending()` returns it and `Window()` stitches the two halves. `ledgerSnapshot` never reads the ring at all. `costledger/row.go`'s package doc names this claim as the error an earlier draft of that doc made, and gives four reasons the ring cannot be the source — it prices independently via `usage.Aggregator.costOf`, its request denominator counts MCP and health traffic this package excludes, it is only 6h deep so a minute held overnight has already rotated out of it, and it knows nothing about what has been flushed, which would make ownership a timing question rather than a provable boundary. Read that doc before touching either side of the seam.
 - **On by default for `--local`, off in Kubernetes.** Writing files inside a pod is wrong; the central collector is the right sink there.
 - **"Today" means local midnight to now, in the machine's timezone.** A laptop crosses timezones and a UTC day would reset mid-afternoon.
 - **Never `$0.00` for an unknown cost.** Unpriced minutes contribute no cost and are visible as the priced/priceable gap.
@@ -40,6 +67,8 @@ So the ledger registers as a **second, independent Recorder**. Two reasons this 
 Cost: the ledger decodes each event's cost record itself, via `costevent.Record`. That is a second read of one small JSON blob per response — not a second pricing decision, which is what #972 forbids. The figure is whatever `inference-parser` settled; the ledger never prices anything.
 
 **The `agent` column stays empty until commit 6** (it needs `EventClient` from the User-Agent). Write the field, leave it `""`, and let commit 6 populate it. Do not omit the field — a schema that gains a column later is worse than one that has an empty column now.
+
+That commit is `fc1a8271` and it landed: the column is populated and is part of the row key, so two agents on one endpoint and model in one minute are two rows. It kept `""` as the storage for *absence* rather than adopting the aggregator's display string `"unknown"` — a durable file must not bake a display value into a field where it becomes permanently indistinguishable from an agent that really called itself that — and `labelFor` maps `""` back to `"unknown"` at the query boundary, so `group=agent` returns the same key whether it was served from the ring or from disk.
 
 ---
 
@@ -439,6 +468,19 @@ func New(dir string, opts ...Option) (*Writer, error) {
 // Never returns an error and never blocks on IO beyond one append per minute
 // roll: this runs on the synchronous session-append path, and the ledger is
 // observability. A failure here must not become a failed request.
+//
+// SUPERSEDED by e1b86747: "beyond one append per minute roll" was still one
+// filesystem write on the request path, and that path holds session.Store's WRITE
+// LOCK, so every other request in the proxy queues behind it. Record now does NO IO
+// at all — one mutex, one map operation, and at most one non-blocking channel send.
+// A background goroutine owns the filesystem and is the only thing that touches it
+// after construction, which also removes the need for any lock around the day files.
+//
+// The send is non-blocking, so a full queue DROPS rather than waits: the only way to
+// fill a 1024-deep buffer is a filesystem that has stopped keeping up, and the
+// alternative to losing a minute of cost history is stalling every proxied request
+// until the disk comes back. Drops are counted, warned about, and exposed on
+// Dropped() — an undisclosed drop is how a total quietly becomes wrong.
 func (w *Writer) Record(_ string, e *pipeline.SessionEvent) {
 	if e == nil || e.Inference == nil {
 		// Non-inference traffic the proxy handled — MCP, health checks, tunnels.
@@ -559,7 +601,14 @@ func (w *Writer) Close() error {
 
 - [ ] **Step 5: Create `store.go`**
 
-Day files, append-only, retention by deletion. Keep it small: `newStore(dir)`, `append([]Row) error`, `close() error`, `prune(keepDays int) error`, `path(t time.Time) string` returning `dir/2026-09-13.jsonl`. Open with `os.OpenFile(..., os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o600)` — `0o600` because the file records spend, and `0o644` would make it world-readable on a shared machine. One `json.Encoder` per append call; do not hold a long-lived handle across day boundaries.
+Day files, append-only, retention by deletion. Keep it small: `newStore(dir)`, `append([]Row) error`, `close() error`, `prune(keepDays int) error`, `path(t time.Time) string` returning `dir/2026-09-13.jsonl`.
+
+Two of those signatures shipped differently, and both differences are the retention window
+moving from the caller to the store: it is `newStore(dir string, retainDays int)`, which
+defaults a non-positive value, and `prune(now time.Time) error`, which reads `s.retainDays`
+and takes the *clock* instead. Passing `now` is what makes retention testable without waiting
+a day, and holding `retainDays` on the store is what stops two call sites disagreeing about
+how long a day file lives. Open with `os.OpenFile(..., os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o600)` — `0o600` because the file records spend, and `0o644` would make it world-readable on a shared machine. One `json.Encoder` per append call; do not hold a long-lived handle across day boundaries.
 
 Default retention 30 days. An active 8h day writes roughly 480 active minutes × a few label combinations ≈ 350 KB, so 30 days is ~10 MB.
 
@@ -916,6 +965,18 @@ Add to `store.go`:
 // than failing the query. A truncated final line is the expected outcome of a crash
 // mid-append, and discarding a whole day because its last line is half-written
 // would turn a 60-second gap into a 24-hour one.
+//
+// SUPERSEDED by d3e771fd, which is the same argument carried one step further. Stopping
+// at the bad line only works if the bad line is the LAST one — which it is for a crash
+// mid-append and is not for any other kind of corruption. A bad line in the morning
+// discarded the rest of the day, reintroducing exactly the 24-hour gap this comment
+// says it exists to avoid. The shipped readDay SKIPS the undecodable line and keeps
+// going, counts how many it skipped, and logs the count; only a scanner error — IO, or
+// a line past maxLineBytes — ends the read, and then it warns rather than debug-logs,
+// because the figure that follows is short by however much came after that point.
+// Neither path ever fails the query, and no message carries bytes from the bad line: a
+// corrupt ledger line could contain anything and this text reaches a log an operator
+// pastes.
 func (s *store) readDay(day time.Time) ([]Row, error) {
 	f, err := os.Open(s.path(day))
 	if os.IsNotExist(err) {
@@ -1242,6 +1303,26 @@ func (s *Server) ledgerSnapshot(spec usage.Spec, sessionID string, group usage.G
 }
 ```
 
+Three things about that body are not what shipped, and the first is the whole point of
+`d181d00a`:
+
+- **`s.ledger.Window(...)`, never `Query(...)`.** `Query` answers only for what has been
+  flushed, so it systematically omits the minute currently accumulating — and omits it
+  *indefinitely* once traffic stops, because the flush is driven by the next event. The case
+  this endpoint exists for is the worst of it: a session whose whole conversation fit inside
+  one minute has nothing on disk at all, so the response said `priced:false` over real money.
+  `Window` composes disk and open minute and guarantees no minute is in both; its doc gives
+  the three-step non-overlap argument.
+- **No `sessionID` parameter.** `handleUsage` refuses `session=` alongside a symbolic window
+  before reaching here, because the ledger's rows hold no session ids — a snapshot echoing a
+  session it did not filter by would be a wrong label on a right number.
+- **`UnpricedBy` and `PricedBy` are absent, deliberately**, and the shipped doc says why:
+  provenance is in the row key so `PricedBy` is reconstructible later, but `UnpricedBy` needs
+  the endpoint-and-model pair of requests that could NOT be priced, which a row carrying only
+  its own labels cannot tell from a priced one of the same pair. Emitting one map without the
+  other would read as "no pricing gaps here". The gap stays visible as
+  `Totals.PricedRequests` against `Totals.PriceableRequests`.
+
 `sessionID` is accepted and echoed but **not filtered on**: the ledger's rows carry no session id, because a session is a laptop-lifetime concept while the ledger is a day-lifetime one. Say so in the godoc rather than silently returning all-sessions data under a session label — and if that seems wrong, the honest alternative is to reject `session` together with a symbolic window, which is also acceptable. Pick one and state it.
 
 `UnpricedBy`/`PricedBy` are not reconstructed here in this task; `provenance` is in the row key so it is possible, but leave it for whoever needs it and say so, rather than emitting a half-populated map that reads as "no gaps".
@@ -1470,7 +1551,17 @@ Set `HasToday` **only** when the response's `window` is actually `today`. If the
 
 ## Self-Review
 
-**Spec coverage:** durable per-minute rows at `~/.cortex/cost/YYYY-MM-DD.jsonl` (Task 1) ✓; `usage.Counts` field names (Task 1, by embedding) ✓; provenance in the key (Task 1) ✓; ring owns the open minute (Task 1) ✓; one stitching reader (Task 2) ✓; `window=today|7d` (Task 3) ✓; on locally / off in-cluster (Task 3) ✓; retention 30 days (Task 1/3) ✓; no prompt content (Task 1, asserted on bytes) ✓; `abctl cost --json` (Task 4) ✓; "today" headline (Task 4) ✓.
+**Spec coverage:** durable per-minute rows at `~/.cortex/cost/YYYY-MM-DD.jsonl` (Task 1) ✓; `usage.Counts` field names (Task 1, by embedding) ✓; provenance in the key (Task 1) ✓; ~~ring owns the open minute (Task 1) ✓~~ — **this tick was false when written**, see below; one stitching reader (Task 2) ✓; `window=today|7d` (Task 3) ✓; on locally / off in-cluster (Task 3) ✓; retention 30 days (Task 1/3) ✓; no prompt content (Task 1, asserted on bytes) ✓; `abctl cost --json` (Task 4) ✓; "today" headline (Task 4) ✓.
+
+**The one false tick, kept visible.** Nothing owned the open minute when this commit landed:
+the ring did not supply it, this package did not yet hold it out, and `ledgerSnapshot` read
+`Query` — so `window=today` under-reported by up to a minute, and by everything since the last
+event once traffic stopped. `d181d00a` closed it by making the writer's own accumulator the
+source and `Window()` the stitch. Left as a struck-through tick rather than edited to pass,
+because the interesting failure is not the missing code: it is that a self-review restated the
+plan's own wrong constraint and ticked it. A checklist item copied from a constraint can only
+ever verify that the constraint was followed, never that it was right. `costledger/row.go`'s
+package doc is where the four reasons the ring cannot be the source now live.
 
 **Deliberate gaps, not omissions:** `agent` is empty until the client-capture commit; the field ships now so no reader sees a schema change. `Avoided`/savings columns arrive with the savings commit — `usage.Counts` embedding means they appear automatically once added there, which is the point of embedding.
 

@@ -316,12 +316,28 @@ func (s *Server) ledgerSnapshot(spec usage.Spec, group usage.Group) (usage.Snaps
 		return usage.Snapshot{}, err
 	}
 	totals, series := costledger.Fold(rows, group)
+	// Read AFTER Window, never before: both counters are gauges for the most recent read,
+	// so sampling them earlier would report the previous caller's answer as this one's.
+	//
+	// Surfaced here because the ledger having the numbers is not the same as a client
+	// being able to see them. Until this, a day that lost lines produced a response
+	// byte-identical to a clean one — a short total under priced:true — so the skip that
+	// saved the rest of the day was invisible to everyone downstream of it.
+	var degraded *usage.Degraded
+	if skipped, truncated := s.ledger.SkippedLines(), s.ledger.TruncatedDays(); skipped > 0 || truncated > 0 {
+		degraded = &usage.Degraded{SkippedLines: skipped, TruncatedDays: truncated}
+		// At Warn, and unconditionally: a client may not render the field, and an operator
+		// with a corrupt day file wants to hear about it once per read rather than never.
+		slog.Warn("sessionapi: cost ledger read was incomplete — the total is short",
+			"window", spec.Label, "skippedLines", skipped, "truncatedDays", truncated)
+	}
 	return usage.Snapshot{
 		Window:        spec.Label,
 		BucketSeconds: int(spec.To.Sub(spec.From).Seconds()),
 		Group:         group,
 		Buckets:       []usage.Bucket{{At: spec.From, Counts: totals, Series: series}},
 		Totals:        totals,
+		Degraded:      degraded,
 		// Same rule as Aggregator.Snapshot: an inexact figure is still a figure, so a
 		// window whose every request was a truncated stream reports priced:true over a
 		// real total and discloses the caveat in Totals.IncompleteRequests. Withholding

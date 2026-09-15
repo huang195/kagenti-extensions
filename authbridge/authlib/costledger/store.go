@@ -186,22 +186,92 @@ type dayFile interface {
 
 // writeLines appends one day's rows as JSON lines to the day file at path, returning
 // how many of them did not land. See writeLinesTo.
+//
+// FSYNCS THE DIRECTORY when the day file had to be CREATED, and that is a durability hole
+// rather than a nicety. writeLinesTo fsyncs the FILE, which puts the bytes on the device —
+// but a file's NAME lives in its parent directory, and that directory entry is not covered
+// by the file's own fsync. Without this, the first append of each day could be lost
+// entirely to power loss: the data synced, the name never recorded, and the day file simply
+// absent afterwards with nothing anywhere saying a minute had been written. Every later
+// append that day is safe without it, because the entry already exists.
+//
+// The cost is ONE extra fsync PER DAY, on the writer goroutine, never on a request path —
+// which is why the existence check is worth making rather than syncing the directory on
+// every append. A stat that races another writer's create is harmless: both would sync a
+// directory entry that is already there.
+//
+// Reported like a failed file Sync, not as a lost row: the rows ARE in the file and every
+// reader will see them, and what cannot be claimed is that the file survives the host
+// losing power. Writer.write already separates those two cases (see its "zero lost with a
+// non-nil error" branch), so this arrives as an error with a drop count of zero.
 func writeLines(path string, rows []Row) (int, error) {
-	return writeLinesTo(rows, func() (dayFile, error) {
+	// Checked BEFORE the open, which is the only place it can be: the open creates the
+	// file, after which "did this exist" is unanswerable.
+	_, statErr := os.Stat(path)
+	creating := os.IsNotExist(statErr)
+	lost, err := writeLinesTo(rows, func() (dayFile, error) {
 		return os.OpenFile(path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, fileMode)
 	})
+	if !creating {
+		return lost, err
+	}
+	if derr := syncNewDayFileName(filepath.Dir(path)); derr != nil && err == nil {
+		// Behind a write error, never in front of it: a tear is what a caller can act on,
+		// and an unsynced directory entry only adds that the same device is failing in a
+		// second way.
+		err = derr
+	}
+	return lost, err
+}
+
+// syncNewDayFileName is syncDir, indirected for ONE reason: an fsync has no userspace
+// effect, so nothing in this package — or any test of it — can otherwise tell the call from
+// a no-op. A durability step nothing can pin is a step a future edit removes silently, and
+// this one was already missing once.
+//
+// Replaced only by this package's tests, exactly like Writer.betweenWindowReads. Nil is
+// never a valid value.
+var syncNewDayFileName = syncDir
+
+// syncDir fsyncs a directory, so a file just created in it has a NAME that survives power
+// loss and not only contents that do.
+//
+// BEST EFFORT BY DESIGN on the platforms where it is not a thing: opening a directory for
+// reading and fsyncing it is POSIX behaviour, and a filesystem that refuses either returns
+// an error here which the caller reports as a durability claim it cannot make. It never
+// affects whether the rows are readable.
+func syncDir(dir string) error {
+	f, err := os.Open(dir)
+	if err != nil {
+		return fmt.Errorf("costledger: cannot open %s to make a new day file's name durable: %w", dir, err)
+	}
+	serr := f.Sync()
+	cerr := f.Close()
+	if serr != nil {
+		return fmt.Errorf("costledger: a new day file's rows are on the device but its name in "+
+			"%s is not, so power loss can leave the file absent: %w", dir, serr)
+	}
+	return cerr
 }
 
 // writeLinesTo is writeLines with the opening of the day file injected, so a test can
 // put a file that fails part-way through a write where the real one goes.
 //
 // Marshalled in full FIRST and written ONCE, which is what keeps a day file
-// syntactically intact under a failure. Encoding straight to the file, a row at a
+// syntactically intact under a SHORT WRITE. Encoding straight to the file, a row at a
 // time, meant a short write — ENOSPC, EIO — left a fragment with no trailing
 // newline, and the next successful append concatenated onto it: a guaranteed syntax
 // error at that offset. readDay resyncs past one now, but not producing the damage
 // beats tolerating it, and a laptop filling its disk is exactly when someone asks
 // what things cost.
+//
+// IT DOES NOT HOLD ACROSS A CRASH, and an earlier version of this paragraph said
+// "under a failure" without qualification. A short write is a failure this function is
+// still running after, so it can append the fence newline appendBytes documents. Power
+// loss, SIGKILL and a panic are failures it is not: the write may have landed partly with
+// nothing left to fence it, and the file is then exactly the shape described above — a
+// fragment that swallows whatever is appended next. See appendBytes for what that costs
+// and why it is still the right trade.
 //
 // RETURNS HOW MANY ROWS DID NOT LAND, which is not the same as len(rows) whenever the
 // write tore. The single Write reports the byte count it stored, the rows are laid out in
@@ -309,11 +379,10 @@ func lostRows(ends []int, n int) int {
 //
 // A ROLLBACK THAT CAN BE WRONG IS WORSE THAN NO ROLLBACK, because of what the two
 // failures cost. Not rolling back leaves one undecodable line: readDay steps over it and
-// COUNTS it, and the count reaches a caller on Writer.SkippedLines, so the loss is
-// bounded at that line and it is visible. Rolling back over another writer's rows
-// deletes committed history with no error, no count and nothing left in the file to say
-// it happened. Bounded and reported beats unbounded and silent, and that is the whole
-// trade.
+// COUNTS it, and the count reaches a caller in Caveats, so the loss is bounded and it is
+// visible. Rolling back over another writer's rows deletes committed history with no
+// error, no count and nothing left in the file to say it happened. Bounded and reported
+// beats unbounded and silent, and that is the whole trade.
 //
 // Hence the newline. A torn write ends mid-row, and with no terminator the NEXT append
 // concatenates onto that fragment and makes its first row unreadable too — so one byte
@@ -321,6 +390,24 @@ func lostRows(ends []int, n int) int {
 // often refuse this too, and then the file is merely back to the bounded case above. It
 // can only ever ADD a byte, which is what makes it safe to attempt on a file another
 // writer has open.
+//
+// THE FENCE ONLY RUNS IF THIS PROCESS IS STILL ALIVE, which is the load-bearing
+// qualification and used to be missing. It covers a SHORT WRITE — the device refused some
+// bytes and returned an error, and the next statement appends the newline. It cannot cover
+// power loss, SIGKILL or a panic between the write and the fence: nothing runs, the file
+// keeps an unterminated fragment, and the next append concatenates onto it.
+//
+// WHAT THAT COSTS, measured rather than reasoned about: TWO rows are missing from the
+// answer — the fragment and the row appended onto it, which the scanner reads as one
+// undecodable line — while the caveat for that day says ONE skipped line. So the reported
+// count is a FLOOR on rows lost, not an exact figure, and the doc that called it exact was
+// wrong. It is still bounded (one extra row per fragment, and only ever the first row
+// appended after a crash), still visible, and still better than a silent rollback over
+// another writer's committed spend. The honest statement of the guarantee is: a live short
+// write costs the rows it tore and no more; a crash mid-append costs those plus the first
+// row written afterwards, and the skipped-line count under-reports it by that one row.
+// Making the count exact would need the reader to distinguish a fragment from a corrupt
+// line, which the bytes do not support.
 //
 // NO LOCK, and that is a decision rather than an omission. With nothing on this path
 // that shortens a file, concurrent writers can only append: each flush is one write to
@@ -455,8 +542,10 @@ func (s *store) readDay(day time.Time) ([]Row, dayIssues, error) {
 // Writer.TruncatedDays. Without that, a day file that lost half its lines produced the
 // same API response as a clean one — window:"today", priced:true, no caveat.
 type dayIssues struct {
-	// skippedLines is undecodable lines stepped over. The rows around them survive, so
-	// the loss is bounded by this count.
+	// skippedLines is undecodable lines stepped over. The rows around them survive, so the
+	// loss is bounded — but this count is a FLOOR on the rows lost, not an exact figure: a
+	// line that is a crash fragment with the next append concatenated onto it is ONE
+	// undecodable line holding TWO lost rows. See appendBytes for the measurement.
 	skippedLines int
 	// truncated reports that the read STOPPED before the end of the file. Everything
 	// after that offset is missing from the answer and nothing says how much, which is

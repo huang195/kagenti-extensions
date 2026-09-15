@@ -146,6 +146,12 @@ func (w *Writer) Window(ctx context.Context, from, to time.Time) ([]Row, Caveats
 type Caveats struct {
 	// SkippedLines is how many lines this read could not decode and stepped over. Each is
 	// spend that happened and is not in the rows returned beside it.
+	//
+	// A FLOOR ON ROWS LOST, not an exact count of them. One undecodable line is usually one
+	// row, but a line that is a crash fragment with the next append concatenated onto it is
+	// one line holding two lost rows — measured. So a non-zero value here means "at least
+	// this many rows are missing", which is the reading a client has to present. See
+	// store.appendBytes for why the bytes cannot support an exact figure.
 	SkippedLines int64
 	// TruncatedDays is how many day files this read ABANDONED part-way — an IO error, or a
 	// line past maxLineBytes that a scanner cannot step over.

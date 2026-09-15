@@ -4,6 +4,7 @@ import (
 	"net/http"
 	"strings"
 	"testing"
+	"unicode/utf8"
 )
 
 func TestParseUserAgent(t *testing.T) {
@@ -71,6 +72,142 @@ func TestParseUserAgent_CapsBeforeMatching(t *testing.T) {
 	}
 	if len(got.Label()) > maxClientLen+len(got.Name)+1 {
 		t.Errorf("Label() is %d bytes; the cap must bound every derived string", len(got.Label()))
+	}
+}
+
+// A control character in the User-Agent never reaches Label().
+//
+// THROUGH Label(), not through the sanitiser in isolation, because Label() is what the
+// consumers call: the live usage aggregator keys its byAgent series on it and the cost
+// ledger writes it into a durable row. A test that only exercised sanitizeUA would still
+// pass if ParseUserAgent stopped calling it.
+//
+// The forward proxy is protected by net/http, which rejects control bytes in a header
+// value — accidentally, and only there. THE EXT_PROC PATH HAS NO SUCH PARSER: Envoy hands
+// header values over as protobuf bytes, so on that path these strings are exactly what a
+// client sent. CWE-150.
+func TestParseUserAgent_SanitisesControlCharactersBeforeLabel(t *testing.T) {
+	for _, tc := range []struct {
+		name, ua string
+		// want is the exact label, so the assertion pins the substitution rather than
+		// merely the absence of the byte.
+		want string
+	}{
+		// The C0 case: ESC [ 2J clears the screen, ESC [ 31m recolours it.
+		{"esc", "claude-cli/2.1.14\x1b[2J\x1b[31mPWNED", "claude-code/2.1.14\uFFFD[2J\uFFFD[31mPWNED"},
+		// C1, and the reason a C0-only filter is not enough. U+009B IS the CSI: a terminal
+		// decoding UTF-8 acts on "\u009b2J" exactly as it acts on "\x1b[2J", and there is no
+		// byte below 0x20 anywhere in it. It encodes as 0xC2 0x9B, so a scan for control
+		// BYTES walks straight past it.
+		{"c1 CSI in the version", "claude-cli/2.1.14\u009b2J", "claude-code/2.1.14\uFFFD2J"},
+		{"c1 CSI in an unrecognised agent", "newagent/1\u009b31m", "newagent/1\uFFFD31m"},
+		// DEL, and a raw byte that is not valid UTF-8 at all — the same character in a pane
+		// that is not in UTF-8 mode.
+		{"del", "newagent/1\x7f", "newagent/1\uFFFD"},
+		{"invalid byte", "newagent/1\x9b", "newagent/1\uFFFD"},
+		// A newline breaks a table apart wherever the label is rendered in one.
+		{"newline", "newagent/1\nfake-row", "newagent/1\uFFFDfake-row"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			c := ParseUserAgent(tc.ua)
+			if c == nil {
+				t.Fatal("ParseUserAgent returned nil for a UA that was sent")
+			}
+			if got := c.Label(); got != tc.want {
+				t.Errorf("Label() = %q, want %q", got, tc.want)
+			}
+			// And every field, since Raw is persisted and Version is joined into the label
+			// for a recognised agent.
+			for name, got := range map[string]string{"Raw": c.Raw, "Version": c.Version, "Label": c.Label()} {
+				if hasControlRunes(got) {
+					t.Errorf("%s = %q still carries a control character", name, got)
+				}
+			}
+		})
+	}
+}
+
+// The version a recognised agent reports is sanitised too, and that matters more than the
+// raw string: Label() joins it to a name we control, so "claude-code/<escape sequence>" is
+// a row that looks trustworthy up to the slash.
+func TestParseUserAgent_SanitisationSurvivesTheProductTokenParse(t *testing.T) {
+	c := ParseUserAgent("claude-cli/2.1.14\x1b[31m (external, cli)")
+	if c == nil {
+		t.Fatal("ParseUserAgent returned nil")
+	}
+	if c.Name != "claude-code" {
+		t.Errorf("Name = %q; sanitising must not break recognition of a real agent", c.Name)
+	}
+	if c.Version != "2.1.14\uFFFD[31m" {
+		t.Errorf("Version = %q, want the ESC replaced and the rest kept", c.Version)
+	}
+}
+
+// SANITISE THEN CAP, and the cap is still in BYTES.
+//
+// The order is what makes the byte cap mean anything: a substitution triples the string,
+// so capping first would let 128 control bytes become 384 in the field that bounds a
+// persisted line. Capping last is what makes the rune boundary necessary — a byte cut has
+// a two-in-three chance of leaving a fragment of a 3-byte U+FFFD.
+func TestParseUserAgent_SanitisesBeforeCappingAndStillHonoursTheByteCap(t *testing.T) {
+	// Every byte a control byte, past the cap: 3x maxClientLen after substitution.
+	c := ParseUserAgent(strings.Repeat("\x1b", maxClientLen+32))
+	if c == nil {
+		t.Fatal("ParseUserAgent returned nil for a UA that was sent")
+	}
+	if len(c.Raw) > maxClientLen {
+		t.Errorf("Raw is %d bytes, want <= %d; the cap bounds retained memory and the "+
+			"length of a persisted line, so it has to be a BYTE cap", len(c.Raw), maxClientLen)
+	}
+	if hasControlRunes(c.Raw) {
+		t.Errorf("Raw = %q: capping must not be able to reintroduce a control character", c.Raw)
+	}
+	// A cut mid-U+FFFD is invalid UTF-8 in a string that goes to a durable file and to a
+	// chart — the failure the substitution exists to avoid rather than to cause.
+	if !utf8.ValidString(c.Raw) {
+		t.Errorf("Raw = %q is not valid UTF-8; the byte cap split a rune", c.Raw)
+	}
+	if !utf8.ValidString(c.Label()) {
+		t.Errorf("Label() = %q is not valid UTF-8", c.Label())
+	}
+}
+
+// A multi-byte rune straddling the cap is not halved, and the byte bound still holds.
+//
+// Stated separately from the hostile case because this one is ordinary: a UA is usually
+// ASCII, but nothing makes it so, and the cut lands wherever the client's bytes put it.
+func TestParseUserAgent_CapCutsOnARuneBoundary(t *testing.T) {
+	// 2-byte runes, so 64 of them is exactly maxClientLen: a few more puts a rune across
+	// the boundary at byte 128, where a byte cut leaves half of it behind.
+	c := ParseUserAgent(strings.Repeat("é", maxClientLen/2+8))
+	if c == nil {
+		t.Fatal("ParseUserAgent returned nil")
+	}
+	if len(c.Raw) > maxClientLen {
+		t.Errorf("Raw is %d bytes, want <= %d", len(c.Raw), maxClientLen)
+	}
+	if !utf8.ValidString(c.Raw) {
+		t.Errorf("Raw = %q is not valid UTF-8; the cut split a rune in half", c.Raw)
+	}
+	// And the cap is not quietly loosened to a rune count: 64 two-byte runes is the most
+	// that fits, so the cut must land ON the byte cap rather than one rune past it.
+	if len(c.Raw) != maxClientLen {
+		t.Errorf("Raw is %d bytes; a rune-boundary cut must still honour the byte cap "+
+			"exactly when the boundary allows it", len(c.Raw))
+	}
+}
+
+// Valid non-ASCII is NOT mangled. The rule filters control characters, not "anything the
+// author did not expect to see"; a sanitiser that ate legitimate text would make the
+// breakdown wrong for every non-English label rather than for a hostile one.
+func TestParseUserAgent_LeavesLegitimateNonASCIIAlone(t *testing.T) {
+	const ua = "wetter-agent/1.0 (Zürich, ✓)"
+	c := ParseUserAgent(ua)
+	if c == nil {
+		t.Fatal("ParseUserAgent returned nil")
+	}
+	if c.Raw != ua {
+		t.Errorf("Raw = %q, want it untouched: %q", c.Raw, ua)
 	}
 }
 

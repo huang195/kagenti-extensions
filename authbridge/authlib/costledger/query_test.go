@@ -10,6 +10,7 @@ import (
 	"sync"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	"github.com/rossoctl/cortex/authbridge/authlib/pipeline"
 	"github.com/rossoctl/cortex/authbridge/authlib/usage"
@@ -358,15 +359,23 @@ func TestRecord_LabelsAreCappedSoALineCanNeverExceedTheReadLimit(t *testing.T) {
 // that is retained for retentionDays, that an operator cats, and that cannot be edited
 // afterwards. An escape sequence there rewrites the terminal of whoever reads it, on every
 // read, for as long as the file exists. CWE-150.
+//
+// C1 IS IN HERE DELIBERATELY. The sanitiser filtered C0 and DEL only, and this test could
+// not see that: U+009B is the single-character CSI, so "2J" clears the pane of
+// whoever cats the file with no ESC byte for a C0 filter to catch, and the assertion that
+// was meant to prove no control character survived was reading a predicate with the same
+// blind spot.
 func TestRecord_ControlCharactersNeverReachADayFile(t *testing.T) {
 	dir := t.TempDir()
 	now := at
 	w := newTestWriter(t, dir, func() time.Time { return now })
 
-	// An SGR sequence that recolours the pane, a newline that breaks a table apart, and a
-	// carriage return that erases the line reporting it.
+	// An SGR sequence that recolours the pane, a newline that breaks a table apart, a
+	// carriage return that erases the line reporting it — and a C1 CSI, which is the same
+	// attack as the first one with the ESC byte removed.
 	e := costedEvent(t, "gw\x1b[31m", "opus\nnext-line", 0.25, 100, 50)
 	e.Client = &pipeline.EventClient{Raw: "curl/8.4\r\x07"}
+	setProvenance(t, e, "gateway\u009b2J")
 	w.Record("s1", e)
 
 	now = at.Add(time.Minute)
@@ -380,9 +389,17 @@ func TestRecord_ControlCharactersNeverReachADayFile(t *testing.T) {
 	}
 	for name, got := range map[string]string{
 		"Endpoint": rows[0].Endpoint, "Model": rows[0].Model, "Agent": rows[0].Agent,
+		"Provenance": rows[0].Provenance,
 	} {
-		if hasControlBytes(got) {
-			t.Errorf("%s = %q on disk: a control byte reached a durable row", name, got)
+		if hasControlRunes(got) {
+			t.Errorf("%s = %q on disk: a control character reached a durable row", name, got)
+		}
+		// The C1 half asserted on its own, because the byte-scanning predicate this test
+		// used to read reported the row clean while the CSI was still in it — two bytes,
+		// 0xC2 0x9B, which a terminal decoding UTF-8 acts on exactly as it acts on ESC [.
+		if strings.ContainsRune(got, '\u009b') {
+			t.Errorf("%s = %q on disk: U+009B (CSI) survived; a C0-only filter does not "+
+				"protect the operator who cats this file", name, got)
 		}
 		// REPLACED, not dropped: "gw[31m" would read as a plausible hostname and hide the
 		// tampering, which is the whole reason sanitizeLabel substitutes rather than deletes.
@@ -431,6 +448,80 @@ func TestRecord_ASanitisedLabelIsStillCappedInBYTES(t *testing.T) {
 			t.Errorf("%s is %d BYTES on disk, want at most %d: the cap was applied before the "+
 				"substitution, so each byte it kept grew to three", name, len(got), maxLabelLen)
 		}
+	}
+}
+
+// A label is cut on a RUNE boundary, and the cap is still counted in BYTES.
+//
+// The cut used to be a plain byte slice, so a multi-byte rune straddling byte 96 was
+// halved and an invalid UTF-8 sequence went into an append-only file that other tools
+// parse and that cannot be corrected afterwards. Two ways to reach it, both here: a model
+// name a workload chose (ordinary non-ASCII), and a label this package rewrote itself,
+// where every replacement is a 3-byte U+FFFD and a byte cut has a two-in-three chance of
+// splitting one.
+//
+// THE BYTE CAP STAYS. It is what bounds the line length maxLabelLen exists to guarantee,
+// so the assertion is <= maxLabelLen bytes AND valid UTF-8 — not a rune count.
+//
+// AND THE BYTE CUT BREAKS THE BYTE CAP, which is the argument for this fix that the
+// UTF-8 one obscures. Measured against the mutation: a 121-byte label cut at 96 leaves a
+// 2-byte fragment, and encoding/json expands each invalid byte into a 3-byte U+FFFD, so
+// the label lands on disk at 100 bytes — past the cap the line-length arithmetic rests on.
+// Cutting cleanly is what makes maxLabelLen mean what it says.
+//
+// EVERY CASE CARRIES A ONE-BYTE PREFIX, and without it this test proves nothing:
+// maxLabelLen is 96, which is a multiple of both 2 and 3, so a label made only of 2- or
+// 3-byte runes has a rune boundary exactly at byte 96 and even a plain byte cut lands
+// cleanly. The first version of this test had no prefix and passed against the byte cut it
+// was written to catch. The prefix is what puts a rune across the cap.
+func TestRecord_ALabelIsCutOnARuneBoundary(t *testing.T) {
+	for _, tc := range []struct{ name, label string }{
+		// 3-byte runes behind one ASCII byte, so byte 96 falls in the middle of one.
+		{"multi-byte model name", "m" + strings.Repeat("模", maxLabelLen/3+8)},
+		// Sanitised control bytes, which become 3-byte U+FFFD runes on the way through —
+		// this package's own output, cut by this package's own cap.
+		{"a label this package rewrote", "m" + strings.Repeat("\x1b", maxLabelLen+32)},
+		// A 2-byte rune, which straddles a different byte offset.
+		{"two-byte runes", "m" + strings.Repeat("é", maxLabelLen)},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			now := at
+			w := newTestWriter(t, dir, func() time.Time { return now })
+
+			e := costedEvent(t, tc.label, tc.label, 0.25, 100, 50)
+			e.Client = &pipeline.EventClient{Raw: tc.label}
+			setProvenance(t, e, tc.label)
+			w.Record("s1", e)
+
+			now = at.Add(time.Minute)
+			if err := w.Flush(); err != nil {
+				t.Fatalf("Flush: %v", err)
+			}
+
+			rows := readAllRows(t, dir)
+			if len(rows) != 1 {
+				t.Fatalf("got %d rows, want 1: %+v", len(rows), rows)
+			}
+			for name, got := range map[string]string{
+				"Endpoint": rows[0].Endpoint, "Model": rows[0].Model,
+				"Agent": rows[0].Agent, "Provenance": rows[0].Provenance,
+			} {
+				if len(got) > maxLabelLen {
+					t.Errorf("%s is %d BYTES on disk, want at most %d", name, len(got), maxLabelLen)
+				}
+				if !utf8.ValidString(got) {
+					t.Errorf("%s = %q on disk is not valid UTF-8: the cut split a rune, and this "+
+						"file is append-only", name, got)
+				}
+			}
+			// The bytes on disk, not only the decoded row: json.Marshal substitutes U+FFFD for
+			// invalid input, so a decoded row can read as valid while the file it came from
+			// carried the fragment. Asserting the file is what makes this about the file.
+			if !utf8.Valid(readAllBytes(t, dir)) {
+				t.Error("the day file is not valid UTF-8")
+			}
+		})
 	}
 }
 

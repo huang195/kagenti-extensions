@@ -273,6 +273,34 @@ type Snapshot struct {
 	// Summed from the raw buckets alongside Totals, so it is unaffected by the requested
 	// resolution.
 	UngroupedCostMicros *int64 `json:"ungroupedCostMicros,omitempty"`
+	// SeriesOvershootMicros is the residual with the WRONG SIGN: the amount by which this
+	// response's series summed to MORE than Totals.CostMicros.
+	//
+	// It is not a property of the traffic. Every event lands in at most one entry of a
+	// reconcilable group's map, so the entries can only sum to the total or to less than it —
+	// a negative residual means this process is wrong about its own arithmetic. There are
+	// exactly two ways: a Group was marked Reconcilable when its series double-counts (which
+	// is why GroupPlugin is excluded), or a series accumulator counts one event twice.
+	//
+	// IT USED TO BE DISCARDED. SetUngroupedCost took `micros <= 0` as "nothing to disclose"
+	// and returned, which collapsed "the breakdown accounts for everything" together with
+	// "the breakdown accounts for more than everything" — and the second is a defect report
+	// this package threw away on the floor. That matters more now, not less: reconcilability
+	// has become a property of the SOURCE as well as the group (see Group.Reconcilable), so a
+	// disagreement between the two predicates is a live possibility, and this residual going
+	// negative is exactly how it would show.
+	//
+	// A SEPARATE FIELD rather than a negative UngroupedCostMicros, because the two are
+	// different claims and a client acts on them differently. UngroupedCostMicros is a
+	// residual band to render — real spend with no key on this axis. This is "do not trust
+	// the breakdown in this response, and file a bug", and no chart should draw it. Signing
+	// one field would have every consumer branch on the sign to tell a normal response from a
+	// broken one, and the ones that forgot would render a negative band.
+	//
+	// ABSENT unless it happened, on the same rule as UngroupedCostMicros and Degraded: it
+	// should never appear in a healthy deployment, and a zero would have to mean both "checked
+	// and fine" and "not checked".
+	SeriesOvershootMicros *int64 `json:"seriesOvershootMicros,omitempty"`
 	// Degraded reports that this answer is known to be MISSING ROWS, and is absent
 	// whenever it is not.
 	//
@@ -368,17 +396,42 @@ func (g Group) Reconcilable() bool {
 	return true
 }
 
-// SetUngroupedCost records the residual and leaves the field ABSENT when there is none.
+// SetUngroupedCost records the residual, whichever way it went, and leaves both fields
+// ABSENT when there is none.
 //
 // The single implementation of the absent-not-zero rule, called by the ring in Snapshot
 // and by the ledger in sessionapi, so neither can serialise a zero that would read as
 // "checked, complete" from a path that computed nothing. See
 // Snapshot.UngroupedCostMicros.
+//
+// A NEGATIVE RESIDUAL IS A DEFECT REPORT AND USED TO BE SWALLOWED HERE. The guard was
+// `micros <= 0`, which treated "the series accounts for every dollar" and "the series
+// accounts for MORE dollars than exist" as the same clean answer. Only the first can happen
+// to correct code: a reconcilable group's series sums to the total or to less. The second
+// means a Group is marked reconcilable while its series double-counts, or an accumulator
+// counted an event twice — and it now travels as Snapshot.SeriesOvershootMicros instead of
+// being discarded at the one place that could see it.
+//
+// Both callers get it for free, which is why the disclosure lives here rather than in an
+// error return: an error would need every caller to hold a logger (this package has none)
+// and would let a caller drop the signal again, which is the defect being fixed.
 func (s *Snapshot) SetUngroupedCost(micros int64) {
-	if micros <= 0 {
-		return
+	switch {
+	case micros > 0:
+		s.UngroupedCostMicros = &micros
+	case micros < 0:
+		// Negated into a magnitude, so the field reads as "the series overshot by this much"
+		// rather than making a client interpret a sign it did not ask for.
+		//
+		// math.MinInt64 has no positive counterpart, so negating it blindly returns the same
+		// negative number and publishes exactly the sign confusion this field exists to avoid.
+		// Reachable only from a saturated total, which is itself already disclosed.
+		over := int64(math.MaxInt64)
+		if micros != math.MinInt64 {
+			over = -micros
+		}
+		s.SeriesOvershootMicros = &over
 	}
-	s.UngroupedCostMicros = &micros
 }
 
 // seriesCost is the dollars a label breakdown accounts for.

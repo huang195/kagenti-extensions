@@ -3,6 +3,7 @@ package usage
 import (
 	"encoding/json"
 	"fmt"
+	"math"
 	"strings"
 	"testing"
 	"time"
@@ -136,6 +137,93 @@ func TestSnapshot_GroupsThatCannotReconcileReportNoUngroupedCost(t *testing.T) {
 		}
 	}
 }
+
+// TestSetUngroupedCost_ANegativeResidualIsDisclosedNotDropped covers the case the setter
+// used to discard.
+//
+// `micros <= 0` collapsed two answers: "the breakdown accounts for every dollar", which is
+// the ordinary clean result, and "the breakdown accounts for MORE dollars than the total
+// beside it", which correct code cannot produce. A reconcilable group's series sums to the
+// total or to less than it — every event lands in at most one entry — so a negative residual
+// says this process is wrong about its own arithmetic, either because a Group is marked
+// reconcilable while its series double-counts or because an accumulator counted an event
+// twice. Discarding it meant the one place that could see the fault was the place that
+// deleted the evidence.
+//
+// Each direction asserts what the OTHER field does too. A negative residual that set
+// UngroupedCostMicros would put a bug report in the field clients render as a spend band.
+func TestSetUngroupedCost_ANegativeResidualIsDisclosedNotDropped(t *testing.T) {
+	for _, tc := range []struct {
+		name          string
+		micros        int64
+		wantUngrouped *int64
+		wantOvershoot *int64
+	}{
+		{name: "short breakdown is a residual", micros: 250_000, wantUngrouped: ptr(int64(250_000))},
+		{name: "exact breakdown discloses nothing", micros: 0},
+		{name: "overshooting breakdown is a fault", micros: -250_000, wantOvershoot: ptr(int64(250_000))},
+		{
+			// The magnitude of math.MinInt64 is not representable, so a blind negation returns
+			// the same negative number and publishes the sign confusion the field exists to
+			// avoid. Reachable only from a saturated total.
+			name:          "the residual is the int64 floor",
+			micros:        math.MinInt64,
+			wantOvershoot: ptr(int64(math.MaxInt64)),
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var snap Snapshot
+			snap.SetUngroupedCost(tc.micros)
+			for _, f := range []struct {
+				name      string
+				got, want *int64
+			}{
+				{"UngroupedCostMicros", snap.UngroupedCostMicros, tc.wantUngrouped},
+				{"SeriesOvershootMicros", snap.SeriesOvershootMicros, tc.wantOvershoot},
+			} {
+				switch {
+				case f.want == nil && f.got != nil:
+					t.Errorf("SetUngroupedCost(%d) set %s = %d, want absent", tc.micros, f.name, *f.got)
+				case f.want != nil && f.got == nil:
+					t.Errorf("SetUngroupedCost(%d) left %s absent, want %d — a residual with this "+
+						"sign is a signal, and dropping it is how the fault stays invisible",
+						tc.micros, f.name, *f.want)
+				case f.want != nil && *f.got != *f.want:
+					t.Errorf("SetUngroupedCost(%d) set %s = %d, want %d", tc.micros, f.name, *f.got, *f.want)
+				}
+			}
+		})
+	}
+}
+
+// The overshoot is absent from a clean response and present when it is not, on the same wire
+// rule as every other disclosure here: a client must be able to tell "checked and fine" from
+// "not checked", and a zero cannot say both.
+func TestSnapshot_SeriesOvershootIsOmittedUnlessItHappened(t *testing.T) {
+	var clean Snapshot
+	clean.SetUngroupedCost(0)
+	body, err := json.Marshal(clean)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	if strings.Contains(string(body), "seriesOvershootMicros") {
+		t.Errorf("a clean window serialised the overshoot: %s", body)
+	}
+
+	var broken Snapshot
+	broken.SetUngroupedCost(-1)
+	body, err = json.Marshal(broken)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	if !strings.Contains(string(body), `"seriesOvershootMicros":1`) {
+		t.Errorf("an overshooting window did not serialise the fault: %s — the disclosure only "+
+			"works if it reaches the client", body)
+	}
+}
+
+// ptr is a pointer to a value, for the absent-versus-present tables above.
+func ptr[T any](v T) *T { return &v }
 
 // Summed from the RAW buckets, like Totals: a client that asked for coarser bars must
 // get the same residual as one that asked for fine ones, or the reconciliation would

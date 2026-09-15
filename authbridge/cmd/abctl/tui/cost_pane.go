@@ -10,6 +10,7 @@ import (
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 
+	"github.com/rossoctl/cortex/authbridge/authlib/pipeline"
 	"github.com/rossoctl/cortex/authbridge/authlib/usage"
 )
 
@@ -40,13 +41,18 @@ var costPaneWindows = []string{usage.WindowToday, usage.Window7d, "1h"}
 // on screen one row above it, so a cycle position that showed nothing new would
 // just be a way to lose the breakdown.
 //
-// No agent axis, because there is none. Client identity is not implemented, so
-// usage.Group has no GroupAgent constant and the aggregator keeps no per-agent
-// series; declaring one here would put a heading over an empty section forever.
-// Session is the closest thing available and is already in the cycle — with the
-// caveat usage.GroupSession's own doc records, that while several concurrent agents
-// share one session id their spend lands in one entry.
-var costPaneGroups = []usage.Group{usage.GroupModel, usage.GroupEndpoint, usage.GroupSession}
+// Agent is LAST rather than first despite being the axis this pane was asked for,
+// because it is the only one whose rows can be spoofed: a User-Agent is self-reported
+// (see pipeline.EventClient), so a per-agent table is an attribution aid and not
+// evidence. Model and endpoint come from the request the proxy actually forwarded.
+// Ordering the trustworthy axes first means the spoofable one is something a reader
+// chooses, not the first thing they are shown.
+//
+// Session stays in the cycle alongside it rather than being replaced by it: they
+// answer different questions, and neither subsumes the other. Several concurrent
+// agents can share one session id — usage.GroupSession's own doc records that their
+// spend lands in one entry — while one agent moving between sessions spans several.
+var costPaneGroups = []usage.Group{usage.GroupModel, usage.GroupEndpoint, usage.GroupSession, usage.GroupAgent}
 
 // costPaneState is the Cost pane's view state and its poll chain.
 //
@@ -658,7 +664,7 @@ func costBreakdownSection(snap *usage.Snapshot, group usage.Group, width int) co
 		// request body's `model` field, chosen by the workload and recorded verbatim by the
 		// parser, so writing it raw to a TTY lets an escape sequence recolour the pane or
 		// erase the very row it is reporting. CWE-150.
-		row := costRow{label: sanitizeLabel(label)}
+		row := costRow{label: costSeriesLabel(label, group)}
 		if c.PricedRequests == 0 {
 			row.right = "cost unavailable"
 			rows = append(rows, row)
@@ -684,6 +690,36 @@ func costBreakdownSection(snap *usage.Snapshot, group usage.Group, width int) co
 		}
 	}
 	return sec
+}
+
+// costUnattributedLabel renders the reserved agent bucket.
+//
+// pipeline.UnknownClientLabel is the wire value "unknown", and its own doc forbids a
+// consumer presenting it as an agent name. Rendered verbatim it would sit in the same
+// column as "claude-code/2.1.14" and read as a program called "unknown" that spent
+// real money — so this pane, which IS that consumer, spells it as a state instead. The
+// brackets are load-bearing: no User-Agent product token contains them at the start,
+// so the row cannot be mistaken for a name at a glance.
+//
+// Not collision-proof, and cannot be: Label() returns the RAW User-Agent for an
+// unrecognised client, so a caller sending literally "(no user-agent)" renders
+// identically. That is strictly narrower than the status quo it replaces — "unknown" is
+// a plausible thing for a real client to send, "(no user-agent)" is not — and the
+// spoofability of the whole axis is documented on pipeline.EventClient.
+const costUnattributedLabel = "(no user-agent)"
+
+// costSeriesLabel renders one breakdown key.
+//
+// Only group=agent gets the substitution. On any other axis "unknown" is a value the
+// wire really carried — a model or an endpoint could legitimately be named that — and
+// rewriting it there would hide a real key behind a state.
+func costSeriesLabel(key string, group usage.Group) string {
+	if group == usage.GroupAgent && key == pipeline.UnknownClientLabel {
+		return costUnattributedLabel
+	}
+	// sanitizeLabel for everything else: these keys are wire-derived (see the call
+	// site). The constant above needs no sanitising, being authored here.
+	return sanitizeLabel(key)
 }
 
 // costTierHeading names the token section, and says in the heading what it reports.

@@ -10,6 +10,7 @@ import (
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 
+	"github.com/rossoctl/cortex/authbridge/authlib/pipeline"
 	"github.com/rossoctl/cortex/authbridge/authlib/usage"
 	"github.com/rossoctl/cortex/authbridge/cmd/abctl/apiclient"
 )
@@ -1167,5 +1168,43 @@ func TestCostPane_AnAcceptedReplyStampsItsAgeAndClearsLoading(t *testing.T) {
 	}
 	if got := m.paneView(); !strings.Contains(got, "updated") {
 		t.Errorf("the pane reports no age after a reply landed:\n%s", got)
+	}
+}
+
+// TestCostPaneGroups_IncludesAgentLast pins both the membership and the position.
+//
+// Membership, because the agent axis is the one this pane was asked for. Position,
+// because agent is the only axis whose rows are SPOOFABLE — a User-Agent is
+// self-reported — so it must not be what a reader is shown first.
+func TestCostPaneGroups_IncludesAgentLast(t *testing.T) {
+	if len(costPaneGroups) == 0 || costPaneGroups[len(costPaneGroups)-1] != usage.GroupAgent {
+		t.Errorf("costPaneGroups = %v, want GroupAgent last", costPaneGroups)
+	}
+	for _, g := range costPaneGroups {
+		if g == usage.GroupNone {
+			t.Error("GroupNone is in the cycle; an ungrouped view is the spend strip one row above")
+		}
+	}
+}
+
+// TestCostSeriesLabel_ReservedAgentBucketIsNotRenderedAsAName is the consumer half of
+// pipeline.UnknownClientLabel's contract, which says in terms that a consumer must not
+// present it as an agent name. This pane IS that consumer, so the rule is only real if
+// something here enforces it.
+func TestCostSeriesLabel_ReservedAgentBucketIsNotRenderedAsAName(t *testing.T) {
+	got := costSeriesLabel(pipeline.UnknownClientLabel, usage.GroupAgent)
+	if got == pipeline.UnknownClientLabel {
+		t.Errorf("group=agent rendered the reserved bucket verbatim as %q; it would sit in the same "+
+			"column as claude-code/2.1.14 and read as a program by that name that spent real money", got)
+	}
+	if got != costUnattributedLabel {
+		t.Errorf("costSeriesLabel = %q, want %q", got, costUnattributedLabel)
+	}
+	// Only that axis. "unknown" is a legitimate value on the others — a model or an
+	// endpoint could be named it — and rewriting it there would hide a real key.
+	for _, g := range []usage.Group{usage.GroupModel, usage.GroupEndpoint, usage.GroupSession} {
+		if got := costSeriesLabel(pipeline.UnknownClientLabel, g); got != pipeline.UnknownClientLabel {
+			t.Errorf("group=%s rewrote a real key %q to %q", g, pipeline.UnknownClientLabel, got)
+		}
 	}
 }

@@ -212,6 +212,60 @@ func TestRunCost_JSONReportsTheWindowServedNotTheOneRequested(t *testing.T) {
 	}
 }
 
+// costJSON described itself as the totals verbatim and omitted pricedBy and unpricedBy, so
+// the one reader that cannot eyeball anything was the one reader that could not tell a
+// MODELLED total from a BILLED one — the distinction usage_render.go's comment says
+// matters, and which the human summary, the strip and the Cost pane all label.
+func TestRunCost_JSONCarriesProvenanceAndTheNamedGaps(t *testing.T) {
+	srv := fakeUsageServer(t, `{"window":"today","totals":{"requests":10,`+
+		`"costMicros":1240000,"pricedRequests":7,"priceableRequests":10},"priced":true,`+
+		`"pricedBy":{"authoritative":4,"bundled":3},`+
+		`"unpricedBy":{"api.openai.com gpt-5":3}}`)
+	defer srv.Close()
+
+	var out, errOut strings.Builder
+	if code := runCost([]string{"--endpoint", srv.URL, "--json"}, &out, &errOut); code != 0 {
+		t.Fatalf("exit = %d, want 0; stderr = %s", code, errOut.String())
+	}
+	var decoded struct {
+		PricedBy   map[string]int64 `json:"pricedBy"`
+		UnpricedBy map[string]int64 `json:"unpricedBy"`
+	}
+	if err := json.Unmarshal([]byte(out.String()), &decoded); err != nil {
+		t.Fatalf("--json output is not valid JSON: %v\n%s", err, out.String())
+	}
+	// A total that is part modelled is not the same figure as one a gateway billed, and
+	// $1.24 says nothing about which this is.
+	if decoded.PricedBy["bundled"] != 3 || decoded.PricedBy["authoritative"] != 4 {
+		t.Errorf("pricedBy = %v, want the provenance split the server reported:\n%s",
+			decoded.PricedBy, out.String())
+	}
+	// "3 requests unpriced" is not actionable; the endpoint and model name the pricing
+	// entry that would close the gap.
+	if decoded.UnpricedBy["api.openai.com gpt-5"] != 3 {
+		t.Errorf("unpricedBy = %v, want the named gap:\n%s", decoded.UnpricedBy, out.String())
+	}
+}
+
+// Both maps are omitempty, so a response carrying neither prints exactly what it printed
+// before — a null or an empty object would make a script that checks for presence read
+// "there were no gaps", which is a claim the ledger path in particular cannot make.
+func TestRunCost_JSONOmitsTheMapsWhenTheServerSentNone(t *testing.T) {
+	srv := fakeUsageServer(t, `{"window":"today","totals":{"requests":2,`+
+		`"costMicros":250000,"pricedRequests":2,"priceableRequests":2},"priced":true}`)
+	defer srv.Close()
+
+	var out, errOut strings.Builder
+	if code := runCost([]string{"--endpoint", srv.URL, "--json"}, &out, &errOut); code != 0 {
+		t.Fatalf("exit = %d, want 0", code)
+	}
+	for _, absent := range []string{"pricedBy", "unpricedBy"} {
+		if strings.Contains(out.String(), absent) {
+			t.Errorf("--json emitted %q for a response that carried none:\n%s", absent, out.String())
+		}
+	}
+}
+
 func TestRunCost_UnreachableProxyExitsNonZeroAndSaysWhatToRun(t *testing.T) {
 	var out, errOut strings.Builder
 	code := runCost([]string{"--endpoint", "http://127.0.0.1:1"}, &out, &errOut)

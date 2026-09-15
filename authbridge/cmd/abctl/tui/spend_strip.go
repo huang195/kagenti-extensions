@@ -3,6 +3,7 @@ package tui
 import (
 	"fmt"
 	"strings"
+	"time"
 
 	"github.com/charmbracelet/lipgloss"
 )
@@ -251,7 +252,31 @@ func renderSpendStrip(s spendSummary, width int) string {
 	if s.HasSaved {
 		figures = append(figures, plainFigure("saved "+formatUSDCell(s.SavedUSD)))
 	}
+	// The age rides last, so it is the first thing a narrow terminal gives up. It
+	// qualifies every figure on the line rather than one of them, and unlike a partiality
+	// marker it is recoverable — the next poll either answers or the age keeps growing —
+	// so it is the one caveat that may be dropped outright.
+	if s.Stale {
+		age := formatSpendAge(s.Age)
+		figures = append(figures, stripFigure{full: "polled " + age + " ago", compact: age + " ago"})
+	}
 	return fitStripFigures(stripLabel, figures, width)
+}
+
+// formatSpendAge renders an age the way a strip has room for: "3m", not "3m12.4s".
+//
+// Rounded DOWN to the coarsest unit that still says something, because the number's job
+// is to distinguish "a poll or two behind" from "this chain stopped answering", and no
+// reader needs the seconds of a five-minute-old figure to tell those apart.
+func formatSpendAge(d time.Duration) string {
+	switch {
+	case d < time.Minute:
+		return fmt.Sprintf("%ds", int(d.Seconds()))
+	case d < time.Hour:
+		return fmt.Sprintf("%dm", int(d.Minutes()))
+	default:
+		return fmt.Sprintf("%dh", int(d.Hours()))
+	}
 }
 
 // fitStripFigures joins as many LEADING figures as fit, dropping whole ones from

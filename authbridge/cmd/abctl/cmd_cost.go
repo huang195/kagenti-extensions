@@ -29,7 +29,8 @@ const costFetchTimeout = 15 * time.Second
 func runCost(args []string, stdout, stderr io.Writer) int {
 	fs := flag.NewFlagSet("abctl cost", flag.ContinueOnError)
 	fs.SetOutput(stderr)
-	asJSON := fs.Bool("json", false, "emit the snapshot's totals as JSON, with usage.Counts' own field names")
+	asJSON := fs.Bool("json", false,
+		"emit the totals, their provenance and the coverage gaps as JSON, with usage.Counts' own field names")
 	window := fs.String("window", usage.WindowToday,
 		"window to report: today, 7d, or a duration such as 1h or 6h")
 	endpoint := fs.String("endpoint", "",
@@ -116,12 +117,24 @@ Flags:
 }
 
 // costJSON is the --json shape: the window actually served plus the totals
-// verbatim.
+// verbatim, and the two maps that say where the totals came from and what they miss.
 //
 // Totals is usage.Counts embedded, NOT re-keyed and NOT re-cased. An unattended
 // workload parses this, and the whole point of the shared schema is that the CLI,
 // /v1/usage and the ledger on disk say the same words for the same quantity. A
 // friendlier spelling here would be a fourth vocabulary for the same numbers.
+//
+// PricedBy and UnpricedBy are INCLUDED rather than the self-description being
+// corrected, and the choice is deliberate. Both readings were available: drop the
+// "verbatim" claim and admit this is a subset, or make the claim true. The claim is worth
+// making true, because it is the human path's own reasoning applied to the machine path —
+// usage_render.go's comment says "$12.40 assembled from a gateway's own numbers and
+// $12.40 modelled from a shipped vendor-list table are not equally trustworthy figures",
+// and the TUI, the Cost pane and the human summary all label the difference. A scripted
+// consumer, the one nobody eyeballs, was the only reader that could not tell a modelled
+// total from a billed one, and could not name a coverage gap it was told the size of.
+// Both are omitempty on the wire, so a response that carries neither is byte-identical to
+// what this printed before.
 type costJSON struct {
 	// Window is what the SERVER served, so a script reading this learns it got six
 	// hours rather than a day without having to ask a second question.
@@ -130,12 +143,32 @@ type costJSON struct {
 	// absence as zero spend.
 	Priced bool         `json:"priced"`
 	Totals usage.Counts `json:"totals"`
+	// PricedBy counts the priced requests by the provenance of their figure —
+	// "authoritative" when the gateway reported it, otherwise the rate table's level. It
+	// is what makes CostMicros interpretable rather than merely readable.
+	PricedBy map[string]int64 `json:"pricedBy,omitempty"`
+	// UnpricedBy names the coverage gaps, keyed "<endpoint> <model>". Totals already
+	// says how many requests went unpriced; this says which pricing entry would close
+	// them, which is the only form of that fact a script can act on.
+	//
+	// Absent is not a claim that there were no gaps: it is never present on a
+	// ledger-backed window at all, where a per-minute row cannot distinguish the
+	// unpriced pairs from the priced ones. Compare Totals.PricedRequests with
+	// Totals.PriceableRequests for that, exactly as the human summary does.
+	UnpricedBy map[string]int64 `json:"unpricedBy,omitempty"`
 }
 
 func writeCostJSON(snap *usage.Snapshot, stdout, stderr io.Writer) int {
 	enc := json.NewEncoder(stdout)
 	enc.SetIndent("", "  ")
-	if err := enc.Encode(costJSON{Window: snap.Window, Priced: snap.Priced, Totals: snap.Totals}); err != nil {
+	out := costJSON{
+		Window:     snap.Window,
+		Priced:     snap.Priced,
+		Totals:     snap.Totals,
+		PricedBy:   snap.PricedBy,
+		UnpricedBy: snap.UnpricedBy,
+	}
+	if err := enc.Encode(out); err != nil {
 		fmt.Fprintf(stderr, "abctl cost: writing JSON: %v\n", err)
 		return 1
 	}

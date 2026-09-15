@@ -582,7 +582,7 @@ func (m *model) handleKey(msg tea.KeyMsg) tea.Cmd {
 			if !ok {
 				return nil
 			}
-			m.showDetail(er)
+			m.showDetail(er, true)
 			m.pane = paneDetail
 			return nil
 		case panePipeline:
@@ -591,7 +591,7 @@ func (m *model) handleKey(msg tea.KeyMsg) tea.Cmd {
 				return nil
 			}
 			m.previousPane = panePipeline
-			m.showPluginDetail(p)
+			m.showPluginDetail(p, true)
 			m.pane = panePluginDetail
 			// Fetch immediately rather than waiting for the next refresh tick:
 			// opening the pane is exactly when someone wants current counters.
@@ -602,7 +602,7 @@ func (m *model) handleKey(msg tea.KeyMsg) tea.Cmd {
 				return nil
 			}
 			m.previousPane = paneCatalog
-			m.showPluginDetail(p)
+			m.showPluginDetail(p, true)
 			m.pane = panePluginDetail
 			return nil
 		}
@@ -1006,7 +1006,6 @@ func (m *model) layout() {
 	m.pipelineTbl.SetColumns(fitTableColumns(pipelineColumns(), m.width))
 	m.catalogTbl.SetColumns(fitTableColumns(catalogColumns(), m.width))
 
-	m.sessionsTbl.SetHeight(bodyH)
 	// Rebuild the sessions ROWS, not just re-fit the columns. AFTER SetColumns above, and
 	// the order is the whole point: rebuildSessionsTable reads the width COST was
 	// actually fitted to (fittedSessionsColumnWidth) to decide whether a dollar figure
@@ -1024,26 +1023,64 @@ func (m *model) layout() {
 	// already-empty table and parks the cursor at 0. It is the same call
 	// rebuildEventsTable a few lines down already makes unconditionally.
 	m.rebuildSessionsTable()
+	// Through setTableHeight, not SetHeight: a height change re-windows the rows while the
+	// viewport keeps the offset it had for the old height, so something has to reconcile
+	// it.
+	//
+	// AFTER the rebuild, and that ordering is load-bearing rather than incidental. Merging
+	// #998 with the rebuild above put two cursor-touching calls next to each other:
+	// rebuildSessionsTable reads Cursor() first, to re-select the same SESSION ID after the
+	// rows are replaced, while setTableHeight moves the cursor (GotoTop, then
+	// setCursorVisible). Height first would hand the rebuild a cursor that had already
+	// moved, so it would preserve whichever row the re-windowing happened to land on
+	// instead of the one the operator had selected. Rows first, then reconcile the offset
+	// against the final row set.
+	//
+	// #998's own justification for this call — "these tables are not rebuilt from here" —
+	// is no longer true of THIS table, though it still holds for the four below. The call
+	// is still wanted here: the rebuild replaces rows, not the viewport's offset.
+	setTableHeight(&m.sessionsTbl, bodyH)
 	m.bodyHeight = bodyH
 	// Picker tables share the same body area as the session tables so the
 	// terminal real estate stays constant as the user navigates panes.
-	m.namespacesTbl.SetHeight(bodyH)
-	m.podsTbl.SetHeight(bodyH)
+	setTableHeight(&m.namespacesTbl, bodyH)
+	setTableHeight(&m.podsTbl, bodyH)
 	// The events table's height depends on whether the IDENTITY banner
 	// is rendered for the selected session. rebuildEventsTable() applies
 	// the banner-aware adjustment; call it so the size is correct after
 	// a window resize too.
 	m.rebuildEventsTable()
-	m.pipelineTbl.SetHeight(bodyH)
+	setTableHeight(&m.pipelineTbl, bodyH)
+	// The catalog table had no height set anywhere: it kept bubbles' table.New
+	// default of 20 rows for the life of the process, so on a terminal shorter than
+	// that the pane rendered past the bottom (scrolling the title away) and on a
+	// taller one it left the remaining rows unused. TestLayout_EveryPaneFitsTheTerminal
+	// covered this pane but never populated m.catalog, so it only ever measured the
+	// "loading catalog…" line.
+	setTableHeight(&m.catalogTbl, bodyH)
 	m.detailVp.Width = m.width
 	m.detailVp.Height = bodyH
+	// Re-clamp the scroll offset to the new height, for the PLUGIN detail pane:
+	// nothing re-renders that one on a resize, so this is the only place its offset can
+	// be reconciled. The events detail pane is re-rendered just below and clamps itself
+	// (see showDetail), which is why this line cannot simply move down there — the
+	// re-render would land after it either way.
+	m.detailVp.SetYOffset(m.detailVp.YOffset)
 
 	m.filterInput.Width = m.width - 4
 
-	// Re-wrap the detail viewport to the new width so long JSON values
-	// continue to fit after a terminal resize.
-	if m.detailEvent != nil {
-		m.showDetail(m.detailRow)
+	// Re-wrap the detail viewport to the new width so long JSON values continue to fit
+	// after a terminal resize. Not a scroll reset: the reader stays where they were, as
+	// in the help overlay.
+	//
+	// Only while that pane is the one on screen. detailVp is shared with the PLUGIN
+	// detail pane, and m.detailEvent outlives the pane that set it — nothing clears it
+	// on the way out, only the pod/session reset does — so read an event, esc, open a
+	// plugin, resize, and this call replaced the plugin's content with the old event's
+	// JSON under a "pipeline · tool-prune" title. The clamp above then reconciled the
+	// offset against content the operator had not asked for.
+	if m.pane == paneDetail && m.detailEvent != nil {
+		m.showDetail(m.detailRow, false)
 	}
 }
 

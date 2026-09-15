@@ -554,7 +554,15 @@ func (m *model) syncHelpViewport(resetScroll bool) {
 	m.helpVp.SetContent(body)
 	if resetScroll {
 		m.helpVp.GotoTop()
+		return
 	}
+	// Keeping the reader where they were still means clamping to what the new size
+	// can show. Height is a plain field, so assigning it above moved maxYOffset
+	// without touching YOffset, and SetContent only clamps against the LINE COUNT —
+	// so growing the terminal under a scrolled-down overlay left the offset past the
+	// bottom, rendering the body with dead space below it. SetYOffset is the
+	// clamping setter, and a no-op when the offset is already in range.
+	m.helpVp.SetYOffset(m.helpVp.YOffset)
 }
 
 // Init fires the initial fetch + starts the SSE pump and the tick.
@@ -810,7 +818,8 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// Metrics would still read (none) however long traffic ran.
 		if m.pane == panePluginDetail && m.detailPlugin != nil {
 			if p := m.livePipelinePlugin(m.detailPlugin); p != nil {
-				m.showPluginDetail(p)
+				// A refresh, not an opening: hold the reader's scroll position.
+				m.showPluginDetail(p, false)
 			}
 		}
 		return m, nil

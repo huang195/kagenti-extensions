@@ -129,9 +129,25 @@ func ParseUserAgent(ua string) *EventClient {
 	return c
 }
 
+// UnknownClientLabel is the reserved key for traffic that carried no User-Agent.
+//
+// EXPORTED so there is exactly one definition of it. Both surfaces that serve
+// group=agent have to agree on this string: the live aggregator keys its series on
+// Label() directly, while the cost ledger stores absence losslessly as "" and maps it
+// back at the query boundary (see costledger.labelFor). Those are two different code
+// paths reaching the same bucket, so two spellings would surface as two rows in any
+// client that merged a ring answer with a ledger answer — and each row would hold half
+// the unattributed spend, which is worse than either alone. It was a bare literal in
+// both packages, agreeing only by the comment that said it must; this makes the
+// agreement something the compiler keeps.
+//
+// NOT an agent name. See Label for what it means and why a consumer must not present
+// it as one.
+const UnknownClientLabel = "unknown"
+
 // Label returns the display key for this client: "claude-code/2.1.14" for a
-// recognised agent, the raw User-Agent for an unrecognised one, and "unknown"
-// when there is no client at all.
+// recognised agent, the raw User-Agent for an unrecognised one, and
+// UnknownClientLabel ("unknown") when there is no client at all.
 //
 // NIL-SAFE ON PURPOSE. Every consumer — the usage aggregator, the cost ledger —
 // calls this on events that may carry no client, and a nil check at each call site
@@ -156,11 +172,11 @@ func ParseUserAgent(ua string) *EventClient {
 // a known property rather than a surprise to whoever first sees the row.
 func (c *EventClient) Label() string {
 	if c == nil {
-		return "unknown"
+		return UnknownClientLabel
 	}
 	if c.Name == "" {
 		if c.Raw == "" {
-			return "unknown"
+			return UnknownClientLabel
 		}
 		return c.Raw
 	}

@@ -199,6 +199,22 @@ type spendSummary struct {
 	// sessions table's COST cell and the Usage pane's cost cell all republished exactly
 	// that floor as an exact figure. Carried here so the strip can mark it.
 	Incomplete int64
+	// Saturated reports that an addition into the window's totals reached the int64 ceiling
+	// and was CLAMPED rather than allowed to wrap, so WindowUSD — and the counters beside it —
+	// are FLOORS by an amount nothing in the response can state.
+	//
+	// A FOURTH claim about the window figure, and the one that is neither coverage, exactness
+	// nor damage. Coverage says how much of the traffic the figure covers, exactness says
+	// whether the figures it covers are the real ones, damage says rows are missing from the
+	// sum — and this says the sum itself stopped being able to hold the answer. See
+	// usage.Counts.Saturated, whose doc argues that the clamp is only acceptable BECAUSE this
+	// flag travels with it.
+	//
+	// It is on the ROLLING window as well as the day, unlike TodayDegraded, because the flag
+	// lives on usage.Counts rather than on the ledger's read: Counts.Add is where the clamp
+	// happens, and the in-memory ring sums with the same method. A field carried for the day
+	// alone would leave the strip's other reading able to publish a clamped figure bare.
+	Saturated bool
 	// HasSnapshot reports that a poll actually answered.
 	//
 	// It is what separates "we looked, and there was no inference traffic" from
@@ -260,6 +276,10 @@ type spendSummary struct {
 	// not by the strip — the strip has no reading to attach it to, and an unattached caveat
 	// on this line is the misattribution moneyFigure exists to end.
 	TodayDegraded *usage.Degraded
+	// TodaySaturated is the day figure's own clamp disclosure, separate from Saturated for the
+	// reason every other Today* counter is separate from its window twin: it is a different
+	// question about a different span, and one figure must never wear another's qualification.
+	TodaySaturated bool
 
 	SavedUSD float64 // set once tool-prune savings are aggregated
 	HasSaved bool
@@ -311,7 +331,11 @@ func (m *model) spendSummary() spendSummary {
 		// Carried whether or not the window is priced: a snapshot cannot report an inexact
 		// figure without reporting a priced one, but reading it unconditionally means the
 		// renderer decides what to do with it in one place rather than two.
-		Incomplete:  snap.Totals.IncompleteRequests,
+		Incomplete: snap.Totals.IncompleteRequests,
+		// Read unconditionally for the same reason, and NOT gated on Priced: a clamp says every
+		// counter in this Counts is a floor, and Requests overflowing is enough on its own —
+		// there need be no dollars involved for the answer to have stopped fitting.
+		Saturated:   snap.Totals.Saturated,
 		HasSnapshot: true,
 	}
 	// A negative total is refused HERE, before anything derives a figure from it, which
@@ -605,6 +629,10 @@ func (m *model) applyTodayFigure(out *spendSummary) {
 	// only a ledger-backed window can populate, which is why it hangs off the today figure
 	// and off nothing else. See spendSummary.TodayDegraded.
 	out.TodayDegraded = snap.Degraded
+	// And the day's own clamp, which is a FOURTH claim and the only one of the four that says
+	// the arithmetic itself ran out of room. A day can be fully covered, wholly exact, read
+	// cleanly, and still be a floor — see usage.Counts.Saturated.
+	out.TodaySaturated = snap.Totals.Saturated
 }
 
 // spendTodayTickIsCurrent reports whether a today tick belongs to the live chain.

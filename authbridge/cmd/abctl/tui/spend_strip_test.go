@@ -1030,6 +1030,55 @@ func TestApplyTodayFigure_ACleanReadLeavesNoDisclosure(t *testing.T) {
 	}
 }
 
+// TestSpendSummary_CarriesTheClampDisclosureOnBothSpans.
+//
+// The data half. usage.Counts.Saturated had ZERO non-test consumers in cmd/abctl, so a clamped
+// aggregate produced a figure indistinguishable from a settled one on every money surface at
+// once. Both spans are asserted because the flag is on usage.Counts rather than on a ledger
+// read: the ring's Add clamps too, so carrying it for the day alone would leave the strip's
+// rolling reading able to publish a clamped figure bare.
+func TestSpendSummary_CarriesTheClampDisclosureOnBothSpans(t *testing.T) {
+	clamped := usage.Counts{Requests: 400, CostMicros: 4_170_000,
+		PricedRequests: 400, PriceableRequests: 400, Saturated: true}
+
+	m := &model{}
+	m.spend.snap = &usage.Snapshot{Window: "1h", Totals: clamped, Priced: true,
+		Buckets: []usage.Bucket{{Counts: clamped}}}
+	m.spend.todaySnap = &usage.Snapshot{Window: usage.WindowToday, Totals: clamped, Priced: true}
+
+	out := m.spendSummary()
+	if !out.Saturated {
+		t.Error("Saturated is false; a clamped rolling window reaches no renderer")
+	}
+	if !out.TodaySaturated {
+		t.Error("TodaySaturated is false; a clamped day reaches no renderer")
+	}
+	// And the figures are still published: they are floors, not unknowns, and withholding them
+	// would report measured spend as unavailable.
+	if !out.HasToday || out.WindowUSD == 0 {
+		t.Errorf("HasToday=%v WindowUSD=%v; clamped figures were withheld rather than qualified",
+			out.HasToday, out.WindowUSD)
+	}
+}
+
+// TestSpendSummary_ACleanAggregateLeavesTheClampUnset is the mirror: false must mean "the
+// arithmetic held", so nothing may be rendered for it.
+func TestSpendSummary_ACleanAggregateLeavesTheClampUnset(t *testing.T) {
+	clean := usage.Counts{Requests: 400, CostMicros: 4_170_000,
+		PricedRequests: 400, PriceableRequests: 400}
+
+	m := &model{}
+	m.spend.snap = &usage.Snapshot{Window: "1h", Totals: clean, Priced: true,
+		Buckets: []usage.Bucket{{Counts: clean}}}
+	m.spend.todaySnap = &usage.Snapshot{Window: usage.WindowToday, Totals: clean, Priced: true}
+
+	out := m.spendSummary()
+	if out.Saturated || out.TodaySaturated {
+		t.Errorf("Saturated=%v TodaySaturated=%v for an aggregate that never clamped",
+			out.Saturated, out.TodaySaturated)
+	}
+}
+
 // TestRenderSpendStrip_ADamagedDayWearsItsOwnMarker.
 //
 // The rendered half. The marker rides on the FIGURE, so the fitter can drop the words and
@@ -1223,5 +1272,146 @@ func TestRenderSpendStrip_ADisclosureWithNoCountersStillMarksTheFigure(t *testin
 	}
 	if !strings.Contains(got, "rows lost") {
 		t.Errorf("strip %q says nothing about a disclosure it was sent", got)
+	}
+}
+
+// TestRenderSpendStrip_AClampedFigureWearsTheShortMarkerOnEitherReading.
+//
+// usage.Counts.Saturated says an addition into a window's totals reached the int64 ceiling and
+// was CLAMPED rather than allowed to wrap, so the figure is a floor by an amount nothing in the
+// response can state. The server aggregated it and no client in cmd/abctl read it, which is the
+// same defect usage.Snapshot.Degraded shipped with — and here it is worse than a missing caveat,
+// because a clamped figure is not merely low but absurd, and an absurd number with no marker
+// reads as a real one.
+//
+// BOTH READINGS, which is the asymmetry with damage. Degraded is a property of a LEDGER READ, so
+// only the day figure can carry one. Saturated is on usage.Counts, and the ring's Add clamps
+// exactly like the ledger's fold does — so a rolling hour can overflow with no ledger anywhere
+// near it, and a strip that marked only the day would publish the other figure bare.
+func TestRenderSpendStrip_AClampedFigureWearsTheShortMarkerOnEitherReading(t *testing.T) {
+	t.Run("the day", func(t *testing.T) {
+		s := spendSummary{
+			TodayUSD: 4.17, HasToday: true, TodayPriceable: 400, TodaySaturated: true,
+			WindowUSD: 1.12, WindowLabel: "1h", Priced: true, HasSnapshot: true, Priceable: 10,
+		}
+		got := renderSpendStrip(s, 200)
+		if !strings.Contains(got, damagedMarker+"$4.1700 today") {
+			t.Errorf("strip %q publishes a clamped day figure with no marker on it", got)
+		}
+		if !strings.Contains(got, saturatedNote) {
+			t.Errorf("strip %q does not say the day's figures are floors", got)
+		}
+		// The clean rolling figure must NOT be marked: a caveat on the wrong figure is the
+		// misattribution moneyFigure was built to end.
+		if strings.Contains(got, damagedMarker+"$1.1200") {
+			t.Errorf("strip %q marks an unclamped window figure as short", got)
+		}
+	})
+	t.Run("the rolling window", func(t *testing.T) {
+		s := spendSummary{
+			TodayUSD: 4.17, HasToday: true, TodayPriceable: 400,
+			WindowUSD: 1.12, WindowLabel: "1h", Priced: true, HasSnapshot: true, Priceable: 10,
+			Saturated: true,
+		}
+		got := renderSpendStrip(s, 200)
+		if !strings.Contains(got, damagedMarker+"$1.1200 /1h") {
+			t.Errorf("strip %q publishes a clamped rolling figure with no marker on it", got)
+		}
+		if strings.Contains(got, damagedMarker+"$4.1700") {
+			t.Errorf("strip %q marks an unclamped day figure as short", got)
+		}
+	})
+}
+
+// TestRenderSpendStrip_ACleanAggregateCarriesNoClampCaveat is the mirror. A permanent "figures
+// are floors" note over an aggregate that never clamped is the same false signal as a coverage
+// warning that never clears — and it would appear on every strip there is.
+func TestRenderSpendStrip_ACleanAggregateCarriesNoClampCaveat(t *testing.T) {
+	s := spendSummary{
+		TodayUSD: 4.17, HasToday: true, TodayPriceable: 400,
+		WindowUSD: 1.12, WindowLabel: "1h", Priced: true, HasSnapshot: true, Priceable: 10,
+	}
+	got := renderSpendStrip(s, 200)
+	if strings.Contains(got, saturatedNote) || strings.Contains(got, damagedMarker) {
+		t.Errorf("strip %q qualifies a clean aggregate", got)
+	}
+}
+
+// TestRenderSpendStrip_TheClampMarkerSurvivesNarrowing.
+//
+// The words are droppable, the marker is not — fitStripFigures gives up every figure's
+// explanation before it gives up a reading. A narrow terminal losing "clamped, figures are
+// floors" is a cost; losing the "!" would publish a clamped total as a settled one, which is the
+// worst outcome available on this line.
+func TestRenderSpendStrip_TheClampMarkerSurvivesNarrowing(t *testing.T) {
+	s := spendSummary{
+		TodayUSD: 4.17, HasToday: true, TodayPriceable: 400, TodayIncomplete: 7,
+		TodayUnpriced: 100, TodaySaturated: true,
+		HasSnapshot: true,
+	}
+	for w := 1; w <= 200; w++ {
+		got := renderSpendStrip(s, w)
+		if got == "" {
+			continue
+		}
+		if !strings.Contains(got, damagedMarker+inexactMarker+"$4.1700"+partialMarker) {
+			t.Errorf("width %d: %q lost one of the three markers", w, got)
+		}
+	}
+}
+
+// TestMoneyFigure_OneMarkerForBothWaysAFigureCanBeShort.
+//
+// damagedMarker's two causes take ONE cell between them, and each keeps its own words. "!!" on a
+// figure that is short twice over reads as emphasis rather than as two facts, and a fourth glyph
+// would deepen the strip's vocabulary to draw a distinction that changes nothing about how the
+// number must be read — where the WORDS do change what an operator goes and looks at: a day file
+// for one, whatever produced 9.2e18 micros of traffic for the other.
+func TestMoneyFigure_OneMarkerForBothWaysAFigureCanBeShort(t *testing.T) {
+	fig := moneyFigure(4.17, "today", 0, 400, 0, &usage.Degraded{SkippedLines: 3}, true)
+	if n := strings.Count(fig.compact, damagedMarker); n != 1 {
+		t.Errorf("compact form %q carries %d %q cells, want exactly 1", fig.compact, n, damagedMarker)
+	}
+	for _, want := range []string{saturatedNote, "3 lines lost"} {
+		if !strings.Contains(fig.full, want) {
+			t.Errorf("full form %q is missing %q — one marker must not collapse two causes into "+
+				"one explanation", fig.full, want)
+		}
+	}
+	// The clamp leads: it is short in every column of the aggregate, where a damaged read is
+	// short in the dollars. Same order as the Cost pane and `abctl cost`.
+	if clamp, damaged := strings.Index(fig.full, saturatedNote), strings.Index(fig.full, "3 lines lost"); clamp > damaged {
+		t.Errorf("the damaged-read note outranks the clamp in %q", fig.full)
+	}
+}
+
+// The width matrix again, with the clamp caveat live. Same contract as ever: one line, never
+// wider than the budget, never a clipped figure. The CJK label is two display columns per rune,
+// so any len()- or rune-based arithmetic in the new caveat path renders wider than it claims.
+func TestRenderSpendStrip_TheClampCaveatObeysTheWidthContract(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		s    spendSummary
+	}{
+		{"a clamped day beside a clamped hour", spendSummary{
+			TodayUSD: 4.17, HasToday: true, TodayPriceable: 400, TodaySaturated: true,
+			WindowUSD: 1.12, WindowLabel: "1h", BurnPerMin: 0.0187, Priced: true,
+			HasSnapshot: true, Priceable: 318, Saturated: true,
+		}},
+		{"every caveat a day can carry at once", spendSummary{
+			TodayUSD: 0.0031, HasToday: true, TodayUnpriced: 399, TodayPriceable: 400,
+			TodayIncomplete: 7, TodaySaturated: true,
+			TodayDegraded: &usage.Degraded{SkippedLines: 1_234_567, TruncatedDays: 89},
+			WindowUSD:     1.12, WindowLabel: "過去一時間", BurnPerMin: 0.0187, Priced: true,
+			HasSnapshot: true, Unpriced: 12, Priceable: 318, Incomplete: 3, Saturated: true,
+			SavedUSD: 0.24, HasSaved: true,
+			Age: 3 * time.Minute, Stale: true,
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			for w := 1; w <= 200; w++ {
+				assertStripFits(t, tc.s, w)
+			}
+		})
 	}
 }

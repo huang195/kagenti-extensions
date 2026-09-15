@@ -668,7 +668,10 @@ func costTotalFigure(snap *usage.Snapshot) string {
 	if snap.Totals.IncompleteRequests > 0 {
 		amount = inexactMarker + amount
 	}
-	if snapshotDamaged(snap.Degraded) {
+	// Both causes of "short by an unstatable amount" take the same glyph, and a total that is
+	// damaged AND clamped wears it once: the marker is the claim, not a count of reasons. See
+	// figureIsShort and damagedMarker.
+	if figureIsShort(snap.Degraded, snap.Totals.Saturated) {
 		amount = damagedMarker + amount
 	}
 	// A coverage gap needs its denominator to be a gap at all: PriceableRequests of zero is
@@ -732,7 +735,19 @@ func costTotalBody(snap *usage.Snapshot, width int) costTotalParts {
 	//
 	// This pane's window defaults to "today" (costPaneWindows[0]), the only window that can
 	// populate the field, so this is the default path rather than an edge of one.
+	//
+	// A CLAMPED AGGREGATE LEADS EVEN THAT, and it is the one caveat that qualifies every
+	// number in the answer rather than the dollars alone. usage.Counts.Saturated says an
+	// addition into these totals hit the int64 ceiling and was capped rather than allowed to
+	// wrap, so the requests, the tokens and the cost are all FLOORS. A damaged read loses rows
+	// from one sum; this loses value from every sum in the struct, which is why it goes first.
+	// Both wear damagedMarker on the figure — see figureIsShort — and each gets its own words,
+	// because "a day file was lost" and "the arithmetic overflowed" send an operator to
+	// completely different places.
 	addDamage := func() {
+		if snap.Totals.Saturated {
+			parts.caveats = append(parts.caveats, wrap(costSaturatedNote))
+		}
 		if snapshotDamaged(snap.Degraded) {
 			parts.caveats = append(parts.caveats, wrap(costDamagedNote(snap.Degraded)))
 		}
@@ -826,6 +841,27 @@ func costTotalBody(snap *usage.Snapshot, width int) costTotalParts {
 func costTotalSection(snap *usage.Snapshot, width int) costSection {
 	return costSection{heading: "TOTAL", lines: costTotalBody(snap, width).lines()}
 }
+
+// costSaturatedNote is the Cost pane's spelling of a CLAMPED AGGREGATE.
+//
+// usage.Counts.Saturated is a BOOL, not a counter, and its doc says why: "this number is a
+// ceiling" is a property of the number and survives any regrouping, where "it was clamped four
+// times" is a property of the arithmetic path and does not. So this is a constant sentence with
+// no figure in it — there is no honest number to interpolate, and inventing one ("clamped by
+// $N") would be the same fabrication the pane refuses everywhere else.
+//
+// EVERY FIGURE, not just the dollars, and the sentence says all three out loud. Add clamps on
+// the whole Counts, so Requests and Tokens are floors alongside CostMicros. A caveat naming
+// only money would leave a reader trusting a request count that is also short — and the
+// request count is the denominator of every ratio on this pane.
+//
+// It says CLAMPED RATHER THAN WRAPPED, because that is the only reason the number on screen is
+// worth anything at all: the alternative was a wrapped total, which is a large negative or a
+// small positive presented as a fact. The clamp is what makes the figure a floor instead of
+// fiction, and this disclosure is what makes the clamp honest.
+const costSaturatedNote = "every figure in this window is a FLOOR — a total reached the " +
+	"largest whole number the aggregate can hold and was CLAMPED rather than allowed to wrap, " +
+	"so the real requests, tokens and cost are all larger, by an amount nothing here can state"
 
 // costDamagedNote is the Cost pane's spelling of a damaged ledger read: the sentence form,
 // where the strip has room only for damagedNote's three words and a one-cell marker.
@@ -1062,6 +1098,53 @@ func costUngroupedRow(snap *usage.Snapshot) (costRow, bool) {
 	return row, true
 }
 
+// costOvershootNote is the breakdown's DEFECT REPORT, or "" when there is none.
+//
+// usage.Snapshot.SeriesOvershootMicros is the residual with the wrong sign: the amount by
+// which this response's series summed to MORE than Totals.CostMicros. Its own doc is
+// explicit that this is not a property of the traffic — every event lands in at most one
+// entry of a reconcilable group's map, so the entries can sum to the total or to less, never
+// to more. A positive value means the producer is wrong about its own arithmetic: a Group
+// marked Reconcilable whose series double-counts, or an accumulator counting one event twice.
+//
+// SO IT IS NOT A BAND, AND MUST NOT LOOK LIKE ONE. costUngroupedRow renders the OTHER
+// residual as a row with a figure, a share and a bar, because that residual is legitimate
+// unattributed spend and belongs in the money column beside the rows it completes. This one
+// is the opposite claim — the rows are WRONG — and no chart should draw it. Confusing the two
+// would be worse than rendering neither: a reader would take a defect report for real money
+// and go looking for the workload that spent it. That is why the field is a separate unsigned
+// magnitude rather than a signed residual (see usage.SetUngroupedCost), and rendering it in
+// the same column would put the sign back.
+//
+// It names TOTAL as unaffected, which is the whole difference from costDamagedNote. Totals is
+// summed from the raw buckets before any grouping, so an overshoot indicts the SERIES and
+// leaves the headline exactly as trustworthy as it was. A reader told only "this answer is
+// broken" would stop believing the one figure that is still correct.
+//
+// The MAGNITUDE is stated even though no chart draws it, because it is what makes the bug
+// report actionable: a quarter of a dollar over says one row is doubled, and a figure the
+// size of the total says the whole series is. It sits inside a sentence that opens by
+// refusing the rows, never in the figure column, for the reason above.
+//
+// ABSENT OR NON-POSITIVE RENDERS NOTHING, on the same rule costUngroupedRow holds to: the
+// field is a pointer precisely so a healthy response serialises no zero, and a zero would
+// have to mean both "checked, the series adds up" and "not checked". The non-positive guard
+// is defence in depth — usage.SetUngroupedCost publishes only a positive magnitude here — and
+// restating it is this pane's convention rather than inheriting a guarantee silently.
+func costOvershootNote(snap *usage.Snapshot) string {
+	if snap.SeriesOvershootMicros == nil {
+		return ""
+	}
+	over := *snap.SeriesOvershootMicros
+	if over <= 0 {
+		return ""
+	}
+	return fmt.Sprintf("DO NOT TRUST THESE ROWS — they sum to %s MORE than the total above, "+
+		"which cannot happen to a correct breakdown: a series here is counting spend twice. "+
+		"The total itself is unaffected. This is a defect in Cortex, not a gap in your rate "+
+		"table — please report it.", costMoney(over))
+}
+
 // costBreakdownSection is where the money went, by the selected axis.
 //
 // Ordered by cost descending, ties broken on the label: map iteration is
@@ -1208,6 +1291,25 @@ func costBreakdownSection(snap *usage.Snapshot, group usage.Group, width int) co
 	if labelRows > len(lines) {
 		labelRows = len(lines)
 	}
+	// THE DEFECT REPORT LEADS, above the rows rather than below them, and it is the one
+	// disclosure in this section that does. The band and the "+N more" note both qualify how
+	// COMPLETE the rows are, so they follow the rows they are about; this one says the rows are
+	// WRONG, and a reader who scans the table and stops has read numbers they were told not to
+	// believe. Every other money claim on this branch rides on its figure as a marker for that
+	// exact reason (see costTotalFigure); an overshoot has no single figure to ride on — it
+	// indicts the whole series — so leading the section is the only form available.
+	//
+	// Inside the section, so the height budget drops it WITH the rows: fitCostSections takes a
+	// section whole or not at all, and with no rows on screen there is nothing left to
+	// distrust. Same reason it is not emitted on the no-series path above — "no model breakdown
+	// for this window" leaves no breakdown for this to be about, and the field cannot arrive
+	// there anyway, since an empty series sums to zero and zero cannot exceed a total the
+	// server refuses to publish negative.
+	if note := costOvershootNote(snap); note != "" {
+		for _, l := range wrapCells(note, body) {
+			sec.lines = append(sec.lines, costIndent+l)
+		}
+	}
 	// Copied rather than sliced onto sec.lines. lines[:labelRows] keeps the whole backing
 	// array, so appending the note to it would overwrite the band's own line — the section
 	// would then show the note twice and the residual not at all.
@@ -1303,6 +1405,37 @@ func costTokenSection(snap *usage.Snapshot, width int) costSection {
 		}
 	}
 	t := snap.Totals
+	// The refusal caveat, which belongs to EVERY path out of this function.
+	//
+	// usage.Counts.RefusedTokenRequests counts requests whose token report was rejected as
+	// implausible and contributed nothing to any figure in this section. Non-zero means the
+	// counts AND the split are SHORT by an amount that is unknowable by construction — the
+	// report that would have said how much is the report that was thrown away.
+	//
+	// SHORT BY AN UNSTATABLE AMOUNT is damagedMarker's claim, not inexactMarker's, and the
+	// glyph is not reused here only because there is no figure for it to ride on: a refused
+	// report says nothing about WHICH tier lost tokens, so marking one row would assert a
+	// locality the field does not have and marking all of them would spell one fact five
+	// times. Prose is safe where it would not be on TOTAL, because fitCostSections drops a
+	// section whole and never clips one — the rows and this sentence cannot be separated.
+	//
+	// IT SAYS THE DOLLARS ARE FINE, and that is the point of putting it here rather than on
+	// TOTAL. Cost is settled by a different producer and bounded separately
+	// (pricing.MaxPlausibleRequestCostMicros, pricing.MaxCostMicros), so a refused token
+	// report does not remove a cent from Totals.CostMicros. A window can carry trustworthy
+	// dollars and short tokens at once, and a caveat that let a reader think their money
+	// figure was wrong would send them after the wrong number.
+	addRefused := func() {
+		if r := t.RefusedTokenRequests; r > 0 {
+			// Both grammatical numbers come out of one sentence with no verb to agree: "1 token
+			// report REFUSED" and "3 token reports REFUSED" both read, where "was/were" would
+			// need a second string for a caveat about money that must not read as a typo.
+			add(fmt.Sprintf("%s token report%s REFUSED as implausible, counted in none of the "+
+				"figures here — so these counts and this split are SHORT by an amount nothing can "+
+				"state. The dollar total is unaffected: cost is settled and bounded separately.",
+				formatCount(int(r)), plural(int(r))))
+		}
+	}
 	// A tier is shown when the provider DECLARED it or when it carries a count.
 	//
 	// Declared-and-zero is a real measurement worth a row: "this traffic wrote no
@@ -1335,6 +1468,11 @@ func costTokenSection(snap *usage.Snapshot, width int) costSection {
 		} else {
 			add("no tokens recorded in this window")
 		}
+		// STATED HERE TOO, and this is the path where it matters most: "no tokens recorded in
+		// this window" over a refused report is a false negative, not a shortfall. Reports
+		// arrived, were rejected, and left the section looking like a quiet window. The sentence
+		// above is about the rows that were KEPT; this says some were thrown away.
+		addRefused()
 		return sec
 	}
 	// The denominator is the sum of the SHOWN tiers, never Counts.Tokens. Tokens is not
@@ -1382,6 +1520,10 @@ func costTokenSection(snap *usage.Snapshot, width int) costSection {
 		return costSection{}
 	}
 	sec.lines = tierLines
+	// The shortfall BEFORE the how-to-read note, in severity order: one says the numbers above
+	// are incomplete, the other says how to compare them. A reader who stops after the first
+	// sentence must have read the one that qualifies the figures.
+	addRefused()
 	add("Tiers price very differently — a cache read is roughly 0.1x uncached input, a cache " +
 		"write roughly 1.25x, and output the dearest — so the largest share is the first place " +
 		"to look, not the largest cost. Volume only: no per-tier dollars are aggregated " +

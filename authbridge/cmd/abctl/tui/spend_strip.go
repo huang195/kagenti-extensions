@@ -48,10 +48,24 @@ const inexactMarker = "~"
 // which is what a coverage gap means for a total.
 const partialMarker = "+"
 
-// damagedMarker precedes a dollar figure whose LEDGER READ WAS INCOMPLETE: rows the answer
-// needed could not be read at all — a day file that lost lines, or one whose scan was
-// abandoned part-way — so the figure is SHORT by an amount nothing in the response can
-// state. See usage.Snapshot.Degraded and snapshotDamaged.
+// damagedMarker precedes a dollar figure that is SHORT of real spend by an amount nothing in
+// the response can state. It has TWO CAUSES and one meaning:
+//
+//   - THE LEDGER READ WAS INCOMPLETE: rows the answer needed could not be read at all — a day
+//     file that lost lines, or one whose scan was abandoned part-way. See
+//     usage.Snapshot.Degraded and snapshotDamaged.
+//   - THE AGGREGATE ARITHMETIC WAS CLAMPED: an addition into the totals hit the int64 ceiling
+//     and was capped rather than allowed to wrap, so every figure in that window is a floor.
+//     See usage.Counts.Saturated, whose own doc says the disclosure "travels on the same
+//     response as the number it qualifies, which is where an operator reading that number will
+//     see it" — this is that place.
+//
+// ONE GLYPH FOR BOTH, because the claim a reader acts on is identical: the number on screen is
+// less than the money that was spent, and by how much is unstatable. The words beside it name
+// which cause, exactly as inexactMarker carries one glyph over the two directions
+// usage.Snapshot.IncompleteBy distinguishes. A second glyph would make the strip's vocabulary
+// four marks deep to draw a distinction that changes nothing about how the figure must be
+// read. figureIsShort is the one spelling of the test.
 //
 // A THIRD GLYPH, and deliberately not one of the other two. Degraded's own doc is explicit
 // that this is a different claim from usage.Counts.IncompleteRequests and that the two must
@@ -73,6 +87,19 @@ const partialMarker = "+"
 // is dropped — accepted, and the same trade the other two already make, because the marker
 // is the fact and the words are the explanation.
 const damagedMarker = "!"
+
+// figureIsShort reports that a figure wears damagedMarker: it is short of real spend by an
+// amount nothing in the response can state, from either of the two causes that produce that
+// claim. See damagedMarker.
+//
+// A function rather than the disjunction written at each site, for the reason negativeCost is
+// one: the same test is made by the strip's today figure, the Cost pane's TOTAL, the pane's
+// caveat block and `abctl cost`, and a predicate written four times is a predicate that drifts.
+// usage.Counts.Saturated arrived after usage.Snapshot.Degraded and only one surface picked it
+// up; the next disclosure of this class should have one place to be added.
+func figureIsShort(degraded *usage.Degraded, saturated bool) bool {
+	return snapshotDamaged(degraded) || saturated
+}
 
 // stripFigure is one reading in the strip, in the two forms it can take.
 //
@@ -137,6 +164,21 @@ func damagedNote(d *usage.Degraded) string {
 	}
 }
 
+// saturatedNote is the strip's spelling of a clamped aggregate: the shortest form that still
+// says which way the figure is wrong.
+//
+// One fact at three verbosities, the same relationship damagedNote has with
+// costSaturatedNote's sentence and cmd_cost.go's line. "clamped" alone would leave a reader
+// guessing whether the number shown is too big or too small, and "floors" is the half they
+// act on — the real spend is LARGER than the figure beside it.
+//
+// A constant, because usage.Counts.Saturated is a bool: there is no count of clamped
+// additions to interpolate, and its doc explains why there deliberately is not one.
+//
+// It rides in the figure's FULL form only. damagedMarker is what survives into the compact
+// form, exactly as with damagedNote, so width pressure costs the explanation and never the fact.
+const saturatedNote = "clamped, figures are floors"
+
 // moneyFigure builds one dollar reading together with the caveats that belong to IT.
 //
 // label is the figure's own suffix — "today", "/1h" — and it is why this takes one at
@@ -157,15 +199,22 @@ func damagedNote(d *usage.Degraded) string {
 // the read was clean and nothing is rendered for it — see snapshotDamaged, which is where
 // the pointer semantics are argued. Only a ledger-backed figure can carry one, so the
 // window reading passes nil.
+//
+// saturated is a FOURTH claim that SHARES the third one's glyph, because it makes the same
+// demand of a reader: this figure is short of real spend by an amount nothing can state. It is
+// also the only claim on this line that BOTH readings can carry — usage.Counts.Saturated lives
+// on Counts, so the ring's window totals and the ledger's day totals can each clamp, where a
+// damaged read is ledger-only. See figureIsShort and damagedMarker.
 func moneyFigure(usd float64, label string, unpriced, priceable, incomplete int64,
-	degraded *usage.Degraded) stripFigure {
+	degraded *usage.Degraded, saturated bool) stripFigure {
 	amount := formatUSDCell(usd)
 	if incomplete > 0 {
 		amount = inexactMarker + amount
 	}
 	// Outermost, so the leftmost cell is the most serious claim. See damagedMarker for why
-	// it is a third glyph rather than a reuse of either of the other two.
-	if snapshotDamaged(degraded) {
+	// it is a third glyph rather than a reuse of either of the other two, and why its two
+	// causes take one cell between them rather than a cell each.
+	if figureIsShort(degraded, saturated) {
 		amount = damagedMarker + amount
 	}
 	// A gap is only readable with a denominator, and a denominator of zero is not a
@@ -176,6 +225,13 @@ func moneyFigure(usd float64, label string, unpriced, priceable, incomplete int6
 	}
 	fig := plainFigure(amount + " " + label)
 	var caveats []string
+	// The clamp leads even the damaged read: it is short in every column of the aggregate, not
+	// only in the dollars, and it is the reason a figure this line renders can be absurd rather
+	// than merely low. Both can be true of one reading, and each keeps its own words — one sends
+	// an operator to a day file, the other to whatever produced 9.2e18 micros of traffic.
+	if saturated {
+		caveats = append(caveats, saturatedNote)
+	}
 	if snapshotDamaged(degraded) {
 		caveats = append(caveats, damagedNote(degraded))
 	}
@@ -297,7 +353,7 @@ func renderSpendStrip(s spendSummary, width int) string {
 		// rendered a figure byte-identical to a clean one — the exact failure
 		// usage.Snapshot.Degraded exists to end, on the strip's headline reading.
 		figures = append(figures, moneyFigure(s.TodayUSD, "today",
-			s.TodayUnpriced, s.TodayPriceable, s.TodayIncomplete, s.TodayDegraded))
+			s.TodayUnpriced, s.TodayPriceable, s.TodayIncomplete, s.TodayDegraded, s.TodaySaturated))
 	}
 	// Guarded on Priced independently of the branch above, which lets !Priced
 	// through whenever HasToday is set. Without this guard that combination — a
@@ -313,8 +369,13 @@ func renderSpendStrip(s spendSummary, width int) string {
 		// ring, which has no lines to fail to decode and no files to abandon, so a duration
 		// window leaves usage.Snapshot.Degraded nil and that absence is the truth. See
 		// snapshotDamaged.
+		//
+		// The CLAMP is not nil-by-construction the same way, and passing false here would be a
+		// second bug of the shape this whole exercise is about: usage.Counts.Saturated is on
+		// Counts, and the ring's Add clamps exactly like the ledger's fold does, so a rolling
+		// window can overflow with no ledger anywhere near it.
 		figures = append(figures, moneyFigure(s.WindowUSD, "/"+s.WindowLabel,
-			s.Unpriced, s.Priceable, s.Incomplete, nil))
+			s.Unpriced, s.Priceable, s.Incomplete, nil, s.Saturated))
 	} else if s.Unpriced > 0 && s.Priceable > 0 {
 		// The window figure is suppressed because nothing in the window was priced, so
 		// its coverage gap has no figure to ride on. It still has to be stated — this is

@@ -2203,6 +2203,11 @@ var costCaveatSentences = map[string]string{
 	"this total is SHORT":        "an amount nothing here can state",
 	"covers 300 of 400":          "the rest carry no figure",
 	"priced figures are inexact": "does not record which way",
+	// The clamp disclosure's own closing, which is deliberately long: its tail shares
+	// "an amount nothing here can state" with the damaged-read sentence above, so a short key
+	// would be satisfied by the WRONG caveat's ending whenever both are on screen.
+	"every figure in this window is a FLOOR": "the real requests, tokens and cost are all " +
+		"larger, by an amount nothing here can state",
 }
 
 // TestRenderCostPane_ATinyHeightNeverShowsABareConfidentFigure.
@@ -2285,7 +2290,8 @@ func TestRenderCostPane_TheFigureWearsTheSameMarkersAsEveryOtherMoneySurface(t *
 
 	stripFig := moneyFigure(12.5, "today",
 		snap.Totals.PriceableRequests-snap.Totals.PricedRequests,
-		snap.Totals.PriceableRequests, snap.Totals.IncompleteRequests, snap.Degraded)
+		snap.Totals.PriceableRequests, snap.Totals.IncompleteRequests, snap.Degraded,
+		snap.Totals.Saturated)
 	// Same markers in the same places; only the amount's own formatter differs (costMoney
 	// states four places, formatUSDCell adds a "<" floor), so compare the marker frame.
 	paneFrame := strings.ReplaceAll(paneFigure, "$12.5000", "AMOUNT")
@@ -2846,5 +2852,460 @@ func TestRenderCostPane_TheResidualBandSharesTheRowsColumnGrid(t *testing.T) {
 	}
 	if !bandSeen {
 		t.Fatalf("no band matched; test premise is wrong:\n%s", by)
+	}
+}
+
+// overshotSnapshot is a breakdown whose series sums to MORE than the published total, which is
+// the state usage.Snapshot.SeriesOvershootMicros exists to report.
+//
+// Built through SetUngroupedCost with a NEGATIVE residual, because that is the only way the
+// field is ever populated — the producers pass a signed number and the setter turns a negative
+// one into this unsigned magnitude. A fixture assigning the pointer directly would pass while
+// the real path was broken, which is the shape of defect this whole file is about.
+func overshotSnapshot(t *testing.T, seriesCost map[string]int64, overshoot int64) *usage.Snapshot {
+	t.Helper()
+	if overshoot <= 0 {
+		t.Fatalf("fixture premise is wrong: an overshoot of %d is not an overshoot", overshoot)
+	}
+	var series = map[string]usage.Counts{}
+	var seriesTotal int64
+	for label, micros := range seriesCost {
+		series[label] = usage.Counts{Requests: 1, PriceableRequests: 1, PricedRequests: 1,
+			CostMicros: micros}
+		seriesTotal += micros
+	}
+	// The total is SHORT of the series by exactly the overshoot, which is what makes the
+	// residual negative and the setter publish the magnitude.
+	total := seriesTotal - overshoot
+	snap := &usage.Snapshot{
+		Window: usage.WindowToday, Group: usage.GroupModel, Priced: true,
+		Totals: usage.Counts{Requests: int64(len(series)), PriceableRequests: int64(len(series)),
+			PricedRequests: int64(len(series)), CostMicros: total},
+		Buckets: []usage.Bucket{{Series: series}},
+	}
+	snap.SetUngroupedCost(total - seriesTotal)
+	if snap.SeriesOvershootMicros == nil {
+		t.Fatalf("fixture premise is wrong: series %d over a total of %d published no overshoot",
+			seriesTotal, total)
+	}
+	if snap.UngroupedCostMicros != nil {
+		t.Fatalf("fixture premise is wrong: an overshoot also published a residual of %d",
+			*snap.UngroupedCostMicros)
+	}
+	return snap
+}
+
+// TestRenderCostPane_AnOvershotBreakdownSaysNotToTrustIt.
+//
+// The defect this closes: usage.Snapshot.SeriesOvershootMicros was populated by both producers
+// and read by nothing, so a response whose breakdown summed to MORE than its own total rendered
+// byte-identically to a correct one — a reader adding the column up got a bigger number than
+// the total two sections above, with nothing on screen saying the rows were wrong.
+//
+// The field's doc is explicit that this cannot happen to correct code: every event lands in at
+// most one entry of a reconcilable group's map, so the entries sum to the total or to less. So
+// the rendering has to be a DEFECT REPORT — refuse the rows, say the total is still good, and
+// say where the bug is — rather than one more number in the money column.
+func TestRenderCostPane_AnOvershotBreakdownSaysNotToTrustIt(t *testing.T) {
+	snap := overshotSnapshot(t, map[string]int64{"m-a": 3_000_000, "m-b": 1_500_000}, 250_000)
+
+	by := sectionOf(t, renderCostPane(snap, usage.GroupModel, 120, 40), "BY MODEL")
+	flat := unwrapCostBody(by)
+	// It refuses the rows out loud. "Inconsistent" on its own leaves a reader deciding for
+	// themselves whether to believe a table; this tells them not to.
+	if !strings.Contains(flat, "DO NOT TRUST THESE ROWS") {
+		t.Errorf("the breakdown does not refuse rows that sum to more than the total:\n%s", by)
+	}
+	// The magnitude, because it is what makes the bug report actionable: a quarter of a dollar
+	// over says one row is doubled, a figure the size of the total says the whole series is.
+	if !strings.Contains(flat, "$0.2500") {
+		t.Errorf("the defect report states no magnitude (want $0.2500):\n%s", by)
+	}
+	// And it names TOTAL as still trustworthy, which is the whole difference from a damaged
+	// read. Totals is summed from the raw buckets before any grouping, so an overshoot indicts
+	// the series and leaves the headline exactly as good as it was. A reader told only "this
+	// answer is broken" would stop believing the one figure that is still right.
+	if !strings.Contains(flat, "total itself is unaffected") {
+		t.Errorf("the defect report does not say the total is still good:\n%s", by)
+	}
+	// It says whose bug it is. A coverage gap is the operator's to close with a rate-table
+	// entry; this one is not theirs at all, and a caveat that reads like a configuration
+	// warning sends them to edit a file that has nothing wrong with it.
+	if !strings.Contains(flat, "defect in Cortex") || !strings.Contains(flat, "report it") {
+		t.Errorf("the defect report does not say it is a bug to report:\n%s", by)
+	}
+	if tot := sectionOf(t, renderCostPane(snap, usage.GroupModel, 120, 40), "TOTAL"); !strings.Contains(tot, "$4.2500") {
+		t.Errorf("TOTAL is not the published figure:\n%s", tot)
+	}
+}
+
+// TestRenderCostPane_TheOvershootIsNotTheResidualBand.
+//
+// The confusion that would be worse than rendering neither. usage.Snapshot.UngroupedCostMicros
+// is legitimate unattributed spend and gets a row with a figure, a share and a bar; the
+// overshoot is the claim that the rows are WRONG and no chart should draw it. The field is a
+// separate unsigned magnitude rather than a signed residual precisely so a consumer cannot
+// render the second as the first — see usage.SetUngroupedCost — and putting it in the money
+// column would put the sign back.
+//
+// Both directions are asserted, because either mix-up is the same defect: an overshoot must not
+// draw a band, and a real residual must not read as a defect report.
+func TestRenderCostPane_TheOvershootIsNotTheResidualBand(t *testing.T) {
+	over := overshotSnapshot(t, map[string]int64{"m-a": 3_000_000, "m-b": 1_500_000}, 250_000)
+	by := sectionOf(t, renderCostPane(over, usage.GroupModel, 120, 40), "BY MODEL")
+	if strings.Contains(by, costUngroupedLabel) {
+		t.Errorf("an overshoot was rendered as the (unattributed) residual band:\n%s", by)
+	}
+	// No share and no bar for the magnitude: those are what make the band comparable with the
+	// rows, and a defect report is not comparable with anything. The bar glyph is the tell.
+	for _, l := range strings.Split(by, "\n") {
+		if strings.Contains(l, "$0.2500") && strings.Contains(l, "█") {
+			t.Errorf("the overshoot magnitude was drawn with a share bar:\n%s", l)
+		}
+	}
+
+	// And the mirror: a genuine residual is not a defect.
+	band := ungroupedSnapshot(t, map[string]int64{"m-a": 3_000_000, "m-b": 1_000_000}, 250_000)
+	if band.SeriesOvershootMicros != nil {
+		t.Fatalf("fixture premise is wrong: a positive residual published an overshoot of %d",
+			*band.SeriesOvershootMicros)
+	}
+	bandBy := sectionOf(t, renderCostPane(band, usage.GroupModel, 120, 40), "BY MODEL")
+	if strings.Contains(bandBy, "DO NOT TRUST") {
+		t.Errorf("a legitimate residual was rendered as a defect report:\n%s", bandBy)
+	}
+}
+
+// TestRenderCostPane_TheOvershootLeadsTheRowsItIndicts.
+//
+// ORDER, not merely presence. Every other disclosure in this section follows the rows because
+// it qualifies how COMPLETE they are; this one says they are WRONG, and a reader who scans the
+// table and stops has read numbers they were told not to believe. There is no single figure for
+// the claim to ride on as a marker — it indicts the whole series — so leading the section is the
+// only form available.
+func TestRenderCostPane_TheOvershootLeadsTheRowsItIndicts(t *testing.T) {
+	snap := overshotSnapshot(t, map[string]int64{"m-a": 3_000_000, "m-b": 1_500_000}, 250_000)
+	by := sectionOf(t, renderCostPane(snap, usage.GroupModel, 120, 40), "BY MODEL")
+	note := costLineIndex(by, "DO NOT TRUST")
+	firstRow := costLineIndex(by, "m-a")
+	if note < 0 || firstRow < 0 {
+		t.Fatalf("premise is wrong: note=%d firstRow=%d:\n%s", note, firstRow, by)
+	}
+	if note > firstRow {
+		t.Errorf("the defect report is drawn below the rows it refuses:\n%s", by)
+	}
+	// Below the heading, though: the heading is what says which axis these rows are.
+	if heading := costLineIndex(by, "BY MODEL"); note <= heading {
+		t.Errorf("the defect report displaced the section heading:\n%s", by)
+	}
+}
+
+// TestCostOvershootNote_OnlyAPublishedPositiveMagnitudeIsRendered.
+//
+// The absent-not-zero rule, restated on this side of the wire. A zero would have to mean both
+// "checked, the series adds up" and "not checked", which is why the field is a pointer; and a
+// non-positive value is not an overshoot at all. usage.SetUngroupedCost already refuses to
+// publish either, and this is the same defence in depth costUngroupedRow applies to its own
+// field — a guarantee inherited silently is a guarantee that stops holding without anything
+// noticing.
+func TestCostOvershootNote_OnlyAPublishedPositiveMagnitudeIsRendered(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		value *int64
+		want  bool
+	}{
+		{"absent", nil, false},
+		{"zero", ptrInt64(0), false},
+		{"negative", ptrInt64(-250_000), false},
+		{"positive", ptrInt64(250_000), true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			snap := &usage.Snapshot{Priced: true,
+				Totals:                usage.Counts{CostMicros: 4_250_000, PricedRequests: 3, PriceableRequests: 3},
+				SeriesOvershootMicros: tc.value}
+			got := costOvershootNote(snap)
+			if (got != "") != tc.want {
+				t.Fatalf("costOvershootNote = %q, want non-empty = %v", got, tc.want)
+			}
+		})
+	}
+}
+
+// TestRenderCostPane_AnOvershootTravelsWithTheRowsAndFitsEveryWidth.
+//
+// Two contracts at once, because the note is prose inside the breakdown section and both apply
+// to it. The height budget drops a section WHOLE — so the report never appears without the rows
+// it refuses, and losing it costs nothing, since Totals still carries every dollar exactly. The
+// width budget is absolute: never exceed it, and never clip a figure into a different, smaller
+// number.
+func TestRenderCostPane_AnOvershootTravelsWithTheRowsAndFitsEveryWidth(t *testing.T) {
+	snap := overshotSnapshot(t, map[string]int64{
+		"a-really-long-ascii-model-name": 3_000_000,
+		"日本語モデル":                         1_500_000,
+	}, 250_000)
+	for _, w := range append(costWidthFloors, costHostileWidths()...) {
+		for _, h := range []int{60, 40, 24, 20, 16, 8, 4, 1} {
+			got := renderCostPane(snap, usage.GroupModel, w, h)
+			for i, line := range strings.Split(got, "\n") {
+				if lw := lipgloss.Width(line); lw > w {
+					t.Errorf("w=%d h=%d line %d is %d columns: %q", w, h, i, lw, line)
+				}
+			}
+			if n := len(strings.Split(got, "\n")); h > 0 && n > h {
+				t.Errorf("w=%d h=%d rendered %d lines:\n%s", w, h, n, got)
+			}
+			// The answer survives every budget, as it must on every path in this pane.
+			if !strings.Contains(got, "$4.2500") {
+				t.Errorf("w=%d h=%d dropped the total:\n%s", w, h, got)
+			}
+			// The largest row's own figure rather than its label: a narrow terminal truncates
+			// the label to "a-…" while the figure column is never clipped, so the figure is
+			// what says a row is really on screen.
+			if strings.Contains(got, "DO NOT TRUST") && !strings.Contains(got, "$3.0000") {
+				t.Errorf("w=%d h=%d refuses rows that are not on screen:\n%s", w, h, got)
+			}
+			// A clipped magnitude is a different, smaller number. Held to the same rule as
+			// every other figure in this pane.
+			if strings.Contains(got, "$0.25") && !strings.Contains(got, "$0.2500") {
+				t.Errorf("w=%d h=%d clipped the overshoot magnitude mid-digits:\n%s", w, h, got)
+			}
+		}
+	}
+}
+
+// refusedTokenSnapshot is a window whose token figures are SHORT because reports were refused.
+//
+// Deliberately a HEALTHY answer in every other respect — fully priced, wholly exact, clean read
+// — because that is the state the disclosure has to survive: cost is settled and bounded
+// separately from the token report, so trustworthy dollars beside short tokens is the normal
+// shape of this field rather than an edge of it.
+func refusedTokenSnapshot(refused int64, split usage.Counts) *usage.Snapshot {
+	totals := split
+	totals.Requests = 400
+	totals.PricedRequests = 400
+	totals.PriceableRequests = 400
+	totals.CostMicros = 12_500_000
+	totals.RefusedTokenRequests = refused
+	return &usage.Snapshot{
+		Window: usage.WindowToday, BucketSeconds: 86_400, Group: usage.GroupModel, Priced: true,
+		Totals:  totals,
+		Buckets: []usage.Bucket{{Series: map[string]usage.Counts{"claude-opus-5": totals}}},
+	}
+}
+
+// TestRenderCostPane_ARefusedTokenReportSaysTheTokensAreShort.
+//
+// The defect this closes: usage.Counts.RefusedTokenRequests was aggregated by the server and
+// read by nothing, so a window that threw away token reports rendered a tier table
+// byte-identical to a complete one. The counter exists because capping cost while leaving
+// tokens unbounded is not a position that survives being stated — and a bound whose refusals
+// are invisible is the same thing again one step later.
+//
+// It is disclosed in WHERE IT WENT rather than on TOTAL, and the wording has to carry the
+// asymmetry: the figures in this section are short, the dollar figure is not.
+func TestRenderCostPane_ARefusedTokenReportSaysTheTokensAreShort(t *testing.T) {
+	snap := refusedTokenSnapshot(3, usage.Counts{
+		Tokens: 120_000, InputTokens: 20_000, CacheReadTokens: 90_000, OutputTokens: 10_000,
+		PresentKinds: kindInput | kindCacheRead | kindOutput,
+	})
+	got := renderCostPane(snap, usage.GroupModel, 120, 60)
+	tier := unwrapCostBody(sectionOf(t, got, costTierHeading))
+
+	if !strings.Contains(tier, "3 token reports REFUSED") {
+		t.Errorf("the token section does not say reports were refused:\n%s", tier)
+	}
+	// SHORT, not "inexact". A refused report contributed nothing at all, so these counts are
+	// missing whatever those requests really used — a different claim from a figure that is
+	// present and imprecise, and the branch keeps those two apart everywhere else.
+	if !strings.Contains(tier, "SHORT by an amount nothing can state") {
+		t.Errorf("the caveat does not say the counts are short by an unstatable amount:\n%s", tier)
+	}
+	// And it says the money is fine, which is the point of putting it here.
+	if !strings.Contains(tier, "dollar total is unaffected") {
+		t.Errorf("the caveat does not clear the dollar figure:\n%s", tier)
+	}
+	// The tiers still render: the counts are short, not unknown, and withholding them would
+	// report a window of measured traffic as unmeasured.
+	if !strings.Contains(tier, "cache-read") {
+		t.Errorf("the tier rows were withheld over a refusal:\n%s", tier)
+	}
+}
+
+// TestRenderCostPane_ARefusedTokenReportDoesNotQualifyTheDollarTotal.
+//
+// The asymmetry, asserted rather than only documented. Cost is settled by a different producer
+// and bounded twice over (pricing.MaxPlausibleRequestCostMicros, pricing.MaxCostMicros), so a
+// refused token report removes nothing from Totals.CostMicros. Marking the dollar figure would
+// send an operator after the one number in the answer that is right.
+func TestRenderCostPane_ARefusedTokenReportDoesNotQualifyTheDollarTotal(t *testing.T) {
+	snap := refusedTokenSnapshot(3, usage.Counts{
+		Tokens: 120_000, InputTokens: 20_000, PresentKinds: kindInput,
+	})
+	if figure := costTotalFigure(snap); figure != "$12.5000" {
+		t.Errorf("costTotalFigure = %q, want a bare $12.5000: a refused TOKEN report is not a "+
+			"claim about the dollars", figure)
+	}
+	tot := unwrapCostBody(sectionOf(t, renderCostPane(snap, usage.GroupModel, 120, 60), "TOTAL"))
+	if strings.Contains(tot, "REFUSED") {
+		t.Errorf("the refusal caveat reached the TOTAL section:\n%s", tot)
+	}
+}
+
+// TestRenderCostPane_ARefusedReportIsDisclosedWhereNoTierWasReported.
+//
+// The path where silence would be a FALSE NEGATIVE rather than a shortfall. With every tier
+// absent the section says "no tokens recorded in this window" — and over a refused report that
+// is wrong in the worst available direction: reports arrived, were rejected, and the window
+// reads as quiet. This is the exit the caveat is easiest to forget on, because it returns early.
+func TestRenderCostPane_ARefusedReportIsDisclosedWhereNoTierWasReported(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		split usage.Counts
+		want  string
+	}{
+		{"no tokens at all", usage.Counts{}, "no tokens recorded"},
+		{"only a total reported", usage.Counts{Tokens: 120_000}, "no breakdown"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			snap := refusedTokenSnapshot(2, tc.split)
+			tier := unwrapCostBody(sectionOf(t,
+				renderCostPane(snap, usage.GroupModel, 120, 60), costTierHeading))
+			if !strings.Contains(tier, tc.want) {
+				t.Fatalf("premise is wrong: the section does not take the %q path:\n%s", tc.name, tier)
+			}
+			if !strings.Contains(tier, "2 token reports REFUSED") {
+				t.Errorf("a refusal on the %q path is not disclosed, so the section reads as a "+
+					"measurement nobody refused:\n%s", tc.name, tier)
+			}
+		})
+	}
+}
+
+// TestRenderCostPane_NoRefusalsCarryNoRefusalCaveat is the mirror, and the half that keeps the
+// caveat worth reading. Zero renders nothing: a permanent line saying no reports were refused is
+// the "checked, fine" claim from a producer that never checked, and it trains a reader to skip
+// the one line that matters.
+func TestRenderCostPane_NoRefusalsCarryNoRefusalCaveat(t *testing.T) {
+	snap := refusedTokenSnapshot(0, usage.Counts{
+		Tokens: 120_000, InputTokens: 20_000, CacheReadTokens: 90_000,
+		PresentKinds: kindInput | kindCacheRead,
+	})
+	got := renderCostPane(snap, usage.GroupModel, 120, 60)
+	for _, unwanted := range []string{"REFUSED", "0 token report"} {
+		if strings.Contains(got, unwanted) {
+			t.Errorf("a clean window rendered %q:\n%s", unwanted, got)
+		}
+	}
+}
+
+// TestRenderCostPane_AClampedAggregateMarksTheTotalAndSaysEveryFigureIsAFloor.
+//
+// usage.Counts.Saturated says an addition into these totals reached the int64 ceiling and was
+// CLAMPED rather than allowed to wrap, so every figure in the answer is a floor. Its own doc
+// argues the clamp is only acceptable BECAUSE the flag travels with it, and that it is
+// deliberately not logged because "the disclosure travels on the same response as the number it
+// qualifies, which is where an operator reading that number will see it" — a client that drops
+// it is what turns the clamp back into a lie.
+//
+// It takes damagedMarker, not a fourth glyph: the reader's action is identical to a damaged
+// read's — the number is less than the money that was spent, by an unstatable amount — and the
+// words are what name the cause.
+func TestRenderCostPane_AClampedAggregateMarksTheTotalAndSaysEveryFigureIsAFloor(t *testing.T) {
+	snap := damagedTodaySnapshot(nil)
+	snap.Totals.Saturated = true
+
+	if figure := costTotalFigure(snap); !strings.HasPrefix(figure, damagedMarker) {
+		t.Errorf("costTotalFigure = %q, want a leading %q: a clamped total is short of real "+
+			"spend by an amount nothing can state", figure, damagedMarker)
+	}
+	tot := unwrapCostBody(sectionOf(t, renderCostPane(snap, usage.GroupModel, 120, 60), "TOTAL"))
+	if !strings.Contains(tot, "every figure in this window is a FLOOR") {
+		t.Errorf("TOTAL does not disclose the clamp:\n%s", tot)
+	}
+	// Every figure, not the dollars alone: Add clamps the whole Counts, so Requests and Tokens
+	// are floors too — and Requests is the denominator of every ratio on this pane.
+	if !strings.Contains(tot, "requests, tokens and cost are all larger") {
+		t.Errorf("the clamp caveat names only some of the figures it invalidates:\n%s", tot)
+	}
+	// It says CLAMPED rather than wrapped, which is the only reason the figure on screen is
+	// worth anything: the alternative was a wrapped total, a large negative presented as fact.
+	if !strings.Contains(tot, "rather than allowed to wrap") {
+		t.Errorf("the clamp caveat does not say the number is a floor rather than a wrap:\n%s", tot)
+	}
+}
+
+// TestRenderCostPane_ACleanAggregateCarriesNoClampCaveat is the mirror. A permanent "these are
+// floors" line over an aggregate that never clamped is the same false signal as a coverage
+// warning that never clears.
+func TestRenderCostPane_ACleanAggregateCarriesNoClampCaveat(t *testing.T) {
+	snap := damagedTodaySnapshot(nil)
+	if snap.Totals.Saturated {
+		t.Fatal("fixture premise is wrong: the clean snapshot is already saturated")
+	}
+	got := renderCostPane(snap, usage.GroupModel, 120, 60)
+	if strings.Contains(got, "is a FLOOR") {
+		t.Errorf("a clean aggregate rendered the clamp caveat:\n%s", got)
+	}
+	if strings.Contains(costTotalFigure(snap), damagedMarker) {
+		t.Errorf("costTotalFigure = %q wears the damaged marker over a clean read and a clean sum",
+			costTotalFigure(snap))
+	}
+}
+
+// TestCostTotalFigure_OneMarkerForBothWaysATotalCanBeShort.
+//
+// damagedMarker's two causes take ONE cell between them. A glyph per cause would say "!!" for a
+// figure that is short twice over, which reads as emphasis rather than as two facts, and it
+// would make the strip's vocabulary four marks deep to draw a distinction that changes nothing
+// about how the number must be read. The words carry the causes; the marker carries the claim.
+func TestCostTotalFigure_OneMarkerForBothWaysATotalCanBeShort(t *testing.T) {
+	snap := damagedTodaySnapshot(&usage.Degraded{SkippedLines: 3})
+	snap.Totals.Saturated = true
+	figure := costTotalFigure(snap)
+	if n := strings.Count(figure, damagedMarker); n != 1 {
+		t.Errorf("costTotalFigure = %q carries %d %q cells, want exactly 1", figure, n, damagedMarker)
+	}
+	// And BOTH sets of words, because one sends an operator to a day file and the other to
+	// whatever produced 9.2e18 micros of traffic.
+	tot := unwrapCostBody(sectionOf(t, renderCostPane(snap, usage.GroupModel, 120, 60), "TOTAL"))
+	for _, want := range []string{"every figure in this window is a FLOOR", "this total is SHORT"} {
+		if !strings.Contains(tot, want) {
+			t.Errorf("TOTAL is missing %q — one marker must not collapse two causes into one "+
+				"explanation:\n%s", want, tot)
+		}
+	}
+	// The clamp leads: it is short in every column of the aggregate, where a damaged read is
+	// short in the dollars.
+	if clamp, damaged := costLineIndex(tot, "is a FLOOR"), costLineIndex(tot, "total is SHORT"); clamp > damaged {
+		t.Errorf("the damaged-read caveat outranks the clamp:\n%s", tot)
+	}
+}
+
+// TestRenderCostPane_AClampedTotalKeepsItsMarkerAtEveryHeight.
+//
+// The tiny-height rule, extended to the new caveat unit. A budget may drop the WORDS — they are
+// wrapped prose and a whole unit goes at a time — but the figure keeps its marker, so a clamped
+// total can never be published as a settled one. This is the promise renderCostPane's fallback
+// path was written to keep, and a fourth caveat unit is exactly the kind of addition that breaks
+// it silently.
+func TestRenderCostPane_AClampedTotalKeepsItsMarkerAtEveryHeight(t *testing.T) {
+	snap := damagedTodaySnapshot(&usage.Degraded{SkippedLines: 3})
+	snap.Totals.Saturated = true
+	for _, w := range []int{40, 60, 80, 120} {
+		for h := 1; h <= 24; h++ {
+			got := renderCostPane(snap, usage.GroupModel, w, h)
+			if !strings.Contains(got, damagedMarker+"~$12.5000+") {
+				t.Errorf("w=%d h=%d published a figure stripped of its markers:\n%s", w, h, got)
+			}
+			// Whatever words survive must be whole sentences, the same rule the other caveats
+			// are held to.
+			flat := unwrapCostBody(got)
+			for opening, closing := range costCaveatSentences {
+				if strings.Contains(flat, opening) && !strings.Contains(flat, closing) {
+					t.Errorf("w=%d h=%d: caveat %q is rendered without its ending %q:\n%s",
+						w, h, opening, closing, flat)
+				}
+			}
+		}
 	}
 }

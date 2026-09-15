@@ -236,7 +236,10 @@ type Snapshot struct {
 	// the (other) band a table already collapses into — and never present the sum of a
 	// series as the window's total. The arithmetic it restores is exact:
 	// sum(series CostMicros) + UngroupedCostMicros == Totals.CostMicros, for every group
-	// where Group.Reconcilable is true.
+	// where Group.Reconcilable is true AND the source answering could group by it — read
+	// the Group this response reports, not the one that was requested, since a
+	// ledger-backed window reports GroupNone for an axis its rows have no column for. See
+	// Group.Reconcilable for why one predicate was not enough.
 	//
 	// BOTH WINDOW KINDS POPULATE IT, verified rather than assumed — which is why this is
 	// not ledger-only the way Degraded is:
@@ -332,6 +335,19 @@ type Degraded struct {
 //
 // Exported because both producers — Aggregator.Snapshot and the ledger's fold — have to
 // make the same call, and a predicate written twice is a predicate that drifts.
+//
+// NOT SUFFICIENT ON ITS OWN, and a caller that treated it as such published a residual
+// equal to an entire total. This says whether a group's series WOULD reconcile against
+// Totals; it cannot say whether the source being read can produce that series at all.
+// The two are different questions, and the second one belongs to the source: the ring
+// keeps a status series, a plugin series and per-session rings, while a cost-ledger row
+// is (endpoint, model, agent, provenance) per minute and has no column for status or
+// session. costledger.Groupable answers it there, and costledger.Fold requires BOTH —
+// because "the breakdown falls short by this much" and "there is no breakdown to fall
+// short" are different answers, and only the first is a residual.
+//
+// So: reconcilability is a property of the SOURCE AND the group. This half is the
+// group's, and a true here is a necessary condition rather than a licence.
 func (g Group) Reconcilable() bool {
 	switch g {
 	case GroupNone, GroupPlugin:

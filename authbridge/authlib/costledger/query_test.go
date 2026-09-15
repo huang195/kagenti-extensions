@@ -891,17 +891,24 @@ func TestFold_GroupingsTheLedgerCannotAnswerReturnNoSeries(t *testing.T) {
 		if totals.CostMicros != 10 {
 			t.Errorf("group=%s totals.CostMicros = %d, want 10", g, totals.CostMicros)
 		}
-		// An axis a persisted row cannot represent leaves the WHOLE total outside the
-		// breakdown, and for the two that can be reconciled that is what the residual says:
-		// the series is short by everything. group=plugin is excluded by
-		// usage.Group.Reconcilable, because on a ring-backed window that same series
-		// deliberately double-counts dollars and the number would not mean the same thing.
-		want := int64(10)
-		if !g.Reconcilable() {
-			want = 0
-		}
-		if ungrouped != want {
-			t.Errorf("group=%s ungrouped cost = %d, want %d", g, ungrouped, want)
+		// NO RESIDUAL, and this assertion used to demand the opposite: that an axis a
+		// persisted row cannot represent leaves the WHOLE total outside the breakdown, so
+		// the residual says "the series is short by everything". That is what shipped, and
+		// it made GET /v1/usage?window=today&group=status answer with series: null and
+		// ungroupedCostMicros equal to Totals.CostMicros — a response asserting that none of
+		// the money in it could be accounted for, over traffic where every dollar had an
+		// endpoint, a model and an agent. usage.Group.Reconcilable refuses GroupNone for
+		// exactly that reason ("a residual equal to the entire total ... would read as a
+		// fault"), and these two axes reach the same state by a different door.
+		//
+		// A residual is a statement about a breakdown that ALMOST accounts for the total.
+		// Where the source can produce no breakdown at all there is nothing for it to be a
+		// residual of, and the honest response says which grouping was actually applied
+		// instead — see Groupable and sessionapi's ledgerSnapshot.
+		if ungrouped != 0 {
+			t.Errorf("group=%s ungrouped cost = %d over a total of %d, want 0: the ledger cannot "+
+				"group by this axis at all, which is not the same claim as a breakdown that fell "+
+				"short by 100%%", g, ungrouped, totals.CostMicros)
 		}
 	}
 }

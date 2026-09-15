@@ -271,9 +271,19 @@ func dayNoon(y int, m time.Month, d int, loc *time.Location) time.Time {
 // usage.Snapshot.UngroupedCostMicros. A row with no value for the requested axis counts
 // toward the total and cannot be a series key — a gateway-priced /v1/embeddings
 // response is stored with Model "" — so summing the series gives a smaller number than
-// the total beside it, and this is the size of that difference. Zero for a group where
-// usage.Group.Reconcilable is false, which is what keeps a group that offers no
-// reconciliation from reporting its whole total as a residual.
+// the total beside it, and this is the size of that difference.
+//
+// ZERO FOR AN AXIS THIS SOURCE CANNOT GROUP BY AT ALL, which is a stronger condition
+// than usage.Group.Reconcilable and the fix for a defect that reported real spend as
+// entirely unaccounted for. Reconcilable answers for the ring, and is false only for
+// GroupNone and GroupPlugin; a ledger row also carries no session id and no status, so
+// group=session and group=status produced NO series and a residual equal to the whole
+// total — "none of this money can be attributed", over a window where every dollar was
+// attributable to an endpoint, a model and an agent. Both conditions are now required:
+// Groupable, because a residual against an absent breakdown is meaningless, and
+// Reconcilable, because GroupPlugin's series is not a partition. See Groupable, and see
+// sessionapi's ledgerSnapshot for how a client tells "cannot group by that" from "the
+// breakdown is complete".
 //
 // Counted HERE rather than left to the caller as totals-minus-series, because this is
 // the loop that decides what to skip. A caller deriving it would be re-deriving a
@@ -283,7 +293,9 @@ func Fold(rows []Row, group usage.Group) (usage.Counts, map[string]usage.Counts,
 	var totals usage.Counts
 	var series map[string]usage.Counts
 	var ungrouped int64
-	reconcilable := group.Reconcilable()
+	// BOTH predicates, and the source's one first: a residual is only meaningful where
+	// this source can produce a breakdown to be the residual OF.
+	reconcilable := Groupable(group) && group.Reconcilable()
 	for _, r := range rows {
 		totals.Add(r.Counts)
 		label, ok := labelFor(r, group)
@@ -301,6 +313,43 @@ func Fold(rows []Row, group usage.Group) (usage.Counts, map[string]usage.Counts,
 		series[label] = cur
 	}
 	return totals, series, ungrouped
+}
+
+// Groupable reports whether a LEDGER ROW can carry a value for this axis — that is,
+// whether a breakdown by it is answerable from this source at all.
+//
+// RECONCILABILITY IS A PROPERTY OF THE SOURCE, NOT OF THE GROUP, and this predicate
+// exists because that distinction was missing. usage.Group.Reconcilable answers for the
+// RING, whose buckets keep a status series and a plugin series and can be filtered by
+// session; it is false only for GroupNone and GroupPlugin. The ledger's rows are
+// (endpoint, model, agent, provenance) per minute and carry none of the other three: a
+// session is a laptop-lifetime concept, and status and plugin composition are
+// per-request facts a per-minute row cannot represent without one entry per combination.
+// So a group the ring can reconcile may be unanswerable here, and Fold used the ring's
+// predicate to decide whether to publish a residual — which turned
+// GET /v1/usage?window=today&group=status into a response whose residual equalled its
+// entire total. See Fold.
+//
+// EXPORTED because sessionapi has to ask the same question one layer up, to report the
+// grouping the ledger could actually APPLY rather than the one that was requested. A
+// client comparing the two learns "this source cannot break down by that axis", which is
+// a different fact from "the breakdown is complete" and from "the breakdown fell short by
+// this much" — and all three have to be distinguishable from the response alone.
+//
+// KEPT HONEST BY A TEST rather than by matching comments: labelFor is the loop that
+// actually produces the keys, and TestGroupable_MatchesWhatLabelForCanActuallyProduce
+// asserts this switch and that one agree for every axis usage defines. A new axis fails
+// that test until somebody decides which side it belongs on.
+func Groupable(group usage.Group) bool {
+	switch group {
+	// Every axis a Row has a field for. GroupMethod is the model series under an older
+	// name — see labelFor.
+	case usage.GroupModel, usage.GroupMethod, usage.GroupEndpoint, usage.GroupAgent:
+		return true
+	}
+	// GroupNone included: it asks for no breakdown, so there is nothing to answer and
+	// nothing to reconcile, which is the same conclusion Reconcilable reaches for it.
+	return false
 }
 
 // unknownAgentLabel is the reserved DISPLAY bucket for traffic that carried no

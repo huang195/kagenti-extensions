@@ -338,7 +338,29 @@ func (s *Server) ledgerSnapshot(ctx context.Context, spec usage.Spec, group usag
 	if err != nil {
 		return usage.Snapshot{}, err
 	}
-	totals, series, ungrouped := costledger.Fold(rows, group)
+	// THE GROUPING THIS SOURCE CAN APPLY, which is not always the one that was asked for,
+	// and the response says which it was.
+	//
+	// A ledger row is (endpoint, model, agent, provenance) per minute, so group=session,
+	// group=status and group=plugin have no column to key on here — while the ring, which
+	// serves the same axes over a duration window, answers all three. Echoing the
+	// requested group over an empty series made those two states indistinguishable from
+	// the response: a client asking for status got group:"status" with series:null and no
+	// way to tell "this source cannot break down by status" from "there was no traffic".
+	// Worse, Fold used to publish a residual for them, so the response also claimed 100%
+	// of its own total was unaccounted for. See costledger.Groupable.
+	//
+	// Reported as the grouping IN EFFECT rather than refused with a 400, because a
+	// rejection would have to be conditional on a ledger being wired up at all — the same
+	// request is served from the ring in Kubernetes, where it is answerable — and an API
+	// whose validity depends on the deployment is one a client cannot code against. That
+	// is the argument the session= guard above makes in the other direction, and it is
+	// load-bearing in both.
+	applied := group
+	if !costledger.Groupable(group) {
+		applied = usage.GroupNone
+	}
+	totals, series, ungrouped := costledger.Fold(rows, applied)
 	// Read AFTER Window, never before: both counters are gauges for the most recent read,
 	// so sampling them earlier would report the previous caller's answer as this one's.
 	//
@@ -357,10 +379,12 @@ func (s *Server) ledgerSnapshot(ctx context.Context, spec usage.Spec, group usag
 	snap := usage.Snapshot{
 		Window:        spec.Label,
 		BucketSeconds: int(spec.To.Sub(spec.From).Seconds()),
-		Group:         group,
-		Buckets:       []usage.Bucket{{At: spec.From, Counts: totals, Series: series}},
-		Totals:        totals,
-		Degraded:      degraded,
+		// The grouping SERVED, on the same rule as Window above: a response says what it
+		// actually did, and a client that asked for something else learns so by comparing.
+		Group:    applied,
+		Buckets:  []usage.Bucket{{At: spec.From, Counts: totals, Series: series}},
+		Totals:   totals,
+		Degraded: degraded,
 		// Same rule as Aggregator.Snapshot: an inexact figure is still a figure, so a
 		// window whose every request was a truncated stream reports priced:true over a
 		// real total and discloses the caveat in Totals.IncompleteRequests. Withholding

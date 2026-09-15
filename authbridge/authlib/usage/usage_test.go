@@ -8,6 +8,7 @@ import (
 	"strings"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	"github.com/rossoctl/cortex/authbridge/authlib/costevent"
 	"github.com/rossoctl/cortex/authbridge/authlib/pipeline"
@@ -864,6 +865,144 @@ func TestRecord_LabelLengthIsCapped(t *testing.T) {
 		if len(k) > maxLabelLen {
 			t.Errorf("retained a %d-byte label, cap is %d", len(k), maxLabelLen)
 		}
+	}
+}
+
+// TestTruncateLabel_CutsOnARuneBoundaryAndKeepsTheByteCap is the cap the byte cut was
+// breaking.
+//
+// s[:maxLabelLen] can split a multi-byte sequence, and encoding/json then expands each
+// invalid byte into a 3-byte U+FFFD — so the serialised label came out LONGER than the cap
+// (measured in costledger: 121 bytes cut at 96 serialised at 100). The invalid fragment is
+// the smaller problem; the byte cap silently not holding is the defect.
+//
+// EVERY CASE HAS A ONE-BYTE PREFIX, and that is load-bearing rather than incidental.
+// maxLabelLen is 96, which is divisible by 2, 3 and 4 — so a label of uniform multi-byte
+// runes has a rune boundary exactly AT the cap and the byte cut is accidentally correct. The
+// first version of this test in costledger passed against the unfixed code for precisely that
+// reason. One ASCII byte in front moves the cut to offset 95, which is a boundary for none of
+// the three widths.
+func TestTruncateLabel_CutsOnARuneBoundaryAndKeepsTheByteCap(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		rune string
+	}{
+		{"two-byte runes", "é"},
+		{"three-byte runes", "€"},
+		{"four-byte runes", "𝄞"},
+		{"the replacement character sanitising produces", "�"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			// The prefix is what stops 96 from landing on a boundary; see the doc above.
+			in := "a" + strings.Repeat(tc.rune, maxLabelLen)
+			got := truncateLabel(in)
+
+			if len(got) > maxLabelLen {
+				t.Errorf("truncateLabel returned %d bytes, cap is %d", len(got), maxLabelLen)
+			}
+			if !utf8.ValidString(got) {
+				t.Errorf("truncateLabel returned invalid UTF-8 (%q): the cut landed inside a rune",
+					got)
+			}
+			// The reason the boundary matters, asserted as the property rather than as UTF-8
+			// validity: a round trip through the encoder must not change the bytes, or the byte
+			// cap this function enforces does not hold on the wire.
+			enc, err := json.Marshal(got)
+			if err != nil {
+				t.Fatalf("marshal: %v", err)
+			}
+			var back string
+			if uerr := json.Unmarshal(enc, &back); uerr != nil {
+				t.Fatalf("unmarshal: %v", uerr)
+			}
+			if back != got {
+				t.Errorf("the label changed through encoding/json: %q became %q — an invalid "+
+					"trailing byte was expanded into U+FFFD", got, back)
+			}
+			if len(enc)-2 > maxLabelLen {
+				t.Errorf("the label serialises to %d bytes, past the %d-byte cap it was cut to; "+
+					"the cap does not hold where it is spent", len(enc)-2, maxLabelLen)
+			}
+			// And the cut must not be so eager that it drops a whole rune it could have kept: at
+			// most three bytes of slack, which is the walk-back limit.
+			if maxLabelLen-len(got) > 3 {
+				t.Errorf("truncateLabel returned %d bytes for a %d-byte cap: it walked back further "+
+					"than the longest UTF-8 sequence", len(got), maxLabelLen)
+			}
+		})
+	}
+}
+
+// TestRingLabel_SanitisesBeforeCapping pins the ORDER, which is the half that is easy to get
+// backwards and impossible to notice.
+//
+// Sanitising triples a control byte (one byte becomes a 3-byte U+FFFD), so capping first
+// would let 96 control bytes become 288 and break the bound that exists to make a label's
+// memory and line length predictable.
+func TestRingLabel_SanitisesBeforeCapping(t *testing.T) {
+	got := ringLabel(strings.Repeat("\x1b", maxLabelLen))
+	if len(got) > maxLabelLen {
+		t.Errorf("ringLabel returned %d bytes for %d control bytes, cap is %d: the cap was applied "+
+			"before the rewrite that expands each byte threefold", len(got), maxLabelLen, maxLabelLen)
+	}
+	if strings.ContainsRune(got, 0x1b) {
+		t.Errorf("ringLabel kept an ESC byte: %q", got)
+	}
+	if !utf8.ValidString(got) {
+		t.Errorf("ringLabel returned invalid UTF-8: %q — capping split a replacement character", got)
+	}
+}
+
+// TestSnapshot_TheRingDoesNotServeControlBytesInALabel is the gap that mattered more than the
+// cut.
+//
+// The ring did not sanitise AT ALL. The model comes off the parsed request body and the
+// endpoint is the host the workload asked for, so GET /v1/usage served an ANSI escape
+// straight out of memory — while the ledger's copy of the same label was clean, because
+// costledger sanitises on write. Two surfaces, one request, different bytes: group=model
+// showed the label as two series, and only the unfixed surface could reposition an operator's
+// cursor. CWE-150.
+//
+// U+009B IS IN THE TABLE because it is the case a byte scan cannot see: it is the
+// single-character CSI, encoded as 0xC2 0x9B, so nothing about it is below 0x20 and a
+// terminal decoding UTF-8 acts on it exactly as on ESC [.
+func TestSnapshot_TheRingDoesNotServeControlBytesInALabel(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		label string
+	}{
+		{"an ESC-bracket colour sequence", "claude\x1b[31m-opus"},
+		{"a bare carriage return", "claude\r-opus"},
+		{"DEL", "claude\x7f-opus"},
+		{"U+009B, the single-byte CSI a byte scan misses", "claude2J-opus"},
+		{"an invalid UTF-8 byte", "claude\xff-opus"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			now := time.Date(2026, 9, 4, 23, 30, 30, 0, time.UTC)
+			a := New(WithClock(fixedClock(now)))
+			e := respEvent(now, 200, time.Second, tc.label, 10)
+			// Both axes, because both are set off-host and neither passed through a sanitiser.
+			e.Host = tc.label
+			a.Record("s1", e)
+
+			for _, g := range []Group{GroupMethod, GroupEndpoint} {
+				for k := range mergeSeries(a.Snapshot(time.Minute, BucketWidth, "", g).Buckets) {
+					if hasControlRunes(k) {
+						t.Errorf("group=%s served the label %q, which still carries a control rune: "+
+							"/v1/usage hands it to whatever renders it, and the ledger's copy of the "+
+							"same label is clean", g, k)
+					}
+					if !utf8.ValidString(k) {
+						t.Errorf("group=%s served invalid UTF-8: %q", g, k)
+					}
+					if !strings.Contains(k, "�") {
+						t.Errorf("group=%s served %q with no replacement character: the hostile bytes "+
+							"were DROPPED rather than replaced, which collapses tampering into a "+
+							"plausible-looking label nobody would question", g, k)
+					}
+				}
+			}
+		})
 	}
 }
 

@@ -16,8 +16,10 @@ package usage
 import (
 	"math"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 
 	"github.com/rossoctl/cortex/authbridge/authlib/costevent"
 	"github.com/rossoctl/cortex/authbridge/authlib/pipeline"
@@ -1031,10 +1033,10 @@ func (a *Aggregator) foldInto(ring []bucket, t time.Time, sessionID string, e *p
 	// and PresentKinds is `0 | x`. Errors is set below and so is unaffected by the order.
 	one.Add(split)
 	if ec.unpricedKey != "" {
-		addLabel(&b.byUnpriced, truncateLabel(ec.unpricedKey), Counts{Requests: 1})
+		addLabel(&b.byUnpriced, ringLabel(ec.unpricedKey), Counts{Requests: 1})
 	}
 	if ec.provenance != "" {
-		addLabel(&b.byProvenance, truncateLabel(ec.provenance), Counts{Requests: 1})
+		addLabel(&b.byProvenance, ringLabel(ec.provenance), Counts{Requests: 1})
 	}
 	// Keyed on the reason, counted per request: Counts.IncompleteRequests above says how
 	// many figures are inexact, and this says in which way — "at least $X" versus "roughly
@@ -1042,7 +1044,7 @@ func (a *Aggregator) foldInto(ring []bucket, t time.Time, sessionID string, e *p
 	// (costOf labels an unlabelled caveat rather than dropping it), so these counts sum to
 	// IncompleteRequests.
 	if ec.incompleteReason != "" {
-		addLabel(&b.byIncomplete, truncateLabel(ec.incompleteReason), Counts{Requests: 1})
+		addLabel(&b.byIncomplete, ringLabel(ec.incompleteReason), Counts{Requests: 1})
 	}
 	if e.StatusCode >= 400 || e.Phase == pipeline.SessionDenied {
 		one.Errors = 1
@@ -1058,7 +1060,7 @@ func (a *Aggregator) foldInto(ring []bucket, t time.Time, sessionID string, e *p
 	}
 
 	if model != "" {
-		addLabel(&b.byMethod, truncateLabel(model), one)
+		addLabel(&b.byMethod, ringLabel(model), one)
 	}
 	// Recorded on whichever ring is being folded, including the per-session one
 	// where it is redundant — a uniform call site beats a conditional, and the
@@ -1073,20 +1075,20 @@ func (a *Aggregator) foldInto(ring []bucket, t time.Time, sessionID string, e *p
 	// spend lands in one entry and a per-session figure is a per-id figure — a
 	// caveat about the current session-bucketing behaviour, not about this axis.
 	if sessionID != "" {
-		addLabel(&b.bySession, truncateLabel(sessionID), one)
+		addLabel(&b.bySession, ringLabel(sessionID), one)
 	}
 	// Guarded on non-empty: Host is unset when the listener did not populate it,
 	// and an "" key renders as a blank row in a breakdown table, which reads as a
 	// bug rather than as missing data.
 	if e.Host != "" {
-		addLabel(&b.byEndpoint, truncateLabel(e.Host), one)
+		addLabel(&b.byEndpoint, ringLabel(e.Host), one)
 	}
 	// UNCONDITIONAL, where byMethod and byEndpoint are guarded on a non-empty value.
 	// Label() is nil-safe and answers "unknown" for an event that carried no client,
 	// so there is no empty key to guard against — and folding unconditionally is what
 	// makes this axis's series sum to the bucket total. That is also what gives it a
 	// different denominator from group=model's; see byAgent.
-	addLabel(&b.byAgent, truncateLabel(e.Client.Label()), one)
+	addLabel(&b.byAgent, ringLabel(e.Client.Label()), one)
 	if e.StatusCode > 0 {
 		addLabel(&b.byStatus, strconv.Itoa(e.StatusCode), one)
 	} else if e.Phase == pipeline.SessionDenied {
@@ -1113,13 +1115,13 @@ func (a *Aggregator) foldInto(ring []bucket, t time.Time, sessionID string, e *p
 	seen := make(map[string]bool, 4)
 	for _, name := range invocationPlugins(e.Invocations) {
 		seen[name] = true
-		addLabel(&b.byPlugin, name, one)
+		addLabel(&b.byPlugin, ringLabel(name), one)
 	}
 	for _, name := range requestPlugins {
 		if seen[name] {
 			continue
 		}
-		addLabel(&b.byPlugin, name, one)
+		addLabel(&b.byPlugin, ringLabel(name), one)
 	}
 }
 
@@ -1150,11 +1152,116 @@ const overflowLabel = "(other)"
 // prefixes and dated suffixes.
 const maxLabelLen = 96
 
+// truncateLabel caps a label at maxLabelLen BYTES, cutting on a rune boundary.
+//
+// BYTES, because that is what bounds the memory a label occupies and the line it becomes in
+// the ledger; RUNE BOUNDARY, because a byte cut breaks the very byte cap it enforces. The cut
+// used to be s[:maxLabelLen], which can split a multi-byte sequence and leave an invalid
+// trailing fragment — and encoding/json then expands each invalid byte into a 3-byte U+FFFD,
+// so a 121-byte label cut at 96 SERIALISED AT 100 BYTES (measured in costledger, where the
+// same defect was fixed first). The invalid fragment is the smaller problem; the cap silently
+// not holding is the reason this is a fix rather than tidying.
+//
+// Walking back off continuation bytes shortens the label by at most three bytes, which no
+// real model id notices.
 func truncateLabel(s string) string {
 	if len(s) <= maxLabelLen {
 		return s
 	}
-	return s[:maxLabelLen]
+	cut := maxLabelLen
+	// At most three steps: no UTF-8 sequence is longer than four bytes.
+	for cut > 0 && !utf8.RuneStart(s[cut]) {
+		cut--
+	}
+	return s[:cut]
+}
+
+// ringLabel prepares one string for a bucket's label map: sanitised, then capped.
+//
+// THE ORDER MATTERS, for the reason costledger.rowLabel gives: sanitising can triple a
+// string's length — every replaced byte becomes a 3-byte U+FFFD — so capping first would let
+// 96 control bytes become 288 and break the bound. Capping last is exact now that
+// truncateLabel cuts on a rune boundary.
+func ringLabel(s string) string {
+	return truncateLabel(sanitizeLabel(s))
+}
+
+// sanitizeLabel replaces C0 controls, DEL, C1 controls and invalid UTF-8 with U+FFFD.
+//
+// THE RING DID NOT SANITISE AT ALL, and that was the larger half of this gap. The model comes
+// off the parsed request body and the endpoint is the host the workload asked for, so
+// GET /v1/usage served a model name containing an ANSI escape straight out of memory — while
+// the ledger's copy of the very same label was clean, because costledger sanitises on write.
+// Two surfaces, one request, different bytes: group=model showed the label as two series, and
+// only the surface nobody had fixed could reposition an operator's cursor. CWE-150.
+//
+// REPLACED, NOT DROPPED, so tampering stays visible rather than collapsing into a
+// plausible-looking label: "m\x1b[31mx" reads as "m�[31mx" rather than as "m[31mx",
+// which nobody would question.
+//
+// C1 IS INCLUDED — U+0080–U+009F. U+009B is the single-character CSI, and a terminal decoding
+// UTF-8 acts on it exactly as on ESC [, so "2J" clears the pane with no ESC byte in the
+// label at all. C1 encodes as 0xC2 0x80–0xC2 0x9F, so nothing in it is below 0x20 and a byte
+// scan steps straight past it — which is why the scan below decodes runes.
+//
+// FOURTH COPY OF A FIVE-LINE RULE, AND THE LAYERING IS WHY:
+//
+//   - pipeline.sanitizeUA is PRIMARY for the Agent label, at the point a User-Agent header
+//     becomes a value, so it already covers this package's byAgent.
+//   - costledger.sanitizeLabel is PRIMARY for the durable row — the copy in front of a file
+//     retained for retentionDays that cannot be edited afterwards.
+//   - THIS one is primary for the RING's byMethod and byEndpoint, which reach /v1/usage
+//     without passing through either of the other two.
+//   - abctl's tui.sanitizeLabel is a render-time copy in a main module this library must not
+//     import, and still filters C0 and DEL only.
+//
+// Neither of the first two is reachable from here: pipeline's is unexported and costledger
+// IMPORTS this package, so referencing it would invert the layering into a cycle. A shared
+// leaf package is the real fix and cannot be done from this side alone — migrating one caller
+// to it while the other two stay put makes five copies rather than one. So: copied, with the
+// rule stated identically, and a change to any of them belongs in all of them.
+func sanitizeLabel(s string) string {
+	if !hasControlRunes(s) {
+		// The overwhelmingly common case, and no allocation for it: this runs on the fold path,
+		// once per label per event, under the aggregator's write lock.
+		return s
+	}
+	var b strings.Builder
+	b.Grow(len(s))
+	for i := 0; i < len(s); {
+		r, size := utf8.DecodeRuneInString(s[i:])
+		if isControlRune(r) || (r == utf8.RuneError && size == 1) {
+			b.WriteRune('�')
+			i += size
+			continue
+		}
+		b.WriteString(s[i : i+size])
+		i += size
+	}
+	return b.String()
+}
+
+// hasControlRunes reports whether s carries anything sanitizeLabel would replace.
+//
+// A RUNE scan for the reason in sanitizeLabel: a byte scan is exact for C0 and DEL and blind
+// to C1. An INVALID byte reports true (RuneError at size 1 is the decoder saying "this is not
+// UTF-8"); a legitimately encoded U+FFFD does not, because it decodes at size 3, so an
+// already-sanitised label does not read as still hostile.
+func hasControlRunes(s string) bool {
+	for i := 0; i < len(s); {
+		r, size := utf8.DecodeRuneInString(s[i:])
+		if isControlRune(r) || (r == utf8.RuneError && size == 1) {
+			return true
+		}
+		i += size
+	}
+	return false
+}
+
+// isControlRune is the shared rule: C0, DEL, C1. Identical to costledger.isControlRune and
+// pipeline's, deliberately — see sanitizeLabel.
+func isControlRune(r rune) bool {
+	return r < 0x20 || r == 0x7f || (r >= 0x80 && r <= 0x9f)
 }
 
 func addLabel(m *map[string]Counts, key string, c Counts) {

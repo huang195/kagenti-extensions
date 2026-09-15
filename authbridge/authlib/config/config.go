@@ -69,11 +69,19 @@ type Config struct {
 // and per-plugin config in place, but the ledger is constructed once at startup and
 // handed to the session store as a recorder, so a running proxy holds whichever writer
 // it opened. Editing anything here — enabled, dir, retention_days — takes effect on
-// RESTART, and turning it off in a live config leaves the existing writer recording to
-// the old directory until the process ends.
+// RESTART.
 //
-// Worth stating rather than leaving to be discovered: an operator who edits this to stop
-// writing cost history has every reason to believe it stopped.
+// The edit is REFUSED rather than ignored: reloader.validateReloadable compares this
+// block the way it compares mode and listener.*, so a live edit fails the reload,
+// leaves LastError naming cost_ledger on /reload/status, and asks for a pod restart.
+//
+// It did not always. This doc used to warn that "an operator who edits this to stop
+// writing cost history has every reason to believe it stopped" — and they did, because
+// the edit was ACCEPTED: ReloadsOK incremented, ActiveConfigSHA256 moved, and /config
+// served the new values while the startup writer kept appending under the old
+// retention. Documenting that was the weaker of the two options available; the guard
+// is three lines and the precedent for it was already in the same function. Pinned by
+// reloader.TestReloader_RefusesCostLedgerChange.
 type CostLedgerConfig struct {
 	// Enabled is a POINTER so "unset" and "explicitly false" are different states.
 	// The local default is on, and an operator has to be able to turn it off; with a

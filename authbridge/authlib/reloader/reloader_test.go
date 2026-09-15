@@ -217,6 +217,87 @@ func TestReloader_RefusesListenerChange(t *testing.T) {
 	}
 }
 
+// A cost_ledger edit must be REFUSED, not accepted-and-discarded.
+//
+// This is the defect the guard was added for: the ledger is a *costledger.Writer
+// opened once at startup and handed to the session store as a Recorder, so a reload
+// cannot reach it. Before the guard, editing `enabled: true` to `enabled: false`
+// incremented ReloadsOK, published a new ActiveConfigSHA256 on /reload/status, and
+// made /config serve `enabled: false` while the writer kept appending — three
+// independent signals all telling an operator the edit took effect.
+//
+// Deliberately driven by a REAL config.Load builder rather than the fakeBuilder the
+// tests above use. A fake would only prove validateReloadable compares the field it
+// is handed; this proves the yaml key reaches that comparison, so a wiring mistake
+// (block renamed, field dropped from the struct, guard called with the wrong config)
+// fails here too. The four assertions are the four things an operator would read as
+// confirmation.
+func TestReloader_RefusesCostLedgerChange(t *testing.T) {
+	dir := t.TempDir()
+	cfgPath := filepath.Join(dir, "config.yaml")
+	const before = "mode: envoy-sidecar\ncost_ledger:\n  enabled: true\n  retention_days: 8\n"
+	if err := os.WriteFile(cfgPath, []byte(before), 0o600); err != nil {
+		t.Fatalf("initial WriteFile: %v", err)
+	}
+
+	initialCfg, err := config.Load(cfgPath)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if !initialCfg.CostLedger.LedgerEnabled(false) {
+		t.Fatalf("fixture is wrong: the ledger must start ENABLED for the edit below to be the dangerous one")
+	}
+
+	// Built up front, not inside the closure: build() runs on the watch goroutine,
+	// and t.Fatalf from a non-test goroutine is not allowed.
+	newIn, newOut := emptyPipeline(t), emptyPipeline(t)
+	build := func() (*pipeline.Pipeline, *pipeline.Pipeline, *config.Config, error) {
+		c, lerr := config.Load(cfgPath)
+		if lerr != nil {
+			return nil, nil, nil, lerr
+		}
+		return newIn, newOut, c, nil
+	}
+
+	inH := pipeline.NewHolder(emptyPipeline(t))
+	outH := pipeline.NewHolder(emptyPipeline(t))
+	oldIn, oldOut := inH.Load(), outH.Load()
+
+	r := New(cfgPath, inH, outH, build, initialCfg,
+		WithDebounce(20*time.Millisecond), WithDrainWindow(0), WithStartTimeout(5*time.Second))
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	if err := r.Start(ctx); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	shaBefore := r.Status().ActiveConfigSHA256
+
+	// The edit an operator makes to stop writing cost history.
+	writeConfig(t, cfgPath, "mode: envoy-sidecar\ncost_ledger:\n  enabled: false\n  retention_days: 8\n")
+
+	waitFor(t, 2*time.Second, func() bool { return r.Status().ReloadsFailed >= 1 }, "reload to be refused")
+
+	st := r.Status()
+	if !contains(st.LastError, "cost_ledger") {
+		t.Errorf("error must name the section the operator has to restart for, got %q", st.LastError)
+	}
+	if st.ReloadsOK != 0 {
+		t.Errorf("ReloadsOK = %d; a refused reload must not report success", st.ReloadsOK)
+	}
+	if st.ActiveConfigSHA256 != shaBefore {
+		t.Errorf("ActiveConfigSHA256 moved to %q on a refused reload; /reload/status would claim the edit is live",
+			st.ActiveConfigSHA256)
+	}
+	// The one an operator is most likely to check: /config must still show the
+	// ledger the running writer is actually using.
+	if got := r.ConfigProvider(); !got().CostLedger.LedgerEnabled(false) {
+		t.Errorf("/config now reports the ledger disabled while the startup writer is still recording")
+	}
+	if inH.Load() != oldIn || outH.Load() != oldOut {
+		t.Errorf("holders swapped despite a refused reload")
+	}
+}
+
 // PipelineBuilder error (e.g., config.Validate rejects) → reload fails;
 // holders unchanged; error reflected in Status.
 func TestReloader_BuilderError(t *testing.T) {

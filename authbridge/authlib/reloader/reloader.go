@@ -240,7 +240,8 @@ func (r *Reloader) reloadOnce(parent context.Context) {
 
 	// Refuse changes to unreloadable fields. Listener addresses and
 	// mode bind to sockets that can't be rebound under the running
-	// gRPC/HTTP servers; operator needs a pod restart for those.
+	// gRPC/HTTP servers; the cost ledger is a writer opened once and
+	// held by the session store. Operator needs a pod restart for those.
 	if err := validateReloadable(r.activeCfg.Load(), newCfg); err != nil {
 		r.recordFailure(attempt, err)
 		return
@@ -317,6 +318,19 @@ func validateReloadable(active, next *config.Config) error {
 	// listener construction.
 	if !reflect.DeepEqual(active.Listener, next.Listener) {
 		diffs = append(diffs, "listener.*")
+	}
+	// cost_ledger.* for the same reason, and it is the more dangerous of the two to
+	// leave out. The ledger is a *costledger.Writer constructed once at startup and
+	// handed to the session store as a Recorder, so nothing here can reach the
+	// running writer. Without this branch an edit was ACCEPTED: ReloadsOK
+	// incremented, /reload/status published a new ActiveConfigSHA256, and /config
+	// served the new values while the writer kept appending to the old directory
+	// under the old retention. An operator who edits `enabled: false` to stop
+	// recording cost history reads all three of those as confirmation that it
+	// stopped. Refusing the reload and asking for a restart is the honest answer.
+	// Pointer-to-struct, so DeepEqual covers nil↔present as well as field drift.
+	if !reflect.DeepEqual(active.CostLedger, next.CostLedger) {
+		diffs = append(diffs, "cost_ledger.*")
 	}
 	if len(diffs) > 0 {
 		return fmt.Errorf("unreloadable field changed, pod restart required: %v", diffs)

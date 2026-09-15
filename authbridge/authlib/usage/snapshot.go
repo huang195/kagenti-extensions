@@ -309,8 +309,20 @@ type Snapshot struct {
 // single piece of damage, and a client watching it would infer an outage that is not
 // happening.
 type Degraded struct {
-	// SkippedLines is how many rows could not be decoded and were passed over. Each is
+	// SkippedLines is how many LINES could not be decoded and were passed over. Each is
 	// spend that happened and is not in the total.
+	//
+	// A FLOOR ON ROWS LOST, NOT AN EXACT COUNT OF THEM, and this doc used to read as
+	// though it were exact. It counts lines because that is what the reader can see. One
+	// undecodable line is usually one row — but the ledger's newline fence only runs while
+	// the writing process is alive, so a crash mid-append leaves an unterminated fragment
+	// and the next append is concatenated onto it: ONE line holding TWO lost rows.
+	// MEASURED that way — two rows missing from the answer while the count said one.
+	//
+	// So a non-zero value means "AT LEAST this many rows are missing", which is the reading
+	// a client has to present. Same number and same qualification as
+	// costledger.Caveats.SkippedLines, which is where this field is copied from; see
+	// costledger's appendBytes for why the bytes on disk cannot support an exact figure.
 	SkippedLines int64 `json:"skippedLines,omitempty"`
 	// TruncatedDays is how many day files were abandoned part-way. Worse than a skipped
 	// line by an unbounded amount: the rest of that file is missing, and a file holds a
@@ -411,6 +423,120 @@ func ParseWindow(s string) (time.Duration, error) {
 	return d, nil
 }
 
+// dayAnchorHour is the hour used to establish WHICH local date is meant, before any
+// boundary arithmetic is done on it.
+//
+// NOON, and deliberately the same convention and the same value as costledger's dayHour:
+// these two layers have to agree about where a day starts, because this package computes
+// the window bounds that select the day files that package names. A DST transition moves
+// the clock by an hour (Australia/Lord_Howe by thirty minutes), so no transition can move
+// noon onto a different DATE. Midnight is the opposite, and that is this constant's whole
+// reason to exist.
+//
+// AN ANCHOR, NEVER A BOUND, which is the one place the two layers legitimately differ.
+// costledger.dayOf may stop at noon because it only has to IDENTIFY a day — it names a
+// file. A window's From has to be the day's FIRST INSTANT, so noon is not reusable
+// directly and StartOfLocalDay sweeps back from it.
+const dayAnchorHour = 12
+
+// dayStartSweepSteps refine StartOfLocalDay's forward sweep, coarsest first.
+//
+// Hours then minutes then seconds is at most about 150 zone lookups, against roughly
+// 90,000 for a second-by-second sweep of a whole day. A second is the finest step worth
+// taking: every UTC offset and every transition instant in the IANA database is a whole
+// number of seconds, so the boundary this lands on is exact rather than rounded.
+var dayStartSweepSteps = []time.Duration{time.Hour, time.Minute, time.Second}
+
+// StartOfLocalDay is the earliest instant that EXISTS on t's local calendar date, in t's
+// own zone. It is the lower bound of "today".
+//
+// IT IS NOT time.Date(y, m, d, 0, 0, 0, 0, loc), and the difference is money. In a zone
+// whose DST transition falls AT 00:00 the spring-forward day has no midnight at all, and
+// time.Date resolves a wall time inside the gap onto the far side of it. MEASURED, with
+// that expression as the bound:
+//
+//	now  = 2026-03-08 15:00 -0400 America/Havana
+//	From = 2026-03-07 23:00 -0500   ← an hour before the previous day even ended
+//	now  = 2026-09-06 15:00 -0300 America/Santiago
+//	From = 2026-09-05 23:00 -0400   ← same shape
+//
+// So window=today reached an hour and fifty-nine minutes back into YESTERDAY and folded
+// its last hour of spend into today's total. America/New_York, whose transition is at
+// 02:00, was unaffected — which is why a suite whose only non-UTC zone was a
+// time.FixedZone passed. A fixed offset has no transitions and structurally cannot express
+// this. See TestStartOfLocalDay_IsTheFirstInstantOnTheDateInEveryZone.
+//
+// IT MATTERS MORE THAN IT DID, because the layer underneath was just corrected. The cost
+// ledger names its day files from a date carried at noon (costledger.dayOf, dayFromName
+// and dayHour), so a file is now named for the date a row is genuinely on, in every zone.
+// This function is what SELECTS those files. Left as a midnight, the bound and the naming
+// disagreed about where a Havana day starts, and the disagreement was silent: no error, no
+// caveat, just a total including an hour that belongs to another date.
+//
+// THE RULE, stated plainly: sweep the instant axis forward from a point certainly before
+// the date began and take the FIRST instant whose local date is the one wanted. That is
+// the definition of "earliest existing instant" evaluated directly, rather than a wall
+// time handed to time.Date and hoped to exist. It needs no assumption about which
+// direction time.Date normalises, or that local time is monotone across a transition.
+//
+// AUTUMN-BACK IS THE OTHER HALF, and it is a real choice rather than a corollary. Where
+// the clock goes back THROUGH midnight the wall time 00:00 occurs TWICE — in
+// America/Havana on 2026-11-01 at 00:00 -0400 and again at 00:00 -0500, an hour apart.
+// Both are on the date, so "midnight" alone does not name a bound. THE EARLIER ONE IS
+// CHOSEN: a lower bound of the later instant would exclude the first hour of the day, and
+// any spend in it would be missing from today's total with nothing saying so — the same
+// silent shortfall in the other direction. The sweep picks it for free, because the
+// earlier instant is the first one it reaches. Go's own time.Date happens to resolve an
+// ambiguous wall time to the earlier occurrence here, but its documentation explicitly
+// declines to guarantee that, so the choice is made here instead of inherited.
+//
+// EXPORTED because sessionapi's tests have to anchor a "today" fixture to the SAME
+// boundary this serves. That helper was a second copy of the midnight expression and
+// carried the identical flaw; a boundary derived twice is a boundary that drifts. The
+// dependency direction is sessionapi to usage, never the reverse.
+func StartOfLocalDay(t time.Time) time.Time {
+	loc := t.Location()
+	y, m, d := t.Date()
+	onDate := func(x time.Time) bool {
+		xy, xm, xd := x.Date()
+		return xy == y && xm == m && xd == d
+	}
+
+	// before must be an instant OUTSIDE this date and earlier than it, so the sweep below
+	// always starts before the boundary it is looking for. Noon anchors the date; whole days
+	// back from that noon leave it.
+	//
+	// SUBTRACTED FROM THE ANCHOR AS A DURATION, not stepped with AddDate, and the difference
+	// is a hang. A zone can skip a whole calendar date — Pacific/Apia dropped 2011-12-30
+	// entirely when it crossed the date line — and then that date has no noon either, so
+	// time.Date resolves it onto the NEXT one. AddDate on an already-normalised anchor
+	// re-normalises to the same instant and the loop spins forever; MEASURED as a hang on
+	// Pacific/Apia 2011-12-31 while writing this. A duration subtraction cannot normalise.
+	//
+	// It terminates because each iteration moves a fixed 24h further back on the instant
+	// axis while a local date covers a bounded interval of it — under 50h even for
+	// 1892-07-04 in Pacific/Apia, the longest in the database, where crossing the line the
+	// other way made the date happen twice. So no iteration cap is needed, and one that
+	// gave up while still inside the date would only hide the failure.
+	noon := time.Date(y, m, d, dayAnchorHour, 0, 0, 0, loc)
+	before := noon
+	for back := 1; onDate(before); back++ {
+		before = noon.Add(-time.Duration(back) * 24 * time.Hour)
+	}
+
+	first := before
+	for _, step := range dayStartSweepSteps {
+		first = before
+		for !onDate(first) {
+			first = first.Add(step)
+		}
+		// first is on the date and first-step is not — the sweep visited it and moved on —
+		// so the boundary lies in (first-step, first]. Restart the next, finer pass there.
+		before = first.Add(-step)
+	}
+	return first
+}
+
 // WindowToday and Window7d are the symbolic windows the API accepts.
 //
 // Symbolic because neither is a LENGTH: "today" is a boundary, and while "7d" has a
@@ -444,6 +570,23 @@ const Window7dSpan = 7 * 24 * time.Hour
 // window:"7d" over a partial week — the exact case the floor exists to refuse.
 // TestParseWindowSpec_SevenDaysTouchesEightLocalDays pins the arithmetic, and
 // TestCostLedgerConfig_TheFloorCoversEveryDayTheWindowTouches pins the agreement.
+//
+// EIGHT ASSUMES EVERY DAY IN THE WEEK IS 24 HOURS LONG, and one week a year is not. A
+// spring-forward week is 167 hours, so a 168-hour span reaches an hour further back than a
+// calendar week does. MEASURED at 00:00 local on 2026-03-15: From lands at 23:00 on
+// 2026-03-07 and the window touches NINE dates — in America/Havana, in America/Santiago and
+// in America/New_York alike, since this has nothing to do with WHERE the transition falls.
+// Autumn is the harmless direction: a 169-hour week means the span reaches less far, and
+// eight still covers it.
+//
+// UNRESOLVED, and recorded here rather than quietly widened. Nine would make the retention
+// floor derived from this keep an extra day file on every host all year to cover two
+// midnights a year, and the alternative — making 7d calendar-aligned — changes what the
+// window MEANS, which is a product decision and not a bound to correct. What is not in
+// doubt is the direction of the error: on those two mornings a 7d answer can be short by
+// whatever was spent in one hour eight dates ago, because retention was allowed to drop the
+// file holding it. Distinct from the local-midnight defect StartOfLocalDay fixes: 7d's From
+// is a plain duration subtraction from now and contains no calendar arithmetic at all.
 const Window7dLocalDays = int(Window7dSpan/(24*time.Hour)) + 1
 
 // Spec is a parsed window request. Either Dur is set (a fixed length the ring can
@@ -471,10 +614,15 @@ func (s Spec) Symbolic() bool { return s.Dur == 0 }
 // and so "today" is computed once per request instead of drifting between the
 // bound calculation and the response label.
 //
-// "today" is LOCAL midnight to now. Local, not UTC: a laptop that crosses a
-// timezone must not have its day reset mid-afternoon, which a UTC day would do.
-// Just after midnight it is a five-minute window, not a 24-hour one — that is the
-// point of a boundary rather than a length.
+// "today" is the START OF THE LOCAL DAY to now. Local, not UTC: a laptop that
+// crosses a timezone must not have its day reset mid-afternoon, which a UTC day would
+// do. Just after the day starts it is a five-minute window, not a 24-hour one — that
+// is the point of a boundary rather than a length.
+//
+// The start of the day, NOT "local midnight", and the distinction is not pedantry:
+// midnight does not exist on the spring-forward day of any zone whose transition is at
+// 00:00, and it occurs twice on the autumn one. StartOfLocalDay states which instant is
+// meant and why, and it is the same day boundary the cost ledger names its files by.
 //
 // "7d" is exactly 7x24h back from now, ROLLING rather than seven calendar days.
 // The label is echoed as "7d" so a client can read it that way; a "last 7 days"
@@ -488,7 +636,7 @@ func ParseWindowSpec(s string, now time.Time) (Spec, error) {
 	case WindowToday:
 		return Spec{
 			Label: WindowToday,
-			From:  time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, now.Location()),
+			From:  StartOfLocalDay(now),
 			To:    now,
 		}, nil
 	case Window7d:

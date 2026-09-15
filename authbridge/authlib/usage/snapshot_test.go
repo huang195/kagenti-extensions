@@ -398,20 +398,33 @@ func TestParseWindowSpec_FixedLengths(t *testing.T) {
 	}
 }
 
-// testZone is a fixed non-UTC zone for the day-boundary tests.
+// testZone is a REAL zone, seven hours off UTC on every date the tests below use.
 //
 // Not time.Local, which is what the first version of these tests used on both sides
 // of the assertion. On a host where time.Local IS UTC — the default in most CI
 // containers — that made the guard vacuous: an implementation reading
 // time.Date(..., time.UTC) passed, because the expectation was computed in the same
-// zone as the input. Pinning a zone seven hours off UTC means midnight here is 07:00
-// UTC, so a UTC reading lands on the wrong instant on every machine.
-var testZone = time.FixedZone("test", -7*3600)
+// zone as the input. A zone seven hours off UTC means midnight here is 07:00 UTC, so a
+// UTC reading lands on the wrong instant on every machine.
+//
+// AND NOT A time.FixedZone, which is what it was, added under a commit titled "Pin a
+// non-UTC zone, so the local-midnight guard actually guards". A fixed offset does stop a
+// UTC reading passing — but it has NO TRANSITIONS, so it cannot express a local midnight
+// that does not exist, and the guard did not guard: the local-midnight bound shipped in
+// this file's subject, and the same expression shipped in the cost ledger, under that very
+// commit. America/Los_Angeles is -0700 on 2026-09-14 with a real transition table behind
+// it, so it is a drop-in that can fail. The zones whose transitions fall where this one's
+// do not are in dst_test.go, which is where the boundary itself is pinned.
+func testZone(t *testing.T) *time.Location {
+	t.Helper()
+	return mustZone(t, "America/Los_Angeles")
+}
 
-func TestParseWindowSpec_TodayIsLocalMidnightToNow(t *testing.T) {
+func TestParseWindowSpec_TodayIsTheLocalDayStartToNow(t *testing.T) {
 	// The caller's zone, not UTC. A laptop crossing a timezone must not have its day
 	// reset mid-afternoon, and a UTC day would do exactly that.
-	now := time.Date(2026, 9, 14, 15, 30, 0, 0, testZone)
+	zone := testZone(t)
+	now := time.Date(2026, 9, 14, 15, 30, 0, 0, zone)
 	got, err := ParseWindowSpec("today", now)
 	if err != nil {
 		t.Fatalf("ParseWindowSpec: %v", err)
@@ -419,9 +432,13 @@ func TestParseWindowSpec_TodayIsLocalMidnightToNow(t *testing.T) {
 	if !got.Symbolic() {
 		t.Fatal("today reported a fixed length; want symbolic")
 	}
-	wantFrom := time.Date(2026, 9, 14, 0, 0, 0, 0, testZone)
+	// Midnight spelled literally, and correct HERE because 2026-09-14 in this zone is an
+	// ordinary date whose midnight exists and occurs once. It is written out rather than
+	// taken from StartOfLocalDay so the expectation is not the implementation restated. The
+	// dates where midnight is the WRONG answer are in dst_test.go.
+	wantFrom := time.Date(2026, 9, 14, 0, 0, 0, 0, zone)
 	if !got.From.Equal(wantFrom) {
-		t.Errorf("From = %v, want midnight in the caller's zone %v", got.From, wantFrom)
+		t.Errorf("From = %v, want the start of the day in the caller's zone %v", got.From, wantFrom)
 	}
 	// The span is the load-bearing assertion, because it is the one a UTC reading gets
 	// wrong: 15:30 minus midnight is 15h30m in the caller's zone and 22h30m if the
@@ -442,7 +459,7 @@ func TestParseWindowSpec_TodayIsLocalMidnightToNow(t *testing.T) {
 // so a UTC reading reports seven and a half hours of "today" — most of it yesterday
 // evening's spend.
 func TestParseWindowSpec_TodayJustAfterMidnightInANonUTCZone(t *testing.T) {
-	now := time.Date(2026, 9, 14, 0, 30, 0, 0, testZone)
+	now := time.Date(2026, 9, 14, 0, 30, 0, 0, testZone(t))
 	got, err := ParseWindowSpec("today", now)
 	if err != nil {
 		t.Fatalf("ParseWindowSpec: %v", err)
@@ -455,7 +472,12 @@ func TestParseWindowSpec_TodayJustAfterMidnightInANonUTCZone(t *testing.T) {
 func TestParseWindowSpec_TodayJustAfterMidnightIsAShortWindow(t *testing.T) {
 	// The boundary case: at 00:05, "today" is five minutes, not 24 hours. A
 	// fixed-length reading would report yesterday evening's spend as today's.
-	now := time.Date(2026, 9, 14, 0, 5, 0, 0, time.Local)
+	//
+	// A pinned zone, not time.Local: with time.Local the result depends on the TZ the suite
+	// happens to run under, and 00:05 is exactly the wall time that does not exist on some
+	// zones' spring-forward day. Pinning makes the assertion mean the same thing on every
+	// host. dst_test.go is where the zone is the variable under test.
+	now := time.Date(2026, 9, 14, 0, 5, 0, 0, testZone(t))
 	got, err := ParseWindowSpec("today", now)
 	if err != nil {
 		t.Fatalf("ParseWindowSpec: %v", err)
@@ -466,7 +488,7 @@ func TestParseWindowSpec_TodayJustAfterMidnightIsAShortWindow(t *testing.T) {
 }
 
 func TestParseWindowSpec_SevenDaysIsRollingNotCalendar(t *testing.T) {
-	now := time.Date(2026, 9, 14, 15, 30, 0, 0, time.Local)
+	now := time.Date(2026, 9, 14, 15, 30, 0, 0, testZone(t))
 	got, err := ParseWindowSpec("7d", now)
 	if err != nil {
 		t.Fatalf("ParseWindowSpec: %v", err)
@@ -493,11 +515,25 @@ func TestParseWindowSpec_SevenDaysIsRollingNotCalendar(t *testing.T) {
 // 00:00 — where the eighth date contributes a single instant, and is still a file to
 // open — as at 15:30, because a floor that holds only for part of the day is not a
 // floor.
+//
+// A TRANSITION-FREE WEEK IN A PINNED ZONE, and the pin is load-bearing rather than tidying.
+// EIGHT is only true of a week whose days are all 24 hours long. MEASURED at 00:00 on
+// 2026-03-15, in the week after a spring-forward: the rolling span reaches back to 23:00 on
+// 2026-03-07, so it touches NINE dates, not eight — in America/Havana, in America/Santiago
+// AND in America/New_York, which is the control zone for everything else here. It is not
+// the local-midnight defect and this fix does not change it: 7d's From is a plain duration
+// subtraction from now, with no calendar arithmetic in it at all. It is the rolling span
+// itself against a week that is 167 hours long. Left as a note on Window7dLocalDays rather
+// than pinned as an expectation, because the constant it would contradict is what config's
+// retention floor is derived from and moving it is a decision about retention, not a fix to
+// a bound. Pinning the zone here is what stops this test asserting eight in a week where
+// the answer is nine, which is exactly what running under TZ=America/Santiago would do.
 func TestParseWindowSpec_SevenDaysTouchesEightLocalDays(t *testing.T) {
+	zone := testZone(t)
 	for hour := 0; hour < 24; hour++ {
-		now := time.Date(2026, 9, 14, hour, 30, 0, 0, time.Local)
+		now := time.Date(2026, 9, 14, hour, 30, 0, 0, zone)
 		if hour == 0 {
-			now = time.Date(2026, 9, 14, 0, 0, 0, 0, time.Local)
+			now = time.Date(2026, 9, 14, 0, 0, 0, 0, zone)
 		}
 		spec, err := ParseWindowSpec(Window7d, now)
 		if err != nil {
@@ -505,9 +541,15 @@ func TestParseWindowSpec_SevenDaysTouchesEightLocalDays(t *testing.T) {
 		}
 		// Whole local days from From to To inclusive, which is the walk
 		// costledger.Writer.Query makes over day files.
+		//
+		// Walked at dayAnchorHour, which is what costledger.dayOf does and NOT what this
+		// loop used to do. It carried its own time.Date(..., 0, 0, 0, 0, loc) — a third copy
+		// of the defect, in the test that measures how many day files a window needs. In a
+		// zone whose transition is at 00:00 that expression counts a date twice or skips one,
+		// so the count would have been wrong about the very thing being counted.
 		days := 0
-		day := time.Date(spec.From.Year(), spec.From.Month(), spec.From.Day(), 0, 0, 0, 0, spec.From.Location())
-		last := time.Date(spec.To.Year(), spec.To.Month(), spec.To.Day(), 0, 0, 0, 0, spec.To.Location())
+		day := time.Date(spec.From.Year(), spec.From.Month(), spec.From.Day(), dayAnchorHour, 0, 0, 0, spec.From.Location())
+		last := time.Date(spec.To.Year(), spec.To.Month(), spec.To.Day(), dayAnchorHour, 0, 0, 0, spec.To.Location())
 		for ; !day.After(last); day = day.AddDate(0, 0, 1) {
 			days++
 		}

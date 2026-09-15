@@ -12,6 +12,11 @@ import (
 	"testing"
 	"time"
 
+	// EMBEDDED TZDATA, so mustZone can treat a load failure as a test failure rather than a
+	// skip. A scratch CI container may carry no zone database, and a skip there would report
+	// success for the one assertion in this file that needs a zone whose offset CHANGES.
+	_ "time/tzdata"
+
 	"github.com/rossoctl/cortex/authbridge/authlib/costevent"
 	"github.com/rossoctl/cortex/authbridge/authlib/costledger"
 	"github.com/rossoctl/cortex/authbridge/authlib/pipeline"
@@ -309,16 +314,75 @@ func ledgerWithOneCostedMinute(t *testing.T, at time.Time, host, model string, c
 	return led
 }
 
-// midnightToday is the LOCAL start of today, which is the boundary window=today uses.
+// startOfToday is the LOCAL start of today, which is the boundary window=today uses.
 //
 // Fixtures for a symbolic window have to be anchored here rather than offset from
-// time.Now(): backing off the current clock crosses midnight during the first minutes of
-// each day, filing the row under yesterday while the request asks about today. Local, not
-// UTC, because that is what usage.ParseWindowSpec means by "today" — see its doc for why a
-// laptop crossing a timezone must not have its day reset mid-afternoon.
-func midnightToday() time.Time {
-	n := time.Now()
-	return time.Date(n.Year(), n.Month(), n.Day(), 0, 0, 0, 0, n.Location())
+// time.Now(): backing off the current clock crosses the day boundary during the first
+// minutes of each day, filing the row under yesterday while the request asks about today.
+// Local, not UTC, because that is what usage.ParseWindowSpec means by "today" — see its doc
+// for why a laptop crossing a timezone must not have its day reset mid-afternoon.
+//
+// DELEGATED, not derived, and it used to be derived. This was
+// time.Date(n.Year(), n.Month(), n.Day(), 0, 0, 0, 0, n.Location()) — a second copy of the
+// expression ParseWindowSpec carried, with the identical flaw: in a zone whose DST
+// transition falls at 00:00 that instant does not exist on the spring-forward day and
+// time.Date resolves it onto the neighbouring one. A fixture whose whole job is to sit
+// inside the window under test cannot afford to compute the window's edge a second way, so
+// it now calls the one function that defines it. The dependency runs sessionapi to usage,
+// which is the direction this package's imports already go; usage must never import back.
+func startOfToday() time.Time {
+	return usage.StartOfLocalDay(time.Now())
+}
+
+// mustZone loads a real zone, FAILING rather than skipping when it cannot.
+//
+// t.Fatalf, deliberately: a skip would report success for a test that never ran the code it
+// exists to cover, which is how the local-midnight bound survived a suite whose only
+// non-UTC zone was a transition-free time.FixedZone.
+func mustZone(t *testing.T, name string) *time.Location {
+	t.Helper()
+	loc, err := time.LoadLocation(name)
+	if err != nil {
+		t.Fatalf("LoadLocation(%q): %v — this file embeds time/tzdata precisely so this "+
+			"cannot happen; a failure here means the import was dropped, not that the host "+
+			"lacks a zone database", name, err)
+	}
+	return loc
+}
+
+// TestStartOfToday_IsTheEndpointsOwnBoundaryAndNotALocalMidnight is what makes the
+// delegation above worth more than a shorter line.
+//
+// It asserts two things a copy could not. First, that the anchor these fixtures use IS the
+// bound usage.ParseWindowSpec("today") serves — in a zone where a re-derivation would
+// differ, so the equality is not trivially true. Second, that the expression this helper
+// used to contain really does differ there, which is the negative control: without it the
+// test would keep passing if someone swapped the zone for UTC, and a green suite would
+// again say nothing about any zone that shifts.
+func TestStartOfToday_IsTheEndpointsOwnBoundaryAndNotALocalMidnight(t *testing.T) {
+	// America/Havana shifts AT 00:00, so 2026-03-08 has no midnight at all.
+	loc := mustZone(t, "America/Havana")
+	const date = "2026-03-08"
+	now := time.Date(2026, 3, 8, 15, 0, 0, 0, loc)
+
+	spec, err := usage.ParseWindowSpec(usage.WindowToday, now)
+	if err != nil {
+		t.Fatalf("ParseWindowSpec: %v", err)
+	}
+	if got := usage.StartOfLocalDay(now); !got.Equal(spec.From) {
+		t.Errorf("StartOfLocalDay = %v but window=today starts at %v; the fixture anchor and "+
+			"the window under test are two different instants", got, spec.From)
+	}
+	// The negative control: the old expression, and why it could not be kept.
+	naive := time.Date(2026, 3, 8, 0, 0, 0, 0, loc)
+	if naive.Format("2006-01-02") == date {
+		t.Fatalf("local midnight of %s in America/Havana resolved onto its own date (%v), so "+
+			"this test no longer exercises the defect", date, naive)
+	}
+	if !naive.Before(spec.From) {
+		t.Errorf("the old anchor %v is not earlier than the window's start %v; the flaw was "+
+			"that it sat OUTSIDE the window it was meant to be inside", naive, spec.From)
+	}
 }
 
 // newTestLedger opens an empty ledger with its clock pinned to at.
@@ -649,14 +713,15 @@ func TestHandleUsage_SessionWithDurationWindowStillWorks(t *testing.T) {
 // cannot see, so the improvement was invisible to every consumer.
 func TestHandleUsage_ACorruptLedgerLineIsDisclosedInTheResponse(t *testing.T) {
 	// Two minutes into TODAY, not two minutes before NOW. Backing off the current clock
-	// crosses local midnight for the first two minutes of every day: the row lands in
+	// crosses the day boundary for the first two minutes of every day: the row lands in
 	// yesterday's day file while window=today asks about this one, and the test fails for
-	// a reason that has nothing to do with what it is checking. `today` is a local-midnight
-	// boundary, so a fixture near it has to be anchored to the boundary rather than to now.
-	when := midnightToday().Add(2 * time.Minute)
+	// a reason that has nothing to do with what it is checking. `today` is a boundary, not a
+	// length, so a fixture near it has to be anchored to the boundary rather than to now —
+	// and to the SAME boundary, which is why startOfToday delegates.
+	when := startOfToday().Add(2 * time.Minute)
 	if now := time.Now(); when.After(now) {
 		// Guards the other end: inside the first two minutes of the day the anchor would be
-		// in the future, and a future row falls outside [midnight, now].
+		// in the future, and a future row falls outside [start of day, now].
 		when = now
 	}
 	// An explicit dir rather than newTestLedger's hidden t.TempDir(), because this test

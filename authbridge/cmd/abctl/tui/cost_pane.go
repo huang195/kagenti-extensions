@@ -11,6 +11,7 @@ import (
 	"github.com/charmbracelet/lipgloss"
 
 	"github.com/rossoctl/cortex/authbridge/authlib/pipeline"
+	"github.com/rossoctl/cortex/authbridge/authlib/pricing"
 	"github.com/rossoctl/cortex/authbridge/authlib/usage"
 )
 
@@ -807,10 +808,7 @@ func costTotalBody(snap *usage.Snapshot, width int) costTotalParts {
 	// the other half of the rule — a permanent caveat with nothing to act on is what
 	// teaches an operator to ignore the one that matters.
 	if inc := snap.Totals.IncompleteRequests; inc > 0 {
-		parts.caveats = append(parts.caveats, wrap(fmt.Sprintf(
-			"%s of %s priced figures are lower bounds — a stream ended before "+
-				"its output count arrived, so the real total is higher",
-			formatCount(int(inc)), formatCount(int(priced)))))
+		parts.caveats = append(parts.caveats, wrap(costInexactNote(inc, priced, snap.IncompleteBy)))
 	}
 	return parts
 }
@@ -865,6 +863,90 @@ func costDamagedNote(d *usage.Degraded) string {
 		return "this total is SHORT — the cost ledger reported an incomplete read without " +
 			"saying how much it lost; rows are missing from the sum"
 	}
+}
+
+// costInexactNote is the pane's sentence for an inexact total, and it names a DIRECTION only
+// where the response named one.
+//
+// It used to assert one unconditionally: "N of M priced figures are lower bounds — a stream
+// ended before its output count arrived, so the real total is higher". That sentence is true
+// for pricing.ReasonOutputUncounted and FALSE for pricing.ReasonSplitUnreported, where a
+// gateway reported only a total and the figure is off in NO KNOWN DIRECTION — over-priced for
+// a cache-heavy request, under-priced for a generation-heavy one. It was printed over both,
+// because Totals.IncompleteRequests is a single number that cannot tell them apart.
+// usage.Snapshot.IncompleteBy is the field that can, and reading it is the difference between
+// "the total is at least this" and "the total is about this" — different claims about money.
+//
+// The two also want different reactions, which is why one wording cannot serve: a floor is
+// usually a transient failure worth chasing (a stream that died), while an approximation is a
+// standing property of a gateway that holds for every request it answers. Presented as an
+// incident, the second teaches an operator to ignore the first.
+//
+// NO REASONS AT ALL gets the direction-free wording rather than the old sentence, and that is
+// the common case on this pane: today and 7d are ledger-backed, and a persisted per-minute row
+// has no reason column, so IncompleteBy is never populated for them. The count line still
+// prints — absence of the reasons is not a claim of exactness, per usage.Snapshot.IncompleteBy's
+// own doc — it simply stops claiming to know which way.
+//
+// An unrecognised key is PRINTED under its own name, never dropped: the map's counts sum to
+// IncompleteRequests by contract, so a dropped key would leave a reader's own subtraction
+// implying those figures were exact. Sanitized on the way out for the reason costPricedBy
+// sanitizes its keys — a reason string is a wire value, and an ESC in one reaches the TTY.
+func costInexactNote(inc, priced int64, by map[string]int64) string {
+	head := fmt.Sprintf("%s of %s priced figures are inexact",
+		formatCount(int(inc)), formatCount(int(priced)))
+	clauses := costInexactClauses(by)
+	if len(clauses) == 0 {
+		return head + " — the total is not exact, and this window does not record which way"
+	}
+	return head + " — " + strings.Join(clauses, "; ")
+}
+
+// costInexactClauses is costInexactNote's per-reason prose, in a fixed order: the floor first
+// because it is the stronger claim and the only one with a direction, then the approximation,
+// then a caveat whose kind nobody named, then any key this build does not know (sorted, so two
+// runs of the same data read the same).
+//
+// The keys come from pricing rather than being spelled here, so what this matches on is what
+// the producer writes. "unlabelled" has to be a literal — usage keeps that key unexported —
+// and usage.Snapshot.IncompleteBy's doc is where its meaning is defined.
+func costInexactClauses(by map[string]int64) []string {
+	if len(by) == 0 {
+		return nil
+	}
+	var out []string
+	known := map[string]bool{}
+	for _, r := range []struct{ key, singular, plural string }{
+		{pricing.ReasonOutputUncounted,
+			"1 is a lower bound (a stream ended before its output count arrived, so the real total is higher)",
+			"%s are lower bounds (a stream ended before its output count arrived, so the real total is higher)"},
+		{pricing.ReasonSplitUnreported,
+			"1 is an approximation (a gateway reported only a total, so it is off in no known direction)",
+			"%s are approximations (a gateway reported only a total, so they are off in no known direction)"},
+		{"unlabelled",
+			"1 carries a caveat whose kind its producer did not name",
+			"%s carry a caveat whose kind their producer did not name"},
+	} {
+		known[r.key] = true
+		switch n := by[r.key]; {
+		case n == 1:
+			out = append(out, r.singular)
+		case n > 1:
+			out = append(out, fmt.Sprintf(r.plural, formatCount(int(n))))
+		}
+	}
+	var rest []string
+	for k, n := range by {
+		if !known[k] && n > 0 {
+			rest = append(rest, k)
+		}
+	}
+	sort.Strings(rest)
+	for _, k := range rest {
+		out = append(out, fmt.Sprintf("%s under %q, a reason this build does not know",
+			formatCount(int(by[k])), sanitizeLabel(k)))
+	}
+	return out
 }
 
 // costPricedBy sanitizes the provenance keys before they reach provenanceNote.

@@ -309,11 +309,19 @@ func TestRenderCostPane_TotalSaysUnavailableRatherThanZero(t *testing.T) {
 }
 
 func TestRenderCostPane_DisclosesAnInexactTotal(t *testing.T) {
-	// IncompleteRequests means at least one figure in this total is a FLOOR — a
-	// truncated stream priced prompt-only. A total that hides that reads as exact.
+	// IncompleteRequests means at least one figure in this total is not exact. A total that
+	// hides that reads as exact.
+	//
+	// IncompleteBy says WHICH WAY, and the fixture carries it because the "higher" assertion
+	// below depends on it: output-uncounted is the FLOOR case — a truncated stream priced
+	// prompt-only — and it is the only one of the two reasons that has a direction at all.
+	// The fixture used to omit it and the assertion still demanded "higher", which pinned a
+	// claim the data did not support; see TestRenderCostPane_AnApproximationIsNotCalledAFloor
+	// for the case that made it false.
 	snap := &usage.Snapshot{Window: "today", Priced: true,
 		Totals: usage.Counts{Requests: 10, CostMicros: 4_170_000,
-			PricedRequests: 10, PriceableRequests: 10, IncompleteRequests: 2}}
+			PricedRequests: 10, PriceableRequests: 10, IncompleteRequests: 2},
+		IncompleteBy: map[string]int64{"output-uncounted": 2}}
 	got := renderCostPane(snap, usage.GroupModel, 120, 40)
 	if !strings.Contains(got, "2") {
 		t.Errorf("total does not disclose its 2 inexact figures:\n%s", got)
@@ -2078,8 +2086,10 @@ func TestRenderCostPane_DamageIsNotMergedWithInexactness(t *testing.T) {
 	snap := damagedTodaySnapshot(&usage.Degraded{SkippedLines: 3})
 	got := renderCostPane(snap, usage.GroupModel, 120, 40)
 
-	// The inexactness caveat keeps its own words and its own numbers.
-	if !strings.Contains(got, "7 of 300 priced figures are lower bounds") {
+	// The inexactness caveat keeps its own words and its own numbers. Direction-free,
+	// because this fixture is a ledger-shaped window and carries no IncompleteBy — see
+	// costInexactNote and the two tests below it.
+	if !strings.Contains(got, "7 of 300 priced figures are inexact") {
 		t.Errorf("the inexactness caveat was displaced by the damage one:\n%s", got)
 	}
 	// And the damage caveat does not borrow them: no "lower bound" wording, and it says the
@@ -2100,7 +2110,7 @@ func TestRenderCostPane_DamageIsNotMergedWithInexactness(t *testing.T) {
 	// incomplete, where the others qualify a figure the sum contains.
 	iDmg := strings.Index(got, "SHORT")
 	iCov := strings.Index(got, "covers 300 of 400")
-	iInc := strings.Index(got, "lower bounds")
+	iInc := strings.Index(got, "priced figures are inexact")
 	if iDmg > iCov || iCov > iInc {
 		t.Errorf("caveats out of order (damaged %d, coverage %d, inexact %d):\n%s",
 			iDmg, iCov, iInc, got)
@@ -2190,9 +2200,9 @@ func qualifiedTotalSnapshot(d *usage.Degraded) *usage.Snapshot {
 // closing words of the same sentence. A rendered caveat must carry both: half a sentence
 // about a missing day reads as a complete one about something else.
 var costCaveatSentences = map[string]string{
-	"this total is SHORT":    "an amount nothing here can state",
-	"covers 300 of 400":      "the rest carry no figure",
-	"priced figures are low": "so the real total is higher",
+	"this total is SHORT":        "an amount nothing here can state",
+	"covers 300 of 400":          "the rest carry no figure",
+	"priced figures are inexact": "does not record which way",
 }
 
 // TestRenderCostPane_ATinyHeightNeverShowsABareConfidentFigure.
@@ -2340,5 +2350,144 @@ func TestRenderCostPane_EachQualificationMarksTheFigureOnItsOwn(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+// inexactBySnapshot is a ledger-shaped today window whose inexact figures carry REASONS —
+// usage.Snapshot.IncompleteBy — so the pane's caveat can be asked which way it claims the
+// total is wrong.
+//
+// Built on damagedTodaySnapshot with the damage removed: same 7-of-300 inexact figures, no
+// missing rows, so the only caveat under test is the inexactness one.
+func inexactBySnapshot(by map[string]int64) *usage.Snapshot {
+	snap := damagedTodaySnapshot(nil)
+	snap.IncompleteBy = by
+	return snap
+}
+
+// TestRenderCostPane_AFloorIsCalledAFloor keeps the strong wording where it is TRUE. The
+// direction is the actionable half of the disclosure — a total that will only go up is a
+// different thing to chase than one that is merely fuzzy — so a fix for the false case must
+// not cost the true one its words.
+func TestRenderCostPane_AFloorIsCalledAFloor(t *testing.T) {
+	got := unwrapCostBody(renderCostPane(
+		inexactBySnapshot(map[string]int64{"output-uncounted": 7}), usage.GroupModel, 120, 40))
+
+	if !strings.Contains(got, "7 are lower bounds") {
+		t.Errorf("a window whose figures are all floors does not say so:\n%s", got)
+	}
+	if !strings.Contains(got, "real total is higher") {
+		t.Errorf("the floor is named without its direction, which is the half an operator "+
+			"acts on:\n%s", got)
+	}
+}
+
+// TestRenderCostPane_AnApproximationIsNotCalledAFloor is the defect this reading fixes.
+//
+// pricing.ReasonSplitUnreported means a gateway reported only a total, so the figure is off in
+// NO KNOWN DIRECTION — over-priced for a cache-heavy request, under-priced for a
+// generation-heavy one. The pane asserted "lower bounds … so the real total is higher" over
+// every inexact figure, because Totals.IncompleteRequests is one number that cannot tell the
+// two apart. Claiming a direction that does not exist is a false statement about money, and it
+// also mis-frames a STANDING property of a gateway as an incident.
+func TestRenderCostPane_AnApproximationIsNotCalledAFloor(t *testing.T) {
+	got := unwrapCostBody(renderCostPane(
+		inexactBySnapshot(map[string]int64{"split-unreported": 7}), usage.GroupModel, 120, 40))
+
+	if !strings.Contains(got, "7 are approximations") {
+		t.Errorf("the pane does not name the figures as approximations:\n%s", got)
+	}
+	if !strings.Contains(got, "no known direction") {
+		t.Errorf("the pane states an approximation without saying it has no direction:\n%s", got)
+	}
+	for _, banned := range []string{"lower bound", "real total is higher"} {
+		if strings.Contains(got, banned) {
+			t.Errorf("the pane says %q over figures that are approximations, which claims a "+
+				"direction the data does not have:\n%s", banned, got)
+		}
+	}
+}
+
+// TestRenderCostPane_MixedReasonsAreBothStated. Both kinds in one window, so neither is
+// rounded up into the other's wording — and the count line above still says how many in total.
+func TestRenderCostPane_MixedReasonsAreBothStated(t *testing.T) {
+	got := unwrapCostBody(renderCostPane(
+		inexactBySnapshot(map[string]int64{"output-uncounted": 6, "split-unreported": 1}),
+		usage.GroupModel, 120, 40))
+
+	for _, want := range []string{"7 of 300 priced figures are inexact", "6 are lower bounds",
+		"1 is an approximation"} {
+		if !strings.Contains(got, want) {
+			t.Errorf("output missing %q — a mixed window must state both claims:\n%s", want, got)
+		}
+	}
+}
+
+// TestRenderCostPane_NoReasonsClaimsNoDirection is the pane's DEFAULT window, and the reason
+// the direction had to become conditional rather than merely correct sometimes: today and 7d
+// are ledger-backed, and a persisted per-minute row has no reason column, so IncompleteBy is
+// never populated for them and the old sentence's direction was a guess on every real run.
+//
+// The caveat itself still prints. usage.Snapshot.IncompleteBy's doc is explicit that its
+// absence is not a claim of exactness.
+func TestRenderCostPane_NoReasonsClaimsNoDirection(t *testing.T) {
+	got := unwrapCostBody(renderCostPane(inexactBySnapshot(nil), usage.GroupModel, 120, 40))
+
+	if !strings.Contains(got, "7 of 300 priced figures are inexact") {
+		t.Errorf("a window that does not record the reasons dropped the inexactness caveat "+
+			"entirely, which reads as an exact total:\n%s", got)
+	}
+	if !strings.Contains(got, "does not record which way") {
+		t.Errorf("the pane neither names a direction nor says the window has none:\n%s", got)
+	}
+	for _, banned := range []string{"lower bound", "real total is higher", "approximation"} {
+		if strings.Contains(got, banned) {
+			t.Errorf("the pane invented %q for a window that reported no reasons:\n%s", banned, got)
+		}
+	}
+	// The figure keeps its marker either way: what is unknown is the direction, not the
+	// inexactness.
+	if !strings.Contains(got, inexactMarker+"$12.5000") {
+		t.Errorf("the figure lost its inexactness marker:\n%s", got)
+	}
+}
+
+// TestCostInexactClauses_OrderAndUnknownKeys pins the two rules the caveat's prose depends on
+// that are awkward to see through a rendered pane: a FIXED order (a map's iteration order is
+// randomised, so a substring check can pass on a lucky shuffle) and an unrecognised key
+// PRINTED rather than dropped.
+//
+// Dropping it would be the worse bug of the two: IncompleteBy's counts sum to
+// IncompleteRequests by contract, so a reader subtracting the clauses from the count would
+// conclude the remainder were exact figures. Sanitized on the way out, because a reason string
+// is a wire value and an ESC in one reaches the TTY — the hazard costPricedBy exists for.
+func TestCostInexactClauses_OrderAndUnknownKeys(t *testing.T) {
+	if got := costInexactClauses(nil); got != nil {
+		t.Errorf("costInexactClauses(nil) = %v, want nothing at all", got)
+	}
+	got := costInexactClauses(map[string]int64{
+		"split-unreported": 2,
+		"output-uncounted": 5,
+		"unlabelled":       1,
+		"zz-new":           3,
+		"aa-\x1b[31mnew":   4,
+	})
+	if len(got) != 5 {
+		t.Fatalf("got %d clauses, want 5: %v", len(got), got)
+	}
+	wantPrefix := []string{
+		"5 are lower bounds",
+		"2 are approximations",
+		"1 carries a caveat",
+		"4 under \"aa-�[31mnew\"",
+		"3 under \"zz-new\"",
+	}
+	for i, want := range wantPrefix {
+		if !strings.HasPrefix(got[i], want) {
+			t.Errorf("clause %d = %q, want it to start %q", i, got[i], want)
+		}
+	}
+	if strings.Contains(strings.Join(got, " "), "\x1b") {
+		t.Errorf("a raw ESC from a wire key reached the rendered caveat: %v", got)
 	}
 }

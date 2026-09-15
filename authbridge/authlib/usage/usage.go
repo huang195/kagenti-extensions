@@ -81,6 +81,30 @@ type Counts struct {
 	// double-counts every reasoning token at the output rate, which is the most
 	// expensive tier there is.
 	ReasoningTokens int64 `json:"reasoningTokens,omitempty"`
+	// RefusedTokenRequests counts the requests whose token report was REJECTED as
+	// implausible and contributed nothing to any figure above. See plausibleTokenReport for
+	// the rule and for why the whole report goes rather than the offending field.
+	//
+	// It exists because capping cost while leaving tokens unbounded is not a position that
+	// survives being stated. Cost is bounded per request twice over
+	// (pricing.MaxPlausibleRequestCostMicros for a gateway's own figure,
+	// pricing.MaxCostMicros for the unit), and the token fields were read straight from a
+	// provider-controlled `int` on the wire with no bound at all — so the same forged
+	// response that cannot move the dollar total by more than $10,000 could move the token
+	// total by 9.2e18, and both feed the same aggregate that a client renders side by side.
+	// A negative figure was accepted too, and subtracted.
+	//
+	// REFUSED, NOT CLAMPED, matching how an out-of-range cost is handled: a clamp invents a
+	// number nobody reported, and 10,000,000 tokens presented as fact is a worse answer than
+	// no figure plus a count of what was dropped. The request itself still counts in
+	// Requests, and its cost — settled by a different producer, bounded separately — is
+	// untouched, because this says nothing about whether the response was billed.
+	//
+	// A COUNTER, on the same reasoning as PricedRequests: buckets are summed when a client
+	// asks for a coarser resolution, and a count survives that where a flag degrades to
+	// "somewhere in here". Non-zero here means Tokens and the split are SHORT by whatever
+	// those requests really used, which is unknowable by construction.
+	RefusedTokenRequests int64 `json:"refusedTokenRequests,omitempty"`
 	// PresentKinds is the OR of every folded event's InferenceExtension.PresentKinds:
 	// a set bit means at least one response in this bucket actually REPORTED that
 	// kind. Bit layout matches parsercommon.Kind (Input=1, CacheRead=2,
@@ -255,6 +279,7 @@ func (c *Counts) Add(o Counts) {
 	c.addInto(&c.CacheReadTokens, o.CacheReadTokens)
 	c.addInto(&c.CacheWriteTokens, o.CacheWriteTokens)
 	c.addInto(&c.OutputTokens, o.OutputTokens)
+	c.addInto(&c.RefusedTokenRequests, o.RefusedTokenRequests)
 	// Summed alongside OutputTokens, never into it: it is a subset of the output
 	// the provider already reported, so folding it in would bill it twice.
 	c.addInto(&c.ReasoningTokens, o.ReasoningTokens)
@@ -297,6 +322,54 @@ func (c *Counts) addInto(dst *int64, v int64) {
 // aggregator today. It is here because Add is exported, because "unreachable today" is how
 // the wrap arrived in the first place, and because a half-guarded accumulator invites a
 // reader to conclude the other half was considered and ruled out.
+// maxPlausibleRequestTokens is the largest token count one request could report, per field.
+//
+// THE SAME NUMBER AND THE SAME REASONING AS pricing's unexported maxPlausibleTokens: the
+// largest context window on any path we run is 1,000,000 tokens (the Claude [1m] beta), a
+// request bills prompt plus completion, so 2,000,000 covers the worst real call and ten
+// million is 5x that. A future window growth cannot turn a legitimate response into a
+// refusal.
+//
+// STATED TWICE, WHICH IS A DEBT AND IS RECORDED AS ONE. pricing declares the bound
+// unexported and derives MaxPlausibleRequestCostMicros from it; this package cannot read it
+// and cannot export it from there without editing a package another change owns. Two
+// literals that must agree is exactly the shape that let the retention floor and the window
+// span drift (see config.minCostLedgerRetentionDays), and the fix is to export ONE of them
+// and derive the other — deliberately not done here, because it belongs in the commit that
+// can touch both. Until then: if either moves, move both.
+//
+// PER FIELD, NOT PER REPORT. Six fields at the bound is 6e7, which is nowhere near an int64
+// and needs no separate sum check; a per-report bound would have to pick between refusing a
+// legitimate large prompt and admitting a forged split, and a per-field one refuses neither.
+const maxPlausibleRequestTokens = 10_000_000
+
+// plausibleTokenReport reports whether an event's token counters could have come from a real
+// inference response.
+//
+// ALL OR NOTHING, and that is the point. If one figure in the report is impossible then the
+// report is not trustworthy, and mixing a believed number with a refused one in the same row
+// produces a breakdown that cannot be reconciled against its own total — the client is then
+// worse off than with no figures at all. So one bad field refuses the whole set, and
+// Counts.RefusedTokenRequests says how many times that happened.
+//
+// NEGATIVE IS REFUSED TOO, not merely the ceiling. These arrive as `int` decoded from a
+// provider's JSON, so a negative is one minus sign away, and a negative token count
+// SUBTRACTS from the aggregate — a forged response that makes a real bill look smaller,
+// which is the direction an attacker actually wants.
+//
+// The nil check is the caller's; every call site here has already tested it.
+func plausibleTokenReport(inf *pipeline.InferenceExtension) bool {
+	for _, n := range [...]int{
+		inf.TotalTokens, inf.InputTokens, inf.CacheReadTokens,
+		inf.CacheWriteTokens, inf.OutputTokens, inf.ReasoningTokens,
+	} {
+		if n < 0 || n > maxPlausibleRequestTokens {
+			return false
+		}
+	}
+	return true
+}
+
 func addSat(a, b int64) (int64, bool) {
 	if b > 0 && a > math.MaxInt64-b {
 		return math.MaxInt64, true
@@ -912,26 +985,39 @@ func (a *Aggregator) foldInto(ring []bucket, t time.Time, sessionID string, e *p
 	// from tokens: the parser is the only component that knows the breakdown, and
 	// there is no way to recover it from the total afterwards.
 	var split Counts
+	// refusedTokens is 1 when the report was rejected as implausible, so the drop is
+	// counted rather than silent. See Counts.RefusedTokenRequests.
+	var refusedTokens int64
 	if e.Inference != nil {
-		tokens = int64(e.Inference.TotalTokens)
 		model = e.Inference.Model
-		split = Counts{
-			InputTokens:      int64(e.Inference.InputTokens),
-			CacheReadTokens:  int64(e.Inference.CacheReadTokens),
-			CacheWriteTokens: int64(e.Inference.CacheWriteTokens),
-			OutputTokens:     int64(e.Inference.OutputTokens),
-			ReasoningTokens:  int64(e.Inference.ReasoningTokens),
-			PresentKinds:     e.Inference.PresentKinds,
+		if plausibleTokenReport(e.Inference) {
+			tokens = int64(e.Inference.TotalTokens)
+			split = Counts{
+				InputTokens:      int64(e.Inference.InputTokens),
+				CacheReadTokens:  int64(e.Inference.CacheReadTokens),
+				CacheWriteTokens: int64(e.Inference.CacheWriteTokens),
+				OutputTokens:     int64(e.Inference.OutputTokens),
+				ReasoningTokens:  int64(e.Inference.ReasoningTokens),
+				PresentKinds:     e.Inference.PresentKinds,
+			}
+		} else {
+			// REFUSED WHOLE, including PresentKinds. Those bits assert "the provider reported
+			// these kinds", and this branch is the one where that report is not believed; a
+			// breakdown flagged as present with every figure dropped would be the worst of both
+			// answers. The model is still carried: the request happened, and which model it
+			// named is a label rather than a number.
+			refusedTokens = 1
 		}
 	}
 
 	one := Counts{
-		Requests:           1,
-		Tokens:             tokens,
-		CostMicros:         ec.micros,
-		PricedRequests:     ec.priced,
-		IncompleteRequests: ec.incomplete,
-		PriceableRequests:  ec.priceable,
+		Requests:             1,
+		Tokens:               tokens,
+		CostMicros:           ec.micros,
+		PricedRequests:       ec.priced,
+		IncompleteRequests:   ec.incomplete,
+		PriceableRequests:    ec.priceable,
+		RefusedTokenRequests: refusedTokens,
 	}
 	// The split is CARRIED rather than re-enumerated. Add is the one summation over
 	// Counts' fields, for the reason its own doc gives — the copy that hand-summed them

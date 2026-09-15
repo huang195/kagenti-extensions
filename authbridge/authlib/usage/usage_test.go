@@ -936,7 +936,11 @@ func TestFoldInto_CarriesEveryCountsField(t *testing.T) {
 	// become permanently true — a caveat on every clean response — with nothing here to
 	// notice, so the exemption is spelled as its own expectation instead.
 	// TestCountsAdd_EveryInt64FieldSaturatesAndSaysSo covers the true case.
-	assertedAbsent := map[string]bool{"Saturated": true}
+	//
+	// RefusedTokenRequests is exempt on the same footing and for the same reason: this
+	// event's token report is plausible, so refusing it would be the bug. Its non-zero case
+	// is TestFoldInto_RefusesAnImplausibleTokenReportWhicheverFieldCarriesIt.
+	assertedAbsent := map[string]bool{"Saturated": true, "RefusedTokenRequests": true}
 	v := reflect.ValueOf(totals)
 	for i := 0; i < v.NumField(); i++ {
 		name := v.Type().Field(i).Name
@@ -952,6 +956,141 @@ func TestFoldInto_CarriesEveryCountsField(t *testing.T) {
 			t.Errorf("Counts.%s came back zero: the fold does not carry it, so this field is absent from every /v1/usage total. Carry it in foldInto (the token split rides along via Counts.Add) or, if one event genuinely cannot populate it, say so in assertedAbsent above.",
 				name)
 		}
+	}
+}
+
+// tokenSources maps each token field of Counts to the pipeline.InferenceExtension field
+// foldInto reads it from.
+//
+// A map rather than a list of cases, so the test below can assert it COVERS the struct: a
+// seventh token field added to Counts and read from a new wire field fails here by name
+// instead of arriving unguarded. That is the whole reason this is not six hand-written
+// subtests — Tokens was unbounded for as long as it was because nothing enumerated the
+// fields that come from the provider.
+var tokenSources = map[string]string{
+	"Tokens":           "TotalTokens",
+	"InputTokens":      "InputTokens",
+	"CacheReadTokens":  "CacheReadTokens",
+	"CacheWriteTokens": "CacheWriteTokens",
+	"OutputTokens":     "OutputTokens",
+	"ReasoningTokens":  "ReasoningTokens",
+}
+
+// countsTokenFields returns the reflect field indexes of Counts' token figures, and fails if
+// any of them has no entry in tokenSources.
+func countsTokenFields(t *testing.T) []int {
+	t.Helper()
+	rt := reflect.TypeOf(Counts{})
+	var out []int
+	for i := range rt.NumField() {
+		name := rt.Field(i).Name
+		if !strings.HasSuffix(name, "Tokens") {
+			continue
+		}
+		if _, ok := tokenSources[name]; !ok {
+			t.Errorf("Counts.%s is a token figure with no entry in tokenSources: it is read from "+
+				"a provider-controlled field and nothing here checks that an implausible value is "+
+				"refused", name)
+			continue
+		}
+		out = append(out, i)
+	}
+	if len(out) != len(tokenSources) {
+		t.Fatalf("matched %d token fields of Counts against %d mapped sources; the map and the "+
+			"struct have diverged and this test no longer covers what it claims",
+			len(out), len(tokenSources))
+	}
+	return out
+}
+
+// TestFoldInto_RefusesAnImplausibleTokenReportWhicheverFieldCarriesIt is the token half of
+// the bound cost already had.
+//
+// Cost is bounded per request twice over and tokens were not bounded at all: every figure
+// came from a provider-controlled `int` on the wire, straight into the aggregate. So the
+// same forged response that could not move the dollar total by more than $10,000 could move
+// the token total by 9.2e18, and a negative one could move it DOWN — making a real bill look
+// smaller, which is the direction that gets exploited.
+//
+// Three shapes per field, because they fail differently: past the ceiling (the plausible
+// case), the whole int64 range (the wrap case, which Counts.Add now clamps but should never
+// see), and negative (the subtraction). Driven by reflection over Counts so a token field
+// added later cannot skip this.
+func TestFoldInto_RefusesAnImplausibleTokenReportWhicheverFieldCarriesIt(t *testing.T) {
+	fields := countsTokenFields(t)
+	rt := reflect.TypeOf(Counts{})
+	for _, i := range fields {
+		name := rt.Field(i).Name
+		wire := tokenSources[name]
+		for _, bad := range []struct {
+			what string
+			v    int
+		}{
+			{"one past the plausible ceiling", maxPlausibleRequestTokens + 1},
+			{"the whole int64 range", math.MaxInt},
+			{"negative, which subtracts from the aggregate", -1},
+		} {
+			t.Run(name+"/"+bad.what, func(t *testing.T) {
+				now := time.Now().Truncate(BucketWidth)
+				a := New(WithClock(func() time.Time { return now }))
+				e := inferenceEvent("claude-opus-5", 10, 20, 30, 40, 5, 0b11111)
+				e.At = now
+				reflect.ValueOf(e.Inference).Elem().FieldByName(wire).SetInt(int64(bad.v))
+				a.Record("s1", e)
+				totals := a.Snapshot(10*BucketWidth, BucketWidth, "s1", GroupNone).Totals
+
+				if totals.RefusedTokenRequests != 1 {
+					t.Errorf("RefusedTokenRequests = %d after %s = %d (%s), want 1 — a dropped "+
+						"figure that is not counted is indistinguishable from traffic that used no "+
+						"tokens", totals.RefusedTokenRequests, wire, bad.v, bad.what)
+				}
+				// The WHOLE report goes, not just the offending field: a believed figure beside a
+				// refused one is a breakdown that cannot be reconciled against its own total.
+				for _, j := range fields {
+					if got := reflect.ValueOf(totals).Field(j).Int(); got != 0 {
+						t.Errorf("Counts.%s = %d, want 0: %s was %s (%d), so no figure in this "+
+							"report is trustworthy", rt.Field(j).Name, got, wire, bad.what, bad.v)
+					}
+				}
+				if totals.PresentKinds != 0 {
+					t.Errorf("PresentKinds = %#b after a refused report, want 0 — those bits assert "+
+						"the provider REPORTED these kinds, which is the claim being refused",
+						totals.PresentKinds)
+				}
+				// The request still happened, and this says nothing about whether it was billed.
+				if totals.Requests != 1 {
+					t.Errorf("Requests = %d, want 1: refusing the token report must not drop the "+
+						"request", totals.Requests)
+				}
+			})
+		}
+	}
+}
+
+// TestFoldInto_AcceptsATokenReportAtTheCeiling is the control that keeps the bound from
+// being a coverage gap dressed as a guard.
+//
+// A refusal is a figure withheld, so a bound set too low is the same defect in the other
+// direction — and one that would only be discovered when a legitimately large context
+// window arrived. The ceiling is INCLUSIVE, and the largest real call anyone can construct
+// today is 5x under it.
+func TestFoldInto_AcceptsATokenReportAtTheCeiling(t *testing.T) {
+	now := time.Now().Truncate(BucketWidth)
+	a := New(WithClock(func() time.Time { return now }))
+	e := inferenceEvent("claude-opus-5", maxPlausibleRequestTokens, 0, 0, 0, 0, 0b1)
+	e.At = now
+	e.Inference.TotalTokens = maxPlausibleRequestTokens
+	a.Record("s1", e)
+	totals := a.Snapshot(10*BucketWidth, BucketWidth, "s1", GroupNone).Totals
+
+	if totals.RefusedTokenRequests != 0 {
+		t.Errorf("RefusedTokenRequests = %d for a report exactly at the ceiling, want 0: the bound "+
+			"is inclusive, and refusing here withholds a figure that is real",
+			totals.RefusedTokenRequests)
+	}
+	if totals.Tokens != maxPlausibleRequestTokens || totals.InputTokens != maxPlausibleRequestTokens {
+		t.Errorf("Tokens = %d, InputTokens = %d, want %d for both", totals.Tokens,
+			totals.InputTokens, int64(maxPlausibleRequestTokens))
 	}
 }
 

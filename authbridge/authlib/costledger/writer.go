@@ -280,7 +280,11 @@ func (w *Writer) Record(_ string, e *pipeline.SessionEvent) {
 		return
 	}
 	ev, hasCost := costevent.Record(e)
-	if e.Inference == nil && !(hasCost && ev.Priced()) {
+	// Named rather than inlined into the condition below: the admission rule is "this
+	// event is inference, OR somebody priced it", and spelling the second half out makes
+	// the guard read as that rule instead of as a nest of negations.
+	settledCost := hasCost && ev.Priced()
+	if e.Inference == nil && !settledCost {
 		// Non-inference traffic the proxy handled — MCP, health checks, tunnels.
 		// Recording it would put every proxied response in the cost denominator,
 		// the mistake that made a correct deployment read "1/10 priced" forever.

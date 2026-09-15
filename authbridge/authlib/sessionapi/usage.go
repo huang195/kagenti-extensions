@@ -334,7 +334,7 @@ var errSessionWithSymbolicWindow = usageError{
 // which is a claim the rows do not support — the gap is still visible, in
 // Totals.PricedRequests against Totals.PriceableRequests.
 func (s *Server) ledgerSnapshot(ctx context.Context, spec usage.Spec, group usage.Group) (usage.Snapshot, error) {
-	rows, err := s.ledger.Window(ctx, spec.From, spec.To)
+	rows, caveats, err := s.ledger.Window(ctx, spec.From, spec.To)
 	if err != nil {
 		return usage.Snapshot{}, err
 	}
@@ -361,20 +361,25 @@ func (s *Server) ledgerSnapshot(ctx context.Context, spec usage.Spec, group usag
 		applied = usage.GroupNone
 	}
 	totals, series, ungrouped := costledger.Fold(rows, applied)
-	// Read AFTER Window, never before: both counters are gauges for the most recent read,
-	// so sampling them earlier would report the previous caller's answer as this one's.
+	// FROM THE READ THAT PRODUCED THEM, which is why they come back from Window rather
+	// than off the ledger. They used to be two atomics on the Writer, sampled here right
+	// after Window returned — so any other /v1/usage request landing between those two
+	// calls handed this response its caveats. Measured: a reader of a day file holding one
+	// undecodable line reported SkippedLines 0, while a reader of a CLEAN day reported 1.
+	// A chart polling this endpoint is exactly the traffic that produces it.
 	//
 	// Surfaced here because the ledger having the numbers is not the same as a client
 	// being able to see them. Until this, a day that lost lines produced a response
 	// byte-identical to a clean one — a short total under priced:true — so the skip that
 	// saved the rest of the day was invisible to everyone downstream of it.
 	var degraded *usage.Degraded
-	if skipped, truncated := s.ledger.SkippedLines(), s.ledger.TruncatedDays(); skipped > 0 || truncated > 0 {
-		degraded = &usage.Degraded{SkippedLines: skipped, TruncatedDays: truncated}
+	if !caveats.Clean() {
+		degraded = &usage.Degraded{SkippedLines: caveats.SkippedLines, TruncatedDays: caveats.TruncatedDays}
 		// At Warn, and unconditionally: a client may not render the field, and an operator
 		// with a corrupt day file wants to hear about it once per read rather than never.
 		slog.Warn("sessionapi: cost ledger read was incomplete — the total is short",
-			"window", spec.Label, "skippedLines", skipped, "truncatedDays", truncated)
+			"window", spec.Label, "skippedLines", caveats.SkippedLines,
+			"truncatedDays", caveats.TruncatedDays)
 	}
 	snap := usage.Snapshot{
 		Window:        spec.Label,

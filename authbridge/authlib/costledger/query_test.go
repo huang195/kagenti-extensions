@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -47,7 +48,7 @@ func TestQuery_SpanInsideOneDay(t *testing.T) {
 	)
 	w := newTestWriter(t, dir, func() time.Time { return base })
 
-	got, err := w.Query(context.Background(), base, base.Add(time.Minute))
+	got, _, err := w.Query(context.Background(), base, base.Add(time.Minute))
 	if err != nil {
 		t.Fatalf("Query: %v", err)
 	}
@@ -85,7 +86,7 @@ func TestQuery_SpanCrossingLocalMidnight(t *testing.T) {
 		}
 	}
 
-	got, err := w.Query(context.Background(), before, after)
+	got, _, err := w.Query(context.Background(), before, after)
 	if err != nil {
 		t.Fatalf("Query: %v", err)
 	}
@@ -101,7 +102,7 @@ func TestQuery_MissingDayFileIsNotAnError(t *testing.T) {
 	base := time.Date(2026, 9, 13, 9, 0, 0, 0, time.Local)
 	w := newTestWriter(t, dir, func() time.Time { return base })
 
-	got, err := w.Query(context.Background(), base.AddDate(0, 0, -3), base)
+	got, _, err := w.Query(context.Background(), base.AddDate(0, 0, -3), base)
 	if err != nil {
 		t.Fatalf("Query over an empty range: %v", err)
 	}
@@ -123,7 +124,7 @@ func TestQuery_TruncatedFinalLineIsSkippedAndTheRestSurvives(t *testing.T) {
 	)
 	w := newTestWriter(t, dir, func() time.Time { return base })
 
-	got, err := w.Query(context.Background(), base, base.Add(time.Hour))
+	got, _, err := w.Query(context.Background(), base, base.Add(time.Hour))
 	if err != nil {
 		t.Fatalf("Query: %v", err)
 	}
@@ -148,7 +149,7 @@ func TestQuery_CorruptLineMidFileSkipsOnlyThatLine(t *testing.T) {
 	)
 	w := newTestWriter(t, dir, func() time.Time { return base })
 
-	got, err := w.Query(context.Background(), base, base.Add(time.Hour))
+	got, caveats, err := w.Query(context.Background(), base, base.Add(time.Hour))
 	if err != nil {
 		t.Fatalf("Query: %v", err)
 	}
@@ -165,13 +166,15 @@ func TestQuery_CorruptLineMidFileSkipsOnlyThatLine(t *testing.T) {
 	}
 	// J4: the skip has to be VISIBLE. It was counted into a local and logged at
 	// slog.Debug, below the default level, so in production this figure was
-	// indistinguishable from a complete one.
-	if got := w.SkippedLines(); got != 1 {
-		t.Errorf("SkippedLines() = %d, want 1; a caller has no other way to tell this "+
-			"800 from a day that really only cost 800", got)
+	// indistinguishable from a complete one. Read off THIS read's Caveats, not off the
+	// writer: see Caveats for the two readers that swapped them.
+	if caveats.SkippedLines != 1 {
+		t.Errorf("SkippedLines = %d, want 1; a caller has no other way to tell this "+
+			"800 from a day that really only cost 800", caveats.SkippedLines)
 	}
-	if got := w.TruncatedDays(); got != 0 {
-		t.Errorf("TruncatedDays() = %d, want 0 — the read stepped over the damage and finished", got)
+	if caveats.TruncatedDays != 0 {
+		t.Errorf("TruncatedDays = %d, want 0 — the read stepped over the damage and finished",
+			caveats.TruncatedDays)
 	}
 }
 
@@ -189,22 +192,25 @@ func TestQuery_AnAbandonedDayIsReportedSeparatelyFromSkippedLines(t *testing.T) 
 	)
 	w := newTestWriter(t, dir, func() time.Time { return base })
 
-	if _, err := w.Query(context.Background(), base, base.Add(time.Hour)); err != nil {
+	_, caveats, err := w.Query(context.Background(), base, base.Add(time.Hour))
+	if err != nil {
 		t.Fatalf("Query: %v", err)
 	}
-	if got := w.SkippedLines(); got != 1 {
-		t.Errorf("SkippedLines() = %d, want 1", got)
+	if caveats.SkippedLines != 1 {
+		t.Errorf("SkippedLines = %d, want 1", caveats.SkippedLines)
 	}
-	if got := w.TruncatedDays(); got != 1 {
-		t.Errorf("TruncatedDays() = %d, want 1; a day the reader gave up on must not be "+
-			"served as a complete one", got)
+	if caveats.TruncatedDays != 1 {
+		t.Errorf("TruncatedDays = %d, want 1; a day the reader gave up on must not be "+
+			"served as a complete one", caveats.TruncatedDays)
 	}
 }
 
-// GAUGES, not counters. A day file with one corrupt line is re-read on every
-// /v1/usage request, so a cumulative count would climb forever over one piece of
-// damage and read as a fault that is getting worse.
-func TestQuery_ReadIssuesReportTheLastReadNotAllOfThem(t *testing.T) {
+// PER READ, not cumulative. A day file with one corrupt line is re-read on every
+// /v1/usage request, so a running count would climb forever over one piece of damage and
+// read as a fault that is getting worse. Returning the counts to the read that produced
+// them is what makes that true for every caller at once rather than for whichever one
+// sampled the writer last; see Caveats.
+func TestQuery_ReadIssuesDescribeTheReadThatReturnedThem(t *testing.T) {
 	dir := t.TempDir()
 	base := time.Date(2026, 9, 13, 9, 0, 0, 0, time.Local)
 	writeDay(t, dir, base,
@@ -214,23 +220,27 @@ func TestQuery_ReadIssuesReportTheLastReadNotAllOfThem(t *testing.T) {
 	w := newTestWriter(t, dir, func() time.Time { return base })
 
 	for i := 0; i < 3; i++ {
-		if _, err := w.Query(context.Background(), base, base.Add(time.Hour)); err != nil {
+		_, caveats, err := w.Query(context.Background(), base, base.Add(time.Hour))
+		if err != nil {
 			t.Fatalf("Query %d: %v", i, err)
 		}
-		if got := w.SkippedLines(); got != 1 {
-			t.Fatalf("after read %d SkippedLines() = %d, want 1 — one line of damage must not "+
-				"read as %d lines of damage because it was queried %d times", i+1, got, got, i+1)
+		if caveats.SkippedLines != 1 {
+			t.Fatalf("read %d returned SkippedLines = %d, want 1 — one line of damage must not "+
+				"read as %d lines of damage because it was queried %d times",
+				i+1, caveats.SkippedLines, caveats.SkippedLines, i+1)
 		}
 	}
 
-	// And a clean read clears it, or the gauge would outlive the file it described.
+	// And a read of a clean day carries nothing, or a caveat would outlive the file it
+	// described.
 	clean := base.AddDate(0, 0, -1)
 	writeDay(t, dir, clean, line(clean, "gw", "m", 1, 10, 5, 100))
-	if _, err := w.Query(context.Background(), clean, clean.Add(time.Hour)); err != nil {
+	_, caveats, err := w.Query(context.Background(), clean, clean.Add(time.Hour))
+	if err != nil {
 		t.Fatalf("Query: %v", err)
 	}
-	if got := w.SkippedLines(); got != 0 {
-		t.Errorf("SkippedLines() = %d after reading a clean day, want 0", got)
+	if !caveats.Clean() {
+		t.Errorf("a read of a clean day returned %+v, want no caveats", caveats)
 	}
 }
 
@@ -250,7 +260,7 @@ func TestQuery_FragmentConcatenatedWithTheNextAppendCostsOneLine(t *testing.T) {
 	}
 	w := newTestWriter(t, dir, func() time.Time { return base })
 
-	got, err := w.Query(context.Background(), base, base.Add(time.Hour))
+	got, _, err := w.Query(context.Background(), base, base.Add(time.Hour))
 	if err != nil {
 		t.Fatalf("Query: %v", err)
 	}
@@ -286,7 +296,7 @@ func TestQuery_LineBeyondTheBufferLimitEndsThatDay(t *testing.T) {
 	)
 	w := newTestWriter(t, dir, func() time.Time { return base })
 
-	got, err := w.Query(context.Background(), base, base.Add(time.Hour))
+	got, caveats, err := w.Query(context.Background(), base, base.Add(time.Hour))
 	if err != nil {
 		t.Fatalf("Query must not fail the whole request over one day file: %v", err)
 	}
@@ -295,9 +305,9 @@ func TestQuery_LineBeyondTheBufferLimitEndsThatDay(t *testing.T) {
 	}
 	// And it must SAY SO. A truncated day served as a complete one is how the short
 	// figure reaches a client as window:"today", priced:true with no caveat.
-	if w.TruncatedDays() != 1 {
-		t.Errorf("TruncatedDays() = %d, want 1 — a day abandoned part-way must be visible "+
-			"to the caller, not only in a log line", w.TruncatedDays())
+	if caveats.TruncatedDays != 1 {
+		t.Errorf("TruncatedDays = %d, want 1 — a day abandoned part-way must be visible "+
+			"to the caller, not only in a log line", caveats.TruncatedDays)
 	}
 }
 
@@ -446,7 +456,7 @@ func TestQuery_AHostileLabelCannotDestroyTheRestOfTheDay(t *testing.T) {
 		t.Fatalf("Flush: %v", err)
 	}
 
-	rows, err := w.Query(context.Background(), at.Add(-time.Hour), now)
+	rows, _, err := w.Query(context.Background(), at.Add(-time.Hour), now)
 	if err != nil {
 		t.Fatalf("Query: %v", err)
 	}
@@ -467,7 +477,7 @@ func TestQuery_DoesNotSeeTheOpenMinute(t *testing.T) {
 	w := newTestWriter(t, dir, func() time.Time { return now })
 	w.Record("s1", costedEvent(t, "gw", "m", 0.25, 100, 50))
 
-	got, err := w.Query(context.Background(), at.Add(-time.Hour), at)
+	got, _, err := w.Query(context.Background(), at.Add(-time.Hour), at)
 	if err != nil {
 		t.Fatalf("Query: %v", err)
 	}
@@ -485,11 +495,11 @@ func TestWindow_IncludesTheOpenMinuteWithNothingOnDisk(t *testing.T) {
 	w := newTestWriter(t, dir, func() time.Time { return now })
 	w.Record("s1", costedEvent(t, "gw", "m", 0.25, 100, 50))
 
-	if disk, err := w.Query(context.Background(), at.Add(-time.Hour), at); err != nil || len(disk) != 0 {
+	if disk, _, err := w.Query(context.Background(), at.Add(-time.Hour), at); err != nil || len(disk) != 0 {
 		t.Fatalf("disk half = %d rows (err %v), want 0 — the premise of this test", len(disk), err)
 	}
 
-	rows, err := w.Window(context.Background(), at.Add(-time.Hour), at)
+	rows, _, err := w.Window(context.Background(), at.Add(-time.Hour), at)
 	if err != nil {
 		t.Fatalf("Window: %v", err)
 	}
@@ -514,7 +524,7 @@ func TestWindow_CountsAMinuteExactlyOnceAcrossTheFlush(t *testing.T) {
 	w.Record("s1", costedEvent(t, "gw", "m", 0.25, 100, 50))
 
 	from, to := at.Add(-time.Hour), at.Add(time.Hour)
-	before, err := w.Window(context.Background(), from, to)
+	before, _, err := w.Window(context.Background(), from, to)
 	if err != nil {
 		t.Fatalf("Window while open: %v", err)
 	}
@@ -531,7 +541,7 @@ func TestWindow_CountsAMinuteExactlyOnceAcrossTheFlush(t *testing.T) {
 		t.Fatalf("sync: %v", err)
 	}
 
-	after, err := w.Window(context.Background(), from, to)
+	after, _, err := w.Window(context.Background(), from, to)
 	if err != nil {
 		t.Fatalf("Window after the roll: %v", err)
 	}
@@ -586,15 +596,15 @@ func TestWindow_ARestartInTheSameMinuteHidesNothingAlreadyCommitted(t *testing.T
 	p2 := newTestWriter(t, dir, clock)
 	p2.Record("s1", costedEvent(t, "gw", "m", 0.25, 100, 50))
 
-	rows, err := p2.Window(context.Background(), at.Add(-time.Hour), at)
+	rows, caveats, err := p2.Window(context.Background(), at.Add(-time.Hour), at)
 	if err != nil {
 		t.Fatalf("Window: %v", err)
 	}
 	totals, _, _ := Fold(rows, usage.GroupNone)
 	if totals.CostMicros < committed {
 		t.Errorf("Window() = %d micros, BELOW the %d already on disk — a committed row is "+
-			"hidden, and nothing reports it: Dropped() = %d, SkippedLines() = %d",
-			totals.CostMicros, committed, p2.Dropped(), p2.SkippedLines())
+			"hidden, and nothing reports it: Dropped() = %d, read caveats = %+v",
+			totals.CostMicros, committed, p2.Dropped(), caveats)
 	}
 	if want := int64(1_250_000); totals.CostMicros != want {
 		t.Errorf("CostMicros = %d, want %d ($1.00 on disk + $0.25 held); 250000 is the "+
@@ -632,7 +642,7 @@ func TestWindow_AFlushRacingTheReadIsCountedExactlyOnce(t *testing.T) {
 		}
 	}
 
-	rows, err := w.Window(context.Background(), at.Add(-time.Hour), at)
+	rows, _, err := w.Window(context.Background(), at.Add(-time.Hour), at)
 	if err != nil {
 		t.Fatalf("Window: %v", err)
 	}
@@ -663,7 +673,7 @@ func TestQuery_ACancelledContextStopsTheReadBeforeAnyIO(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 
-	rows, err := w.Query(ctx, base, base.Add(time.Minute))
+	rows, _, err := w.Query(ctx, base, base.Add(time.Minute))
 	if !errors.Is(err, context.Canceled) {
 		t.Errorf("Query on a cancelled context: err = %v, want context.Canceled", err)
 	}
@@ -676,7 +686,7 @@ func TestQuery_ACancelledContextStopsTheReadBeforeAnyIO(t *testing.T) {
 
 	// And Window, which is what a reader actually calls, propagates it rather than
 	// answering from memory alone.
-	if _, werr := w.Window(ctx, base, base.Add(time.Minute)); !errors.Is(werr, context.Canceled) {
+	if _, _, werr := w.Window(ctx, base, base.Add(time.Minute)); !errors.Is(werr, context.Canceled) {
 		t.Errorf("Window on a cancelled context: err = %v, want context.Canceled", werr)
 	}
 }
@@ -701,7 +711,7 @@ func TestWindow_KeepsADiskRowAboveTheHeldMinute(t *testing.T) {
 	next := at.Truncate(time.Minute).Add(time.Minute)
 	writeDay(t, dir, next, line(next, "gw", "m", 1, 100, 50, 1_000_000))
 
-	rows, err := w.Window(context.Background(), at.Add(-time.Hour), next.Add(time.Hour))
+	rows, _, err := w.Window(context.Background(), at.Add(-time.Hour), next.Add(time.Hour))
 	if err != nil {
 		t.Fatalf("Window: %v", err)
 	}
@@ -727,7 +737,7 @@ func TestWindow_ExcludesAHeldMinuteOutsideTheRange(t *testing.T) {
 
 	// "today" as ParseWindowSpec builds it: local midnight to now.
 	now = midnight.Add(5 * time.Minute)
-	rows, err := w.Window(context.Background(), midnight, now)
+	rows, _, err := w.Window(context.Background(), midnight, now)
 	if err != nil {
 		t.Fatalf("Window: %v", err)
 	}
@@ -745,7 +755,7 @@ func TestQuery_ReversedRangeIsNormalised(t *testing.T) {
 	writeDay(t, dir, base, line(base, "gw", "m", 1, 10, 5, 100))
 	w := newTestWriter(t, dir, func() time.Time { return base })
 
-	got, err := w.Query(context.Background(), base.Add(time.Hour), base)
+	got, _, err := w.Query(context.Background(), base.Add(time.Hour), base)
 	if err != nil {
 		t.Fatalf("Query: %v", err)
 	}
@@ -1074,5 +1084,99 @@ func TestLedgerAndRingAgreeOnASpoofedUnknownAgent(t *testing.T) {
 	if ledgerKey != ringKey {
 		t.Errorf("ledger key %q != ring key %q; the two sources would render two rows for one thing",
 			ledgerKey, ringKey)
+	}
+}
+
+// TestQuery_TwoReadersDoNotSwapEachOthersCaveats is the fourth defect, and the reason
+// Caveats is a return value rather than two counters on the Writer.
+//
+// They used to be atomics set by whichever Query ran last, sampled by the caller in a
+// separate call — which is exactly what sessionapi does, once per /v1/usage request, on an
+// endpoint a chart polls. Measured on this fixture, with the reads INTERLEAVED and no
+// concurrency at all:
+//
+//	reader A read the day holding an undecodable line, then reported SkippedLines() = 0
+//	reader B read the CLEAN day, then reported SkippedLines() = 1
+//
+// Both halves of the report in one sequence: a damaged day served as complete, and a
+// clean day carrying a caveat about someone else's file. Nothing needs to race — any
+// other read between the call and the sample is enough, and there is no ordering that
+// makes the pair safe, which is why the fix is to attach the counts to the read.
+func TestQuery_TwoReadersDoNotSwapEachOthersCaveats(t *testing.T) {
+	dir := t.TempDir()
+	base := time.Date(2026, 9, 13, 9, 0, 0, 0, testZone)
+	clean := base.AddDate(0, 0, -1)
+	writeDay(t, dir, base,
+		line(base, "gw", "m", 1, 10, 5, 100),
+		`{"at":"2026-09-13T09:01:00Z","endpoint":"gw"`, // the damage
+	)
+	writeDay(t, dir, clean, line(clean, "gw", "m", 1, 10, 5, 100))
+	w := newTestWriter(t, dir, func() time.Time { return base })
+
+	// A starts on the corrupt day, B answers from the clean one in between, A finishes.
+	// The interleaving that used to hand each the other's answer.
+	_, aCaveats, aErr := w.Query(context.Background(), base, base.Add(time.Hour))
+	if aErr != nil {
+		t.Fatalf("A Query: %v", aErr)
+	}
+	_, bCaveats, bErr := w.Query(context.Background(), clean, clean.Add(time.Hour))
+	if bErr != nil {
+		t.Fatalf("B Query: %v", bErr)
+	}
+	if aCaveats.SkippedLines != 1 {
+		t.Errorf("the read of the CORRUPT day returned SkippedLines = %d, want 1: a day that "+
+			"lost a line must not report clean because another reader finished after it",
+			aCaveats.SkippedLines)
+	}
+	if !bCaveats.Clean() {
+		t.Errorf("the read of the CLEAN day returned %+v, want no caveats: a client would "+
+			"render another reader's damage as its own, and an operator would go looking for "+
+			"corruption in the wrong file", bCaveats)
+	}
+}
+
+// TestQuery_ConcurrentReadersEachGetTheirOwnCaveats is the same property under real
+// concurrency, which is how it reaches production: two /v1/usage requests, one asking
+// about a day that lost a line and one about a day that did not.
+//
+// Worth having alongside the interleaved test above because -race says nothing about this
+// on its own — the old counters were atomics, so the swap was a perfectly race-free wrong
+// answer.
+func TestQuery_ConcurrentReadersEachGetTheirOwnCaveats(t *testing.T) {
+	dir := t.TempDir()
+	base := time.Date(2026, 9, 13, 9, 0, 0, 0, testZone)
+	clean := base.AddDate(0, 0, -1)
+	writeDay(t, dir, base,
+		line(base, "gw", "m", 1, 10, 5, 100),
+		`{"at":"2026-09-13T09:01:00Z","endpoint":"gw"`,
+	)
+	writeDay(t, dir, clean, line(clean, "gw", "m", 1, 10, 5, 100))
+	w := newTestWriter(t, dir, func() time.Time { return base })
+
+	const rounds = 200
+	var wg sync.WaitGroup
+	errs := make(chan string, 2*rounds)
+	read := func(from time.Time, want int64) {
+		defer wg.Done()
+		for i := 0; i < rounds; i++ {
+			_, caveats, err := w.Query(context.Background(), from, from.Add(time.Hour))
+			if err != nil {
+				errs <- fmt.Sprintf("Query: %v", err)
+				return
+			}
+			if caveats.SkippedLines != want {
+				errs <- fmt.Sprintf("read of %s returned SkippedLines = %d, want %d",
+					from.Format(dayLayout), caveats.SkippedLines, want)
+				return
+			}
+		}
+	}
+	wg.Add(2)
+	go read(base, 1)
+	go read(clean, 0)
+	wg.Wait()
+	close(errs)
+	for msg := range errs {
+		t.Error(msg + " — each read has to carry the caveats for the file IT opened")
 	}
 }

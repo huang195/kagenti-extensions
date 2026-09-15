@@ -215,7 +215,7 @@ func TestQuery_TheDayWalkOpensEachDayExactlyOnceAcrossADSTMidnight(t *testing.T)
 				t.Fatalf("Flush: %v", ferr)
 			}
 
-			rows, err := w.Window(context.Background(), day1.Add(-time.Hour), day2.Add(time.Hour))
+			rows, _, err := w.Window(context.Background(), day1.Add(-time.Hour), day2.Add(time.Hour))
 			if err != nil {
 				t.Fatalf("Window: %v", err)
 			}

@@ -92,7 +92,7 @@ import (
 // 250,000 micros instead of 1,250,000. Recorded here because it is the same mistake
 // twice — a reader deciding what to discard from an invariant it cannot check — and the
 // second fix is what removes the class rather than the instance.
-func (w *Writer) Window(ctx context.Context, from, to time.Time) ([]Row, error) {
+func (w *Writer) Window(ctx context.Context, from, to time.Time) ([]Row, Caveats, error) {
 	fromMin, toMin := span(from, to)
 	pending, _, gen := w.pending()
 	if w.betweenWindowReads != nil {
@@ -100,14 +100,14 @@ func (w *Writer) Window(ctx context.Context, from, to time.Time) ([]Row, error) 
 		w.betweenWindowReads()
 	}
 
-	rows, err := w.Query(ctx, from, to)
+	rows, caveats, err := w.Query(ctx, from, to)
 	if err != nil {
-		return nil, err
+		return nil, Caveats{}, err
 	}
 	if w.flushGeneration() != gen {
 		// Step 3: the accumulator moved while this read ran, so the snapshot may be on
 		// disk too. Return the disk half alone rather than risk counting a minute twice.
-		return rows, nil
+		return rows, caveats, nil
 	}
 	for _, r := range pending {
 		if m := r.At.Truncate(time.Minute); m.Before(fromMin) || m.After(toMin) {
@@ -119,8 +119,47 @@ func (w *Writer) Window(ctx context.Context, from, to time.Time) ([]Row, error) 
 		}
 		rows = append(rows, r)
 	}
-	return rows, nil
+	return rows, caveats, nil
 }
+
+// Caveats is what ONE READ could not deliver — and it belongs to that read.
+//
+// RETURNED, NOT STORED, and that is the fix rather than a style choice. These two counts
+// used to be atomics on the Writer, set by whichever Query ran last and sampled by the
+// caller afterwards, so two concurrent /v1/usage readers swapped each other's answers.
+// Measured, with one clean day file and one holding an undecodable line:
+//
+//	reader A read the CORRUPT day and then reported SkippedLines() = 0
+//	reader B read the CLEAN   day and then reported SkippedLines() = 1
+//
+// Both directions of the same defect in one interleaving: a damaged day served as
+// complete, and a clean day carrying a caveat that described someone else's file. No
+// ordering is needed to produce it — the read and the sample are two separate calls, and
+// anything at all between them is another reader's write. sessionapi does exactly that,
+// once per request, on an endpoint a chart polls.
+//
+// STILL A GAUGE RATHER THAN A COUNTER, in the sense the old doc meant: it describes the
+// read that returned it and never accumulates. A day file with one corrupt line is
+// re-read on every /v1/usage request, and a cumulative count would climb forever over one
+// piece of damage and read as an escalating fault. Attaching it to the read is what makes
+// that true per caller instead of per process.
+type Caveats struct {
+	// SkippedLines is how many lines this read could not decode and stepped over. Each is
+	// spend that happened and is not in the rows returned beside it.
+	SkippedLines int64
+	// TruncatedDays is how many day files this read ABANDONED part-way — an IO error, or a
+	// line past maxLineBytes that a scanner cannot step over.
+	//
+	// Worse than a skipped line by an unknown amount: everything after that offset is
+	// missing and the file gives no way to say how much. Tracked separately from a skip
+	// rather than added to it for exactly that reason.
+	TruncatedDays int64
+}
+
+// Clean reports that the read lost nothing, so a caller can disclose the caveats only
+// when there are some. The absent-not-zero convention usage.Degraded documents: zeros in
+// an always-present object read as "checked, fine" from a producer that never checked.
+func (c Caveats) Clean() bool { return c == Caveats{} }
 
 // Query returns every row whose minute falls in [from, to], inclusive at minute
 // granularity.
@@ -128,10 +167,12 @@ func (w *Writer) Window(ctx context.Context, from, to time.Time) ([]Row, error) 
 // Reads only what the Writer has flushed — closed minutes. Prefer Window, which
 // adds the open minute; this is the disk half on its own, kept separate so
 // "only closed minutes reach disk" stays directly testable.
-// PUBLISHES WHAT IT COULD NOT READ, on SkippedLines and TruncatedDays. A day file
-// that lost lines, or one whose read was abandoned part-way, otherwise produced
-// exactly the same answer as a clean one — a short total labelled priced:true with no
-// caveat anywhere in it.
+//
+// RETURNS WHAT IT COULD NOT READ, as Caveats, beside the rows it did. A day file that
+// lost lines, or one whose read was abandoned part-way, otherwise produced exactly the
+// same answer as a clean one — a short total labelled priced:true with no caveat anywhere
+// in it. They travel with the rows rather than on the Writer because they describe THIS
+// read; see Caveats for the two readers that swapped them.
 //
 // EXPORTED WITH NO NON-TEST CALLER, and it stays that way: it is the named disk half of
 // this package's contract, cited by name from sessionapi's ledgerSnapshot, from
@@ -148,11 +189,11 @@ func (w *Writer) Window(ctx context.Context, from, to time.Time) ([]Row, error) 
 // is what bounds the work an abandoned read can still do. A cancelled read returns the
 // context's error and NO rows: a partial day would be a short total with nothing saying
 // it was short, which is the failure SkippedLines exists to stop being invisible.
-func (w *Writer) Query(ctx context.Context, from, to time.Time) ([]Row, error) {
+func (w *Writer) Query(ctx context.Context, from, to time.Time) ([]Row, Caveats, error) {
 	fromMin, toMin := span(from, to)
 
 	var out []Row
-	var skipped, truncated int64
+	var caveats Caveats
 	// Walk dates rather than globbing the directory: the read stays bounded by the
 	// span the caller asked for instead of by how long the ledger has been running.
 	//
@@ -164,17 +205,17 @@ func (w *Writer) Query(ctx context.Context, from, to time.Time) ([]Row, error) {
 	for d := w.store.dayOf(fromMin); !d.After(w.store.dayOf(toMin)); d = d.AddDate(0, 0, 1) {
 		if err := ctx.Err(); err != nil {
 			// Before the first read too, so a request cancelled while it queued does no IO
-			// at all. The gauges are left alone: they describe the most recent read that
-			// produced an answer, and this one did not.
-			return nil, err
+			// at all. No caveats are returned with it: they describe an answer, and a
+			// cancelled read is not one.
+			return nil, Caveats{}, err
 		}
 		rows, issues, err := w.store.readDay(d)
 		if err != nil {
-			return nil, err
+			return nil, Caveats{}, err
 		}
-		skipped += int64(issues.skippedLines)
+		caveats.SkippedLines += int64(issues.skippedLines)
 		if issues.truncated {
-			truncated++
+			caveats.TruncatedDays++
 		}
 		for _, r := range rows {
 			if m := r.At.Truncate(time.Minute); m.Before(fromMin) || m.After(toMin) {
@@ -183,11 +224,7 @@ func (w *Writer) Query(ctx context.Context, from, to time.Time) ([]Row, error) {
 			out = append(out, r)
 		}
 	}
-	// Stored, not added: these are gauges for the read that just happened. See
-	// SkippedLines for why a cumulative counter would be the wrong shape.
-	w.skippedLines.Store(skipped)
-	w.truncatedDays.Store(truncated)
-	return out, nil
+	return out, caveats, nil
 }
 
 // span normalises a caller's range to inclusive minute bounds.

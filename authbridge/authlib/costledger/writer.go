@@ -135,10 +135,6 @@ type Writer struct {
 	// loggedDrops is the cumulative drop count already reported. Atomic only because
 	// submit's post-Close inline path can reach write from a caller's goroutine.
 	loggedDrops atomic.Int64
-	// skippedLines and truncatedDays report what the MOST RECENT Query could not read.
-	// See SkippedLines.
-	skippedLines  atomic.Int64
-	truncatedDays atomic.Int64
 
 	// betweenWindowReads is a TEST SEAM and nothing else: Window calls it, when
 	// non-nil, between reading the accumulator and reading the day files.
@@ -844,8 +840,8 @@ func (w *Writer) logDrops() {
 // WHAT IT DOES NOT COUNT: rows whose fsync failed. They are in the file and every reader
 // will see them; only their survival across power loss is unproven, and that is reported
 // as an error from Flush and Close rather than as a lost row. Nor does it count anything
-// a reader could not decode later — that is SkippedLines and TruncatedDays, which are
-// gauges for the last read rather than a write-path total.
+// a reader could not decode later — that is Caveats, which Query and Window return to the
+// read that produced them rather than accumulating on the write path.
 //
 // Exported so a caller can surface it rather than leaving it in a log line nobody
 // greps: a cost total assembled from a ledger that dropped rows is short by an unknown
@@ -853,37 +849,15 @@ func (w *Writer) logDrops() {
 //
 // NO NON-TEST CALLER TODAY, and it stays exported anyway. It is the completeness signal
 // the package doc and Window's contract both cite, and the /v1/usage response has a
-// Degraded field that already carries the two READ-side gauges beside it (see
-// SkippedLines and TruncatedDays) — this is the write-side one that belongs there next,
-// which is a sessionapi change rather than a reason to withdraw the number.
+// Degraded field that already carries the two READ-side counts beside it (see Caveats) —
+// this is the write-side one that belongs there next, which is a sessionapi change rather
+// than a reason to withdraw the number.
+//
+// UNLIKE Caveats, THIS ONE IS PROCESS-WIDE ON PURPOSE. A dropped row is a fact about the
+// writer, not about anybody's read: it happened once, no later read can rediscover it, and
+// every reader of this ledger is equally short because of it. Caveats are the opposite —
+// what THIS read could not decode — which is why they are returned and this is not.
 func (w *Writer) Dropped() int64 { return w.dropped.Load() }
-
-// SkippedLines is how many lines the MOST RECENT Query or Window could not decode.
-//
-// A GAUGE, NOT A COUNTER, and deliberately: a day file with one corrupt line is
-// re-read on every /v1/usage request, so a cumulative count would climb forever over
-// one piece of damage and read as an escalating fault. The last read's figure answers
-// the question a caller actually has — "is the number you just gave me complete".
-//
-// Skips were previously counted into a local and logged at slog.Debug, below the
-// default level, so a day quietly losing lines was indistinguishable in production
-// from a clean one.
-func (w *Writer) SkippedLines() int64 { return w.skippedLines.Load() }
-
-// TruncatedDays is how many day files the MOST RECENT Query or Window ABANDONED
-// part-way through — an IO error, or a line past maxLineBytes that a scanner cannot
-// step over.
-//
-// Worse than a skipped line by an unknown amount: everything after that offset is
-// missing from the answer and the file gives no way to say how much. A non-zero value
-// means the total just returned is short, and a caller that reports a figure without
-// checking it is serving a truncated day as a complete one.
-//
-// Same gauge semantics as SkippedLines. NOT yet reflected in the /v1/usage response
-// shape — that is authlib/sessionapi's to add, and until it does, a client reading
-// only the JSON still cannot see this. Exported here so it is available rather than
-// discarded.
-func (w *Writer) TruncatedDays() int64 { return w.truncatedDays.Load() }
 
 // run is the ONLY goroutine that touches the filesystem after construction.
 //

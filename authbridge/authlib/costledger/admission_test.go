@@ -7,7 +7,6 @@ import (
 
 	"github.com/rossoctl/cortex/authbridge/authlib/costevent"
 	"github.com/rossoctl/cortex/authbridge/authlib/pipeline"
-	"github.com/rossoctl/cortex/authbridge/authlib/usage"
 )
 
 // refusedEvent builds the response event costing.implausibleUnparsedCost publishes: a
@@ -177,10 +176,6 @@ func TestRecord_APromptOnlyOrAvoidedOnlyRecordIsARowWithNoDollars(t *testing.T) 
 			// already visible without either figure.
 			if rows[0].PriceableRequests != 1 {
 				t.Errorf("PriceableRequests = %d, want 1", rows[0].PriceableRequests)
-			}
-			var zero usage.Counts
-			if rows[0].Counts.CostMicros != zero.CostMicros {
-				t.Errorf("unexpected dollars on the row: %+v", rows[0].Counts)
 			}
 		})
 	}

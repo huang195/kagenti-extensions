@@ -1327,7 +1327,7 @@ func TestRecord_ARowTimestampedInAnotherZoneIsStillFiledUnderTheLedgerDay(t *tes
 			"for that ledger day visits")
 	}
 	// The assertion that matters: a query for that ledger day finds it.
-	rows, err := w.Query(context.Background(), dayOf(evening), evening.Add(time.Hour))
+	rows, _, err := w.Query(context.Background(), dayOf(evening), evening.Add(time.Hour))
 	if err != nil {
 		t.Fatalf("Query: %v", err)
 	}
@@ -1379,11 +1379,11 @@ func TestQuery_WindowBoundsInAnotherZoneReadTheSameDayFiles(t *testing.T) {
 		}
 	}
 
-	local, err := w.Query(context.Background(), before, after)
+	local, _, err := w.Query(context.Background(), before, after)
 	if err != nil {
 		t.Fatalf("Query in the ledger zone: %v", err)
 	}
-	utc, err := w.Query(context.Background(), before.UTC(), after.UTC())
+	utc, _, err := w.Query(context.Background(), before.UTC(), after.UTC())
 	if err != nil {
 		t.Fatalf("Query in UTC: %v", err)
 	}

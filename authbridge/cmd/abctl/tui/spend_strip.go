@@ -15,6 +15,77 @@ const stripLabel = "SPEND"
 // same spacing the footer's status line uses between its own readings.
 const stripGap = "   "
 
+// partialMarker follows a dollar figure that covers only PART of the traffic it
+// appears to be about: something in the window was priceable and carries no figure, so
+// the real total is LARGER than the number shown.
+//
+// One display column, and it rides on the figure itself rather than in the words beside
+// it. That is the whole point: fitStripFigures may shorten a caveat to nothing and may
+// drop a whole figure, but while a figure is on screen its marker is on screen with it,
+// so a partial total can never be published as a complete one. It reads as "and more",
+// which is what a coverage gap means for a total.
+const partialMarker = "+"
+
+// stripFigure is one reading in the strip, in the two forms it can take.
+//
+// full spells the caveat out; compact keeps the figure and its marker and drops only
+// the words. Both forms of a qualified figure carry the marker — see partialMarker —
+// so degradation costs an explanation and never the fact.
+//
+// Two forms rather than a general shortener because the strip has exactly one thing to
+// give up under width pressure, and the fitter's job is to choose between whole
+// readings, not to edit them.
+type stripFigure struct {
+	full    string
+	compact string
+}
+
+// plainFigure is a reading with nothing to qualify: both forms are the same string.
+func plainFigure(s string) stripFigure { return stripFigure{full: s, compact: s} }
+
+// plainFigures lifts the fixed strings the non-figure branches render ("cost
+// unavailable", "[u] usage") into the fitter's type. None of them can be partial, so
+// none of them degrades.
+func plainFigures(ss ...string) []stripFigure {
+	out := make([]stripFigure, 0, len(ss))
+	for _, s := range ss {
+		out = append(out, plainFigure(s))
+	}
+	return out
+}
+
+// coverageNote is the one spelling of a coverage gap, shared by every branch so the
+// wording cannot drift between them.
+func coverageNote(unpriced, priceable int64) string {
+	return fmt.Sprintf("%d of %d unpriced", unpriced, priceable)
+}
+
+// moneyFigure builds one dollar reading together with the caveats that belong to IT.
+//
+// label is the figure's own suffix — "today", "/1h" — and it is why this takes one at
+// all: the coverage note used to ride at the END of the line, describing the rolling
+// window, while the today figure sat at the front as the headline. "SPEND $4.1700
+// today  $1.1200 /1h  40 of 40 unpriced" reads as qualifying the day and describes the
+// hour. A caveat attached to its own figure cannot be misread that way, and a figure
+// with no caveat of its own now says so by carrying no marker.
+//
+// Exactness is not this function's business yet; coverage is. Both caveats end up in
+// one parenthetical when both apply.
+func moneyFigure(usd float64, label string, unpriced, priceable int64) stripFigure {
+	amount := formatUSDCell(usd)
+	// A gap is only readable with a denominator, and a denominator of zero is not a
+	// gap at all — it is a window with nothing to price, which the caller handles.
+	partial := unpriced > 0 && priceable > 0
+	if partial {
+		amount += partialMarker
+	}
+	fig := plainFigure(amount + " " + label)
+	if partial {
+		fig.full = fig.compact + " (" + coverageNote(unpriced, priceable) + ")"
+	}
+	return fig
+}
+
 // renderSpendStrip draws the always-on spend line.
 //
 // A pure function of its arguments so it can be table-tested at many widths,
@@ -33,11 +104,14 @@ const stripGap = "   "
 //  1. No poll has answered yet (!HasSnapshot). "We have not looked" is honest and
 //     self-corrects within one poll interval.
 //  2. The terminal is too narrow for even one WHOLE figure. That threshold is the
-//     width of the widest SINGLE figure and nothing more, because fitStripFigures
-//     drops the LABEL before it drops a number: "$1.1200 /1h" is 11 columns and
-//     renders bare from width 11 up, so "" appears only at 10 or below. (This note
-//     said "about 18" — label plus figure — which was right before the label-drop
-//     fallback below existed and has been wrong by 7 since.) Accepted rather than
+//     width of the FIRST figure's most compact form and nothing more, because
+//     fitStripFigures drops the LABEL, and then the caveat's words, before it drops a
+//     number: "$1.1200 /1h" is 11 columns and renders bare from width 11 up, so ""
+//     appears only at 10 or below. A figure carrying a marker is one column wider than
+//     the same figure without one, which moves that threshold by exactly one — the
+//     marker is never what gets dropped. (This note said "about 18" — label plus figure
+//     — which was right before the label-drop fallback below existed and has been wrong
+//     by 7 since.) Accepted rather than
 //     fixed: at that width there is no honest short form, and clipping a number is
 //     forbidden. The row stays reserved, because making the reservation depend on
 //     the rendered result would mean re-running layout() outside WindowSizeMsg and
@@ -67,7 +141,7 @@ func renderSpendStrip(s spendSummary, width int) string {
 	// alone, so returning "" for a persistently failing endpoint buys a permanent
 	// blank line above the footer and no diagnostic anywhere on screen.
 	if s.Failed {
-		return fitStripFigures(stripLabel, []string{"cost unavailable", "[u] usage"}, width)
+		return fitStripFigures(stripLabel, plainFigures("cost unavailable", "[u] usage"), width)
 	}
 
 	// Nothing was priced: say so rather than assert a zero. usage_render.go
@@ -75,11 +149,14 @@ func renderSpendStrip(s spendSummary, width int) string {
 	// answers, and only one of them means the traffic was free.
 	if !s.Priced && !s.HasToday {
 		if s.Priceable > 0 {
-			return fitStripFigures(stripLabel, []string{
+			// No label on the coverage note here, unlike the figures path below: there is
+			// exactly one reading on this line and it is the window's, so there is no second
+			// figure the note could be read as qualifying.
+			return fitStripFigures(stripLabel, plainFigures(
 				"cost unavailable",
-				fmt.Sprintf("%d of %d unpriced", s.Unpriced, s.Priceable),
+				coverageNote(s.Unpriced, s.Priceable),
 				"[u] usage",
-			}, width)
+			), width)
 		}
 		// Priceable == 0 WITH a snapshot in hand is a finding, not an absence: we
 		// looked, and there was no inference traffic to price. Say so. An always-on
@@ -87,7 +164,7 @@ func renderSpendStrip(s spendSummary, width int) string {
 		// reserved on height alone the alternative is a blank line above the footer,
 		// which reads as a broken UI rather than as an absence of data.
 		if s.HasSnapshot {
-			return fitStripFigures(stripLabel, []string{"no priceable traffic yet"}, width)
+			return fitStripFigures(stripLabel, plainFigures("no priceable traffic yet"), width)
 		}
 		// No poll has answered yet. THIS silence is honest: it says "we have not
 		// looked", which is true, brief, and self-correcting within one poll
@@ -96,11 +173,16 @@ func renderSpendStrip(s spendSummary, width int) string {
 	}
 
 	// Ordered most to least important; the tail is what a narrow terminal loses.
-	var figures []string
+	//
+	// EVERY FIGURE CARRIES ITS OWN CAVEAT. A caveat built from one window's counters
+	// and rendered beside another window's figure is not a warning, it is a
+	// misattribution — and the figure it silently vouched for was "today", the headline
+	// of this branch and the one the ledger is most likely to leave partial.
+	var figures []stripFigure
 	if s.HasToday {
 		// Today outranks the rolling window when it exists: it is the figure an
 		// operator is accountable for, and the window is context for it.
-		figures = append(figures, formatUSDCell(s.TodayUSD)+" today")
+		figures = append(figures, moneyFigure(s.TodayUSD, "today", s.TodayUnpriced, s.TodayPriceable))
 	}
 	// Guarded on Priced independently of the branch above, which lets !Priced
 	// through whenever HasToday is set. Without this guard that combination — a
@@ -112,20 +194,24 @@ func renderSpendStrip(s spendSummary, width int) string {
 	// chain, so a fresh session can hold a priced day total beside a rolling hour that
 	// has priced nothing yet. The guard is what makes that state render honestly.
 	if s.Priced {
-		figures = append(figures, formatUSDCell(s.WindowUSD)+" /"+s.WindowLabel)
+		figures = append(figures, moneyFigure(s.WindowUSD, "/"+s.WindowLabel, s.Unpriced, s.Priceable))
+	} else if s.Unpriced > 0 && s.Priceable > 0 {
+		// The window figure is suppressed because nothing in the window was priced, so
+		// its coverage gap has no figure to ride on. It still has to be stated — this is
+		// the reachable state where a ledger-backed day sits beside a rolling hour that
+		// priced nothing — and it is stated WEARING THE WINDOW'S LABEL, so it cannot be
+		// read as qualifying the today figure to its left. That misreading is exactly
+		// what the unlabelled tail note used to produce.
+		figures = append(figures, plainFigure(coverageNote(s.Unpriced, s.Priceable)+" /"+s.WindowLabel))
 	}
 	if s.BurnPerMin > 0 {
-		figures = append(figures, "~"+formatUSDCell(s.BurnPerMin)+"/min")
+		// The leading "~" is the same one-cell claim inexactness makes elsewhere: this is
+		// not an exact figure. A rate derived from a partial or inexact window total is
+		// itself a lower bound, and the marker already says so, so it takes no second one.
+		figures = append(figures, plainFigure("~"+formatUSDCell(s.BurnPerMin)+"/min"))
 	}
 	if s.HasSaved {
-		figures = append(figures, "saved "+formatUSDCell(s.SavedUSD))
-	}
-	// The coverage gap rides at the end: it qualifies the total, so it is the
-	// first thing a narrow terminal gives up — but a fully priced deployment must
-	// never carry it, because a permanent warning with nothing to act on is what
-	// teaches an operator to ignore the one signal that matters.
-	if s.Unpriced > 0 && s.Priceable > 0 {
-		figures = append(figures, fmt.Sprintf("%d of %d unpriced", s.Unpriced, s.Priceable))
+		figures = append(figures, plainFigure("saved "+formatUSDCell(s.SavedUSD)))
 	}
 	return fitStripFigures(stripLabel, figures, width)
 }
@@ -133,6 +219,13 @@ func renderSpendStrip(s spendSummary, width int) string {
 // fitStripFigures joins as many LEADING figures as fit, dropping whole ones from
 // the right. Returns "" when even the first figure cannot fit without clipping,
 // because a clipped figure is a wrong figure.
+//
+// Two degradation steps per prefix length, in this order: every figure spelled out,
+// then every figure compact. So the line gives up its EXPLANATIONS before it gives up a
+// READING, and it gives up a reading before it clips anything. The compact form still
+// carries each figure's marker, so no step of this can turn a partial total into one
+// that looks complete — the worst outcome available on this line, and the one the old
+// tail-mounted coverage note produced whenever it was the thing that got dropped.
 //
 // Width arithmetic is lipgloss.Width throughout, never len() and never a rune
 // count. footer.go:88-92 records the bug that costs: a budget computed in display
@@ -143,21 +236,35 @@ func renderSpendStrip(s spendSummary, width int) string {
 //
 // Linear rather than a binary search over n: the list is at most five figures
 // long, and the loop is the specification — "the widest prefix that fits".
-func fitStripFigures(label string, figures []string, width int) string {
+func fitStripFigures(label string, figures []stripFigure, width int) string {
 	if len(figures) == 0 {
 		return ""
 	}
+	join := func(n int, compact bool) string {
+		parts := make([]string, 0, n)
+		for _, f := range figures[:n] {
+			if compact {
+				parts = append(parts, f.compact)
+			} else {
+				parts = append(parts, f.full)
+			}
+		}
+		return label + "  " + strings.Join(parts, stripGap)
+	}
 	for n := len(figures); n >= 1; n-- {
-		candidate := label + "  " + strings.Join(figures[:n], stripGap)
-		if lipgloss.Width(candidate) <= width {
-			return candidate
+		for _, compact := range []bool{false, true} {
+			if candidate := join(n, compact); lipgloss.Width(candidate) <= width {
+				return candidate
+			}
 		}
 	}
 	// The label does not fit alongside even one figure. Drop the LABEL before
 	// dropping the number: the figure is the information, the label is decoration,
 	// and a dollar amount on its own is still unambiguous in the chrome.
-	if lipgloss.Width(figures[0]) <= width {
-		return figures[0]
+	for _, only := range []string{figures[0].full, figures[0].compact} {
+		if lipgloss.Width(only) <= width {
+			return only
+		}
 	}
 	return ""
 }

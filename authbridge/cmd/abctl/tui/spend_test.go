@@ -460,6 +460,90 @@ func TestSpendSummary_LedgerBackedTodayBecomesTheHeadline(t *testing.T) {
 	}
 }
 
+// The today figure's OWN coverage, which applyTodayFigure used to throw away.
+//
+// The fixture is the shape every "today" fixture in this file lacked: PricedRequests
+// != PriceableRequests. With the counters discarded, this day — one priced request out
+// of four hundred, a total of unknown magnitude and certainly far larger — reached the
+// strip as a bare "$0.0031 today" with no gap marker anywhere on the line, because the
+// only coverage note the strip built came from the 1h ring snapshot.
+func TestSpendSummary_TodayCarriesItsOwnCoverageGap(t *testing.T) {
+	m := &model{}
+	m.spend.todaySnap = &usage.Snapshot{
+		Window: usage.WindowToday,
+		Totals: usage.Counts{
+			Requests: 400, CostMicros: 3_100,
+			PricedRequests: 1, PriceableRequests: 400,
+		},
+		Priced: true,
+	}
+
+	got := m.spendSummary()
+
+	if !got.HasToday || got.TodayUSD != 0.0031 {
+		t.Fatalf("today figure lost: HasToday=%v TodayUSD=%v", got.HasToday, got.TodayUSD)
+	}
+	if got.TodayPriceable != 400 {
+		t.Errorf("TodayPriceable = %d, want 400 — without the denominator the gap is unreadable", got.TodayPriceable)
+	}
+	if got.TodayUnpriced != 399 {
+		t.Errorf("TodayUnpriced = %d, want 399 (priceable minus priced)", got.TodayUnpriced)
+	}
+}
+
+// A fully priced day must carry NO gap, for the reason a fully priced window carries
+// none: a permanent warning with nothing to act on is what teaches an operator to
+// ignore the one signal that matters.
+func TestSpendSummary_FullyPricedTodayCarriesNoGap(t *testing.T) {
+	m := &model{}
+	m.spend.todaySnap = &usage.Snapshot{
+		Window: usage.WindowToday,
+		Totals: usage.Counts{
+			Requests: 318, CostMicros: 4_170_000,
+			PricedRequests: 318, PriceableRequests: 318,
+		},
+		Priced: true,
+	}
+
+	if got := m.spendSummary(); got.TodayUnpriced != 0 {
+		t.Errorf("TodayUnpriced = %d for a fully priced day, want 0", got.TodayUnpriced)
+	}
+}
+
+// The two windows' coverage counters must not be copied into each other. This is the
+// second verified misread at the data layer: the day was complete and the HOUR had the
+// gap, and one shared set of counters is how the day ended up wearing the hour's
+// warning.
+func TestSpendSummary_TodayCoverageIsNotTheWindowsCoverage(t *testing.T) {
+	m := &model{}
+	m.spend.snap = &usage.Snapshot{
+		Window: "1h",
+		Totals: usage.Counts{Requests: 40, PriceableRequests: 40, PricedRequests: 0},
+		Priced: false,
+	}
+	m.spend.todaySnap = &usage.Snapshot{
+		Window: usage.WindowToday,
+		Totals: usage.Counts{
+			Requests: 318, CostMicros: 4_170_000,
+			PricedRequests: 318, PriceableRequests: 318,
+		},
+		Priced: true,
+	}
+
+	got := m.spendSummary()
+
+	if got.Unpriced != 40 || got.Priceable != 40 {
+		t.Fatalf("the window's own gap was lost: Unpriced=%d Priceable=%d", got.Unpriced, got.Priceable)
+	}
+	if got.TodayUnpriced != 0 {
+		t.Errorf("TodayUnpriced = %d — the hour's 40-request gap leaked onto the day, which is complete",
+			got.TodayUnpriced)
+	}
+	if got.TodayPriceable != 318 {
+		t.Errorf("TodayPriceable = %d, want the DAY's 318, not the hour's 40", got.TodayPriceable)
+	}
+}
+
 // THE case where the honest answer is to show less. A proxy with no durable cost
 // ledger — Kubernetes by design — answers window=today from the ring's maximum span
 // and reports THAT span. Trusting the request rather than the answer would label a

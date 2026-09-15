@@ -186,6 +186,26 @@ type spendSummary struct {
 	// ledger, or the window priced nothing).
 	TodayUSD float64
 	HasToday bool
+
+	// TodayUnpriced and TodayPriceable are the TODAY figure's OWN coverage counters,
+	// and they are the reason the fields above are not enough.
+	//
+	// Unpriced/Priceable come from the 1h ring snapshot and describe the HOUR. While
+	// the today figure had no counters of its own, the strip's only coverage note was
+	// built from those two and rendered at the end of the line — so a ledger day with
+	// one priced request out of four hundred printed "$0.0031 today" with no marker at
+	// all, and a fully-priced day beside a gappy hour printed "$4.1700 today  $1.1200
+	// /1h  40 of 40 unpriced", where the warning reads as qualifying the DAY and
+	// describes the HOUR. Both are the same defect: a figure wearing another figure's
+	// caveat, or none.
+	//
+	// Populated on the ledger path — the ledger's Row embeds usage.Counts and Fold sums
+	// them — and /v1/usage's own godoc says the ledger leaves MORE requests
+	// priceable-but-unpriced than the ring does, which makes "today" the figure MORE
+	// likely to be partial and, until now, the only one with no indicator.
+	TodayUnpriced  int64
+	TodayPriceable int64
+
 	SavedUSD float64 // set once tool-prune savings are aggregated
 	HasSaved bool
 }
@@ -433,6 +453,12 @@ func (m *model) fetchSpend() tea.Cmd {
 // admitted here would print "$0.0000 today" — a settled zero for a cost nobody
 // knows, the one thing the strip is forbidden to do. Guarded here rather than there
 // because the renderer already handles both fields and this commit is data-only.
+//
+// The day's own COVERAGE counters come out with the figure, and they are not optional
+// decoration. This read CostMicros and threw PriceableRequests away, so a day the
+// ledger could price one request of four hundred rendered as a complete total: the
+// headline figure of this whole branch, published as exact, with the only gap marker on
+// screen built from a different window's numbers. See spendSummary.TodayUnpriced.
 func (m *model) applyTodayFigure(out *spendSummary) {
 	snap := m.spend.todaySnap
 	if snap == nil || m.spend.todayErr != nil {
@@ -446,6 +472,13 @@ func (m *model) applyTodayFigure(out *spendSummary) {
 	}
 	out.TodayUSD = float64(snap.Totals.CostMicros) / 1e6
 	out.HasToday = true
+	// Priceable minus priced, for the reason the window figure's gap is computed that
+	// way: Requests counts traffic that could never carry a price, so it never reaches
+	// parity and would leave a correct deployment reading a permanent warning.
+	out.TodayPriceable = snap.Totals.PriceableRequests
+	if gap := snap.Totals.PriceableRequests - snap.Totals.PricedRequests; gap > 0 {
+		out.TodayUnpriced = gap
+	}
 }
 
 // spendTodayTickIsCurrent reports whether a today tick belongs to the live chain.

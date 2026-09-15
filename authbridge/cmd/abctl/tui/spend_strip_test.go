@@ -599,6 +599,178 @@ func TestRenderSpendStrip_TodayWithAnUnpricedWindowStatesNoWindowZero(t *testing
 	}
 }
 
+// THE critical finding: a partial day published as a complete total.
+//
+// One priced request out of four hundred. The dollar figure is real and the day's real
+// cost is unknown and far larger, and the strip printed "$0.0031 today" with no marker
+// anywhere on the line — the branch's headline figure, presented as settled. Asserted at
+// EVERY width, because the marker's whole justification is that it is one column and so
+// cannot be squeezed out: wherever the figure appears, the fact that it is partial
+// appears with it.
+func TestRenderSpendStrip_APartialTodayIsNeverPublishedAsComplete(t *testing.T) {
+	s := spendSummary{
+		TodayUSD: 0.0031, HasToday: true, TodayUnpriced: 399, TodayPriceable: 400,
+		WindowUSD: 1.12, WindowLabel: "1h", BurnPerMin: 0.0187, Priced: true,
+		HasSnapshot: true, Priceable: 400,
+	}
+	for w := 1; w <= 200; w++ {
+		got := renderSpendStrip(s, w)
+		if !strings.Contains(got, "$0.0031") {
+			// Dropped whole, which is the honest degradation. It is the figure appearing
+			// UNQUALIFIED that is forbidden.
+			continue
+		}
+		if !strings.Contains(got, "$0.0031"+partialMarker) {
+			t.Fatalf("width %d: %q states today's partial total as a complete one", w, got)
+		}
+	}
+	// Where there is room, the caveat is spelled out — and in TODAY's own numbers, not
+	// the hour's.
+	wide := renderSpendStrip(s, 200)
+	if !strings.Contains(wide, "399 of 400 unpriced") {
+		t.Errorf("wide strip %q does not disclose the day's own coverage gap", wide)
+	}
+}
+
+// The second verified misread, at the renderer: "SPEND $4.1700 today  $1.1200 /1h
+// 40 of 40 unpriced" — a warning that reads as qualifying the DAY and describes the
+// HOUR. Here the day is complete and the hour has the gap, so the day must carry no
+// marker and the gap must be attached to the figure it is about.
+func TestRenderSpendStrip_TheHoursGapDoesNotQualifyTheDay(t *testing.T) {
+	s := spendSummary{
+		TodayUSD: 4.17, HasToday: true, TodayUnpriced: 0, TodayPriceable: 318,
+		WindowUSD: 1.12, WindowLabel: "1h", Priced: true,
+		HasSnapshot: true, Unpriced: 40, Priceable: 40,
+	}
+	got := renderSpendStrip(s, 200)
+
+	if !strings.Contains(got, "$4.1700 today") {
+		t.Errorf("strip %q does not state the day's complete total plainly", got)
+	}
+	if strings.Contains(got, "$4.1700"+partialMarker) {
+		t.Errorf("strip %q marks a fully priced day as partial", got)
+	}
+	if !strings.Contains(got, "$1.1200"+partialMarker+" /1h (40 of 40 unpriced)") {
+		t.Errorf("strip %q does not attach the hour's gap to the hour's own figure", got)
+	}
+	// And the old shape must be gone: an unlabelled coverage note at the end of the line
+	// is the misattribution itself.
+	if strings.HasSuffix(got, "40 of 40 unpriced") {
+		t.Errorf("strip %q still trails an unlabelled coverage note after the day's figure", got)
+	}
+}
+
+// A window that priced NOTHING has no figure for its gap to ride on, and the gap still
+// has to be stated. It wears the window's label, so it cannot be read as qualifying the
+// today figure beside it.
+func TestRenderSpendStrip_ASuppressedWindowsGapWearsTheWindowsLabel(t *testing.T) {
+	s := spendSummary{
+		TodayUSD: 4.17, HasToday: true, TodayPriceable: 318,
+		WindowLabel: "1h", Priced: false,
+		HasSnapshot: true, Unpriced: 40, Priceable: 40,
+	}
+	got := renderSpendStrip(s, 200)
+
+	if !strings.Contains(got, "40 of 40 unpriced /1h") {
+		t.Errorf("strip %q does not name the window the 40-request gap belongs to", got)
+	}
+	if strings.Contains(got, "$4.1700"+partialMarker) {
+		t.Errorf("strip %q marked the day partial from the HOUR's gap", got)
+	}
+}
+
+// The width matrix, with both caveats live. The strip's contract is one line, never
+// wider than its budget, and no clipped number — and a caveat is the newest thing that
+// can break it. The CJK label is two display columns per rune and one rune, so any
+// len()- or rune-based arithmetic in the caveat path renders wider than it claims.
+func TestRenderSpendStrip_CaveatsObeyTheWidthContract(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		s    spendSummary
+	}{
+		{"partial day and partial hour", spendSummary{
+			TodayUSD: 0.0031, HasToday: true, TodayUnpriced: 399, TodayPriceable: 400,
+			WindowUSD: 1.12, WindowLabel: "1h", BurnPerMin: 0.0187, Priced: true,
+			HasSnapshot: true, Unpriced: 12, Priceable: 318,
+			SavedUSD: 0.24, HasSaved: true,
+		}},
+		{"cjk window label under a partial day", spendSummary{
+			TodayUSD: 0.0031, HasToday: true, TodayUnpriced: 399, TodayPriceable: 400,
+			WindowUSD: 1.12, WindowLabel: "過去一時間", BurnPerMin: 0.0187, Priced: true,
+			HasSnapshot: true, Unpriced: 12, Priceable: 318,
+		}},
+		{"suppressed window whose gap wears a cjk label", spendSummary{
+			TodayUSD: 4.17, HasToday: true, TodayUnpriced: 2, TodayPriceable: 318,
+			WindowLabel: "過去一時間", Priced: false,
+			HasSnapshot: true, Unpriced: 40, Priceable: 40,
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			for _, w := range []int{40, 60, 80, 96, 120, 200} {
+				assertStripFits(t, tc.s, w)
+			}
+			// Every width from 1 up, because the interesting failures are at the seams
+			// where a form stops fitting.
+			for w := 1; w <= 200; w++ {
+				assertStripFits(t, tc.s, w)
+			}
+		})
+	}
+}
+
+// assertStripFits is the strip's whole contract in one place: one line, inside the
+// budget, and no half-rendered dollar amount.
+func assertStripFits(t *testing.T, s spendSummary, w int) {
+	t.Helper()
+	got := renderSpendStrip(s, w)
+	if gw := lipgloss.Width(got); gw > w {
+		t.Fatalf("width %d: rendered %d columns: %q", w, gw, got)
+	}
+	if strings.Contains(got, "\n") {
+		t.Fatalf("width %d: strip contains a newline and costs the table a row: %q", w, got)
+	}
+	// A dollar sign that is not followed by a whole four-decimal figure is a clipped
+	// amount. formatUSDCell is the only producer of a "$" on this line.
+	for _, tail := range []string{"$", "$0", "$0.", "$0.0"} {
+		if strings.HasSuffix(got, tail) {
+			t.Fatalf("width %d: %q ends mid-figure", w, got)
+		}
+	}
+}
+
+// A newline in the server's window label, with a caveat live beside it. The label is
+// sanitised in spendSummary, and this is the assertion that the caveats did not open a
+// second path for a wire string to reach the terminal unmeasured: lipgloss.Width
+// measures the WIDEST LINE, so a two-line result passes a budget check and silently
+// steals a row from the table below.
+func TestSpendSummary_CaveatsSurviveANewlineBearingWindowLabel(t *testing.T) {
+	m := &model{}
+	m.spend.snap = &usage.Snapshot{
+		Window: "1h\nEVIL",
+		Totals: usage.Counts{
+			Requests: 318, CostMicros: 1_120_000,
+			PricedRequests: 306, PriceableRequests: 318,
+		},
+		Priced: true,
+	}
+	m.spend.todaySnap = &usage.Snapshot{
+		Window: usage.WindowToday,
+		Totals: usage.Counts{
+			Requests: 400, CostMicros: 3_100,
+			PricedRequests: 1, PriceableRequests: 400,
+		},
+		Priced: true,
+	}
+
+	s := m.spendSummary()
+	for _, w := range []int{40, 60, 80, 96, 120, 200} {
+		assertStripFits(t, s, w)
+	}
+	for w := 1; w <= 200; w++ {
+		assertStripFits(t, s, w)
+	}
+}
+
 // The mirror of the above: a PRICED window keeps its figure when today is present.
 // Without this the guard could be "fixed" by dropping the window figure whenever
 // HasToday is set, which would silently delete a correct reading.

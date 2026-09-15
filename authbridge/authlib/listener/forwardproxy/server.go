@@ -381,6 +381,7 @@ func (s *Server) serveOutbound(w http.ResponseWriter, r *http.Request, isBridge 
 			Host:        pctx.Host,
 			HTTPMethod:  pctx.Method,
 			HTTPPath:    pctx.Path,
+			Client:      pctx.ClientInfo(),
 		}
 		// Record EVERY message that reaches the pipeline — even when no
 		// plugin acted and no parser matched (Invocations/MCP/Inference all
@@ -887,6 +888,7 @@ func (s *Server) recordOutboundResponseEvent(pctx *pipeline.Context, statusCode 
 		StatusCode:  statusCode,
 		Error:       pipeline.DeriveError(pctx),
 		Duration:    pipeline.DurationSince(pctx.StartedAt),
+		Client:      pctx.ClientInfo(),
 	}
 	// Always record — see the request-phase comment. This is what surfaces
 	// responses no plugin acted on (e.g. a generic 404), carrying StatusCode
@@ -1197,6 +1199,7 @@ func (s *Server) recordOutboundReject(pctx *pipeline.Context, action pipeline.Ac
 			Code:    code,
 			Message: message,
 		},
+		Client: pctx.ClientInfo(),
 	}
 	s.Sessions.Append(sid, ev)
 }

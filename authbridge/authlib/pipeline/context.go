@@ -130,6 +130,20 @@ type Context struct {
 	// requestid.go for why it is lazy rather than a constructor argument.
 	requestID string
 
+	// client and clientParsed memoize ClientInfo's answer.
+	//
+	// A separate flag rather than a nil check on client, because nil IS a valid
+	// answer — a request with no User-Agent — and a nil-guard memo would re-parse
+	// on every call for precisely those requests. Each turn calls this at least
+	// twice, once per session event, on the request path.
+	//
+	// Unexported so this stays ONE resolution with one owner. A plugin that could
+	// write it could re-file another program's spend under a name of its choosing,
+	// and a listener that could write it would be a second source of a truth the
+	// context already holds in Headers.
+	client       *EventClient
+	clientParsed bool
+
 	Agent    *AgentIdentity
 	Identity Identity // nil before an auth plugin runs
 
@@ -265,6 +279,49 @@ type Context struct {
 	// call hits a WARN log and early-returns rather than
 	// double-releasing every Finisher's state.
 	finished bool
+}
+
+// ClientInfo returns the calling coding agent, parsed from this request's
+// User-Agent and memoized.
+//
+// CLIENT-ASSERTED AND TRIVIALLY SPOOFABLE — an observability and cost-attribution
+// key, never an authorization subject. See EventClient, and note that this is NOT
+// Identity: that field is the authenticated principal, this one is a self-reported
+// software label.
+//
+// Nil means no User-Agent was sent. Callers do not nil-check: EventClient.Label()
+// is nil-safe and answers "unknown".
+//
+// Resolved HERE — once, on the context — rather than assigned by each listener or
+// re-derived by each consumer. That follows the same doctrine Session states: the
+// value is resolved in one place and never re-derived downstream, because two
+// derivations of one fact are how the two drift apart. Session needs a listener to
+// assign it since it comes from a store lookup; this one does not, because Context
+// already carries the request headers, so an assignment would be a second source
+// of a truth already present. It is also stronger than an assignment for the
+// failure that actually happens: a listener-populated field can be forgotten at
+// one of several context-construction sites and serialize a clean empty value,
+// whereas an accessor over Headers cannot be.
+//
+// NOT goroutine-safe, and that is correct: a Context belongs to one request and
+// the pipeline runs its phases sequentially. Said explicitly because the
+// surrounding type does have fields other goroutines read.
+//
+// A nil Headers map is fine and answers nil. A nil RECEIVER panics, unlike
+// PeerCertificate above, and that difference is deliberate rather than an
+// oversight: this mutates the memo, so it cannot be a no-op on nil, and every
+// caller is an event-construction site that already dereferences pctx for Host and
+// Method on adjacent lines. A guard here would convert a programming error into a
+// silently unattributed event instead of a stack trace.
+func (c *Context) ClientInfo() *EventClient {
+	if c.clientParsed {
+		return c.client
+	}
+	c.clientParsed = true
+	if c.Headers != nil {
+		c.client = ParseUserAgent(c.Headers.Get("User-Agent"))
+	}
+	return c.client
 }
 
 // PeerCertificate returns the verified peer leaf certificate from

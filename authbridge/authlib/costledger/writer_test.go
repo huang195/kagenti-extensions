@@ -797,3 +797,119 @@ func TestWriter_PruneDropsOldDaysAndSparesUnknownNames(t *testing.T) {
 		t.Errorf("an undatable file was deleted: %v", serr)
 	}
 }
+
+func TestWriter_RecordsTheAgentLabel(t *testing.T) {
+	dir := t.TempDir()
+	now := at
+	w := newTestWriter(t, dir, func() time.Time { return now })
+
+	e := costedEvent(t, "gw", "m", 0.25, 100, 50)
+	e.Client = &pipeline.EventClient{Name: "claude-code", Version: "2.1.14"}
+	w.Record("s1", e)
+
+	now = at.Add(time.Minute)
+	w.Flush()
+
+	rows := readAllRows(t, dir)
+	if len(rows) != 1 {
+		t.Fatalf("got %d rows, want 1", len(rows))
+	}
+	if rows[0].Agent != "claude-code/2.1.14" {
+		t.Errorf("Agent = %q, want claude-code/2.1.14", rows[0].Agent)
+	}
+}
+
+func TestWriter_TwoAgentsInOneMinuteAreTwoRows(t *testing.T) {
+	// The agent is part of the composite key, so two agents on the same endpoint
+	// and model must not be merged into one row.
+	dir := t.TempDir()
+	now := at
+	w := newTestWriter(t, dir, func() time.Time { return now })
+
+	a := costedEvent(t, "gw", "m", 0.25, 100, 50)
+	a.Client = &pipeline.EventClient{Name: "claude-code", Version: "2.1.14"}
+	b := costedEvent(t, "gw", "m", 0.25, 100, 50)
+	b.Client = &pipeline.EventClient{Name: "opencode", Version: "0.4.2"}
+	w.Record("s1", a)
+	w.Record("s1", b)
+
+	now = at.Add(time.Minute)
+	w.Flush()
+
+	if rows := readAllRows(t, dir); len(rows) != 2 {
+		t.Fatalf("got %d rows, want 2 — one per agent", len(rows))
+	}
+}
+
+func TestWriter_NoClientStillWritesTheRow(t *testing.T) {
+	// Dropping unattributed traffic would make the ledger's totals disagree with
+	// /v1/usage's, which is worse than an empty column.
+	dir := t.TempDir()
+	now := at
+	w := newTestWriter(t, dir, func() time.Time { return now })
+
+	e := costedEvent(t, "gw", "m", 0.25, 100, 50)
+	e.Client = nil
+	w.Record("s1", e)
+
+	now = at.Add(time.Minute)
+	w.Flush()
+
+	rows := readAllRows(t, dir)
+	if len(rows) != 1 {
+		t.Fatalf("got %d rows, want 1", len(rows))
+	}
+	if rows[0].CostMicros != 250_000 {
+		t.Errorf("CostMicros = %d, want the cost still recorded", rows[0].CostMicros)
+	}
+}
+
+// TestWriter_AbsentClientStoresTheEmptyString pins the STORAGE representation, which
+// deliberately differs from the aggregator's display one.
+//
+// The ledger is a durable file: writing the literal "unknown" into it would destroy
+// the distinction between "no agent was recorded" and "an agent reported itself as
+// unknown", permanently and for every future reader. Storing "" keeps the row
+// lossless, and omitempty keeps it out of the file entirely. labelFor is where "" is
+// mapped to the display bucket, so the two sources still AGREE about what a client
+// sees — see labelFor.
+func TestWriter_AbsentClientStoresTheEmptyString(t *testing.T) {
+	dir := t.TempDir()
+	now := at
+	w := newTestWriter(t, dir, func() time.Time { return now })
+
+	e := costedEvent(t, "gw", "m", 0.25, 100, 50)
+	e.Client = nil
+	w.Record("s1", e)
+
+	now = at.Add(time.Minute)
+	w.Flush()
+
+	if rows := readAllRows(t, dir); rows[0].Agent != "" {
+		t.Errorf("Agent = %q, want the empty string: the ledger stores absence losslessly", rows[0].Agent)
+	}
+	// omitempty: the key must not appear at all, so an absent agent costs no bytes.
+	if bytesContains(readAllBytes(t, dir), `"agent"`) {
+		t.Error(`an absent agent serialized an "agent" key`)
+	}
+}
+
+// TestWriter_UnrecognisedAgentStoresItsRawLabel is the reason Raw exists. A coding
+// agent this parser does not know must still be nameable in the durable history,
+// otherwise the day someone runs a new one is a day of spend attributed to nothing.
+func TestWriter_UnrecognisedAgentStoresItsRawLabel(t *testing.T) {
+	dir := t.TempDir()
+	now := at
+	w := newTestWriter(t, dir, func() time.Time { return now })
+
+	e := costedEvent(t, "gw", "m", 0.25, 100, 50)
+	e.Client = pipeline.ParseUserAgent("SomeNewAgent/9.9")
+	w.Record("s1", e)
+
+	now = at.Add(time.Minute)
+	w.Flush()
+
+	if rows := readAllRows(t, dir); rows[0].Agent != "SomeNewAgent/9.9" {
+		t.Errorf("Agent = %q, want the raw UA", rows[0].Agent)
+	}
+}

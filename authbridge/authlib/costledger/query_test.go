@@ -8,6 +8,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/rossoctl/cortex/authbridge/authlib/pipeline"
 	"github.com/rossoctl/cortex/authbridge/authlib/usage"
 )
 
@@ -509,5 +510,102 @@ func TestFold_GroupingsTheLedgerCannotAnswerReturnNoSeries(t *testing.T) {
 		if totals.CostMicros != 10 {
 			t.Errorf("group=%s totals.CostMicros = %d, want 10", g, totals.CostMicros)
 		}
+	}
+}
+
+// TestFold_GroupAgentBreaksDownByAgent covers labelFor's usage.GroupAgent arm, which
+// the ledger shipped without because the constant did not exist yet.
+func TestFold_GroupAgentBreaksDownByAgent(t *testing.T) {
+	rows := []Row{
+		{Endpoint: "gw", Model: "m", Agent: "claude-code/2.1.14",
+			Counts: usage.Counts{Requests: 1, CostMicros: 100, InputTokens: 10}},
+		{Endpoint: "gw", Model: "m", Agent: "opencode/0.4.2",
+			Counts: usage.Counts{Requests: 1, CostMicros: 200, InputTokens: 20}},
+	}
+
+	totals, series := Fold(rows, usage.GroupAgent)
+
+	if totals.CostMicros != 300 {
+		t.Errorf("totals.CostMicros = %d, want 300", totals.CostMicros)
+	}
+	if got := series["claude-code/2.1.14"].CostMicros; got != 100 {
+		t.Errorf("claude-code CostMicros = %d, want 100", got)
+	}
+	if got := series["opencode/0.4.2"].CostMicros; got != 200 {
+		t.Errorf("opencode CostMicros = %d, want 200", got)
+	}
+}
+
+// TestFold_GroupAgentMapsAbsenceToUnknown is the consistency guarantee between the
+// ledger and the live aggregator.
+//
+// The two differ in REPRESENTATION on purpose — the ledger stores "" so the durable
+// file stays lossless, the aggregator's series keys are display strings — but they
+// must not differ in what a client SEES for the same traffic. Mapping "" to the same
+// reserved "unknown" bucket the aggregator uses is what makes group=agent answer
+// identically whether it was served from the ring or from disk.
+//
+// This is a deliberate departure from how labelFor treats an absent endpoint or
+// model, which produce no series entry at all. That is right for those axes: a row
+// with no model is not inference, so it is not ABOUT that axis. An absent agent is
+// different — the spend certainly happened and certainly belongs somewhere in a
+// per-agent breakdown, which is also why the aggregator's byAgent has no guard where
+// byEndpoint and byMethod do.
+func TestFold_GroupAgentMapsAbsenceToUnknown(t *testing.T) {
+	rows := []Row{
+		{Endpoint: "gw", Model: "m", Agent: "claude-code/2.1.14",
+			Counts: usage.Counts{Requests: 1, CostMicros: 100}},
+		{Endpoint: "gw", Model: "m", Agent: "",
+			Counts: usage.Counts{Requests: 1, CostMicros: 200}},
+	}
+
+	totals, series := Fold(rows, usage.GroupAgent)
+
+	if _, blank := series[""]; blank {
+		t.Error(`series has an "" key; a blank row reads as a bug rather than as unattributed traffic`)
+	}
+	if got := series["unknown"].CostMicros; got != 200 {
+		t.Errorf("unknown CostMicros = %d, want 200", got)
+	}
+	// The series sums to the total, which is the property the mapping buys: dropping
+	// unattributed rows from the breakdown would leave a client unable to reconcile
+	// a per-agent table against the figure beside it.
+	var sum int64
+	for _, c := range series {
+		sum += c.CostMicros
+	}
+	if sum != totals.CostMicros {
+		t.Errorf("series sums to %d but totals is %d", sum, totals.CostMicros)
+	}
+}
+
+// TestLedgerAndRingAgreeOnASpoofedUnknownAgent pins the claim agentLabel's comment
+// makes: a caller that sends literally "User-Agent: unknown" is bucketed the same way
+// by the ledger and by the live aggregator.
+//
+// Reachable from off-host, so it is worth a test rather than a claim. The ring folds
+// it under Label() == "unknown"; the ledger normalises it to "" on disk and labelFor
+// maps that back to "unknown". Two spellings of unattributed traffic would show as two
+// rows in any client that merged the two sources, which is the bug this prevents.
+func TestLedgerAndRingAgreeOnASpoofedUnknownAgent(t *testing.T) {
+	c := pipeline.ParseUserAgent("unknown")
+	if c == nil {
+		t.Fatal("ParseUserAgent(\"unknown\") = nil; a header WAS sent")
+	}
+
+	// The ring's key.
+	ringKey := c.Label()
+	// The ledger's: stored by agentLabel, read back by labelFor.
+	stored := agentLabel(c)
+	if stored != "" {
+		t.Errorf("agentLabel = %q, want \"\": absence has one representation on disk", stored)
+	}
+	ledgerKey, ok := labelFor(Row{Agent: stored}, usage.GroupAgent)
+	if !ok {
+		t.Fatal("labelFor dropped the row; unattributed spend must still appear in the series")
+	}
+	if ledgerKey != ringKey {
+		t.Errorf("ledger key %q != ring key %q; the two sources would render two rows for one thing",
+			ledgerKey, ringKey)
 	}
 }

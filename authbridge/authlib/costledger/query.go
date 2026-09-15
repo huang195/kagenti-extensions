@@ -138,6 +138,15 @@ func Fold(rows []Row, group usage.Group) (usage.Counts, map[string]usage.Counts)
 	return totals, series
 }
 
+// unknownAgentLabel is the reserved DISPLAY bucket for traffic that carried no
+// User-Agent. It is deliberately the same string pipeline.EventClient.Label returns
+// for a nil client: the ring and the ledger both serve group=agent, and two spellings
+// of "unattributed" would surface as two rows in any client that merged them.
+//
+// NOT an agent name, and a consumer must not present it as one — the row is
+// unattributed traffic, not a program that spent money.
+const unknownAgentLabel = "unknown"
+
 // labelFor picks the grouping key, returning ok=false when the row carries no
 // value for that axis — so an empty key never becomes a blank row, the same guard
 // the live foldInto applies. The row still counts toward totals either way.
@@ -148,6 +157,10 @@ func Fold(rows []Row, group usage.Group) (usage.Counts, map[string]usage.Counts)
 // a per-minute row cannot represent without one entry per combination. Returning
 // no series is the honest answer; an empty map that a client renders as "no
 // breakdown" would be the same answer said less clearly.
+//
+// usage.GroupAgent is the ONE axis that maps an absent value to a label rather than
+// dropping the row from the series, so it returns early instead of reaching that
+// guard. See its case.
 func labelFor(r Row, group usage.Group) (string, bool) {
 	var v string
 	switch group {
@@ -157,6 +170,25 @@ func labelFor(r Row, group usage.Group) (string, bool) {
 		v = r.Model
 	case usage.GroupEndpoint:
 		v = r.Endpoint
+	// Agent maps "" to a label instead of dropping the row.
+	//
+	// The non-empty guard is right for model and endpoint: a row with no model is not
+	// an inference row, so it is not ABOUT that axis and excluding it is honest. An
+	// absent agent is a different thing — that spend certainly happened and certainly
+	// belongs somewhere in a per-agent breakdown, so dropping it would leave a client
+	// unable to reconcile a per-agent table against the total printed beside it. The
+	// live aggregator makes the same call: byAgent folds unconditionally where
+	// byEndpoint and byMethod are guarded on non-empty.
+	//
+	// This is also the join point between the two representations: the ledger stores
+	// absence losslessly as "", and here it becomes the same display string /v1/usage
+	// returns from the ring, so group=agent answers identically from either source.
+	// See Row.Agent.
+	case usage.GroupAgent:
+		if r.Agent == "" {
+			return unknownAgentLabel, true
+		}
+		return r.Agent, true
 	default:
 		return "", false
 	}

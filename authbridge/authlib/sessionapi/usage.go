@@ -47,7 +47,7 @@ import (
 //	            symbolic window — the ledger holds no session ids, and serving
 //	            all-sessions data under a session label would be worse than
 //	            refusing. See the guard in handleUsage.
-//	group       none (default), model, endpoint, session, status, plugin.
+//	group       none (default), model, endpoint, session, agent, status, plugin.
 //	            "method" is accepted as an alias for "model" — the series shipped
 //	            under that name before it was clear the aggregator only ever
 //	            populated it from the inference model. "session" is meant for
@@ -60,7 +60,7 @@ import (
 //
 // This response is less sensitive than /v1/sessions, which serves raw prompts,
 // completions and tool results. It carries no message content at all: only
-// counts, timings and cost. But it is not free of information either, and four
+// counts, timings and cost. But it is not free of information either, and five
 // groupings leak deployment shape to anyone who can reach the port:
 //
 //   - group=model exposes the model names in use (claude-sonnet-5, and any
@@ -90,6 +90,27 @@ import (
 //     therefore set off-host — an opaque uuid discloses nothing, an id derived
 //     from a user, agent or ticket name discloses a great deal. That is why it is
 //     not ranked against group=endpoint above rather than placed below it.
+//
+//   - group=agent exposes which coding agents, AT WHICH VERSIONS, run on the
+//     operator's workstation, and attaches spend to each one. That is
+//     fingerprinting-adjacent and the most PERSONAL of the groupings: the others
+//     describe a deployment, this one describes a person's tooling. A reader learns
+//     that this machine runs claude-code 2.1.14, and — combined with a symbolic
+//     window — what that person's use of it has cost over a week. An outdated version
+//     in the answer is also a hint about unpatched local software.
+//
+//     Unlike group=session, its keys ARE drawn from a vocabulary this process
+//     controls: they are parsed from the User-Agent, so the values are predictable
+//     rather than set off-host. That cuts both ways. It bounds what an unrecognised
+//     agent can put in the response, but it does not make the axis less sensitive —
+//     a predictable key that names software on someone's laptop discloses more than
+//     an opaque id does, which is why this bullet sits below group=session rather
+//     than above it.
+//
+//     The key is also CLIENT-ASSERTED and trivially spoofable, so nothing here may be
+//     read as an authenticated statement about what called the proxy. Its accumulator
+//     has no inference guard, so — like group=endpoint — its request denominator
+//     differs from group=model's.
 //
 //   - group=plugin exposes the active pipeline composition — though /v1/pipeline
 //     already publishes that in full, so this adds no new exposure.

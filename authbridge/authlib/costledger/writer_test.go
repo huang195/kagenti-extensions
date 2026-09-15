@@ -1780,3 +1780,99 @@ func TestRecord_PricedImpliesPriceable(t *testing.T) {
 			r.PriceableRequests, r.PricedRequests)
 	}
 }
+
+// unparsedCostedEvent is a response inference-parser could not parse — an
+// /v1/embeddings call, say — that the gateway nonetheless priced by header. No
+// Inference extension, therefore no model and no token counts, but a settled cost.
+func unparsedCostedEvent(t *testing.T, host string, costUSD float64) *pipeline.SessionEvent {
+	t.Helper()
+	rec, err := json.Marshal(costevent.Event{
+		CostUSD: costUSD, Settled: true,
+		Source: costevent.SourceGatewayHeader, Provenance: "authoritative",
+	})
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	return &pipeline.SessionEvent{
+		At: at, Phase: pipeline.SessionResponse, StatusCode: 200, Host: host,
+		Plugins: map[string]json.RawMessage{costevent.Key: rec},
+	}
+}
+
+// TestRecord_APricedResponseWithNoInferenceExtensionIsStillRecorded closes the half of
+// the fourth-bodyless-path fix that lives here.
+//
+// inference-parser only parses six chat/completion paths plus Anthropic Messages, so
+// /v1/embeddings, /v1/rerank and /v1/moderations leave Extensions.Inference nil — and it
+// settles them from the gateway's cost header anyway. Keying admission on the extension
+// dropped that spend from the ledger while the live ring counted it, so the same money
+// appeared in a 1h window and vanished from window=today. Both money surfaces default to
+// window=today, which made the default view the wrong one.
+func TestRecord_APricedResponseWithNoInferenceExtensionIsStillRecorded(t *testing.T) {
+	dir := t.TempDir()
+	w := newTestWriter(t, dir, func() time.Time { return at })
+	w.Record("s1", unparsedCostedEvent(t, "gw.example", 0.25))
+	if err := w.Flush(); err != nil {
+		t.Fatalf("Flush: %v", err)
+	}
+	rows := readAllRows(t, dir)
+	if len(rows) != 1 {
+		t.Fatalf("got %d rows, want 1 — a gateway-priced response the parser could not read "+
+			"is real spend and belongs in the day file", len(rows))
+	}
+	r := rows[0]
+	if r.CostMicros != 250_000 {
+		t.Errorf("CostMicros = %d, want 250000", r.CostMicros)
+	}
+	if r.Model != "" {
+		t.Errorf("Model = %q, want empty — there was no model on the wire to record", r.Model)
+	}
+	// The subset relation the coverage arithmetic depends on. Model is "" and Tokens is 0,
+	// so the model-and-tokens test cannot set PriceableRequests; the priced branch must.
+	if r.PricedRequests != 1 {
+		t.Errorf("PricedRequests = %d, want 1", r.PricedRequests)
+	}
+	if r.PriceableRequests < r.PricedRequests {
+		t.Errorf("PriceableRequests = %d against PricedRequests = %d: priced must remain a "+
+			"SUBSET of priceable, or every consumer's coverage gap goes negative and "+
+			"suppresses its own warning", r.PriceableRequests, r.PricedRequests)
+	}
+}
+
+// TestRecord_AnUnpricedNonInferenceResponseIsStillIgnored is the negative half, and it is
+// what keeps the fix above from becoming the denominator bug it was written to avoid.
+//
+// A health check, an MCP call, a tunnel: no Inference extension AND no priced record.
+// Admitting those would put every proxied response in the cost denominator, which is the
+// mistake that once made a correctly configured deployment read "1/10 priced" forever.
+func TestRecord_AnUnpricedNonInferenceResponseIsStillIgnored(t *testing.T) {
+	dir := t.TempDir()
+	w := newTestWriter(t, dir, func() time.Time { return at })
+	// No plugins at all: the shape of a health check.
+	w.Record("s1", &pipeline.SessionEvent{
+		At: at, Phase: pipeline.SessionResponse, StatusCode: 200, Host: "gw.example",
+	})
+	// A record that EXISTS but priced nothing must not get in either: it adds no dollars,
+	// so admitting it would inflate the request count without moving the money.
+	//
+	// Settled:false is what makes it unpriced. A settled ZERO is a different thing and IS
+	// admitted deliberately — costevent.Priced is `CostUSD > 0 || Settled`, because a
+	// producer writing a settled zero means "this call was free", which is a fact worth a
+	// row. Only something that priced nothing at all is turned away, and a health check
+	// cannot reach even this far: it carries no record for the guard to consult.
+	unsettled, merr := json.Marshal(costevent.Event{Source: costevent.SourceGatewayHeader})
+	if merr != nil {
+		t.Fatalf("marshal: %v", merr)
+	}
+	w.Record("s1", &pipeline.SessionEvent{
+		At: at, Phase: pipeline.SessionResponse, StatusCode: 200, Host: "gw.example",
+		Plugins: map[string]json.RawMessage{costevent.Key: unsettled},
+	})
+	if err := w.Flush(); err != nil {
+		t.Fatalf("Flush: %v", err)
+	}
+	if rows := readAllRows(t, dir); len(rows) != 0 {
+		t.Errorf("got %d rows, want 0 — non-inference traffic carrying no priced figure must "+
+			"stay out of the cost denominator: %+v", len(rows), rows)
+	}
+}

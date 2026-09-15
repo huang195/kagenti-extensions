@@ -1006,9 +1006,39 @@ func (m *model) layout() {
 	m.pipelineTbl.SetColumns(fitTableColumns(pipelineColumns(), m.width))
 	m.catalogTbl.SetColumns(fitTableColumns(catalogColumns(), m.width))
 
-	// Through setTableHeight, not SetHeight: a height change re-windows the rows
-	// while the viewport keeps the offset it had for the old height, and these
-	// tables are not rebuilt from here, so nothing else would reconcile it.
+	// Rebuild the sessions ROWS, not just re-fit the columns. AFTER SetColumns above, and
+	// the order is the whole point: rebuildSessionsTable reads the width COST was
+	// actually fitted to (fittedSessionsColumnWidth) to decide whether a dollar figure
+	// fits or has to be elided, so running it first would read the previous width and
+	// change nothing.
+	//
+	// Without this call the columns were re-fitted on every WindowSizeMsg while the rows
+	// kept the formatting chosen for the PREVIOUS width, until the next
+	// sessionsLoadedMsg or streamed event happened to repaint them. For that interval a
+	// just-narrowed terminal showed one clipped figure and a just-widened one a needless
+	// ellipsis — the seam fittedSessionsColumnWidth's own doc names and leaves to this
+	// call site.
+	//
+	// Safe before the first fetch: m.sessions is empty, so it sets an empty row set on an
+	// already-empty table and parks the cursor at 0. It is the same call
+	// rebuildEventsTable a few lines down already makes unconditionally.
+	m.rebuildSessionsTable()
+	// Through setTableHeight, not SetHeight: a height change re-windows the rows while the
+	// viewport keeps the offset it had for the old height, so something has to reconcile
+	// it.
+	//
+	// AFTER the rebuild, and that ordering is load-bearing rather than incidental. Merging
+	// #998 with the rebuild above put two cursor-touching calls next to each other:
+	// rebuildSessionsTable reads Cursor() first, to re-select the same SESSION ID after the
+	// rows are replaced, while setTableHeight moves the cursor (GotoTop, then
+	// setCursorVisible). Height first would hand the rebuild a cursor that had already
+	// moved, so it would preserve whichever row the re-windowing happened to land on
+	// instead of the one the operator had selected. Rows first, then reconcile the offset
+	// against the final row set.
+	//
+	// #998's own justification for this call — "these tables are not rebuilt from here" —
+	// is no longer true of THIS table, though it still holds for the four below. The call
+	// is still wanted here: the rebuild replaces rows, not the viewport's offset.
 	setTableHeight(&m.sessionsTbl, bodyH)
 	m.bodyHeight = bodyH
 	// Picker tables share the same body area as the session tables so the

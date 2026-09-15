@@ -307,6 +307,18 @@ func ledgerWithOneCostedMinute(t *testing.T, at time.Time, host, model string, c
 	return led
 }
 
+// midnightToday is the LOCAL start of today, which is the boundary window=today uses.
+//
+// Fixtures for a symbolic window have to be anchored here rather than offset from
+// time.Now(): backing off the current clock crosses midnight during the first minutes of
+// each day, filing the row under yesterday while the request asks about today. Local, not
+// UTC, because that is what usage.ParseWindowSpec means by "today" — see its doc for why a
+// laptop crossing a timezone must not have its day reset mid-afternoon.
+func midnightToday() time.Time {
+	n := time.Now()
+	return time.Date(n.Year(), n.Month(), n.Day(), 0, 0, 0, 0, n.Location())
+}
+
 // newTestLedger opens an empty ledger with its clock pinned to at.
 func newTestLedger(t *testing.T, at time.Time) *costledger.Writer {
 	t.Helper()
@@ -562,7 +574,17 @@ func TestHandleUsage_SessionWithDurationWindowStillWorks(t *testing.T) {
 // with nothing anywhere in it saying rows were missing. A client cannot caveat what it
 // cannot see, so the improvement was invisible to every consumer.
 func TestHandleUsage_ACorruptLedgerLineIsDisclosedInTheResponse(t *testing.T) {
-	when := time.Now().Add(-2 * time.Minute)
+	// Two minutes into TODAY, not two minutes before NOW. Backing off the current clock
+	// crosses local midnight for the first two minutes of every day: the row lands in
+	// yesterday's day file while window=today asks about this one, and the test fails for
+	// a reason that has nothing to do with what it is checking. `today` is a local-midnight
+	// boundary, so a fixture near it has to be anchored to the boundary rather than to now.
+	when := midnightToday().Add(2 * time.Minute)
+	if now := time.Now(); when.After(now) {
+		// Guards the other end: inside the first two minutes of the day the anchor would be
+		// in the future, and a future row falls outside [midnight, now].
+		when = now
+	}
 	// An explicit dir rather than newTestLedger's hidden t.TempDir(), because this test
 	// has to reach the day file the writer produced.
 	dir := t.TempDir()

@@ -77,7 +77,15 @@ func (p *InferenceParser) settleCost(pctx *pipeline.Context) {
 	// table that prices every prompt tier but not a populated output tier yields a prompt
 	// figure and no total. Dropping the record there would lose a figure a request row
 	// can legitimately show, and the total stays absent rather than invented.
-	if !settled.Priced && !settled.HasPrompt && len(avoided) == 0 {
+	// A REFUSED figure is also something to say, and it is the only case here that
+	// publishes a record with no money in it. costing declined a cost header this process
+	// could not corroborate (see costing.implausibleUnparsedCost), and publishing nothing
+	// would make that response indistinguishable from one that reported no cost at all —
+	// hiding both the misconfiguration and the forgery. The record is unpriced, so no
+	// consumer counts it as spend: costevent.Priced returns false on a set RejectedReason,
+	// which is what the aggregator's Decode and the ledger writer's admission guard both
+	// ask.
+	if !settled.Priced && !settled.HasPrompt && settled.RejectedReason == "" && len(avoided) == 0 {
 		// NOT LATCHED, exactly as litellm-budget-track's bill() does not latch when
 		// costing.Load finds nothing priced. Nothing was published here, so there is
 		// nothing to charge twice and nothing for a latch to protect — and latching

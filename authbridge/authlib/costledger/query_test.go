@@ -197,8 +197,17 @@ func TestQuery_AnAbandonedDayIsReportedSeparatelyFromSkippedLines(t *testing.T) 
 	if err != nil {
 		t.Fatalf("Query: %v", err)
 	}
-	if caveats.SkippedLines != 1 {
-		t.Errorf("SkippedLines = %d, want 1", caveats.SkippedLines)
+	// AT LEAST ONE, not exactly one, because SkippedLines is documented as a FLOOR on rows
+	// lost rather than a count of them: one undecodable line can hold two rows where a
+	// crash fragment was concatenated with the next append (measured — see
+	// TestQuery_FragmentConcatenatedWithTheNextAppendCostsOneLine), and this file loses a
+	// second row to the wall below regardless. Pinning the exact 1 asserted a stronger
+	// claim than the field makes, and would fail a reader that counted the truth more
+	// completely.
+	if caveats.SkippedLines < 1 {
+		t.Errorf("SkippedLines = %d, want at least 1: the read stepped over a line that held "+
+			"spend, and a caller has no other way to know the figure beside it is short",
+			caveats.SkippedLines)
 	}
 	if caveats.TruncatedDays != 1 {
 		t.Errorf("TruncatedDays = %d, want 1; a day the reader gave up on must not be "+
@@ -864,22 +873,45 @@ func TestFold_ByModelSumsToTotals(t *testing.T) {
 			Requests: 1, InputTokens: 20, CostMicros: 50, PricedRequests: 1, PriceableRequests: 1}},
 	}
 
-	totals, series, _ := Fold(rows, usage.GroupModel)
+	// A row with no model, which is spend the breakdown CANNOT attribute. Without one in
+	// the input this test compares a value to itself: Fold adds every row's Counts to
+	// totals and the groupable ones to series, so with all rows groupable "sum == totals"
+	// is the same accumulation twice and cannot fail whatever labelFor does. The
+	// unattributable row is what makes the reconciliation an assertion.
+	rows = append(rows, Row{At: base, Endpoint: "gw", Counts: usage.Counts{
+		Requests: 1, InputTokens: 10, CostMicros: 25, PricedRequests: 1, PriceableRequests: 1}})
 
-	if totals.CostMicros != 350 {
-		t.Errorf("totals.CostMicros = %d, want 350", totals.CostMicros)
+	totals, series, ungrouped := Fold(rows, usage.GroupModel)
+
+	if totals.CostMicros != 375 {
+		t.Errorf("totals.CostMicros = %d, want 375 (300 + 50 + the 25 with no model)", totals.CostMicros)
 	}
 	if series["opus"].CostMicros != 300 || series["haiku"].CostMicros != 50 {
 		t.Errorf("series = %+v, want opus 300 and haiku 50", series)
 	}
-	// The property that makes a breakdown table trustworthy: its rows account for
-	// the total it sits under.
+	// The gap is DISCLOSED rather than hidden or double-counted. This is the half that can
+	// actually break: Fold publishes a residual only when the group is one the ledger can
+	// answer AND the ring calls reconcilable, and getting that wrong once made
+	// group=status answer with a residual equal to its entire total.
+	if ungrouped != 25 {
+		t.Errorf("ungrouped = %d, want 25 — spend with no model must be disclosed as the "+
+			"residual, not folded into a series key or dropped", ungrouped)
+	}
+	// The property that makes a breakdown table trustworthy, stated as the identity that
+	// holds when the residual is right: the rows plus the residual account for the total
+	// they sit under.
 	var sum int64
 	for _, c := range series {
 		sum += c.CostMicros
 	}
-	if sum != totals.CostMicros {
-		t.Errorf("series sums to %d but totals is %d", sum, totals.CostMicros)
+	if sum+ungrouped != totals.CostMicros {
+		t.Errorf("series sums to %d, residual is %d, totals is %d; a client cannot reconcile "+
+			"the table it was given with the figure above it", sum, ungrouped, totals.CostMicros)
+	}
+	// And the residual is not vacuously zero, which would make the identity above the
+	// tautology this test used to be.
+	if ungrouped == 0 {
+		t.Fatal("the residual is zero, so the reconciliation above proves nothing")
 	}
 }
 

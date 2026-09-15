@@ -60,9 +60,27 @@ const (
 	// maxPlausibleMicrosPerToken is the highest per-token rate one tier could carry, in
 	// micros: 1,000 micros = $0.001/token = $1,000 per million tokens. The most
 	// expensive tier in the bundled VENDOR LIST table is $7.5e-05/token (Claude 3 Opus
-	// / Opus 4 output, $75/Mtok), so this is ~13x the dearest rate that ships today and
-	// a model priced an order of magnitude above anything current still settles
-	// normally.
+	// / Opus 4 output, $75/Mtok), so this is 13.3x the dearest RAW rate that ships today.
+	//
+	// THE EFFECTIVE MARGIN IS 1.33x, NOT 13x, and the difference is a multiplier. A
+	// resolved rate is the table rate times MultiplierRule.Factor, which validate caps at
+	// maxMultiplier = 10 — so what this ceiling has to clear is not the dearest rate in
+	// the table but the dearest rate a legitimate config can PRODUCE from it: 7.5e-05 x 10
+	// = 7.5e-04/token, against a ceiling of 1e-03. That is 1.33x of headroom.
+	//
+	// The comment used to claim the 13x and stop there, which overstated its own
+	// protection: a $100/Mtok model at a 10x markup reaches the cap, and
+	// TestMaxPlausibleRequestCostMicros_Derivation only ever scanned the raw Bundled()
+	// rates, so it would have gone green while it happened. It now applies maxMultiplier
+	// to the scan, and fails when the REAL headroom is exhausted rather than when the raw
+	// rate is.
+	//
+	// 1.33x is thin but it is not the number to raise on its own: this ceiling times
+	// maxPlausibleTokens is what gives the cap three orders of magnitude over the worst
+	// call anyone can actually construct (see MaxPlausibleRequestCostMicros), and a 10x
+	// markup over vendor list is arguably not a legitimate config in the first place. If a
+	// bundled rate ever moves past $100/Mtok, the derivation test is what will say so, and
+	// both halves get revisited then.
 	maxPlausibleMicrosPerToken = 1_000
 )
 

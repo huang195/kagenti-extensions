@@ -460,22 +460,66 @@ func TestWriter_HoldsNoPromptContent(t *testing.T) {
 	}
 }
 
+// A failed append never reaches the request path, and is not silently forgotten either.
+//
+// The ledger is observability: a full disk or a read-only home must not turn into a failed
+// request. Record has no error to return, so "does not propagate" is not a thing this test
+// can observe directly — what it can observe is that the call returns, that the writer is
+// still usable afterwards, and that the loss is counted somewhere an operator can see.
+//
+// IT USED TO ASSERT NOTHING AT ALL. It pointed the writer at a 0o500 directory, discarded
+// Flush's error, called Record twice and ended — no assertion, so it passed against a
+// Writer that propagated every error, and it passed on a disk where the write succeeded.
+// Two changes make it real: the premise is asserted, and the failure is arranged with a
+// DIRECTORY where the day file belongs (blockDayFile), which fails with EISDIR for root
+// too. A permission bit does not: as root the old setup wrote the file successfully and
+// the test reported success over a case it had not exercised.
 func TestWriter_IOFailureDoesNotPropagate(t *testing.T) {
-	// The ledger is observability. A full disk or a read-only home must never turn
-	// into a failed request.
-	dir := filepath.Join(t.TempDir(), "unwritable")
-	if err := os.Mkdir(dir, 0o500); err != nil {
-		t.Fatalf("mkdir: %v", err)
-	}
+	dir := t.TempDir()
 	now := at
 	w := newTestWriter(t, dir, func() time.Time { return now })
+	blockDayFile(t, w, at)
 
+	// The premise. Without this the rest of the test is about a working disk.
 	w.Record("s1", costedEvent(t, "gw", "m", 0.25, 100, 50))
 	now = at.Add(time.Minute)
-	// Must not panic and must not block. Flush may return an error; Record never
-	// surfaces one.
+	if err := w.Flush(); err == nil {
+		t.Fatal("Flush reported success appending to a path that is a directory; the premise " +
+			"of this test is that the append fails")
+	}
+
+	// Record must return. Bounded, because the failure mode is a hang rather than an
+	// error: a writer that wedged on its own IO would block the session-append path that
+	// calls this, and a test that simply called Record would hang with it.
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		w.Record("s1", costedEvent(t, "gw", "m", 0.25, 100, 50))
+	}()
+	select {
+	case <-done:
+	case <-time.After(30 * time.Second):
+		t.Fatal("Record did not return after a failed append; the request path is now waiting " +
+			"on the cost ledger's disk")
+	}
+
+	// And the loss is visible. Dropped() is the only "is my cost history complete" signal
+	// there is; the exact count belongs to TestWriter_AFailedAppendIsCountedAsADrop, so
+	// this asserts only that swallowing the error did not also swallow the fact.
+	now = at.Add(2 * time.Minute)
 	_ = w.Flush()
-	w.Record("s1", costedEvent(t, "gw", "m", 0.25, 100, 50))
+	if w.Dropped() == 0 {
+		t.Error("Dropped() = 0 after two failed appends: the error was hidden from the request " +
+			"path AND from the operator, which is a ledger reporting itself complete over spend " +
+			"it never wrote")
+	}
+
+	// The writer is still usable. An IO error must not close it — that would turn one
+	// unwritable minute into a session with no cost history and no further attempts.
+	if w.closed.Load() {
+		t.Error("the writer closed itself over an IO error; the next day's rows would then be " +
+			"dropped by a flag rather than by the disk")
+	}
 }
 
 // blockDayFile puts a DIRECTORY where the day file for t belongs, so every append to
@@ -936,10 +980,26 @@ func TestAbandon_CountsTheQueueAndTheAccumulator(t *testing.T) {
 // the flag flipped while the goroutine was alive. With the flag set before wg.Wait it
 // flips immediately and the parked goroutine sees it; with it set after, the flag
 // cannot move until this clock has returned and the goroutine has exited.
+//
+// THE OBSERVATION WINDOW STARTS AT close(quit), NOT AT AN ARBITRARY 250 ms. It used to
+// park for a fixed 250 ms from whenever the settle tick happened to fire and then give up
+// silently, so on a loaded runner — a CI box under -race with the rest of the suite in
+// flight — Close could still be waiting to be scheduled when the window expired, and the
+// test passed without ever having looked. That is the vacuous-pass shape this review keeps
+// finding: green because nothing was checked.
+//
+// Close does Flush, close(quit), wg.Wait, drain, closed.Store(true). Waiting for quit to
+// close is therefore a deterministic report that Close is INSIDE its ordering, and it can
+// be waited on for as long as it takes: with the store after wg.Wait, the flag physically
+// cannot move while this clock has not returned, so no amount of waiting can produce a
+// false failure. What remains timing-dependent is only the reverse: a mutant that stores
+// the flag between close(quit) and wg.Wait is caught by the short poll after that point.
+// The window can therefore MISS a mutation on a pathologically slow machine and can never
+// invent one — the safe direction, and the reason it is stated rather than tuned.
 func TestClose_MarksClosedOnlyAfterTheGoroutineHasStopped(t *testing.T) {
 	dir := t.TempDir()
 	var wp atomic.Pointer[Writer]
-	var parked, sawClosedWhileRunning atomic.Bool
+	var parked, sawClosedWhileRunning, sawQuit atomic.Bool
 
 	clock := func() time.Time {
 		w := wp.Load()
@@ -949,11 +1009,33 @@ func TestClose_MarksClosedOnlyAfterTheGoroutineHasStopped(t *testing.T) {
 		}
 		parked.Store(true)
 		defer parked.Store(false)
-		// Long enough for Close to reach its ordering — it takes microseconds to get
-		// there — and short enough that the correct implementation, which waits this out
-		// once, does not slow the suite down.
-		deadline := time.Now().Add(250 * time.Millisecond)
+		// Park until Close has entered its ordering, which close(quit) reports exactly.
+		// Generous, and never a false failure: a correct Close cannot set closed until
+		// this function returns, so waiting longer only ever helps.
+		deadline := time.Now().Add(30 * time.Second)
 		for time.Now().Before(deadline) {
+			if w.closed.Load() {
+				// Before quit even closed, which is the flag set at the very top of Close.
+				sawClosedWhileRunning.Store(true)
+				return at
+			}
+			select {
+			case <-w.quit:
+				sawQuit.Store(true)
+			default:
+				time.Sleep(time.Millisecond)
+				continue
+			}
+			break
+		}
+		if !sawQuit.Load() {
+			// Not a pass. The test failed to arrange what it is about.
+			return at
+		}
+		// From here Close is between close(quit) and its store. A correct implementation
+		// is blocked in wg.Wait until this returns; a mutant that stores the flag in
+		// between flips it now.
+		for poll := time.Now().Add(200 * time.Millisecond); time.Now().Before(poll); {
 			if w.closed.Load() {
 				sawClosedWhileRunning.Store(true)
 				return at
@@ -982,11 +1064,22 @@ func TestClose_MarksClosedOnlyAfterTheGoroutineHasStopped(t *testing.T) {
 	if cerr := w.Close(); cerr != nil {
 		t.Fatalf("Close: %v", cerr)
 	}
+	// The real assertion first, because it can be true while the premise below is false: a
+	// flag set at the very TOP of Close is observed before quit ever closes, and reporting
+	// that as "this test proved nothing" would hide the defect behind the check that exists
+	// to stop it hiding.
 	if sawClosedWhileRunning.Load() {
 		t.Error("closed was set while the writer goroutine was still running: rows recorded " +
 			"during the shutdown are counted as dropped although they could still be written, " +
 			"and submit's inline write and the draining goroutine can both be in writeLines " +
 			"on one day file at once")
+	} else if !sawQuit.Load() {
+		// The premise, asserted rather than assumed: with no observation of close(quit) the
+		// clock never watched Close from inside its ordering, so a green result above means
+		// only that nothing was looked at. This is exactly what the old fixed 250 ms window
+		// turned into a silent pass on a loaded runner.
+		t.Fatal("the parked clock never observed close(quit), so Close was never watched while " +
+			"the writer goroutine was alive; this test proved nothing about the ordering")
 	}
 	if !w.closed.Load() {
 		t.Error("not closed after Close returned; submit would queue work to a goroutine that has gone")

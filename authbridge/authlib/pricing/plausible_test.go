@@ -130,20 +130,47 @@ func TestMaxPlausibleRequestCostMicros_Derivation(t *testing.T) {
 			dearest, dearestModel, capRate)
 	}
 
-	// The whole derivation as one inequality: the dearest rate that ships, applied to
-	// EVERY token the ceiling allows, still fits under the cap. If this fails the cap is
-	// refusing bills a real call could produce, which is the same coverage gap the
-	// refusal path exists to disclose.
-	worstAllowed := float64(maxPlausibleTokens) * dearest
+	// AND THE SAME RATE AFTER A MULTIPLIER, which is the assertion that makes this test
+	// worth running. A resolved rate is a table rate times MultiplierRule.Factor, and
+	// validate accepts a factor up to maxMultiplier — so the raw table is not the ceiling
+	// the cap has to clear. The check above compares against 7.5e-05 and reads as 13x of
+	// headroom; the effective figure is 7.5e-04 against 1e-03, which is 1.33x.
+	//
+	// A $100/Mtok model at a legitimate 10x markup therefore REACHES the cap while the raw
+	// scan above stays green — a test asserting less than the comment it was pinning. This
+	// is the one that fails when the real headroom is gone.
+	dearestResolvable := dearest * maxMultiplier
+	if dearestResolvable > capRate {
+		t.Errorf("the dearest bundled rate (%v/token, %s) scaled by the largest accepted multiplier (%vx) is %v/token, above the derivation's ceiling of %v/token — the effective margin is exhausted, so a legitimate config can price a request past the plausibility cap and have it refused as a forgery",
+			dearest, dearestModel, maxMultiplier, dearestResolvable, capRate)
+	}
+
+	// The whole derivation as one inequality: the dearest rate a config can RESOLVE TO,
+	// applied to EVERY token the ceiling allows, still fits under the cap. If this fails
+	// the cap is refusing bills a real call could produce, which is the same coverage gap
+	// the refusal path exists to disclose.
+	//
+	// Uses the scaled rate rather than the raw one, deliberately: the request whose cost
+	// this cap judges is priced at the resolved rate, so the raw figure is not the worst
+	// case the cap has to admit.
+	worstAllowed := float64(maxPlausibleTokens) * dearestResolvable
 	if !PlausibleRequestCostUSD(worstAllowed) {
-		t.Errorf("a call of %d tokens at the dearest bundled rate (%v) costs $%v and is refused as implausible; the cap is now tighter than its own derivation",
-			maxPlausibleTokens, dearest, worstAllowed)
+		t.Errorf("a call of %d tokens at the dearest RESOLVABLE rate (%v x %vx = %v) costs $%v and is refused as implausible; the cap is now tighter than its own derivation",
+			maxPlausibleTokens, dearest, maxMultiplier, dearestResolvable, worstAllowed)
 	}
 
 	// And the headroom over a call that could actually happen — the largest context
 	// window on any path we run, plus a full-length completion, at the dearest rate.
 	// Documented as coarse on purpose: a cap set near real traffic starts refusing real
 	// bills the first time a vendor reprices.
+	//
+	// AT LIST RATES, unlike the two checks above, and the asymmetry is the point of each.
+	// Those ask what a config could legitimately produce, so they have to include the
+	// multiplier. This one asks what real traffic costs, and a 10x markup over vendor list
+	// is not real traffic — folding it in here would assert the cap has three orders of
+	// magnitude over a bill nobody receives, which is a different claim from the one
+	// MaxPlausibleRequestCostMicros makes. With the multiplier the same figure is 12.5x,
+	// stated here so the number is on the record rather than implied by its absence.
 	const largestContextWindow, longCompletion = 1_000_000, 64_000
 	worstReal := float64(largestContextWindow+longCompletion) * dearest
 	if headroom := float64(MaxPlausibleRequestCostMicros) / 1e6 / worstReal; headroom < 100 {

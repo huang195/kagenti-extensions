@@ -8,10 +8,12 @@ import (
 	"net"
 	"os"
 	"strings"
+	"time"
 
 	"github.com/rossoctl/cortex/authbridge/authlib/pipeline"
 	"github.com/rossoctl/cortex/authbridge/authlib/pricing"
 	"github.com/rossoctl/cortex/authbridge/authlib/session"
+	"github.com/rossoctl/cortex/authbridge/authlib/usage"
 	"gopkg.in/yaml.v3"
 )
 
@@ -102,15 +104,31 @@ type CostLedgerConfig struct {
 // figure from a genuinely quiet week — the label is the same, the priced flag is the
 // same, and the number is wrong by however much was pruned.
 //
+// DERIVED FROM THE WINDOW RATHER THAN WRITTEN AS ITS OWN NUMBER, because as its own
+// number it was WRONG. It was the literal 7, on the reading that "7d" spans seven days;
+// but usage.ParseWindowSpec defines 7d as a ROLLING seven times twenty-four hours, and
+// unless that begins exactly at midnight it starts part-way through one date and ends
+// part-way through another, so the ledger opens EIGHT day files to answer it
+// (usage.Window7dLocalDays). A retention of 7 keeps today and the six before it, so the
+// eighth — the oldest, the one the window opens ON — had already been unlinked:
+// retention_days: 7 passed validation and then answered window:"7d" over a partial
+// week, which is exactly the case this floor exists to refuse. The paragraph above was
+// already saying "eight" while the constant said 7.
+//
+// One surviving file per day retained is exact rather than approximate: store.prune
+// keeps the days in [ref-(retainDays-1), ref], so retainDays IS the number of dates
+// that survive, and clearing usage.Window7dLocalDays means every date the window opens
+// is still on disk.
+//
 // Refused at load rather than clamped, because the operator who chose the number is
 // the one who should learn that the window they will be served does not mean what it
 // says. Zero is untouched by the floor and still means "the package default" (30).
 //
-// This does NOT cover the other half of the same defect: an install younger than 7
-// days has no files for the missing days either, and answers window:"7d" over however
+// This does NOT cover the other half of the same defect: an install younger than the
+// window has no files for the missing days either, and answers window:"7d" over however
 // long it has been running. Retention is not what limits that, so it cannot be fixed
 // here — it needs the response to carry the span actually covered.
-const minCostLedgerRetentionDays = 7
+const minCostLedgerRetentionDays = usage.Window7dLocalDays
 
 // LedgerEnabled reports whether the ledger should run, given the default for this
 // deployment shape.
@@ -131,10 +149,16 @@ func (c *CostLedgerConfig) Validate() error {
 		return fmt.Errorf("cost_ledger.retention_days must not be negative, got %d", c.RetentionDays)
 	}
 	if c.RetentionDays > 0 && c.RetentionDays < minCostLedgerRetentionDays {
+		// Says EIGHT and says why it is not seven: an operator who typed 7 for a seven-day
+		// window is not making a careless mistake, and a message that only quoted the floor
+		// would read as an off-by-one in the software rather than as the rolling span it is.
 		return fmt.Errorf("cost_ledger.retention_days must be at least %d, or 0 for the default: "+
-			"the usage API serves window=7d from these day files, so a shorter retention "+
-			"reports a partial week as a full one, got %d",
-			minCostLedgerRetentionDays, c.RetentionDays)
+			"the usage API serves window=%s from these day files, and that window is a ROLLING "+
+			"%dx24h, so it reads %d local day files rather than %d — a shorter retention reports "+
+			"a partial week as a full one, got %d",
+			minCostLedgerRetentionDays, usage.Window7d,
+			int(usage.Window7dSpan/(24*time.Hour)), usage.Window7dLocalDays,
+			int(usage.Window7dSpan/(24*time.Hour)), c.RetentionDays)
 	}
 	return nil
 }

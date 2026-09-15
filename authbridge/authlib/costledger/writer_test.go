@@ -2,6 +2,7 @@ package costledger
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -271,6 +272,65 @@ func TestWriter_UnpricedTrafficIsRecordedWithoutCost(t *testing.T) {
 	}
 }
 
+// A NEGATIVE token count never reaches a persisted row.
+//
+// These six numbers are decoded from the upstream response body, so their sign is chosen
+// off-host. One negative folds into every later event for that minute through
+// usage.Counts.Add and then persists: the minute, the day and every window containing it
+// are wrong from then on, with nothing in the file to say a count was ever negative. The
+// ring recovers on restart; an append-only file does not. See tokenCount for why the
+// value is recorded as ABSENT rather than clamped, and why PresentKinds is left alone.
+func TestRecord_ANegativeTokenCountIsRecordedAsAbsent(t *testing.T) {
+	dir := t.TempDir()
+	now := at
+	w := newTestWriter(t, dir, func() time.Time { return now })
+
+	e := costedEvent(t, "gw", "m", 0.25, 100, 50)
+	e.Inference.OutputTokens = -50
+	e.Inference.CacheReadTokens = -1
+	e.Inference.TotalTokens = -1_000_000
+	w.Record("s1", e)
+	// A second, ordinary event in the same minute, so the assertion covers what the fold
+	// leaves behind rather than only what one row serialized to.
+	w.Record("s1", costedEvent(t, "gw", "m", 0.25, 10, 5))
+
+	now = at.Add(time.Minute)
+	if err := w.Flush(); err != nil {
+		t.Fatalf("Flush: %v", err)
+	}
+
+	rows := readAllRows(t, dir)
+	if len(rows) != 1 {
+		t.Fatalf("got %d rows, want 1 folded row: %+v", len(rows), rows)
+	}
+	got := rows[0]
+	for name, v := range map[string]int64{
+		"InputTokens": got.InputTokens, "CacheReadTokens": got.CacheReadTokens,
+		"CacheWriteTokens": got.CacheWriteTokens, "OutputTokens": got.OutputTokens,
+		"ReasoningTokens": got.ReasoningTokens, "Tokens": got.Tokens,
+	} {
+		if v < 0 {
+			t.Errorf("%s = %d on disk: a negative count is now part of every total that "+
+				"includes this minute, permanently", name, v)
+		}
+	}
+	// ABSENT, not clamped, and not deducted from the counts that were reportable: the
+	// good half of the second event's usage is still there.
+	if got.InputTokens != 110 {
+		t.Errorf("InputTokens = %d, want 110 (100 + 10) — the negative fields are dropped, "+
+			"not the row", got.InputTokens)
+	}
+	if got.OutputTokens != 5 {
+		t.Errorf("OutputTokens = %d, want 5: -50 is recorded as no count at all, and the "+
+			"second event's 5 still lands", got.OutputTokens)
+	}
+	// The request and its settled dollars still count. A nonsense usage block is not a
+	// reason to lose money that was actually spent.
+	if got.Requests != 2 || got.CostMicros != 500_000 {
+		t.Errorf("Requests = %d, CostMicros = %d, want 2 and 500000", got.Requests, got.CostMicros)
+	}
+}
+
 // The caveat a persisted total cannot afford to lose: a truncated stream's figure
 // is a FLOOR, and once the process restarts this counter is the only thing left
 // saying so. Without it the dollars on disk quietly gain a precision they never had.
@@ -457,7 +517,7 @@ func TestWriter_AFailedAppendIsCountedAsADrop(t *testing.T) {
 	// And the row really is gone from memory too, which is what makes the loss
 	// permanent rather than merely delayed: takeLocked emptied the accumulator before
 	// the write was attempted.
-	if held, open := w.pending(); len(held) != 0 || !open.IsZero() {
+	if held, open, _ := w.pending(); len(held) != 0 || !open.IsZero() {
 		t.Errorf("the accumulator still holds %d rows (open %v); the row was not lost, so "+
 			"this test is not measuring what it claims", len(held), open)
 	}
@@ -542,7 +602,7 @@ func TestRecord_DistinctLabelsPerMinuteAreCapped(t *testing.T) {
 		w.Record("s1", costedEvent(t, "gw", fmt.Sprintf("model-%d", i), 0.25, 100, 50))
 	}
 
-	held, _ := w.pending()
+	held, _, _ := w.pending()
 	if len(held) > maxLabelsPerMinute {
 		t.Errorf("the open minute holds %d rows after %d distinct models, want at most %d; "+
 			"unbounded here is unbounded memory AND an unbounded walk on the request path",
@@ -585,7 +645,7 @@ func TestRecord_TheOverflowRowFitsInsideTheCap(t *testing.T) {
 		w.Record("s1", costedEvent(t, "gw", fmt.Sprintf("model-%d", i), 0.25, 100, 50))
 	}
 
-	held, _ := w.pending()
+	held, _, _ := w.pending()
 	if len(held) != maxLabelsPerMinute {
 		t.Errorf("held %d rows, want exactly %d — %d means the (other) row was added on "+
 			"top of a full map instead of into the slot kept for it",
@@ -609,7 +669,7 @@ func TestRecord_TheCapResetsWithTheMinute(t *testing.T) {
 	fresh.At = now
 	w.Record("s1", fresh)
 
-	held, _ := w.pending()
+	held, _, _ := w.pending()
 	if len(held) != 1 || held[0].Model != "opus" {
 		t.Errorf("the new minute holds %+v, want one row for opus — the cap must not carry "+
 			"over and coarsen a minute that has no cardinality problem", held)
@@ -727,7 +787,7 @@ func TestRecord_DropsRatherThanBlocksWhenTheWriterCannotKeepUp(t *testing.T) {
 			got, want, events-1, depth)
 	}
 	// Nothing is unaccounted for: queued + dropped + held == recorded.
-	held, _ := w.pending()
+	held, _, _ := w.pending()
 	if got := int64(len(w.ops)) + w.Dropped() + int64(len(held)); got != events {
 		t.Errorf("accounted for %d rows of %d recorded", got, events)
 	}
@@ -759,7 +819,7 @@ func TestRecord_AfterCloseIsCountedRatherThanParkedInTheQueue(t *testing.T) {
 	}
 
 	onDisk := int64(len(readAllRows(t, dir)))
-	held, _ := w.pending()
+	held, _, _ := w.pending()
 	if got, want := w.Dropped()+onDisk+int64(len(held)), int64(events); got != want {
 		t.Errorf("accounted for %d rows of %d recorded (dropped %d, on disk %d, held %d); "+
 			"a row in none of the three is a loss Dropped() denies",
@@ -803,7 +863,7 @@ func TestClose_CountsARowThatRacedItsFlush(t *testing.T) {
 		return at
 	}
 
-	w, err := New(dir, WithClock(clock), WithSettleInterval(time.Millisecond))
+	w, err := New(dir, WithClock(clock), withSettleInterval(time.Millisecond))
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
@@ -825,7 +885,7 @@ func TestClose_CountsARowThatRacedItsFlush(t *testing.T) {
 		t.Errorf("Dropped() = %d, want 1; the row is in no queue, no file and no map, and "+
 			"Dropped() is the only signal that says so", got)
 	}
-	if held, _ := w.pending(); len(held) != 0 {
+	if held, _, _ := w.pending(); len(held) != 0 {
 		t.Errorf("the accumulator still holds %d rows after Close; they would be counted twice "+
 			"if a later Flush wrote them", len(held))
 	}
@@ -836,7 +896,7 @@ func TestClose_CountsARowThatRacedItsFlush(t *testing.T) {
 func TestAbandon_CountsTheQueueAndTheAccumulator(t *testing.T) {
 	dir := t.TempDir()
 	now := at
-	w, err := New(dir, WithClock(func() time.Time { return now }), WithSettleInterval(0))
+	w, err := New(dir, WithClock(func() time.Time { return now }), withSettleInterval(0))
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
@@ -856,7 +916,7 @@ func TestAbandon_CountsTheQueueAndTheAccumulator(t *testing.T) {
 	if lost := w.abandon(); lost != 3 {
 		t.Errorf("abandon() = %d, want 3 (two queued rows, one held row)", lost)
 	}
-	if held, _ := w.pending(); len(held) != 0 {
+	if held, _, _ := w.pending(); len(held) != 0 {
 		t.Errorf("the accumulator still holds %d rows after abandon", len(held))
 	}
 }
@@ -904,7 +964,7 @@ func TestClose_MarksClosedOnlyAfterTheGoroutineHasStopped(t *testing.T) {
 	}
 
 	// A fast settle so the goroutine reaches the clock promptly.
-	w, err := New(dir, WithClock(clock), WithSettleInterval(time.Millisecond))
+	w, err := New(dir, WithClock(clock), withSettleInterval(time.Millisecond))
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
@@ -974,7 +1034,7 @@ func TestSettleClosedMinute_WritesAnEndedMinuteWithNoNewTraffic(t *testing.T) {
 	if len(rows) != 1 || rows[0].CostMicros != 250_000 {
 		t.Fatalf("got %+v, want the ended minute written", rows)
 	}
-	if _, open := w.pending(); !open.IsZero() {
+	if _, open, _ := w.pending(); !open.IsZero() {
 		t.Error("the minute is still held after being settled; it would be counted twice")
 	}
 }
@@ -1036,7 +1096,7 @@ func TestPrune_StaysArmedUntilAPruneActuallyRuns(t *testing.T) {
 	dir := t.TempDir()
 	now := at
 	w, err := New(dir, WithClock(func() time.Time { return now }),
-		WithRetentionDays(3), WithSettleInterval(0))
+		WithRetentionDays(3), withSettleInterval(0))
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
@@ -1267,7 +1327,7 @@ func TestRecord_ARowTimestampedInAnotherZoneIsStillFiledUnderTheLedgerDay(t *tes
 			"for that ledger day visits")
 	}
 	// The assertion that matters: a query for that ledger day finds it.
-	rows, err := w.Query(dayOf(evening), evening.Add(time.Hour))
+	rows, err := w.Query(context.Background(), dayOf(evening), evening.Add(time.Hour))
 	if err != nil {
 		t.Fatalf("Query: %v", err)
 	}
@@ -1319,11 +1379,11 @@ func TestQuery_WindowBoundsInAnotherZoneReadTheSameDayFiles(t *testing.T) {
 		}
 	}
 
-	local, err := w.Query(before, after)
+	local, err := w.Query(context.Background(), before, after)
 	if err != nil {
 		t.Fatalf("Query in the ledger zone: %v", err)
 	}
-	utc, err := w.Query(before.UTC(), after.UTC())
+	utc, err := w.Query(context.Background(), before.UTC(), after.UTC())
 	if err != nil {
 		t.Fatalf("Query in UTC: %v", err)
 	}
@@ -1789,7 +1849,7 @@ func assertOwnership(t *testing.T, w *Writer, dir, step string) {
 	if err := w.sync(); err != nil {
 		t.Fatalf("sync: %v", err)
 	}
-	_, open := w.pending()
+	_, open, _ := w.pending()
 	if open.IsZero() {
 		return
 	}
@@ -1839,7 +1899,7 @@ func TestPendingMinute_IsNeverAlsoOnDisk(t *testing.T) {
 	for _, r := range readAllRows(t, dir) {
 		total += r.CostMicros
 	}
-	pending, _ := w.pending()
+	pending, _, _ := w.pending()
 	for _, r := range pending {
 		total += r.CostMicros
 	}

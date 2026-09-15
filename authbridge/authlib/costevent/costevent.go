@@ -63,6 +63,19 @@ const (
 	SourceUsageFallback = "usage-fallback"
 )
 
+// Reasons a producer REFUSED a cost figure that was on the wire. Carried in
+// RejectedReason, which is the only evidence such a figure existed at all.
+//
+// A wire string, spelled like Source and IncompleteReason: hyphenated lowercase.
+const (
+	// RejectedImplausible: a response reported a cost larger than one inference call
+	// could plausibly be (pricing.MaxPlausibleRequestCostMicros) on an endpoint this
+	// pipeline could not parse, so nothing corroborated the figure and it was not
+	// believed. See costing.headerCost for the rule and what it does and does not
+	// protect against.
+	RejectedImplausible = "cost-implausible"
+)
+
 // Event is one request's settled cost. Unlike tool-prune's event, which carries
 // rates and leaves the arithmetic to the consumer, this carries a finished
 // figure.
@@ -150,6 +163,35 @@ type Event struct {
 	// a free completion.
 	OutputUSD float64 `json:"output_usd,omitempty"`
 
+	// RejectedReason names a cost figure the producer REFUSED — RejectedImplausible
+	// today — and is the ONLY evidence that a figure was on the wire at all.
+	//
+	// It exists so a refusal is a DISCLOSED COVERAGE GAP rather than silence. The
+	// alternative to publishing this record is publishing nothing, and then a response
+	// that reported $9,000,000,000 and a response that reported nothing are the same
+	// event to every consumer — which hides both the misconfiguration and the attack.
+	//
+	// NOT A FIGURE, and never clamped to the bound. CostUSD stays 0 with Settled false,
+	// and Priced() returns false whenever this is set, so no consumer can read a refused
+	// figure as money however the other fields arrive. A clamped figure would be a wrong
+	// number wearing a right label, which is worse than a named gap: the ring forgets a
+	// gap in six hours, while the durable ledger keeps a wrong number for thirty days
+	// with no repair path.
+	//
+	// LIMIT OF THE DISCLOSURE, stated because a reader will otherwise assume more: this
+	// gap does not reach usage.Snapshot.UnpricedBy. That map keys on "<endpoint>
+	// <model>" and counts requests that COULD have been priced, and the traffic this
+	// refusal lands on carries no model at all — the extension is nil, which is
+	// precisely why the figure could not be corroborated. Naming it there would mean
+	// widening what "priceable" counts, in a package this record only travels to. The
+	// evidence available today is this field on the record plus the operator warning
+	// costing emits with the host on it.
+	//
+	// ADDITIVE and omitempty, like Provenance and Incomplete: an older consumer decodes
+	// an event carrying it and sees an unsettled zero, which is the pre-fix reading of a
+	// refused figure — unpriced — so it is exactly as correct as it was before.
+	RejectedReason string `json:"rejected_reason,omitempty"`
+
 	// Avoided is cost that was NOT incurred. Nothing in here is spend.
 	//
 	// A nested list rather than sibling floats, deliberately. More counterfactuals are
@@ -229,11 +271,23 @@ func (e Event) TotalAvoidedUSD() float64 {
 // to −2 micros — an aggregate that then sat in the durable ledger for thirty days
 // with no repair path.
 //
+// The bound removed the SATURATION, not the wrap: 1024 figures at the bound still wrap
+// the same sum, and no per-request bound can fix that. See MaxCostMicros, which used to
+// claim otherwise.
+//
 // Zero for an out-of-range figure, and Priced returns false for the same one, so no
 // consumer reaches this value believing it is a price. NOT clamped to the bound: a
 // clamped figure is a wrong number wearing a right label, and unpriced is the honest
 // answer for a figure this package cannot represent.
+//
+// Zero for a REFUSED figure too, on the same rule. Micros and Priced must agree — a
+// consumer that read a figure here while Priced said no would add money to a total while
+// counting the request as uncovered — and RejectedReason means there is no figure to
+// convert, whatever CostUSD happens to hold.
 func (e Event) Micros() int64 {
+	if e.RejectedReason != "" {
+		return 0
+	}
 	m, ok := pricing.MicrosFromUSD(e.CostUSD)
 	if !ok {
 		return 0
@@ -252,12 +306,21 @@ func (e Event) Micros() int64 {
 // traffic as free. A negative figure is never a price.
 //
 // Nor is a figure OUT OF RANGE for the micros unit every consumer accumulates in —
-// above pricing.MaxCostMicros, or NaN, or an infinity. This is the validation point:
+// at or above pricing.MaxCostMicros, or NaN, or an infinity. This is the validation point:
 // the producer's header path accepts any finite non-negative float, and nothing
 // downstream re-derives a total once a saturated value has been added to it. Unpriced
 // rather than clamped, for the reason in Micros.
+//
+// Nor is a figure the producer REFUSED. RejectedReason is checked here rather than left to
+// the producer's zeroing of CostUSD, because this predicate is the one every consumer
+// already asks — the ledger writer's admission guard and the aggregator's Decode both go
+// through it — so one line here means a refused figure cannot read as spend anywhere, even
+// if a future producer sets the reason and forgets to drop the number.
 func (e Event) Priced() bool {
 	if e.CostUSD < 0 {
+		return false
+	}
+	if e.RejectedReason != "" {
 		return false
 	}
 	if _, ok := pricing.MicrosFromUSD(e.CostUSD); !ok {

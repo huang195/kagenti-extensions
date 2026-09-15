@@ -81,6 +81,7 @@
 package costledger
 
 import (
+	"strings"
 	"time"
 
 	"github.com/rossoctl/cortex/authbridge/authlib/usage"
@@ -133,6 +134,11 @@ type Row struct {
 	// gateway's own figures with modelled ones, and a single provenance per row
 	// would have to pick a winner. Keying on it keeps /v1/usage's pricedBy
 	// reconstructible from the ledger.
+	//
+	// EXPORTED BECAUSE encoding/json REQUIRES IT, like every other field here, and not
+	// because a caller reads it: nothing outside this package does today. Unexporting it
+	// would drop the column from every persisted row and from the accumulation key with
+	// it, which is the opposite of tidying up. See Fold for what is served from it.
 	Provenance string `json:"provenance,omitempty"`
 
 	usage.Counts
@@ -179,6 +185,76 @@ func truncateLabel(s string) string {
 		return s
 	}
 	return s[:maxLabelLen]
+}
+
+// sanitizeLabel replaces control characters and DEL with U+FFFD.
+//
+// These strings are request- or upstream-controlled — Endpoint is the host the
+// workload asked for and Model comes straight off the parsed request body — and they
+// are written to a DURABLE file that an operator cats and that other tools parse. An
+// escape sequence in a model name repositions the cursor, recolours the pane or erases
+// the line that reports it, for every future read of a file that is retained for
+// retentionDays and cannot be edited. CWE-150.
+//
+// REPLACED, NOT DROPPED, so tampering is visible instead of collapsing into a
+// plausible-looking label: "m\x1b[31mx" reads as "m�[31mx" rather than as "m[31mx",
+// which nobody would question.
+//
+// This is the same rule abctl's tui.sanitizeLabel applies when RENDERING these labels,
+// and it is deliberately NOT that function: cmd/ is a main-module package this library
+// must not import. Two copies of a five-line rule beats a dependency edge the wrong way
+// round; the rule is stated in both doc comments so a future change to either is a
+// visible divergence rather than a silent one.
+//
+// NOT a JSON-integrity guard — encoding/json escapes control bytes, so an unsanitised
+// label could never split a line or break readDay. Every consumer downstream of the
+// decode is what this protects.
+//
+// The one consequence worth stating: usage (the ring) does not sanitise, so a label
+// carrying control bytes is now spelled differently in the two halves and group=model
+// would show it as two series. That only happens for a label that is already hostile,
+// the ring's copy dies with the process, and the ledger's is the one that survives —
+// so the divergence is the right way round. The matching fix belongs in usage.
+func sanitizeLabel(s string) string {
+	if !hasControlBytes(s) {
+		// The overwhelmingly common case, and no allocation for it: this runs on the
+		// session-append path, under the store's write lock.
+		return s
+	}
+	var b strings.Builder
+	b.Grow(len(s))
+	for _, r := range s {
+		if r == 0x7f || r < 0x20 {
+			b.WriteRune('\uFFFD')
+			continue
+		}
+		b.WriteRune(r)
+	}
+	return b.String()
+}
+
+// hasControlBytes reports whether s carries a C0 control byte or DEL.
+//
+// A BYTE scan, which is exact rather than approximate: no continuation byte of a
+// multi-byte UTF-8 sequence is below 0x80, so a byte below 0x20 can only be that
+// character itself.
+func hasControlBytes(s string) bool {
+	for i := 0; i < len(s); i++ {
+		if s[i] == 0x7f || s[i] < 0x20 {
+			return true
+		}
+	}
+	return false
+}
+
+// rowLabel prepares one string for a durable row: sanitised, then capped.
+//
+// THE ORDER MATTERS. Sanitising can triple a string's length — every replaced byte
+// becomes three — so capping first would let a label of 96 control bytes reach 288 on
+// disk and break the line-length arithmetic maxLabelLen exists to guarantee. Capping
+// last can split a U+FFFD, which truncateLabel already documents as an accepted cost.
+func rowLabel(s string) string {
+	return truncateLabel(sanitizeLabel(s))
 }
 
 // maxLabelsPerMinute caps how many DISTINCT rows one open minute accumulates, and

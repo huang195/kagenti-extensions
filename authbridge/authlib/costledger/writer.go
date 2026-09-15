@@ -85,12 +85,20 @@ type batch struct {
 // this minute" would drop the batch already written. Under-reporting for microseconds
 // beats a rule that can double-count.
 //
-// OWNERSHIP, stated precisely because Window's correctness rests on it: while
-// pending() reports a minute, NOTHING on disk carries that minute or a later one.
-// Three write paths have to keep that true, and each is guarded below —
-// flushLocked advances flushedThrough as it writes, and the two direct-append
-// paths in add only ever write a minute strictly below the one being held.
-// TestPendingMinute_IsNeverAlsoOnDisk drives all three and asserts it.
+// OWNERSHIP, stated precisely: while pending() reports a minute, nothing THIS WRITER has
+// put on disk carries that minute or a later one. Three write paths have to keep that
+// true, and each is guarded below — takeLocked advances flushedThrough as it hands rows
+// off, and the two direct-append paths in add only ever write a minute strictly below the
+// one being held. TestPendingMinute_IsNeverAlsoOnDisk drives all three and asserts it.
+//
+// WINDOW NO LONGER RESTS ON IT, and the qualifier above is why. The rule is about this
+// writer's own writes and says nothing about the day files another writer left there — a
+// previous process that restarted inside the same minute, or a second proxy sharing
+// cost_ledger.dir. Read as a statement about the DIRECTORY it is false, and Window read
+// it that way: it dropped every disk row for the held minute as a duplicate, which hid
+// $1.00 of committed spend on the ordinary restart path. See Window. The rule is still
+// worth keeping and still tested, because it is what makes a minute leave memory exactly
+// once; it is simply not something a reader may infer anything about the disk from.
 type Writer struct {
 	store *store
 	now   func() time.Time
@@ -132,10 +140,33 @@ type Writer struct {
 	skippedLines  atomic.Int64
 	truncatedDays atomic.Int64
 
+	// betweenWindowReads is a TEST SEAM and nothing else: Window calls it, when
+	// non-nil, between reading the accumulator and reading the day files.
+	//
+	// It exists because the one state Window's reconciliation is for — a flush landing
+	// in exactly that gap — cannot otherwise be produced on purpose, and the test that
+	// used to stand in for it hand-seeded a disk row for the held minute instead. That
+	// fixture was indistinguishable from a restart, so it pinned the behaviour that hid
+	// $1.00 (see Window). Unexported and set directly by this package's tests, so it is
+	// not API; nil on every production path.
+	betweenWindowReads func()
+
 	mu sync.Mutex
 	// open is the minute currently accumulating, truncated to the minute.
 	open time.Time
 	rows map[key]*Row
+	// flushGen counts how many times rows have LEFT the accumulator — every takeLocked
+	// that took something, and the abandon at Close. It is not a clock, a size or a
+	// position; only whether it CHANGED across a read is ever read.
+	//
+	// Window's non-overlap rule rests on it. A row in the accumulator has never been
+	// written (the only exits are counted here, and add's direct-append paths write rows
+	// that were never in the map), so if this has not moved between the memory read and
+	// the disk read, the two halves are disjoint by construction and the memory half can
+	// be added. If it HAS moved, the memory half may now also be on disk and is dropped
+	// instead. That replaces the previous rule, which trusted an invariant it could not
+	// verify and hid every committed row for the held minute after a restart. See Window.
+	flushGen uint64
 	// flushedThrough is the newest minute any of whose rows have reached disk.
 	//
 	// It exists so a minute is never HELD after part of it has been written. Without
@@ -160,6 +191,11 @@ type Writer struct {
 type Option func(*Writer)
 
 // WithClock replaces the time source, for tests.
+//
+// EXPORTED FOR TESTS IN OTHER PACKAGES, which is why it is not unexported alongside
+// withSettleInterval: sessionapi's /v1/usage tests pin a ledger's clock to build a
+// window=today fixture that does not drift across local midnight, and they cannot reach
+// an unexported option. No production caller.
 func WithClock(fn func() time.Time) Option { return func(w *Writer) { w.now = fn } }
 
 // WithRetentionDays sets how many day files survive. Zero or negative means the
@@ -168,10 +204,14 @@ func WithRetentionDays(days int) Option {
 	return func(w *Writer) { w.retainDays = days }
 }
 
-// WithSettleInterval overrides how often the writer checks whether the held minute
+// withSettleInterval overrides how often the writer checks whether the held minute
 // has ended. Zero disables the check entirely, which leaves the next event and
 // shutdown as the only triggers — for a test that wants no background writes at all.
-func WithSettleInterval(d time.Duration) Option {
+//
+// UNEXPORTED, because every caller is a test in this package and nothing configures it:
+// there is no cost_ledger settle knob, so exporting it published a knob no operator can
+// turn and no binary sets. Export it again the day the config grows one.
+func withSettleInterval(d time.Duration) Option {
 	return func(w *Writer) { w.settle = d }
 }
 
@@ -253,6 +293,41 @@ func agentLabel(c *pipeline.EventClient) string {
 	return ""
 }
 
+// tokenCount converts one reported token count for a durable row, treating a
+// NEGATIVE as ABSENT.
+//
+// ABSENT, NOT CLAMPED, and the difference is the point rather than the arithmetic —
+// both produce 0. "Clamped" would mean this package decided a count it believes in is
+// too small and raised it; what actually happened is that the provider reported a
+// number that cannot be a count, so the honest record is that no count for that kind
+// arrived. Nothing here invents one, and nothing here rejects the row: the request
+// still counts, and any cost the gateway settled for it still counts.
+//
+// IT HAS TO BE GUARDED HERE because these six numbers are ints decoded from the
+// upstream response body by inference-parser, so their sign is chosen off-host, and
+// this is the last point before they become a line in an append-only file. A single
+// negative folds into usage.Counts.Add on every subsequent event for that minute and
+// then persists: a -1,000,000 InputTokens makes that minute's total, that day's total
+// and every window containing it wrong, permanently, with no error and nothing in the
+// file to say a count was ever negative. The ring recovers on restart; the file does
+// not.
+//
+// PresentKinds IS LEFT AS THE PARSER SET IT, deliberately. Clearing the bit for the
+// offending kind would be the fuller reading of "absent" — a set bit with a zero value
+// means "reported zero" where an unset bit means "not exposed" — but the bit layout is
+// parsercommon's, restated in pipeline.InferenceExtension precisely to avoid an import,
+// and re-deriving it here would put a third copy of it in the tree with nothing keeping
+// the three in agreement. The residual is that a negative count reads as "reported
+// zero" rather than "not exposed", which is a smaller error than a negative total, and
+// smaller still because PresentKinds is a UNION over the minute: any other response
+// reporting that kind sets the same bit anyway.
+func tokenCount(n int) int64 {
+	if n < 0 {
+		return 0
+	}
+	return int64(n)
+}
+
 // Record implements session.Recorder.
 //
 // Never returns an error and never touches disk: this runs on the synchronous
@@ -321,18 +396,22 @@ func (w *Writer) Record(_ string, e *pipeline.SessionEvent) {
 	}
 	r := Row{
 		At: minute,
-		// TRUNCATED, both of them, and this is not cosmetic: Model is the model name
-		// straight off the parsed request body and Host is set by whatever the workload
-		// asked for, so their lengths are chosen off-host and both are written to an
-		// append-only file. One over-long line permanently ends every future read of that
-		// day at its offset. See maxLabelLen for the measurement and the arithmetic.
+		// SANITISED AND TRUNCATED, both of them, and neither is cosmetic: Model is the
+		// model name straight off the parsed request body and Host is set by whatever the
+		// workload asked for, so their CONTENT and their LENGTH are both chosen off-host,
+		// and both are written to an append-only file an operator reads.
+		//
+		// One over-long line permanently ends every future read of that day at its offset
+		// (see maxLabelLen for the measurement and the arithmetic); one escape sequence
+		// rewrites the terminal of whoever cats the file (see sanitizeLabel). rowLabel
+		// applies both, in the order that keeps the length bound true.
 		//
 		// Host is the event's field name; endpoint is what it means here. See Row.Endpoint.
 		//
 		// Model is NOT set here. It comes from the extension, which may be nil now that a
 		// gateway-priced response the parser could not read is admitted, so it is assigned
 		// in the nil-checked block below.
-		Endpoint: truncateLabel(e.Host),
+		Endpoint: rowLabel(e.Host),
 		// The calling coding agent, and part of the row KEY — two agents hitting the
 		// same endpoint and model in the same minute are two rows, not one, or a
 		// per-agent breakdown could not be reconstructed from the file at all.
@@ -341,11 +420,13 @@ func (w *Writer) Record(_ string, e *pipeline.SessionEvent) {
 		// "" where the live aggregator displays it as "unknown". See Row.Agent for why
 		// the two representations differ and why they still mean the same thing.
 		//
-		// Truncated as well. pipeline.maxClientLen already caps the retained User-Agent
+		// Capped as well. pipeline.maxClientLen already caps the retained User-Agent
 		// at 128, so this is not the unbounded case Model is — but the ring truncates the
 		// same label to maxLabelLen before it becomes a byAgent key, so cutting at 96 here
-		// is what keeps group=agent spelled identically whichever half answers.
-		Agent:  truncateLabel(agentLabel(e.Client)),
+		// is what keeps group=agent spelled identically whichever half answers. And
+		// sanitised for the same reason as the two above: EventClient.Raw is the
+		// User-Agent header verbatim, so its bytes are the caller's to choose.
+		Agent:  rowLabel(agentLabel(e.Client)),
 		Counts: usage.Counts{Requests: 1},
 	}
 	// NIL-SAFE, because the guard above now admits a row with no extension: an endpoint
@@ -357,15 +438,18 @@ func (w *Writer) Record(_ string, e *pipeline.SessionEvent) {
 	// still counting toward totals — which is honest, because there is no model to
 	// attribute it to. Leaving it out of the totals instead would lose real dollars.
 	if inf := e.Inference; inf != nil {
-		r.Model = truncateLabel(inf.Model)
+		r.Model = rowLabel(inf.Model)
+		// tokenCount on every one of them: these six numbers are decoded from the
+		// upstream response body, so a negative is reachable from off-host. See tokenCount
+		// for what a negative becomes and why.
 		r.Counts = usage.Counts{
 			Requests:         1,
-			InputTokens:      int64(inf.InputTokens),
-			CacheReadTokens:  int64(inf.CacheReadTokens),
-			CacheWriteTokens: int64(inf.CacheWriteTokens),
-			OutputTokens:     int64(inf.OutputTokens),
-			ReasoningTokens:  int64(inf.ReasoningTokens),
-			Tokens:           int64(inf.TotalTokens),
+			InputTokens:      tokenCount(inf.InputTokens),
+			CacheReadTokens:  tokenCount(inf.CacheReadTokens),
+			CacheWriteTokens: tokenCount(inf.CacheWriteTokens),
+			OutputTokens:     tokenCount(inf.OutputTokens),
+			ReasoningTokens:  tokenCount(inf.ReasoningTokens),
+			Tokens:           tokenCount(inf.TotalTokens),
 			PresentKinds:     inf.PresentKinds,
 		}
 	}
@@ -383,12 +467,13 @@ func (w *Writer) Record(_ string, e *pipeline.SessionEvent) {
 	// Reuses the lookup the admission guard above already did rather than unmarshalling
 	// the same plugin map twice under session.Store.Append's write lock.
 	if hasCost {
-		// Truncated for completeness rather than against a known threat: provenance is
-		// authored by this process's own pricing code, not by a caller. It is the fourth
-		// field of the row key, so leaving one of the four uncapped would leave the
-		// line-length bound maxLabelLen states resting on a promise about a sibling
-		// package instead of on the arithmetic.
-		r.Provenance = truncateLabel(ev.Provenance)
+		// Sanitised and capped for completeness rather than against a known threat:
+		// provenance is authored by this process's own pricing code, not by a caller. It is
+		// the fourth field of the row key, so leaving one of the four untreated would leave
+		// the line-length bound maxLabelLen states resting on a promise about a sibling
+		// package instead of on the arithmetic — and ONE rule for every string this package
+		// writes to a durable file is easier to keep than three plus an exception.
+		r.Provenance = rowLabel(ev.Provenance)
 		if ev.Priced() {
 			r.CostMicros = ev.Micros()
 			r.PricedRequests = 1
@@ -529,6 +614,10 @@ func (w *Writer) takeLocked() batch {
 		w.flushedThrough = w.open
 	}
 	w.rows = map[key]*Row{}
+	// Rows have left the accumulator, so any snapshot a reader took of it may now also
+	// be on disk. Bumped under mu, in the same critical section that empties the map, so
+	// a reader cannot observe the map emptied and the generation unmoved. See flushGen.
+	w.flushGen++
 	return batch{rows: out}
 }
 
@@ -581,19 +670,31 @@ func (w *Writer) markPruned(at time.Time) {
 // COPIED, not aliased: the caller is an HTTP handler that will encode these while
 // the next Record mutates the live map.
 //
-// The returned minute is the ownership boundary Window relies on — see the type
-// doc. Zero, with no rows, when nothing is held.
-func (w *Writer) pending() ([]Row, time.Time) {
+// The returned minute is the ownership boundary the writer keeps — see the type doc and
+// TestPendingMinute_IsNeverAlsoOnDisk. Zero, with no rows, when nothing is held. Window
+// no longer decides anything from it; the third return is what Window uses.
+//
+// THE GENERATION IS RETURNED FROM THE SAME CRITICAL SECTION as the rows, which is the
+// only reason comparing it later means anything: sampled separately, a flush could land
+// between the two samples and the comparison would say nothing happened. See flushGen.
+func (w *Writer) pending() ([]Row, time.Time, uint64) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	if len(w.rows) == 0 {
-		return nil, time.Time{}
+		return nil, time.Time{}, w.flushGen
 	}
 	out := make([]Row, 0, len(w.rows))
 	for _, r := range w.rows {
 		out = append(out, *r)
 	}
-	return out, w.open
+	return out, w.open, w.flushGen
+}
+
+// flushGeneration reports the accumulator's generation. See flushGen.
+func (w *Writer) flushGeneration() uint64 {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return w.flushGen
 }
 
 // enqueue hands a batch to the writer goroutine, or DROPS it.
@@ -705,6 +806,12 @@ func (w *Writer) logDrops() {
 // Exported so a caller can surface it rather than leaving it in a log line nobody
 // greps: a cost total assembled from a ledger that dropped rows is short by an unknown
 // amount, and that is worth saying out loud.
+//
+// NO NON-TEST CALLER TODAY, and it stays exported anyway. It is the completeness signal
+// the package doc and Window's contract both cite, and the /v1/usage response has a
+// Degraded field that already carries the two READ-side gauges beside it (see
+// SkippedLines and TruncatedDays) — this is the write-side one that belongs there next,
+// which is a sessionapi change rather than a reason to withdraw the number.
 func (w *Writer) Dropped() int64 { return w.dropped.Load() }
 
 // SkippedLines is how many lines the MOST RECENT Query or Window could not decode.
@@ -1018,8 +1125,16 @@ func (w *Writer) abandon() int64 {
 			lost += int64(len(b.rows))
 		default:
 			w.mu.Lock()
-			lost += int64(len(w.rows))
-			w.rows = map[key]*Row{}
+			if len(w.rows) > 0 {
+				lost += int64(len(w.rows))
+				w.rows = map[key]*Row{}
+				// The other exit from the accumulator, and the only one where the rows reach
+				// nothing at all. Bumped for the same reason takeLocked does: a reader holding a
+				// snapshot of them must be told the map moved underneath it, and reporting rows
+				// that are now provably lost as though they were still held would outlive this
+				// read by exactly one Dropped() count.
+				w.flushGen++
+			}
 			w.mu.Unlock()
 			return lost
 		}

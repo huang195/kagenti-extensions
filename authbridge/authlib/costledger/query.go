@@ -3,6 +3,7 @@ package costledger
 import (
 	"time"
 
+	"github.com/rossoctl/cortex/authbridge/authlib/pipeline"
 	"github.com/rossoctl/cortex/authbridge/authlib/usage"
 )
 
@@ -139,13 +140,17 @@ func Fold(rows []Row, group usage.Group) (usage.Counts, map[string]usage.Counts)
 }
 
 // unknownAgentLabel is the reserved DISPLAY bucket for traffic that carried no
-// User-Agent. It is deliberately the same string pipeline.EventClient.Label returns
-// for a nil client: the ring and the ledger both serve group=agent, and two spellings
-// of "unattributed" would surface as two rows in any client that merged them.
+// User-Agent. The ring and the ledger both serve group=agent, and two spellings of
+// "unattributed" would surface as two rows in any client that merged them, each
+// holding half the unattributed spend.
+//
+// DEFINED BY pipeline rather than duplicated here, so that agreement is the
+// compiler's to keep rather than a comment's to assert. It was a matching literal in
+// both packages until the axis was wired into abctl, which would have made a third.
 //
 // NOT an agent name, and a consumer must not present it as one — the row is
 // unattributed traffic, not a program that spent money.
-const unknownAgentLabel = "unknown"
+const unknownAgentLabel = pipeline.UnknownClientLabel
 
 // labelFor picks the grouping key, returning ok=false when the row carries no
 // value for that axis — so an empty key never becomes a blank row, the same guard

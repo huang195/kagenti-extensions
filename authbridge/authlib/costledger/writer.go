@@ -278,6 +278,23 @@ func (w *Writer) Record(_ string, e *pipeline.SessionEvent) {
 		if ev.Priced() {
 			r.CostMicros = ev.Micros()
 			r.PricedRequests = 1
+			// PRICED IMPLIES PRICEABLE, and it has to be said here because the test above
+			// does not cover this case. A response that carries the gateway's own cost
+			// header but no parsed token counts — a body-less response, which the proxy
+			// now charges — has Tokens == 0, so the model-and-tokens test leaves
+			// PriceableRequests at 0 while this branch sets PricedRequests to 1.
+			//
+			// That inverts the subset: every consumer computes coverage as
+			// priceable-minus-priced (see abctl's `cost` command and its spend strip),
+			// and a NEGATIVE gap fails their `> 0` test, so a day mixing these responses
+			// with genuinely unpriced ones silently prints no coverage warning at all.
+			// The caveat disappears exactly when there is something to caveat.
+			//
+			// The live aggregator never had the bug: usage.Aggregator.costOf sets priced
+			// and priceable together in one literal. This keeps the ledger's arithmetic
+			// identical to the ring's, which matters because /v1/usage answers from
+			// whichever one the window selects.
+			r.PriceableRequests = 1
 			if ev.Incomplete {
 				// The one caveat a persisted total cannot afford to lose. CostMicros here is
 				// a floor (a stream that died before its output count) or an approximation (a

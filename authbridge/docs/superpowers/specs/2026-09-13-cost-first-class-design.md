@@ -26,9 +26,9 @@
 > here would have been vendor list price.
 >
 > The last two of those arrived late, and a reader of an earlier revision of this
-> banner was told they were missing: the Cost pane landed in `ddb93fbd` and the
+> banner was told they were missing: the Cost pane landed in `a1e662c4` and the
 > `agent` grouping — `usage.GroupAgent`, `pipeline.EventClient`, the ledger's
-> `agent` column — in `fc1a8271`. Both are in the tree. A banner that understates
+> `agent` column — in `80b3f38d`. Both are in the tree. A banner that understates
 > what shipped defeats this convention exactly as thoroughly as one that overstates
 > it, so this is recorded rather than quietly corrected.
 >
@@ -582,8 +582,8 @@ followed by their own fixes — the writer coming off the request path, the open
 supplied at all, a corrupt ledger line no longer discarding the rest of its day. Rows 1, 2 and 7
 did not land in this form: 1 and 2 were superseded upstream (see the banner), and 7 — tool-prune's
 resolver, `Avoided` end to end — did not land at all, which is why the `avoided*` fields are absent
-and why the Cost pane has no `AVOIDED` section. Rows 3, 4, 5 and 6 map to `f974d3db`, `b23bb152`,
-`8bdb9c55` and `fc1a8271`; the Cost pane is `ddb93fbd`, an eighth commit this table does not list.
+and why the Cost pane has no `AVOIDED` section. Rows 3, 4, 5 and 6 map to `cf74f28a`, `49279b22`,
+`90fe5ff7` and `80b3f38d`; the Cost pane is `a1e662c4`, an eighth commit this table does not list.
 
 | commit | content | effect |
 |---|---|---|

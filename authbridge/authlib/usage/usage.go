@@ -14,6 +14,7 @@
 package usage
 
 import (
+	"math"
 	"strconv"
 	"sync"
 	"time"
@@ -92,6 +93,34 @@ type Counts struct {
 	// already carries that distinction; dropping it at the aggregate would throw
 	// away the only thing that makes an empty cell readable.
 	PresentKinds uint8 `json:"presentKinds,omitempty"`
+	// Saturated says that at least one addition into this Counts hit the int64 ceiling and
+	// was CLAMPED rather than allowed to wrap. Every number here is then a FLOOR: the real
+	// figure is larger, and by an amount nothing in this struct can state.
+	//
+	// It exists because the alternative was a wrapped total, and a wrapped total is a lie
+	// that reads as a fact. No per-request bound can prevent the wrap — for any bound C the
+	// sum overflows after ceil(math.MaxInt64/C) requests and nothing bounds the request
+	// count (see pricing.MaxCostMicros, which spells out the arithmetic) — so the only place
+	// to close it is where the sum is kept, which is Add below. A clamp on its own would
+	// merely trade a large negative lie for a large positive one; this field is what makes
+	// the clamp honest, and it is the whole reason the clamp is acceptable.
+	//
+	// A BOOL, NOT A COUNTER, unlike every other disclosure in this struct. A count of
+	// saturating additions would depend on how many folds happened, and that depends on the
+	// bucket resolution the client asked for — which is the one property this package
+	// insists a total must not have (see Totals and UngroupedCostMicros, both summed from
+	// the raw buckets for exactly that reason). "This number is a ceiling" is a property of
+	// the number and survives any regrouping; "it was clamped four times" is a property of
+	// the arithmetic path and does not.
+	//
+	// OR-ED THROUGH Add, like PresentKinds: folding a saturated bucket into a clean one
+	// yields a saturated total, because the total inherits the floor.
+	//
+	// NOT LOGGED, deliberately. This package has no logger and a log line on the fold path
+	// would either flood or be sampled into uselessness; the disclosure travels on the same
+	// response as the number it qualifies, which is where an operator reading that number
+	// will see it.
+	Saturated bool `json:"saturated,omitempty"`
 	// CostMicros is millionths of a US dollar. An integer unit keeps bucket
 	// addition exact and JSON round-tripping lossless, which float dollars do
 	// not; a client divides by 1e6 to display. Zero when nothing here could be
@@ -191,27 +220,91 @@ type Counts struct {
 //
 // Pointer receiver and mutating, matching how the aggregator accumulates on the
 // hot path. For a map value, read-modify-write: `v := m[k]; v.Add(o); m[k] = v`.
+//
+// EVERY FIELD IS A CHECKED ACCUMULATE. `+=` wrapped, and a wrapped total is the worst
+// failure this package has: 1,024 requests at pricing.MaxCostMicros summed to
+// -9214364837600034816, which then sat in the durable ledger for its full retention with
+// no repair path. pricing.MaxCostMicros' own doc proves no per-request bound can close
+// that and names this function as the place that must. It is four lines here because this
+// PR made Add the single summation point; every site that used to sum fields by hand now
+// delegates, so the guard lands once and cannot be forgotten at a call site.
+//
+// WHICH FIELDS ARE ACTUALLY AT RISK, in order:
+//   - The TOKEN fields. They are read from a provider-reported `int` on the wire, and
+//     foldInto now refuses an implausible one — but the refusal is a ceiling per request,
+//     not on the sum, and Add is exported so a consumer can hand it anything.
+//   - CostMicros. Bounded per request at pricing.MaxPlausibleRequestCostMicros for the
+//     modelled path and pricing.MaxCostMicros for a gateway's own cost header, which puts
+//     the wrap at ~9.2e8 and 1,024 requests respectively. The second is reachable.
+//   - Requests, Errors and the three coverage counters are one per event at the source, so
+//     traffic cannot reach 2^63 of them. They are checked anyway: Add is exported, abctl
+//     folds arbitrary Counts through it to build its "(other)" band, and a uniform call
+//     site is the only kind that cannot be forgotten when a field is added.
 func (c *Counts) Add(o Counts) {
-	c.Requests += o.Requests
-	c.Errors += o.Errors
-	c.Tokens += o.Tokens
-	c.CostMicros += o.CostMicros
-	c.PricedRequests += o.PricedRequests
+	c.addInto(&c.Requests, o.Requests)
+	c.addInto(&c.Errors, o.Errors)
+	c.addInto(&c.Tokens, o.Tokens)
+	c.addInto(&c.CostMicros, o.CostMicros)
+	c.addInto(&c.PricedRequests, o.PricedRequests)
 	// Summed alongside PricedRequests, never out of it: it is a subset disclosure, not a
 	// deduction. See the field's own comment for why the aggregate discloses rather than
 	// adjusts.
-	c.IncompleteRequests += o.IncompleteRequests
-	c.PriceableRequests += o.PriceableRequests
-	c.InputTokens += o.InputTokens
-	c.CacheReadTokens += o.CacheReadTokens
-	c.CacheWriteTokens += o.CacheWriteTokens
-	c.OutputTokens += o.OutputTokens
+	c.addInto(&c.IncompleteRequests, o.IncompleteRequests)
+	c.addInto(&c.PriceableRequests, o.PriceableRequests)
+	c.addInto(&c.InputTokens, o.InputTokens)
+	c.addInto(&c.CacheReadTokens, o.CacheReadTokens)
+	c.addInto(&c.CacheWriteTokens, o.CacheWriteTokens)
+	c.addInto(&c.OutputTokens, o.OutputTokens)
 	// Summed alongside OutputTokens, never into it: it is a subset of the output
 	// the provider already reported, so folding it in would bill it twice.
-	c.ReasoningTokens += o.ReasoningTokens
+	c.addInto(&c.ReasoningTokens, o.ReasoningTokens)
 	// Union, not sum: PresentKinds is a set of which kinds were reported, so
 	// adding two buckets' flags would produce a number that is not a bit set.
 	c.PresentKinds |= o.PresentKinds
+	// Inherited, not merely OR-ed for symmetry: if o's own total was a floor then any total
+	// containing it is a floor too. See the field.
+	if o.Saturated {
+		c.Saturated = true
+	}
+}
+
+// addInto accumulates v into *dst, saturating at the int64 bounds, and records on c that
+// the figure it produced is no longer a sum.
+//
+// A METHOD RATHER THAN A CLOSURE over a local flag: this runs once per field per folded
+// event on the aggregator's hot path, and a closure capturing a bool escapes to the heap.
+//
+// The receiver is the same Counts that owns dst in every call above. It is passed
+// separately because the point is to write two places — the field and the disclosure — from
+// one call, so a saturating add cannot record the clamp and lose the fact that it clamped.
+func (c *Counts) addInto(dst *int64, v int64) {
+	sum, saturated := addSat(*dst, v)
+	*dst = sum
+	if saturated {
+		c.Saturated = true
+	}
+}
+
+// addSat is a + b, clamped to the int64 range instead of wrapping, and whether it clamped.
+//
+// The test is written as `a > math.MaxInt64-b` rather than by inspecting the sign of the
+// result, because computing the wrapped sum first and then reasoning about it is signed
+// overflow — undefined in most languages and merely unhelpful in Go, where it silently
+// produces the very number this function exists to avoid returning.
+//
+// BOTH DIRECTIONS. No producer in this package can settle a negative cost — costevent
+// refuses one and MicrosFromUSD rejects it — so the lower clamp is unreachable through the
+// aggregator today. It is here because Add is exported, because "unreachable today" is how
+// the wrap arrived in the first place, and because a half-guarded accumulator invites a
+// reader to conclude the other half was considered and ruled out.
+func addSat(a, b int64) (int64, bool) {
+	if b > 0 && a > math.MaxInt64-b {
+		return math.MaxInt64, true
+	}
+	if b < 0 && a < math.MinInt64-b {
+		return math.MinInt64, true
+	}
+	return a + b, false
 }
 
 // Bucket is one BucketWidth slice of time, as served to clients.

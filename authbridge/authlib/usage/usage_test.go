@@ -135,6 +135,145 @@ func TestCountsAddFoldsPricedRequests(t *testing.T) {
 	}
 }
 
+// TestCountsAdd_EveryInt64FieldSaturatesAndSaysSo walks Counts BY REFLECTION, which is the
+// only way this test cannot rot.
+//
+// A hand-written table of the fields would have to be extended by whoever adds a field —
+// the same person who would have to remember to use the checked accumulate in Add, and the
+// evidence in Add's own doc is that this is exactly what gets forgotten (an out-of-module
+// copy hand-summed these fields and silently missed PricedRequests). Reflection asks the
+// struct instead of asking a list, so a new int64 field added with a bare `+=` fails here on
+// the day it lands.
+//
+// Both halves are asserted, because either alone is a lie: the clamp (the number must not
+// wrap into a negative) and the disclosure (a clamped total must say it is a floor).
+func TestCountsAdd_EveryInt64FieldSaturatesAndSaysSo(t *testing.T) {
+	rt := reflect.TypeOf(Counts{})
+	checked := 0
+	for i := range rt.NumField() {
+		f := rt.Field(i)
+		if f.Type.Kind() != reflect.Int64 {
+			continue
+		}
+		checked++
+		t.Run(f.Name, func(t *testing.T) {
+			for _, dir := range []struct {
+				name       string
+				start, add int64
+				want       int64
+			}{
+				{"upward", math.MaxInt64, 1, math.MaxInt64},
+				{"downward", math.MinInt64, -1, math.MinInt64},
+			} {
+				t.Run(dir.name, func(t *testing.T) {
+					var a, b Counts
+					reflect.ValueOf(&a).Elem().Field(i).SetInt(dir.start)
+					reflect.ValueOf(&b).Elem().Field(i).SetInt(dir.add)
+					a.Add(b)
+					if got := reflect.ValueOf(a).Field(i).Int(); got != dir.want {
+						t.Errorf("%s = %d after overflowing %s, want %d — a bare += wraps here, and "+
+							"the wrapped figure then sits in the durable ledger for its full retention",
+							f.Name, got, dir.name, dir.want)
+					}
+					if !a.Saturated {
+						t.Errorf("%s hit the int64 %s bound and Saturated is false; a silently clamped "+
+							"total is the same class of lie as a wrapped one, and a client has no way "+
+							"to know the figure is a floor", f.Name, dir.name)
+					}
+				})
+			}
+		})
+	}
+	// The loop itself must have found the fields, or a rename made this test a no-op that
+	// reports success — which is the failure mode the reflection was chosen to avoid.
+	if checked < 12 {
+		t.Errorf("walked %d int64 fields of Counts, expected at least 12; the struct was "+
+			"renamed or retyped and this test now asserts nothing", checked)
+	}
+}
+
+// TestCountsAdd_TheWrapMeasuredInPricingIsClosed is the disclosure in
+// pricing.MaxCostMicros, executed.
+//
+// That comment states the arithmetic — math.MaxInt64 / MaxCostMicros is 1023, so 1,024
+// requests each priced at the bound wrap the aggregate to -9214364837600034816 — and names
+// Counts.Add as the place that has to close it, because no per-request bound can. This runs
+// exactly that scenario and asserts the total never goes negative.
+//
+// The count is deliberately past 1,024. A test that stopped at the wrap point would pass on
+// an implementation that wraps once and then keeps accumulating from a negative base.
+func TestCountsAdd_TheWrapMeasuredInPricingIsClosed(t *testing.T) {
+	const atBound = int64(pricing.MaxCostMicros) - 1 // the largest figure MicrosFromUSD admits
+	var total Counts
+	for n := 1; n <= 2_000; n++ {
+		total.Add(Counts{Requests: 1, CostMicros: atBound, PricedRequests: 1})
+		if total.CostMicros < 0 {
+			t.Fatalf("CostMicros = %d after %d requests at %d micros: the aggregate wrapped, which "+
+				"is the failure pricing.MaxCostMicros documents and cannot fix",
+				total.CostMicros, n, atBound)
+		}
+	}
+	if total.CostMicros != math.MaxInt64 {
+		t.Errorf("CostMicros = %d, want math.MaxInt64 (%d) — the sum is meant to CLAMP at the "+
+			"ceiling, not to stop accumulating or to reset", total.CostMicros, int64(math.MaxInt64))
+	}
+	if !total.Saturated {
+		t.Error("2,000 requests at the cost bound produced a clamped total that does not disclose " +
+			"it; the number is then a ceiling presented as a sum")
+	}
+	// Requests is 2,000 and exact. The disclosure must not be read as "nothing here is
+	// trustworthy": one field saturated, the others are still sums.
+	if total.Requests != 2_000 {
+		t.Errorf("Requests = %d, want 2000 — saturation on one field must not disturb another",
+			total.Requests)
+	}
+}
+
+// TestCountsAdd_SaturationIsInheritedByAnyTotalContainingIt is why the flag is OR-ed rather
+// than recomputed.
+//
+// Buckets are folded into totals and into coarser buckets, and a fold does not repeat the
+// addition that saturated. If the flag did not travel, the bucket would say its figure is a
+// floor and the window total containing it would say its own figure is exact — the same
+// number, two different claims, and the client reads the one that is wrong.
+func TestCountsAdd_SaturationIsInheritedByAnyTotalContainingIt(t *testing.T) {
+	saturated := Counts{Requests: 1, CostMicros: math.MaxInt64, Saturated: true}
+	total := Counts{Requests: 1, CostMicros: 5}
+	total.Add(saturated)
+	if !total.Saturated {
+		t.Error("a total that folded in a saturated bucket reports itself exact; the floor is " +
+			"inherited by every sum the bucket is part of")
+	}
+	// And the flag is not sticky the other way: folding a clean bucket into a clean total
+	// must not manufacture a caveat, or the disclosure means nothing.
+	clean := Counts{Requests: 1, CostMicros: 5}
+	clean.Add(Counts{Requests: 1, CostMicros: 5})
+	if clean.Saturated {
+		t.Error("an ordinary fold set Saturated; a caveat that appears on clean data trains an " +
+			"operator to ignore it")
+	}
+}
+
+// TestCountsSaturatedOmittedWhenFalse keeps the wire quiet for the overwhelming majority of
+// responses, on the same rule as PricedRequests below: absence is the clean answer.
+func TestCountsSaturatedOmittedWhenFalse(t *testing.T) {
+	b, err := json.Marshal(Counts{Requests: 3, CostMicros: 5})
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	if strings.Contains(string(b), "saturated") {
+		t.Errorf("a clean Counts serialised the saturation flag, got %s", b)
+	}
+	b, err = json.Marshal(Counts{Requests: 3, Saturated: true})
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	if !strings.Contains(string(b), `"saturated":true`) {
+		t.Errorf("a saturated Counts did not serialise the flag, got %s — the disclosure only "+
+			"works if it reaches the client", b)
+	}
+}
+
 // TestCountsPricedRequestsOmittedWhenZero keeps the wire quiet for deployments
 // that price nothing.
 func TestCountsPricedRequestsOmittedWhenZero(t *testing.T) {
@@ -790,11 +929,28 @@ func TestFoldInto_CarriesEveryCountsField(t *testing.T) {
 	a.Record("s1", e)
 	totals := a.Snapshot(10*BucketWidth, BucketWidth, "s1", GroupNone).Totals
 
+	// Saturated is the ONE field one event cannot populate, and it is asserted the other way
+	// round rather than skipped. It is a fault disclosure, not a carried value: it can only
+	// be true if an addition hit the int64 ceiling, which a single event cannot do and which
+	// no real deployment should ever see. Exempting it with a bare `continue` would let it
+	// become permanently true — a caveat on every clean response — with nothing here to
+	// notice, so the exemption is spelled as its own expectation instead.
+	// TestCountsAdd_EveryInt64FieldSaturatesAndSaysSo covers the true case.
+	assertedAbsent := map[string]bool{"Saturated": true}
 	v := reflect.ValueOf(totals)
 	for i := 0; i < v.NumField(); i++ {
+		name := v.Type().Field(i).Name
+		if assertedAbsent[name] {
+			if !v.Field(i).IsZero() {
+				t.Errorf("Counts.%s is set after folding one ordinary event: it is a fault "+
+					"disclosure and ordinary traffic must leave it clean, or every response "+
+					"carries a caveat that means nothing", name)
+			}
+			continue
+		}
 		if v.Field(i).IsZero() {
-			t.Errorf("Counts.%s came back zero: the fold does not carry it, so this field is absent from every /v1/usage total. Carry it in foldInto (the token split rides along via Counts.Add) or, if one event genuinely cannot populate it, say so here.",
-				v.Type().Field(i).Name)
+			t.Errorf("Counts.%s came back zero: the fold does not carry it, so this field is absent from every /v1/usage total. Carry it in foldInto (the token split rides along via Counts.Add) or, if one event genuinely cannot populate it, say so in assertedAbsent above.",
+				name)
 		}
 	}
 }

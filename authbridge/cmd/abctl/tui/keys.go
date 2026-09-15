@@ -1007,6 +1007,23 @@ func (m *model) layout() {
 	m.catalogTbl.SetColumns(fitTableColumns(catalogColumns(), m.width))
 
 	m.sessionsTbl.SetHeight(bodyH)
+	// Rebuild the sessions ROWS, not just re-fit the columns. AFTER SetColumns above, and
+	// the order is the whole point: rebuildSessionsTable reads the width COST was
+	// actually fitted to (fittedSessionsColumnWidth) to decide whether a dollar figure
+	// fits or has to be elided, so running it first would read the previous width and
+	// change nothing.
+	//
+	// Without this call the columns were re-fitted on every WindowSizeMsg while the rows
+	// kept the formatting chosen for the PREVIOUS width, until the next
+	// sessionsLoadedMsg or streamed event happened to repaint them. For that interval a
+	// just-narrowed terminal showed one clipped figure and a just-widened one a needless
+	// ellipsis — the seam fittedSessionsColumnWidth's own doc names and leaves to this
+	// call site.
+	//
+	// Safe before the first fetch: m.sessions is empty, so it sets an empty row set on an
+	// already-empty table and parks the cursor at 0. It is the same call
+	// rebuildEventsTable a few lines down already makes unconditionally.
+	m.rebuildSessionsTable()
 	m.bodyHeight = bodyH
 	// Picker tables share the same body area as the session tables so the
 	// terminal real estate stays constant as the user navigates panes.

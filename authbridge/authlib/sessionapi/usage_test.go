@@ -322,16 +322,27 @@ func ledgerWithOneCostedMinute(t *testing.T, at time.Time, host, model string, c
 // Local, not UTC, because that is what usage.ParseWindowSpec means by "today" — see its doc
 // for why a laptop crossing a timezone must not have its day reset mid-afternoon.
 //
-// DELEGATED, not derived, and it used to be derived. This was
-// time.Date(n.Year(), n.Month(), n.Day(), 0, 0, 0, 0, n.Location()) — a second copy of the
+// TAKEN FROM THE WINDOW ITSELF, not computed a second way, and it used to be computed. This
+// was time.Date(n.Year(), n.Month(), n.Day(), 0, 0, 0, 0, n.Location()) — a copy of the
 // expression ParseWindowSpec carried, with the identical flaw: in a zone whose DST
-// transition falls at 00:00 that instant does not exist on the spring-forward day and
+// transition falls at 00:00 that instant does not exist on the spring-forward day, and
 // time.Date resolves it onto the neighbouring one. A fixture whose whole job is to sit
-// inside the window under test cannot afford to compute the window's edge a second way, so
-// it now calls the one function that defines it. The dependency runs sessionapi to usage,
-// which is the direction this package's imports already go; usage must never import back.
-func startOfToday() time.Time {
-	return usage.StartOfLocalDay(time.Now())
+// INSIDE the window under test then sat outside it, and the assertion it fed measured an
+// empty ledger while reading as a routing failure.
+//
+// Asking ParseWindowSpec is stronger than sharing usage.StartOfLocalDay with it would be:
+// there is no second derivation left to drift, in any zone, on any date — the anchor IS the
+// bound the request will be served with. Taking t is the price, and it buys a Fatalf on the
+// parse rather than a zero time silently becoming the anchor. The dependency runs sessionapi
+// to usage, which is the direction this package's imports already go; usage must never
+// import back.
+func startOfToday(t *testing.T) time.Time {
+	t.Helper()
+	spec, err := usage.ParseWindowSpec(usage.WindowToday, time.Now())
+	if err != nil {
+		t.Fatalf("ParseWindowSpec(%q): %v", usage.WindowToday, err)
+	}
+	return spec.From
 }
 
 // mustZone loads a real zone, FAILING rather than skipping when it cannot.
@@ -350,38 +361,50 @@ func mustZone(t *testing.T, name string) *time.Location {
 	return loc
 }
 
-// TestStartOfToday_IsTheEndpointsOwnBoundaryAndNotALocalMidnight is what makes the
-// delegation above worth more than a shorter line.
+// TestStartOfToday_TheFixtureAnchorLandsInsideTheWindowItIsQueriedWith is the assertion
+// every window=today test in this file silently depends on.
 //
-// It asserts two things a copy could not. First, that the anchor these fixtures use IS the
-// bound usage.ParseWindowSpec("today") serves — in a zone where a re-derivation would
-// differ, so the equality is not trivially true. Second, that the expression this helper
-// used to contain really does differ there, which is the negative control: without it the
-// test would keep passing if someone swapped the zone for UTC, and a green suite would
-// again say nothing about any zone that shifts.
-func TestStartOfToday_IsTheEndpointsOwnBoundaryAndNotALocalMidnight(t *testing.T) {
-	// America/Havana shifts AT 00:00, so 2026-03-08 has no midnight at all.
-	loc := mustZone(t, "America/Havana")
-	const date = "2026-03-08"
-	now := time.Date(2026, 3, 8, 15, 0, 0, 0, loc)
-
-	spec, err := usage.ParseWindowSpec(usage.WindowToday, now)
+// Each of them writes a ledger row a couple of minutes after the anchor and then asks the
+// endpoint for window=today. If the anchor is not inside [From, now] the row is in a
+// different day file from the one the request reads, the response is empty, and the test
+// fails as though routing or grouping were broken. So the anchor is checked against the
+// window directly, once, here.
+//
+// AND AGAINST THE EXPRESSION IT REPLACED, in a real zone, because that is where the
+// property has teeth. time.Local cannot be changed inside a running process, so the live
+// clock only exercises this on a host whose zone shifts at 00:00, on one of the two dates a
+// year that it does. Pinning America/Havana on 2026-03-08 makes the damage deterministic:
+// the old anchor lands at 23:02 on 2026-03-07 while the window it is meant to sit inside
+// begins at 01:00 on 2026-03-08 — an hour and fifty-eight minutes outside it, on the wrong
+// date, in the wrong day file.
+func TestStartOfToday_TheFixtureAnchorLandsInsideTheWindowItIsQueriedWith(t *testing.T) {
+	// The live clock, which is what the fixtures actually use.
+	spec, err := usage.ParseWindowSpec(usage.WindowToday, time.Now())
 	if err != nil {
 		t.Fatalf("ParseWindowSpec: %v", err)
 	}
-	if got := usage.StartOfLocalDay(now); !got.Equal(spec.From) {
-		t.Errorf("StartOfLocalDay = %v but window=today starts at %v; the fixture anchor and "+
-			"the window under test are two different instants", got, spec.From)
+	at := startOfToday(t).Add(2 * time.Minute)
+	if at.Before(spec.From) {
+		t.Errorf("the anchor fixtures are written at (%v) is before window=today begins (%v), "+
+			"so their rows are filed under a day the request never reads", at, spec.From)
 	}
-	// The negative control: the old expression, and why it could not be kept.
+
+	// America/Havana shifts AT 00:00, so 2026-03-08 has no midnight at all.
+	loc := mustZone(t, "America/Havana")
+	const date = "2026-03-08"
+	hav, err := usage.ParseWindowSpec(usage.WindowToday, time.Date(2026, 3, 8, 15, 0, 0, 0, loc))
+	if err != nil {
+		t.Fatalf("ParseWindowSpec: %v", err)
+	}
 	naive := time.Date(2026, 3, 8, 0, 0, 0, 0, loc)
 	if naive.Format("2006-01-02") == date {
 		t.Fatalf("local midnight of %s in America/Havana resolved onto its own date (%v), so "+
-			"this test no longer exercises the defect", date, naive)
+			"this test no longer exercises the defect and is now vacuous", date, naive)
 	}
-	if !naive.Before(spec.From) {
-		t.Errorf("the old anchor %v is not earlier than the window's start %v; the flaw was "+
-			"that it sat OUTSIDE the window it was meant to be inside", naive, spec.From)
+	if !naive.Add(2 * time.Minute).Before(hav.From) {
+		t.Errorf("the old anchor plus two minutes (%v) is not outside window=today (from %v); "+
+			"the whole reason the anchor is taken from the window is that computing it a "+
+			"second way put the fixture on another date", naive.Add(2*time.Minute), hav.From)
 	}
 }
 
@@ -718,7 +741,7 @@ func TestHandleUsage_ACorruptLedgerLineIsDisclosedInTheResponse(t *testing.T) {
 	// a reason that has nothing to do with what it is checking. `today` is a boundary, not a
 	// length, so a fixture near it has to be anchored to the boundary rather than to now —
 	// and to the SAME boundary, which is why startOfToday delegates.
-	when := startOfToday().Add(2 * time.Minute)
+	when := startOfToday(t).Add(2 * time.Minute)
 	if now := time.Now(); when.After(now) {
 		// Guards the other end: inside the first two minutes of the day the anchor would be
 		// in the future, and a future row falls outside [start of day, now].

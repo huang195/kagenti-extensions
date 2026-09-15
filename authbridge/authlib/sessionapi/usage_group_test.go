@@ -31,7 +31,7 @@ import (
 // The third is pinned by TestLedgerSnapshot_UngroupedCostReachesTheWire; this test
 // covers the first two, because they were the pair that had become the same response.
 func TestHandleUsage_ALedgerWindowSaysWhichGroupingItCouldApply(t *testing.T) {
-	at := startOfToday().Add(3 * time.Hour)
+	at := startOfToday(t).Add(3 * time.Hour)
 	for _, tc := range []struct {
 		asked  string
 		served usage.Group

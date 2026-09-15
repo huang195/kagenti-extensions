@@ -140,7 +140,11 @@ func (s *Server) Process(stream extprocv3.ExternalProcessor_ProcessServer) error
 			pendingDirection = ""
 
 		case *extprocv3.ProcessingRequest_ResponseHeaders:
-			resp = s.handleResponseHeaders(ctx, r.ResponseHeaders.Headers, pctx, requestDirection)
+			// end_of_stream is carried through because it is the only thing that
+			// distinguishes "a body is coming" from "this response is over" — the
+			// same question requestHasBody answers for the request phase above.
+			resp = s.handleResponseHeaders(ctx, r.ResponseHeaders.Headers, pctx, requestDirection,
+				r.ResponseHeaders.GetEndOfStream())
 
 		case *extprocv3.ProcessingRequest_ResponseBody:
 			resp = s.handleResponseBody(ctx, r.ResponseBody.Body, pctx, requestDirection)
@@ -595,7 +599,13 @@ func (s *Server) handleOutboundBody(stream extprocv3.ExternalProcessor_ProcessSe
 	return withBodyMutation(resp, pctx), pctx
 }
 
-func (s *Server) handleResponseHeaders(ctx context.Context, headers *corev3.HeaderMap, pctx *pipeline.Context, direction string) *extprocv3.ProcessingResponse {
+// handleResponseHeaders runs the response phase off the headers alone.
+//
+// endOfStream is Envoy's own statement that no body follows, and it is what
+// decides whether this phase defers to the body phase or finishes the response
+// here. Without it the deferral below was unconditional for every shipped
+// pipeline — see the comment on that branch.
+func (s *Server) handleResponseHeaders(ctx context.Context, headers *corev3.HeaderMap, pctx *pipeline.Context, direction string, endOfStream bool) *extprocv3.ProcessingResponse {
 	if pctx == nil {
 		return &extprocv3.ProcessingResponse{
 			Response: &extprocv3.ProcessingResponse_ResponseHeaders{
@@ -613,7 +623,27 @@ func (s *Server) handleResponseHeaders(ctx context.Context, headers *corev3.Head
 		p = s.InboundPipeline
 	}
 
-	if p.NeedsBody() {
+	// Defer to the body phase — but only when there IS one.
+	//
+	// AND !endOfStream is the fix, not a refinement. NeedsBody() alone was
+	// unconditionally true for every shipped pipeline, because it is
+	// NeedsRequestBody() || NeedsResponseBody() and inference-parser's undirected
+	// ReadsBody counts toward both (pipeline.NeedsRequestBody carries the
+	// argument). So everything below this return was dead code, and a response
+	// with no body at all — a 204, a 304, an error status ended on headers —
+	// reached NEITHER branch: Envoy sends no ResponseBody message for it, whatever
+	// ModeOverride we ask for, so nothing settled its cost and no response row was
+	// recorded. The gateway reports what it charged in a response header, which
+	// needs no body, so that was real spend reaching no ledger and no budget.
+	//
+	// The early return itself is right and stays: when a body IS coming, this
+	// phase must not run the pipeline, because the body phase runs the whole
+	// buffered dispatch — terminal frame included — and that dispatch is what
+	// turns a response into a settled figure. Running both would charge twice.
+	// The request phase has always made exactly this distinction one screen up,
+	// via requestHasBody; this is the same guard on the response side, which was
+	// simply missed.
+	if p.NeedsBody() && !endOfStream {
 		return &extprocv3.ProcessingResponse{
 			Response: &extprocv3.ProcessingResponse_ResponseHeaders{
 				ResponseHeaders: &extprocv3.HeadersResponse{},

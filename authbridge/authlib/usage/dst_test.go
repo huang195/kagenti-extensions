@@ -386,10 +386,10 @@ func TestStartOfLocalDay_TerminatesWhereAZoneSkippedAWholeCalendarDate(t *testin
 // assertion — the span is exactly 7x24h on every transition day in the table, spring and
 // autumn — so that if anyone ever rewrites 7d in terms of dates, this fails.
 //
-// WHAT IT DELIBERATELY DOES NOT ASSERT is how many local DATES that span touches. In the
-// week after a spring-forward it is nine, not the eight Window7dLocalDays says, in the
-// control zone as much as the affected ones; see that constant for why the number is
-// recorded there rather than changed here.
+// HOW MANY LOCAL DATES the span touches is a separate question and is now asserted in
+// TestParseWindowSpec_ASpringForwardWeekReachesTheNinthLocalDate. It used to be recorded here
+// as a known-wrong note — nine in the week after a spring-forward, against a
+// Window7dLocalDays of eight — which is what a fixture says instead of failing.
 func TestParseWindowSpec_SevenDaysIsUnaffectedByTheDayBoundaryInEveryZone(t *testing.T) {
 	for _, c := range dayStartCases {
 		t.Run(c.zone+"/"+c.date, func(t *testing.T) {
@@ -414,6 +414,60 @@ func TestParseWindowSpec_SevenDaysIsUnaffectedByTheDayBoundaryInEveryZone(t *tes
 						"acquire calendar arithmetic, which is what a DST gap can swallow",
 						now, spec.From, now.Add(-Window7dSpan))
 				}
+			}
+		})
+	}
+}
+
+// TestParseWindowSpec_ASpringForwardWeekReachesTheNinthLocalDate is why
+// Window7dLocalDays is nine.
+//
+// A spring-forward week is 167 HOURS LONG, so a rolling 168-hour span reaches an hour
+// further back than a calendar week does — into a NINTH local date. Eight was derived from
+// the rolling span alone and silently assumed every day in the week is 24 hours; it is one
+// day short for one week a year, in every zone that observes DST.
+//
+// It is the CONSTANT'S PREMISE and not the local-midnight defect, which is why
+// America/New_York is in the table beside the 00:00-transition zones rather than serving as
+// a control that escapes it: 7d's From is a plain duration subtraction from now, with no
+// calendar arithmetic for a gap to swallow, so where in the day the transition falls does not
+// matter at all.
+//
+// It matters because config.minCostLedgerRetentionDays agrees with this constant. At eight,
+// retention_days: 8 passed validation and then answered window:"7d" over a partial week on
+// the two mornings a year the span reaches nine dates — the exact case that floor exists to
+// refuse, arrived at a second time by a second route.
+//
+// ASSERTED AT 00:00 LOCAL, which is where the span reaches furthest back. Any later hour on
+// the same date pulls From forward into the eighth date and the ninth disappears, so a test
+// at 15:30 would report eight and prove nothing about the ceiling.
+func TestParseWindowSpec_ASpringForwardWeekReachesTheNinthLocalDate(t *testing.T) {
+	// One date per zone: the day AFTER that zone's spring-forward, so the rolling week
+	// behind it is the short one. Every value measured against tzdata.
+	for _, c := range []struct{ zone, date string }{
+		{"America/Havana", "2026-03-15"},
+		{"America/Santiago", "2026-09-13"},
+		{"America/New_York", "2026-03-15"},
+		{"Asia/Beirut", "2026-04-05"},
+	} {
+		t.Run(c.zone+"/"+c.date, func(t *testing.T) {
+			loc := mustZone(t, c.zone)
+			now := StartOfLocalDay(afternoonOn(t, loc, c.date))
+			// The premise: the week behind this instant really is 167 hours of wall clock, i.e.
+			// the span crosses a transition. Without this the test would pass in a zone with no
+			// DST at all while asserting nothing about it.
+			_, nowOff := now.Zone()
+			_, thenOff := now.Add(-Window7dSpan).Zone()
+			if nowOff-thenOff != 3600 {
+				t.Fatalf("the week before %v in %s does not spring forward by an hour "+
+					"(offsets %d then %d); this fixture no longer covers the short week",
+					now, c.zone, thenOff, nowOff)
+			}
+			if days := localDatesInWindow(t, now); days != Window7dLocalDays {
+				t.Errorf("at %v, window=%q spans %d local days, want Window7dLocalDays = %d — "+
+					"the ceiling must be REACHED by the worst week, or a floor derived from it "+
+					"keeps a day file nobody needs; and if it is exceeded, the floor is short and "+
+					"7d answers over a partial week", now, Window7d, days, Window7dLocalDays)
 			}
 		})
 	}

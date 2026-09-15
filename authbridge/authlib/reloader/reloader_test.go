@@ -235,7 +235,7 @@ func TestReloader_RefusesListenerChange(t *testing.T) {
 func TestReloader_RefusesCostLedgerChange(t *testing.T) {
 	dir := t.TempDir()
 	cfgPath := filepath.Join(dir, "config.yaml")
-	const before = "mode: envoy-sidecar\ncost_ledger:\n  enabled: true\n  retention_days: 8\n"
+	const before = "mode: envoy-sidecar\ncost_ledger:\n  enabled: true\n  retention_days: 9\n"
 	if err := os.WriteFile(cfgPath, []byte(before), 0o600); err != nil {
 		t.Fatalf("initial WriteFile: %v", err)
 	}
@@ -273,7 +273,7 @@ func TestReloader_RefusesCostLedgerChange(t *testing.T) {
 	shaBefore := r.Status().ActiveConfigSHA256
 
 	// The edit an operator makes to stop writing cost history.
-	writeConfig(t, cfgPath, "mode: envoy-sidecar\ncost_ledger:\n  enabled: false\n  retention_days: 8\n")
+	writeConfig(t, cfgPath, "mode: envoy-sidecar\ncost_ledger:\n  enabled: false\n  retention_days: 9\n")
 
 	waitFor(t, 2*time.Second, func() bool { return r.Status().ReloadsFailed >= 1 }, "reload to be refused")
 

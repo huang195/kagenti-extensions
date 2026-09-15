@@ -606,41 +606,52 @@ const (
 // the span can spell it differently.
 const Window7dSpan = 7 * 24 * time.Hour
 
-// Window7dLocalDays is how many distinct LOCAL DAYS a 7d window can touch: EIGHT, not
-// seven.
+// Window7dLocalDays is the MOST distinct LOCAL DATES a 7d window can touch: NINE.
 //
-// The span is rolling rather than calendar-aligned, so unless it happens to begin at
-// midnight it starts part-way through one date and ends part-way through another —
-// seven days' worth of hours spread across eight dates. Asked at 15:30 it runs from
-// 15:30 seven days ago to 15:30 today and needs a piece of every date in between, both
-// ends included. Asked exactly at midnight it needs the eighth date for one instant,
-// which is still a file to open.
+// A CEILING, NOT A COUNT, and that is the correction. It used to be 8 and to be described as
+// how many dates the window touches, which is right for an ordinary week and wrong once a
+// year in every zone that observes DST.
 //
-// It is therefore the number of DAY FILES a durable ledger must still hold to answer
-// this window, which is why config's retention floor is derived from this rather than
-// written as its own literal. They were two constants that had to agree and did not:
-// the floor was 7, so retention_days: 7 passed validation and then answered
-// window:"7d" over a partial week — the exact case the floor exists to refuse.
-// TestParseWindowSpec_SevenDaysTouchesEightLocalDays pins the arithmetic, and
-// TestCostLedgerConfig_TheFloorCoversEveryDayTheWindowTouches pins the agreement.
+// Two increments, for two different reasons:
 //
-// EIGHT ASSUMES EVERY DAY IN THE WEEK IS 24 HOURS LONG, and one week a year is not. A
-// spring-forward week is 167 hours, so a 168-hour span reaches an hour further back than a
-// calendar week does. MEASURED at 00:00 local on 2026-03-15: From lands at 23:00 on
-// 2026-03-07 and the window touches NINE dates — in America/Havana, in America/Santiago and
-// in America/New_York alike, since this has nothing to do with WHERE the transition falls.
-// Autumn is the harmless direction: a 169-hour week means the span reaches less far, and
-// eight still covers it.
+//   - +1 because the span is ROLLING rather than calendar-aligned. Unless it begins exactly
+//     at midnight it starts part-way through one date and ends part-way through another —
+//     seven days' worth of hours spread across eight dates. Asked at 15:30 it runs from
+//     15:30 seven days ago to 15:30 today and needs a piece of every date between, both ends
+//     included. Asked exactly at midnight it needs the eighth date for one instant, which is
+//     still a file to open.
+//   - +1 again because A SPRING-FORWARD WEEK IS 167 HOURS. Eight assumed every day in the
+//     week is 24 hours long, and one week a year is not: a 168-hour span reaches an hour
+//     further back than a calendar week does. MEASURED at 00:00 local on 2026-03-15, From
+//     lands at 23:00 on 2026-03-07 and the window touches NINE dates — in America/Havana, in
+//     America/Santiago and in America/New_York alike, because this has nothing to do with
+//     WHERE in the day the transition falls. Autumn is the harmless direction: a 169-hour
+//     week means the span reaches less far and the ceiling is slack by a day.
 //
-// UNRESOLVED, and recorded here rather than quietly widened. Nine would make the retention
-// floor derived from this keep an extra day file on every host all year to cover two
-// midnights a year, and the alternative — making 7d calendar-aligned — changes what the
-// window MEANS, which is a product decision and not a bound to correct. What is not in
-// doubt is the direction of the error: on those two mornings a 7d answer can be short by
-// whatever was spent in one hour eight dates ago, because retention was allowed to drop the
-// file holding it. Distinct from the local-midnight defect StartOfLocalDay fixes: 7d's From
-// is a plain duration subtraction from now and contains no calendar arithmetic at all.
-const Window7dLocalDays = int(Window7dSpan/(24*time.Hour)) + 1
+// It is therefore the number of DAY FILES a durable ledger must still hold to answer this
+// window, which is why config's retention floor agrees with this rather than being written
+// as its own independent number. They were two constants that had to agree and did not: the
+// floor was 7, so retention_days: 7 passed validation and then answered window:"7d" over a
+// partial week — the exact case the floor exists to refuse. Nine has now been through the
+// same correction twice, which is the argument for the ceiling rather than the count.
+//
+// COSTS ONE DAY FILE OF RETENTION ALL YEAR to cover two mornings of it, and that is the
+// trade taken deliberately. The alternative considered was making 7d CALENDAR-ALIGNED, which
+// is the more correct fix — it would make the count exactly 8 and true every week — but it
+// changes what the window MEANS on the wire: "the last 7 days" and "since midnight 7 days
+// ago" differ by up to a day of spend, every client comparing figures across the change
+// would see a step, and ParseWindowSpec's own doc promises the rolling reading. That is a
+// product decision, so it is disclosed rather than made here. A day file is roughly 300 KB
+// at the volumes this ledger is sized for; the partial week it prevents is a wrong dollar
+// total that nothing downstream can detect.
+//
+// Distinct from the local-midnight defect StartOfLocalDay fixes: 7d's From is a plain
+// duration subtraction from now and contains no calendar arithmetic at all.
+// TestParseWindowSpec_SevenDaysTouchesAtMostWindow7dLocalDays pins the ordinary week,
+// TestParseWindowSpec_ASpringForwardWeekReachesTheNinthLocalDate pins the week that forced
+// the second +1, and TestCostLedgerConfig_TheFloorCoversEveryDayTheWindowTouches pins the
+// agreement with config.
+const Window7dLocalDays = int(Window7dSpan/(24*time.Hour)) + 2
 
 // Spec is a parsed window request. Either Dur is set (a fixed length the ring can
 // serve) or From/To are (a boundary only the ledger can serve).

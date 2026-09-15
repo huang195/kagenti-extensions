@@ -592,61 +592,71 @@ func TestParseWindowSpec_SevenDaysIsRollingNotCalendar(t *testing.T) {
 	}
 }
 
-// A ROLLING WEEK TOUCHES EIGHT DATES, NOT SEVEN, and the difference is a day file the
-// durable ledger has to still hold. The two were confused: the cost ledger's retention
-// floor was the literal 7, so retention_days: 7 loaded cleanly and then answered
-// window:"7d" over a partial week — a figure nothing downstream could tell from a quiet
-// one. Window7dLocalDays is now the single place that says how many days this is, and
-// the floor is derived from it.
+// A ROLLING WEEK TOUCHES EIGHT DATES IN AN ORDINARY WEEK, NOT SEVEN, and the difference is a
+// day file the durable ledger has to still hold. The two were confused: the cost ledger's
+// retention floor was the literal 7, so retention_days: 7 loaded cleanly and then answered
+// window:"7d" over a partial week — a figure nothing downstream could tell from a quiet one.
 //
-// Every hour of the day is checked, midnight included: the count has to be the same at
-// 00:00 — where the eighth date contributes a single instant, and is still a file to
-// open — as at 15:30, because a floor that holds only for part of the day is not a
-// floor.
+// AT MOST, NOT EXACTLY, which is the assertion this test used to get wrong. Window7dLocalDays
+// is a CEILING of nine: eight is what an ordinary week reaches, nine is what a
+// spring-forward week reaches, and a retention floor has to cover the worst case rather than
+// the common one. Asserting equality here made the constant look like a count and is why it
+// sat at 8 with the nine-date week recorded beside it as a known-wrong note.
+// TestParseWindowSpec_ASpringForwardWeekReachesTheNinthLocalDate is the other half: it pins
+// that the ceiling is REACHED, so this test cannot be satisfied by a bound that is merely
+// large.
 //
-// A TRANSITION-FREE WEEK IN A PINNED ZONE, and the pin is load-bearing rather than tidying.
-// EIGHT is only true of a week whose days are all 24 hours long. MEASURED at 00:00 on
-// 2026-03-15, in the week after a spring-forward: the rolling span reaches back to 23:00 on
-// 2026-03-07, so it touches NINE dates, not eight — in America/Havana, in America/Santiago
-// AND in America/New_York, which is the control zone for everything else here. It is not
-// the local-midnight defect and this fix does not change it: 7d's From is a plain duration
-// subtraction from now, with no calendar arithmetic in it at all. It is the rolling span
-// itself against a week that is 167 hours long. Left as a note on Window7dLocalDays rather
-// than pinned as an expectation, because the constant it would contradict is what config's
-// retention floor is derived from and moving it is a decision about retention, not a fix to
-// a bound. Pinning the zone here is what stops this test asserting eight in a week where
-// the answer is nine, which is exactly what running under TZ=America/Santiago would do.
-func TestParseWindowSpec_SevenDaysTouchesEightLocalDays(t *testing.T) {
+// Every hour of the day is checked, midnight included: the count has to hold at 00:00 —
+// where the eighth date contributes a single instant, and is still a file to open — as at
+// 15:30, because a floor that holds only for part of the day is not a floor.
+//
+// The zone is PINNED to a transition-free week on purpose. Under TZ=America/Santiago an
+// unpinned "now" could land in the 167-hour week and count nine, which is legal against the
+// ceiling but would stop this test measuring the ordinary case it exists for.
+func TestParseWindowSpec_SevenDaysTouchesAtMostWindow7dLocalDays(t *testing.T) {
 	zone := testZone(t)
 	for hour := 0; hour < 24; hour++ {
 		now := time.Date(2026, 9, 14, hour, 30, 0, 0, zone)
 		if hour == 0 {
 			now = time.Date(2026, 9, 14, 0, 0, 0, 0, zone)
 		}
-		spec, err := ParseWindowSpec(Window7d, now)
-		if err != nil {
-			t.Fatalf("ParseWindowSpec(%q) at %v: %v", Window7d, now, err)
-		}
-		// Whole local days from From to To inclusive, which is the walk
-		// costledger.Writer.Query makes over day files.
-		//
-		// Walked at dayAnchorHour, which is what costledger.dayOf does and NOT what this
-		// loop used to do. It carried its own time.Date(..., 0, 0, 0, 0, loc) — a third copy
-		// of the defect, in the test that measures how many day files a window needs. In a
-		// zone whose transition is at 00:00 that expression counts a date twice or skips one,
-		// so the count would have been wrong about the very thing being counted.
-		days := 0
-		day := time.Date(spec.From.Year(), spec.From.Month(), spec.From.Day(), dayAnchorHour, 0, 0, 0, spec.From.Location())
-		last := time.Date(spec.To.Year(), spec.To.Month(), spec.To.Day(), dayAnchorHour, 0, 0, 0, spec.To.Location())
-		for ; !day.After(last); day = day.AddDate(0, 0, 1) {
-			days++
-		}
-		if days != Window7dLocalDays {
-			t.Errorf("at %v, window=%q spans %d local days, want Window7dLocalDays = %d — "+
-				"a retention derived from that constant would keep the wrong number of day files",
+		days := localDatesInWindow(t, now)
+		if days > Window7dLocalDays {
+			t.Errorf("at %v, window=%q spans %d local days, more than Window7dLocalDays = %d — "+
+				"the retention floor that agrees with that constant keeps too few day files and "+
+				"the window answers over a partial week",
 				now.Format("15:04"), Window7d, days, Window7dLocalDays)
 		}
+		// And an ordinary week must still reach eight, or the rolling-versus-calendar point
+		// this test was written for has quietly stopped being true.
+		if days != 8 {
+			t.Errorf("at %v, a transition-free week spans %d local days, want 8: seven days of "+
+				"hours across eight dates is what makes the floor bigger than 7",
+				now.Format("15:04"), days)
+		}
 	}
+}
+
+// localDatesInWindow counts the whole local dates a 7d window from now covers, which is the
+// walk costledger.Writer.Query makes over day files.
+//
+// Walked at dayAnchorHour, which is what costledger.dayOf does. It is NOT a walk over local
+// midnights: that expression counts a date twice or skips one in a zone whose transition is
+// at 00:00, and a midnight walk in the helper that measures how many day files a window needs
+// was a third copy of that defect, wrong about the very thing being counted.
+func localDatesInWindow(t *testing.T, now time.Time) int {
+	t.Helper()
+	spec, err := ParseWindowSpec(Window7d, now)
+	if err != nil {
+		t.Fatalf("ParseWindowSpec(%q) at %v: %v", Window7d, now, err)
+	}
+	days := 0
+	day := time.Date(spec.From.Year(), spec.From.Month(), spec.From.Day(), dayAnchorHour, 0, 0, 0, spec.From.Location())
+	last := time.Date(spec.To.Year(), spec.To.Month(), spec.To.Day(), dayAnchorHour, 0, 0, 0, spec.To.Location())
+	for ; !day.After(last); day = day.AddDate(0, 0, 1) {
+		days++
+	}
+	return days
 }
 
 func TestParseWindowSpec_RejectsUnknownWithoutEchoingInput(t *testing.T) {

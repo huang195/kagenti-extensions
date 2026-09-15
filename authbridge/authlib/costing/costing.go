@@ -377,9 +377,20 @@ func Store(pctx *pipeline.Context, s Settled) {
 	pipeline.SetState(pctx, StateKey, &s)
 }
 
-// Load retrieves the outcome. False means no cost owner ran — which, given costing runs in
-// the parser and every consumer declares a hard dependency on it, means this request had no
-// inference in it at all.
+// Load retrieves the outcome. False means the cost owner's RESPONSE PASS never ran for this
+// request — the parser is absent from the pipeline, the request was rejected before the
+// response phase, or no listener delivered a terminal frame.
+//
+// It does NOT mean the request carried no inference, and no longer says anything about the
+// traffic's shape. Store now runs on EVERY proxied response, including the ones this parser
+// has no dialect for, because a gateway reports its own cost in a response header that needs
+// neither a model nor a body — so /v1/embeddings, /mcp, a health check and a CONNECT tunnel
+// all Load TRUE. True therefore says only that a decision was reached; whether the decision
+// was a figure is Settled.Priced, which is false for most of that traffic.
+//
+// The old reading — false means no inference at all — held only while Store was reached from
+// the parsed paths alone, and it is the reading under which a gateway-priced response the
+// parser could not read escaped the ledger entirely.
 func Load(pctx *pipeline.Context) (Settled, bool) {
 	if s := pipeline.GetState[Settled](pctx, StateKey); s != nil {
 		return *s, true

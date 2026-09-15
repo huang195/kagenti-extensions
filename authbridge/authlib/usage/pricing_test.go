@@ -206,6 +206,58 @@ func TestPricing_ErroredResponsesAreNotNamedAsGaps(t *testing.T) {
 	}
 }
 
+// TestPricing_TruncatedStreamWithNoUsageIsANamedGap is the other side of the test
+// above, and the boundary between them is the STATUS, not the empty token split.
+//
+// A 200 whose usage could not be extracted was invisible: it counted in Requests and
+// in nothing else — not PricedRequests, not PriceableRequests, not UnpricedBy — so
+// nine priced requests plus one of these reported "9 of 9 priced", full parity, while
+// real spend was missing from the total. Counts.PriceableRequests promises that ratio
+// "reaches parity when it should"; this is the case that made it lie.
+//
+// The shape is a TRUNCATED OPENAI-DIALECT STREAM: OpenAI reports every counter on the
+// final chunk, so a stream that dies mid-body has a model, a 200, and nothing else.
+// It cannot reach the incomplete-reason floor either, because a floor needs a
+// prompt-side count to be a lower bound of — which is exactly why Anthropic, whose
+// message_start carries the prompt, is caught there and never arrives here.
+func TestPricing_TruncatedStreamWithNoUsageIsANamedGap(t *testing.T) {
+	now := time.Now().Truncate(BucketWidth)
+	a := New(WithClock(func() time.Time { return now }),
+		WithPricing(resolverFor(t, "gpt-5", 5.0/1e6, 25.0/1e6)))
+
+	// Nine ordinary priced turns.
+	for i := 0; i < 9; i++ {
+		a.Record("s1", pricedRespEvent("api.openai.com", "gpt-5", 1000, 500))
+	}
+	// One truncated stream: 200, a model, no counters and no finish reason. A rate
+	// for this pair EXISTS — the gap is the usage, not the table, which is why the
+	// figure can never be recovered by pricing.
+	a.Record("s1", &pipeline.SessionEvent{
+		Phase:      pipeline.SessionResponse,
+		Host:       "api.openai.com",
+		StatusCode: 200,
+		Inference:  &pipeline.InferenceExtension{Model: "gpt-5"},
+	})
+
+	snap := snapshotOf(a, now)
+	if snap.Totals.Requests != 10 {
+		t.Fatalf("Requests = %d, want 10", snap.Totals.Requests)
+	}
+	if snap.Totals.PricedRequests != 9 {
+		t.Errorf("PricedRequests = %d, want 9 — the truncated stream produced no figure", snap.Totals.PricedRequests)
+	}
+	if snap.Totals.PriceableRequests != 10 {
+		t.Errorf("PriceableRequests = %d, want 10 — a 200 that named a model belongs in the coverage denominator", snap.Totals.PriceableRequests)
+	}
+	// The invariant this finding falsified: coverage must NOT read as complete.
+	if snap.Totals.PricedRequests == snap.Totals.PriceableRequests {
+		t.Error("priced == priceable with one request's cost missing: the coverage ratio reports parity it has not earned")
+	}
+	if got := snap.UnpricedBy["api.openai.com gpt-5"]; got != 1 {
+		t.Errorf("UnpricedBy[%q] = %d, want 1; map = %v — the parser reported a model, so the gap is nameable", "api.openai.com gpt-5", got, snap.UnpricedBy)
+	}
+}
+
 // TestPricing_SettledZeroIsNotRePriced: the plugin charges nothing for a gateway
 // that reported a present cost of 0 — a genuine free call. The aggregator used to
 // see no event, fall through to its rate table, and invent a cost for it.

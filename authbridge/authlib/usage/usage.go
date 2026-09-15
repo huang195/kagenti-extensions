@@ -103,8 +103,16 @@ type Counts struct {
 	// asks for a coarser resolution, and because a deployment can price some of
 	// its traffic and not the rest: several endpoints, rates known for some.
 	//
-	// Requests-minus-PricedRequests is the gap, correct at every resolution, and
-	// it is what stops a partial total being presented as a complete one.
+	// PriceableRequests-minus-PricedRequests is the gap, correct at every
+	// resolution, and it is what stops a partial total being presented as a
+	// complete one.
+	//
+	// NOT Requests-minus-PricedRequests, which this comment used to say and which
+	// PriceableRequests' own doc thirty lines below explicitly refutes. Requests
+	// counts every proxied response — MCP tool calls, health checks, tunnels — none
+	// of which can ever carry a price, so that difference never reaches zero and a
+	// client obeying it marks every total partial forever. Requests is not the
+	// denominator for coverage; PriceableRequests is.
 	//
 	// It counts an INEXACT figure too — see IncompleteRequests. This counter answers
 	// "did anything price this", which a request priced from partial counters
@@ -373,15 +381,39 @@ func (a *Aggregator) costOf(e *pipeline.SessionEvent) eventCost {
 	if e.Inference == nil || e.Inference.Model == "" {
 		return eventCost{}
 	}
-	u := pricing.UsageFromInference(e.Inference)
-	// A response carrying no tokens cannot be priced and is not a pricing GAP
-	// either: a 5xx, or a denial after the parser ran, reports a model with zero
-	// usage. Naming it would advertise a missing rate for a model that may well
-	// have one, and adding that entry would never make the row disappear.
-	if u == (pricing.Usage{}) {
-		return eventCost{}
-	}
 	key := e.Host + " " + e.Inference.Model
+	u := pricing.UsageFromInference(e.Inference)
+	if u == (pricing.Usage{}) {
+		// A FAILED response carrying no tokens is not a pricing gap: a 5xx, or a
+		// denial after the parser ran, reports a model with zero usage. Naming it
+		// would advertise a missing rate for a model that may well have one, and
+		// adding that entry would never make the row disappear.
+		if e.StatusCode >= 400 || e.Phase == pipeline.SessionDenied {
+			return eventCost{}
+		}
+		// A SUCCEEDED one is a coverage gap and must be counted as one. Returning a
+		// bare eventCost{} here left the request in Requests and out of
+		// PricedRequests, PriceableRequests and UnpricedBy alike — so nine priced
+		// requests plus one of these read "9/9 priced", parity, while real spend was
+		// missing. That falsifies Counts.PriceableRequests' own promise that the
+		// ratio "reaches parity when it should".
+		//
+		// The dominant instance is a TRUNCATED OPENAI-DIALECT STREAM. OpenAI puts
+		// every counter on the final chunk, so a stream that dies mid-body yields no
+		// usage at all — not even a floor, because pricing.outputUncounted needs a
+		// prompt-side count to be a lower bound OF. Anthropic escapes this only
+		// because message_start carries the prompt counts, which is why the
+		// incomplete-reason path catches it there and never sees it here. Also
+		// reachable on a request/response stream-shape mismatch, since the parser
+		// picks its arm from the REQUEST's stream flag.
+		//
+		// Unpriced, never priced-zero: no figure was settled, so claiming one would
+		// report unmeasured traffic as free. Named, because the parser recognised
+		// this traffic well enough to report a Model — the information to name the
+		// gap was in hand, and this is not the off-allowlist blindness the design
+		// declares out of scope, where nothing is recognised at all.
+		return eventCost{priceable: 1, unpricedKey: key}
+	}
 	if a.rates == nil {
 		return eventCost{priceable: 1, unpricedKey: key}
 	}

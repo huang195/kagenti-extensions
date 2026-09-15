@@ -644,36 +644,112 @@ func costShare(part, whole int64) string {
 	return fmt.Sprintf("%.1f%%", 100*float64(part)/float64(whole))
 }
 
-// costTotalSection is the answer to the pane's own question, with every caveat that
-// applies to it and none that does not.
+// costTotalFigure renders the pane's headline amount WEARING THE MARKERS THAT QUALIFY IT.
 //
-// It carries the coverage RATIO as well as the figure, while the COVERAGE section
-// below names the pairs. That split is deliberate: the ratio is the part that must
-// survive the height budget, because a partial total presented without it reads as a
-// complete one, and COVERAGE is the first section a short terminal drops.
-func costTotalSection(snap *usage.Snapshot, width int) costSection {
-	sec := costSection{heading: "TOTAL"}
+// Marked on the figure, not only spelled out in the prose beside it, and that is what makes
+// the height budget safe rather than merely tidy. partialMarker's own doc states the rule the
+// strip has always held to: a marker rides on the figure, so a budget that drops the
+// explanation can never turn a qualified total into one that looks complete. The Cost pane
+// was the ONE money surface stating its caveats in words alone — and words are exactly what a
+// four-row terminal cuts off, which is how renderCostPane's fallback came to publish a bare
+// "$12.5000" for a total that was both partial and inexact.
+//
+// Same three glyphs as the strip, the sessions COST cell and the Usage pane cell, in the same
+// order and with the same meanings: damaged outermost (rows missing from the sum), then
+// inexact (a figure in the sum is a floor), then partial as a suffix (the total covers only
+// the priced subset). One spelling everywhere; see damagedMarker for why the three are not
+// two.
+//
+// Three cells at most, on a line that already survives costWidthFloors' narrowest width with
+// the figure alone, so nothing here can push the answer off the pane.
+func costTotalFigure(snap *usage.Snapshot) string {
+	amount := costMoney(snap.Totals.CostMicros)
+	if snap.Totals.IncompleteRequests > 0 {
+		amount = inexactMarker + amount
+	}
+	if snapshotDamaged(snap.Degraded) {
+		amount = damagedMarker + amount
+	}
+	// A coverage gap needs its denominator to be a gap at all: PriceableRequests of zero is
+	// a window with nothing to price, not a total covering part of something.
+	if p := snap.Totals.PriceableRequests; p > 0 && snap.Totals.PricedRequests < p {
+		amount += partialMarker
+	}
+	return amount
+}
+
+// costTotalParts is costTotalSection's body, split into the units a height budget may drop
+// WHOLE.
+//
+// It exists because renderCostPane's last-resort path cut the FLAT line list at
+// out[:height], and the lines it cut were the coverage ratio and the lower-bounds caveat —
+// so at layout()'s own four-row floor the pane kept the dollar amount and discarded
+// everything that said the amount was partial or inexact. The comment there claimed "whole
+// lines only", which was true of the FIGURE and of nothing else: every caveat is wrapped
+// prose, and a wrapped sentence cut at a line boundary is half a sentence.
+//
+// head is the answer and travels together: the figure line, plus the provenance note when it
+// had to move to its own line, or the whole of the "cost unavailable" prose on the paths that
+// publish no figure.
+//
+// caveats are self-contained blocks, most severe first. A budget takes them whole or not at
+// all. Dropping one is safe in a way cutting one is not, because costTotalFigure puts each
+// claim on the figure as a marker: what is lost is an explanation, never the fact.
+type costTotalParts struct {
+	head    []string
+	caveats [][]string
+}
+
+// lines flattens the parts back into a section body, which is what a height budget that fits
+// the whole section wants.
+func (p costTotalParts) lines() []string {
+	out := append([]string(nil), p.head...)
+	for _, c := range p.caveats {
+		out = append(out, c...)
+	}
+	return out
+}
+
+// costTotalBody builds the TOTAL section's units. See costTotalParts for why they are units.
+func costTotalBody(snap *usage.Snapshot, width int) costTotalParts {
+	var parts costTotalParts
 	body := width - lipgloss.Width(costIndent)
-	add := func(prose string) {
+	wrap := func(prose string) []string {
+		var out []string
 		for _, l := range wrapCells(prose, body) {
-			sec.lines = append(sec.lines, costIndent+l)
+			out = append(out, costIndent+l)
+		}
+		return out
+	}
+	// A damage disclosure is a unit on every path, and it LEADS the caveats, because it is
+	// the only one of the three that says the SUM is incomplete rather than qualifying a
+	// figure inside it. Coverage knows the size of what it excludes and can name the pricing
+	// entry that would close it; exactness knows how many figures are floors. This one cannot
+	// state how much is missing, which makes it both the most serious and the least
+	// actionable, and it must not be merged with either — see snapshotDamaged and
+	// usage.Snapshot.Degraded.
+	//
+	// This pane's window defaults to "today" (costPaneWindows[0]), the only window that can
+	// populate the field, so this is the default path rather than an edge of one.
+	addDamage := func() {
+		if snapshotDamaged(snap.Degraded) {
+			parts.caveats = append(parts.caveats, wrap(costDamagedNote(snap.Degraded)))
 		}
 	}
 	if !snap.Priced {
 		// Never "$0.0000". A zero cost and an unknown cost are different answers and
 		// only one of them means the traffic was free.
-		add("cost unavailable — nothing in this window carried a cost")
+		parts.head = wrap("cost unavailable — nothing in this window carried a cost")
 		if gap := snap.Totals.PriceableRequests; gap > 0 {
-			add(fmt.Sprintf("%s priceable request%s went through, none of them priced",
-				formatCount(int(gap)), plural(int(gap))))
+			parts.caveats = append(parts.caveats, wrap(fmt.Sprintf(
+				"%s priceable request%s went through, none of them priced",
+				formatCount(int(gap)), plural(int(gap)))))
 		}
 		// Stated on this path TOO, and it is not redundant: "nothing carried a cost" is a
 		// claim about the rows that were READ, and a damaged read may have lost the priced
 		// ones. Without it a corrupt day file renders as a quiet day.
-		if snapshotDamaged(snap.Degraded) {
-			add(costDamagedNote(snap.Degraded))
-		}
-		return sec
+		addDamage()
+		return parts
 	}
 	// A negative total is not a total. The server refuses negative costs, so this cannot
 	// happen against a correct producer — which is exactly why the pane said "$-5.0000"
@@ -684,14 +760,13 @@ func costTotalSection(snap *usage.Snapshot, width int) costSection {
 	// Through negativeCost, which is now that test's one spelling on every money surface.
 	// This pane held it alone and three others inherited it without restating it.
 	if negativeCost(snap.Totals.CostMicros) {
-		add("cost unavailable — the server reported a negative total, which cannot be spend")
+		parts.head = wrap("cost unavailable — the server reported a negative total, " +
+			"which cannot be spend")
 		// A refused figure does not make a damaged read stop mattering: the two are
 		// independent facts and an operator with a corrupt day file wants to hear about it
 		// whatever else went wrong in the same answer.
-		if snapshotDamaged(snap.Degraded) {
-			add(costDamagedNote(snap.Degraded))
-		}
-		return sec
+		addDamage()
+		return parts
 	}
 	// The figure on its own line so the height budget can never cut it, and the
 	// provenance beside it because $12.40 from a gateway's own numbers and $12.40
@@ -704,46 +779,54 @@ func costTotalSection(snap *usage.Snapshot, width int) costSection {
 	// a 7-column figure — so on anything narrower the note moves to its own wrapped line
 	// below. It is never truncated onto the figure's line, because clipping there would
 	// eat the digits: the figure is the answer, the annotation qualifies it.
-	figure := costIndent + costMoney(snap.Totals.CostMicros)
+	//
+	// The moved note joins HEAD rather than becoming a caveat unit: it belongs to the figure
+	// it annotates, and a provenance note that outlived its own figure would say "bundled
+	// 60" over nothing.
+	figure := costIndent + costTotalFigure(snap)
 	prov := provenanceNote(costPricedBy(snap.PricedBy))
 	if lipgloss.Width(figure+prov) <= width {
-		sec.lines = append(sec.lines, figure+prov)
+		parts.head = []string{figure + prov}
 	} else {
-		sec.lines = append(sec.lines, figure)
-		add(strings.TrimSpace(prov))
+		parts.head = append([]string{figure}, wrap(strings.TrimSpace(prov))...)
 	}
 
 	priced, priceable := snap.Totals.PricedRequests, snap.Totals.PriceableRequests
-	// The damage disclosure leads the caveats, because it is the only one of the three that
-	// says the SUM is incomplete rather than qualifying a figure inside it. Coverage knows
-	// the size of what it excludes and can name the pricing entry that would close it;
-	// exactness knows how many figures are floors. This one cannot state how much is
-	// missing, which makes it both the most serious and the least actionable, and it must
-	// not be merged with either — see snapshotDamaged and usage.Snapshot.Degraded.
-	//
-	// This pane's window defaults to "today" (costPaneWindows[0]), which is the only window
-	// that can populate the field, so this is the default path rather than an edge of one.
-	if snapshotDamaged(snap.Degraded) {
-		add(costDamagedNote(snap.Degraded))
-	}
+	addDamage()
 	// Against PRICEABLE requests, never all of them. Requests counts every proxied
 	// response — MCP tool calls, health checks — while only inference can ever be
 	// priced, so the wrong denominator left a correctly configured deployment reading
 	// a permanent warning with nothing to act on.
 	if priceable > 0 && priced < priceable {
-		add(fmt.Sprintf("covers %s of %s priceable requests — the rest carry no figure",
-			formatCount(int(priced)), formatCount(int(priceable))))
+		parts.caveats = append(parts.caveats, wrap(fmt.Sprintf(
+			"covers %s of %s priceable requests — the rest carry no figure",
+			formatCount(int(priced)), formatCount(int(priceable)))))
 	}
 	// IncompleteRequests is a SUBSET of PricedRequests: their dollars are in the total
 	// and the disclosure rides alongside. Rendered only when it is non-zero, which is
 	// the other half of the rule — a permanent caveat with nothing to act on is what
 	// teaches an operator to ignore the one that matters.
 	if inc := snap.Totals.IncompleteRequests; inc > 0 {
-		add(fmt.Sprintf("%s of %s priced figures are lower bounds — a stream ended before "+
-			"its output count arrived, so the real total is higher",
-			formatCount(int(inc)), formatCount(int(priced))))
+		parts.caveats = append(parts.caveats, wrap(fmt.Sprintf(
+			"%s of %s priced figures are lower bounds — a stream ended before "+
+				"its output count arrived, so the real total is higher",
+			formatCount(int(inc)), formatCount(int(priced)))))
 	}
-	return sec
+	return parts
+}
+
+// costTotalSection is the answer to the pane's own question, with every caveat that
+// applies to it and none that does not.
+//
+// It carries the coverage RATIO as well as the figure, while the COVERAGE section
+// below names the pairs. That split is deliberate: the ratio is the part that must
+// survive the height budget, because a partial total presented without it reads as a
+// complete one, and COVERAGE is the first section a short terminal drops.
+//
+// A thin wrapper over costTotalBody, whose units renderCostPane's fallback needs: this
+// section is the flat form, for a budget that can take the whole of it.
+func costTotalSection(snap *usage.Snapshot, width int) costSection {
+	return costSection{heading: "TOTAL", lines: costTotalBody(snap, width).lines()}
 }
 
 // costDamagedNote is the Cost pane's spelling of a damaged ledger read: the sentence form,
@@ -1187,6 +1270,13 @@ func costCoverageSection(snap *usage.Snapshot, width int) costSection {
 // "$12.5" for a $12.5000 total reads as a real, smaller number. No figure is ever
 // clipped, at any width or height.
 //
+// And no figure is ever shown STRIPPED OF ITS QUALIFICATION either, which is a stronger
+// promise than "never clipped" and the one the last-resort path below used to break: it
+// kept the amount and cut the coverage ratio and the lower-bounds caveat, so a four-row
+// terminal published a partial, inexact total as a bare confident number. Whatever survives
+// the budget, the figure wears its markers — see costTotalFigure — so the claims outlive
+// the words that explain them.
+//
 // group is the axis to break down by; a zero or GroupNone value falls back to the head
 // of costPaneGroups, because this pane's whole purpose is the breakdown and an
 // ungrouped view of it is the spend strip one row above.
@@ -1226,18 +1316,51 @@ func renderCostPane(snap *usage.Snapshot, group usage.Group, width, height int) 
 	// Not even the header and the first section fit. The "TOTAL" heading is what goes —
 	// the header one row above already says COST, so the heading is the only thing here
 	// carrying no information — and the figure is kept, because it is the answer to the
-	// question the pane exists for. Whole lines only; costTotalSection puts the figure on
-	// its own first line precisely so this path cannot cut it.
-	out := []string{header}
-	if len(sections) > 0 {
-		out = append(out, sections[0].lines...)
+	// question the pane exists for.
+	//
+	// WHOLE UNITS, not whole lines, and the difference is the whole point of this path. It
+	// used to cut the section's flat line list at out[:height], and the lines it cut were
+	// the coverage ratio and the lower-bounds caveat: at layout()'s own four-row floor the
+	// pane kept the dollar amount and threw away everything saying the amount was partial or
+	// inexact. The comment here claimed "whole lines only… this path cannot cut it", which
+	// was true of the FIGURE and of nothing else — the caveats are wrapped prose, so a cut at
+	// a line boundary left half a sentence, and one row shallower left none of it.
+	//
+	// What makes dropping a caveat safe is that costTotalFigure puts each of its claims on
+	// the figure as a one-cell marker, so "~$12.5000+" still says partial and inexact with no
+	// words at all. A qualified figure is therefore never shown stripped of its
+	// qualification, at any height this can be called with — that is the branch's rule, and
+	// it is why the fix is a marker on the figure rather than a cleverer truncation.
+	parts := costTotalBody(snap, width)
+	out := append([]string{header}, parts.head...)
+	if height == 1 {
+		// One row to spend: the answer outranks the header, which on its own answers nothing.
+		// head[0] and not a cut of it — the figure line is one line by construction, and on
+		// the unpriced paths the first line of the prose is the part that says "unavailable".
+		return parts.head[0]
 	}
+	// The HEADER yields before the answer does, for the reason it yields at height 1: the
+	// pane's title bar already says COST, so the header's information is the window label,
+	// where these lines are the figure and what qualifies it.
 	if height > 0 && len(out) > height {
-		if height == 1 && len(out) > 1 {
-			// One row to spend: the figure outranks the header. A header alone answers nothing.
-			return out[1]
-		}
+		out = parts.head
+	}
+	// And if the head alone still overruns — a provenance note that had to wrap onto its own
+	// lines, on a terminal two rows tall — its FIRST line survives, because that is the
+	// figure. This is the only cut left in this path, it is below layout()'s four-row floor,
+	// and it never touches a caveat.
+	if height > 0 && len(out) > height {
 		out = out[:height]
+	}
+	for _, c := range parts.caveats {
+		if height > 0 && len(out)+len(c) > height {
+			// Stop at the first unit that does not fit rather than skipping to a shorter one
+			// later in the list: the order is severity order, and a pane that showed the
+			// exactness caveat because it was shorter than the damage one would be ranking by
+			// length.
+			break
+		}
+		out = append(out, c...)
 	}
 	return strings.Join(out, "\n")
 }

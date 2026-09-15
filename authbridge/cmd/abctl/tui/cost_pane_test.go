@@ -2101,7 +2101,7 @@ func TestRenderCostPane_DamageIsNotMergedWithInexactness(t *testing.T) {
 	iDmg := strings.Index(got, "SHORT")
 	iCov := strings.Index(got, "covers 300 of 400")
 	iInc := strings.Index(got, "lower bounds")
-	if !(iDmg < iCov && iCov < iInc) {
+	if iDmg > iCov || iCov > iInc {
 		t.Errorf("caveats out of order (damaged %d, coverage %d, inexact %d):\n%s",
 			iDmg, iCov, iInc, got)
 	}
@@ -2162,5 +2162,183 @@ func TestRenderCostPane_ADisclosureWithNoCountersIsStillADisclosure(t *testing.T
 	}
 	if !strings.Contains(got, "without saying how much") {
 		t.Errorf("the pane invented or omitted a count it was not given:\n%s", got)
+	}
+}
+
+// qualifiedTotalSnapshot is a total that is BOTH partial and inexact — the fixture whose
+// absence hid the tiny-height defect. Every test above either switched the caveats off or
+// rendered tall enough that they all fitted, so nothing could see the fallback path drop
+// them.
+//
+// Ledger-shaped, like the window this pane defaults to: one bucket spanning the whole span,
+// no UnpricedBy (a per-minute ledger row cannot distinguish the unpriced pairs from the
+// priced ones).
+func qualifiedTotalSnapshot(d *usage.Degraded) *usage.Snapshot {
+	snap := damagedTodaySnapshot(d)
+	// Explicit about the premise this test rests on, so a fixture edit cannot quietly make
+	// the assertions vacuous.
+	if snap.Totals.PricedRequests >= snap.Totals.PriceableRequests {
+		panic("fixture is not partial")
+	}
+	if snap.Totals.IncompleteRequests == 0 {
+		panic("fixture is not inexact")
+	}
+	return snap
+}
+
+// costCaveatSentences maps the leading words of each caveat the TOTAL section can emit to the
+// closing words of the same sentence. A rendered caveat must carry both: half a sentence
+// about a missing day reads as a complete one about something else.
+var costCaveatSentences = map[string]string{
+	"this total is SHORT":    "an amount nothing here can state",
+	"covers 300 of 400":      "the rest carry no figure",
+	"priced figures are low": "so the real total is higher",
+}
+
+// TestRenderCostPane_ATinyHeightNeverShowsABareConfidentFigure.
+//
+// The defect: renderCostPane's last-resort path cut the TOTAL section's flat line list at
+// out[:height], and what it cut was the coverage ratio and the lower-bounds caveat — so at
+// small heights the pane kept the dollar amount and discarded the two things saying the
+// amount was partial and inexact. Its comment claimed "whole lines only… this path cannot
+// cut it", true of the FIGURE and of nothing else.
+//
+// Heights 4 through 8 because layout()'s own floor is 4, so this is reachable rather than
+// theoretical; 1 through 12 as well, because the interesting failures are at the seams where
+// a unit stops fitting.
+func TestRenderCostPane_ATinyHeightNeverShowsABareConfidentFigure(t *testing.T) {
+	snap := qualifiedTotalSnapshot(&usage.Degraded{SkippedLines: 3})
+	for _, h := range append([]int{4, 5, 6, 7, 8}, 1, 2, 3, 9, 10, 11, 12) {
+		got := renderCostPane(snap, usage.GroupModel, 60, h)
+		if !strings.Contains(got, "$12.5000") {
+			t.Errorf("h=%d dropped the answer entirely:\n%s", h, got)
+			continue
+		}
+		// The figure wears all three claims, whatever the budget left of the words.
+		want := damagedMarker + inexactMarker + "$12.5000" + partialMarker
+		if !strings.Contains(got, want) {
+			t.Errorf("h=%d publishes a qualified total as a bare confident number:\n%s", h, got)
+		}
+		// The budget is respected, not merely smaller.
+		if n := len(strings.Split(got, "\n")); n > h {
+			t.Errorf("h=%d produced %d lines:\n%s", h, n, got)
+		}
+	}
+}
+
+// unwrapCostBody rejoins a rendered pane into one line so a WRAPPED sentence can be matched
+// whole. Trimming each line and joining with a single space reconstructs the prose exactly as
+// wrapCells split it.
+//
+// Needed because the assertion below is about SENTENCES and the pane's own wrapping puts
+// newlines inside them: matching the raw output reports every wrapped caveat as a fragment.
+func unwrapCostBody(s string) string {
+	parts := strings.Split(s, "\n")
+	for i := range parts {
+		parts[i] = strings.TrimSpace(parts[i])
+	}
+	return strings.Join(parts, " ")
+}
+
+// TestRenderCostPane_ATinyHeightDropsWholeCaveatsNotSentences.
+//
+// The other half of "whole lines only": the caveats are WRAPPED PROSE, so a cut at a line
+// boundary leaves a fragment. Whatever survives the budget must be a complete sentence.
+//
+// Every width and every height up to where all four sections fit, because a caveat's line
+// count depends on both, and a fragment appears exactly at the seam where one more line would
+// have carried the whole of it.
+func TestRenderCostPane_ATinyHeightDropsWholeCaveatsNotSentences(t *testing.T) {
+	snap := qualifiedTotalSnapshot(&usage.Degraded{SkippedLines: 3, TruncatedDays: 1})
+	for _, w := range []int{40, 60, 80, 120} {
+		for h := 1; h <= 24; h++ {
+			flat := unwrapCostBody(renderCostPane(snap, usage.GroupModel, w, h))
+			for opening, closing := range costCaveatSentences {
+				if strings.Contains(flat, opening) && !strings.Contains(flat, closing) {
+					t.Errorf("w=%d h=%d: caveat %q is rendered without its ending %q:\n%s",
+						w, h, opening, closing, flat)
+				}
+			}
+		}
+	}
+}
+
+// TestRenderCostPane_TheFigureWearsTheSameMarkersAsEveryOtherMoneySurface.
+//
+// One spelling everywhere. The Cost pane was the only money surface stating its caveats in
+// words alone — which is exactly the surface a short terminal cuts the words off — while the
+// strip, the sessions COST cell and the Usage pane cell all marked theirs. Pinned against
+// the strip's own figure for the same three facts, so the two cannot drift.
+func TestRenderCostPane_TheFigureWearsTheSameMarkersAsEveryOtherMoneySurface(t *testing.T) {
+	snap := qualifiedTotalSnapshot(&usage.Degraded{SkippedLines: 3})
+	paneFigure := costTotalFigure(snap)
+
+	stripFig := moneyFigure(12.5, "today",
+		snap.Totals.PriceableRequests-snap.Totals.PricedRequests,
+		snap.Totals.PriceableRequests, snap.Totals.IncompleteRequests, snap.Degraded)
+	// Same markers in the same places; only the amount's own formatter differs (costMoney
+	// states four places, formatUSDCell adds a "<" floor), so compare the marker frame.
+	paneFrame := strings.ReplaceAll(paneFigure, "$12.5000", "AMOUNT")
+	stripFrame := strings.ReplaceAll(strings.Fields(stripFig.compact)[0], "$12.5000", "AMOUNT")
+	if paneFrame != stripFrame {
+		t.Errorf("pane figure frame %q, strip figure frame %q — two spellings for three facts",
+			paneFrame, stripFrame)
+	}
+}
+
+// TestRenderCostPane_AnUnqualifiedTotalCarriesNoMarkers is the mirror, and the half that
+// keeps the markers worth reading. A figure permanently wearing "~" says nothing.
+func TestRenderCostPane_AnUnqualifiedTotalCarriesNoMarkers(t *testing.T) {
+	snap := damagedTodaySnapshot(nil)
+	snap.Totals.PricedRequests = snap.Totals.PriceableRequests
+	snap.Totals.IncompleteRequests = 0
+	for _, h := range []int{1, 4, 8, 40} {
+		got := renderCostPane(snap, usage.GroupModel, 60, h)
+		if !strings.Contains(got, "$12.5000") {
+			t.Fatalf("h=%d lost the figure; test premise is wrong:\n%s", h, got)
+		}
+		for _, m := range []string{damagedMarker, inexactMarker, partialMarker} {
+			if strings.Contains(got, m+"$12.5000") || strings.Contains(got, "$12.5000"+m) {
+				t.Errorf("h=%d marks a clean, complete, exact total with %q:\n%s", h, m, got)
+			}
+		}
+	}
+}
+
+// TestRenderCostPane_EachQualificationMarksTheFigureOnItsOwn.
+//
+// Each of the three independently, because a fixture with all three on cannot tell "all
+// three markers are applied" from "one marker is applied three times", and the fallback path
+// only has to lose ONE of them to publish a misleading figure.
+func TestRenderCostPane_EachQualificationMarksTheFigureOnItsOwn(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		shape func(*usage.Snapshot)
+		want  string
+	}{
+		{"damaged only", func(s *usage.Snapshot) {
+			s.Degraded = &usage.Degraded{SkippedLines: 3}
+		}, damagedMarker + "$12.5000"},
+		{"inexact only", func(s *usage.Snapshot) {
+			s.Totals.IncompleteRequests = 7
+		}, inexactMarker + "$12.5000"},
+		{"partial only", func(s *usage.Snapshot) {
+			s.Totals.PricedRequests = 300
+		}, "$12.5000" + partialMarker},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			snap := damagedTodaySnapshot(nil)
+			snap.Totals.PricedRequests = snap.Totals.PriceableRequests
+			snap.Totals.IncompleteRequests = 0
+			tc.shape(snap)
+			// Every height including the fallback path's own, because the marker is what makes
+			// that path safe.
+			for _, h := range []int{4, 5, 6, 7, 8, 40} {
+				got := renderCostPane(snap, usage.GroupModel, 60, h)
+				if !strings.Contains(got, tc.want) {
+					t.Errorf("h=%d: figure does not carry %q:\n%s", h, tc.want, got)
+				}
+			}
+		})
 	}
 }

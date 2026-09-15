@@ -1106,6 +1106,94 @@ func TestPrune_AForwardClockStepDoesNotDeleteTheLedger(t *testing.T) {
 	}
 }
 
+// A FUTURE-DATED DAY FILE USED TO SURVIVE FOR EVER, so "at most retainDays files
+// survive" stopped being true after a single clock-skewed write.
+//
+// The floor under the cutoff only ever LOWERS the reference day, and a file dated ahead
+// of the clock is never Before any cutoff derived from it, so nothing could ever reclaim
+// it: one write by a clock that was briefly years fast left that file in the directory
+// for as long as the directory lived. Retention of ordinary days kept advancing, which
+// is why this was a leak rather than a freeze — and why it is invisible until someone
+// lists the directory.
+func TestPrune_AFutureDatedDayFileIsNotKeptForever(t *testing.T) {
+	dir := t.TempDir()
+	const retain = 30
+	s, err := newStore(dir, retain, time.Local)
+	if err != nil {
+		t.Fatalf("newStore: %v", err)
+	}
+	seed := func(d time.Time) string {
+		p := s.path(d)
+		if werr := os.WriteFile(p, []byte("{}\n"), 0o600); werr != nil {
+			t.Fatalf("seed: %v", werr)
+		}
+		return p
+	}
+	// Today and two days of real history, by a clock that is right.
+	live := []string{seed(at), seed(at.AddDate(0, 0, -1)), seed(at.AddDate(0, 0, -2))}
+	// And the artefact: one minute written while the clock read four years hence. Its
+	// rows are dated then too, so no window this clock can express will ever read them.
+	artefact := seed(at.AddDate(4, 0, 0))
+
+	if perr := s.prune(at); perr != nil {
+		t.Fatalf("prune: %v", perr)
+	}
+
+	if _, serr := os.Stat(artefact); !os.IsNotExist(serr) {
+		t.Errorf("%s survived a prune run by a correct clock: a day file dated four years ahead "+
+			"cannot be data this ledger will ever serve, and nothing else will ever reclaim it — "+
+			"the retention cutoff only moves with the clock and a future date is never behind it",
+			filepath.Base(artefact))
+	}
+	for _, p := range live {
+		if _, serr := os.Stat(p); serr != nil {
+			t.Errorf("%s was deleted while reclaiming a future-dated file: %v — pruning the artefact "+
+				"must not cost a user the history beside it", filepath.Base(p), serr)
+		}
+	}
+}
+
+// THE NEAR FUTURE IS NOT AN ARTEFACT, and this is the half that keeps the fix above from
+// becoming the bug the floor exists to prevent.
+//
+// A clock a few seconds fast across midnight files a real minute of spend under
+// tomorrow's date, and a clock that steps BACKWARD — a restored VM snapshot, an NTP
+// correction after a resume — makes several days of genuine history look future-dated.
+// Neither is reclaimed here: ordinary retention sweeps anything within a retention window
+// of the clock's day as the clock advances into it, so those files age out on their own
+// and no rule is needed. Only a file that would outlive the whole window is deleted.
+func TestPrune_ADayFileWithinTheWindowAheadOfTheClockIsKept(t *testing.T) {
+	dir := t.TempDir()
+	const retain = 7
+	s, err := newStore(dir, retain, time.Local)
+	if err != nil {
+		t.Fatalf("newStore: %v", err)
+	}
+	seed := func(d time.Time) string {
+		p := s.path(d)
+		if werr := os.WriteFile(p, []byte("{}\n"), 0o600); werr != nil {
+			t.Fatalf("seed: %v", werr)
+		}
+		return p
+	}
+	// Tomorrow: the midnight-skew case. And retain days ahead: the boundary, which is
+	// still inside what ordinary retention will sweep.
+	kept := []string{seed(at), seed(at.AddDate(0, 0, 1)), seed(at.AddDate(0, 0, retain))}
+
+	if perr := s.prune(at); perr != nil {
+		t.Fatalf("prune: %v", perr)
+	}
+
+	for _, p := range kept {
+		if _, serr := os.Stat(p); serr != nil {
+			t.Errorf("%s was deleted: %v — a day within one retention window of the clock is "+
+				"either a small skew or a clock that stepped back, and deleting a user's cost "+
+				"history on that evidence is the failure the floor exists to prevent",
+				filepath.Base(p), serr)
+		}
+	}
+}
+
 // N7: the day a row is FILED under and the day a reader LOOKS in have to be decided by
 // one zone. path() named the file from the row's own zone while the day walk used the
 // caller's, and they agreed only because nothing in the pipeline calls .UTC(). One that

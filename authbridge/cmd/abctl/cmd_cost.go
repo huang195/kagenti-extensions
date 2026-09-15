@@ -30,7 +30,8 @@ func runCost(args []string, stdout, stderr io.Writer) int {
 	fs := flag.NewFlagSet("abctl cost", flag.ContinueOnError)
 	fs.SetOutput(stderr)
 	asJSON := fs.Bool("json", false,
-		"emit the totals, their provenance and the coverage gaps as JSON, with usage.Counts' own field names")
+		"emit the totals, their provenance, the coverage gaps and any incomplete-read "+
+			"disclosure as JSON, with usage.Counts' own field names")
 	window := fs.String("window", usage.WindowToday,
 		"window to report: today, 7d, or a duration such as 1h or 6h")
 	endpoint := fs.String("endpoint", "",
@@ -117,7 +118,8 @@ Flags:
 }
 
 // costJSON is the --json shape: the window actually served plus the totals
-// verbatim, and the two maps that say where the totals came from and what they miss.
+// verbatim, the two maps that say where the totals came from and what they miss, and the
+// ledger's own admission when the read that produced them was incomplete.
 //
 // Totals is usage.Counts embedded, NOT re-keyed and NOT re-cased. An unattended
 // workload parses this, and the whole point of the shared schema is that the CLI,
@@ -135,6 +137,11 @@ Flags:
 // total from a billed one, and could not name a coverage gap it was told the size of.
 // Both are omitempty on the wire, so a response that carries neither is byte-identical to
 // what this printed before.
+//
+// Degraded is on this struct for exactly that argument taken one step further: it is the
+// only field here that says the totals are INCOMPLETE rather than merely qualified, and a
+// script summing CostMicros across days had no way to know one of them was short. The
+// server logs a warning for it, which is a line no scripted consumer can read.
 type costJSON struct {
 	// Window is what the SERVER served, so a script reading this learns it got six
 	// hours rather than a day without having to ask a second question.
@@ -156,6 +163,23 @@ type costJSON struct {
 	// unpriced pairs from the priced ones. Compare Totals.PricedRequests with
 	// Totals.PriceableRequests for that, exactly as the human summary does.
 	UnpricedBy map[string]int64 `json:"unpricedBy,omitempty"`
+	// Degraded says the totals above are MISSING ROWS — a day file that lost lines, or one
+	// whose scan was abandoned part-way — so CostMicros is short by an amount nothing in
+	// this document can state. See costDegradedText for the claim in full and for why it is
+	// not Totals.IncompleteRequests.
+	//
+	// Here because the log line the server writes reaches nobody on this path. The human
+	// summary can be read by the person who ran it; a scripted consumer is the one nobody
+	// eyeballs, and it was the only reader that could not tell a damaged read from a clean
+	// one. That is the same argument PricedBy and UnpricedBy are on this struct for.
+	//
+	// VERBATIM as *usage.Degraded, not flattened into two fields of our own: the schema rule
+	// is one vocabulary from parser to aggregate to ledger to CLI, and "skippedLines" here
+	// has to be the "skippedLines" on the wire. omitempty on a POINTER, so a clean read
+	// serialises nothing and a response carrying no disclosure is byte-identical to what
+	// this printed before — absence keeps meaning "the read was clean" rather than becoming
+	// zeros a consumer has to interpret.
+	Degraded *usage.Degraded `json:"degraded,omitempty"`
 }
 
 func writeCostJSON(snap *usage.Snapshot, stdout, stderr io.Writer) int {
@@ -167,6 +191,7 @@ func writeCostJSON(snap *usage.Snapshot, stdout, stderr io.Writer) int {
 		Totals:     snap.Totals,
 		PricedBy:   snap.PricedBy,
 		UnpricedBy: snap.UnpricedBy,
+		Degraded:   snap.Degraded,
 	}
 	if err := enc.Encode(out); err != nil {
 		fmt.Fprintf(stderr, "abctl cost: writing JSON: %v\n", err)
@@ -228,6 +253,18 @@ func writeCostSummary(snap *usage.Snapshot, stdout io.Writer) {
 		fmt.Fprintf(stdout, "  %s\n", split)
 	}
 
+	// The damage disclosure leads, ahead of both, because it is the only one of the three
+	// that says the SUM ITSELF is incomplete. The two below qualify a figure this answer
+	// carries; this one says spend is missing from it. usage.Snapshot.Degraded's own doc
+	// forbids merging the two claims or showing them under one marker, so they are three
+	// separate lines with three sets of words and no shared prefix beyond the "!".
+	//
+	// This is the DEFAULT path, not an edge of one: --window defaults to today, and today
+	// (with 7d) is the only window the durable cost ledger serves, which is the only place
+	// the field can be populated at all.
+	if snap.Degraded != nil {
+		fmt.Fprintf(stdout, "  ! %s\n", costDegradedText(snap.Degraded))
+	}
 	// The exactness caveat before the coverage one: it qualifies the dollar figure
 	// itself, where coverage qualifies how much of the traffic the figure covers.
 	// Both can be true at once and they are different claims.
@@ -244,6 +281,63 @@ func writeCostSummary(snap *usage.Snapshot, stdout io.Writer) {
 		// loud so an empty answer reads as a finding rather than as a broken command.
 		fmt.Fprintln(stdout, "  no priceable traffic in this window")
 	}
+}
+
+// costDegradedText says what a damaged ledger read could not deliver.
+//
+// usage.Snapshot.Degraded means the answer is known to be MISSING ROWS: a day file that
+// lost lines, or one whose scan was abandoned part-way. The server populates it and logs a
+// warning; until now nothing in abctl read it, so a damaged read printed a total
+// byte-identical to a clean one — a short figure with no caveat anywhere in it, which is
+// precisely what the field exists to prevent.
+//
+// A DIFFERENT CLAIM from Totals.IncompleteRequests and worded so it cannot be mistaken for
+// it. That counter says a figure this answer CARRIES is inexact — a floor, or an
+// approximation — and the request is still counted and still priced; this says rows are
+// missing from the sum entirely, so the shortfall is not merely unmeasured but unstatable.
+// The two are never merged and never share a form of words.
+//
+// PRESENCE is the claim, not the counters. The field is a pointer so a clean read serialises
+// nothing, and a present object whose counters are both zero still reports damage: a
+// producer that sent the object is saying it found some. Zeros read as "checked, fine" would
+// be the same false reassurance as "$0.00" over unpriced traffic.
+//
+// A truncated day is called out as worse than a skipped line because it is worse by an
+// unbounded amount — a line is one request, a file is a whole day.
+//
+// The TUI states the same fact in its own two verbosities (tui.costDamagedNote for the Cost
+// pane, tui.damagedNote plus a one-cell marker for the spend strip). Three spellings for one
+// fact is the same arrangement the coverage gap already has, and for the same reason: this
+// is a package boundary, and each surface has a different amount of room.
+func costDegradedText(d *usage.Degraded) string {
+	switch {
+	case d.SkippedLines > 0 && d.TruncatedDays > 0:
+		return fmt.Sprintf("this total is SHORT — the cost ledger skipped %s unreadable line%s "+
+			"and abandoned %s day file%s part-way; that spend happened and is missing from the "+
+			"sum, by an amount nothing here can state",
+			plainCount(d.SkippedLines), plainPlural(d.SkippedLines),
+			plainCount(d.TruncatedDays), plainPlural(d.TruncatedDays))
+	case d.SkippedLines > 0:
+		return fmt.Sprintf("this total is SHORT — the cost ledger skipped %s unreadable line%s; "+
+			"that spend happened and is missing from the sum, by an amount nothing here can state",
+			plainCount(d.SkippedLines), plainPlural(d.SkippedLines))
+	case d.TruncatedDays > 0:
+		return fmt.Sprintf("this total is SHORT — the cost ledger abandoned %s day file%s "+
+			"part-way; a file holds a whole day, so the amount missing from the sum is unbounded",
+			plainCount(d.TruncatedDays), plainPlural(d.TruncatedDays))
+	default:
+		return "this total is SHORT — the cost ledger reported an incomplete read without " +
+			"saying how much it lost; rows are missing from the sum"
+	}
+}
+
+// plainPlural is the "s" a count needs, for the one message in this file that has to
+// agree with a number it does not control.
+func plainPlural(n int64) string {
+	if n == 1 {
+		return ""
+	}
+	return "s"
 }
 
 // costWindowLabel tidies a duration window for reading and passes anything else

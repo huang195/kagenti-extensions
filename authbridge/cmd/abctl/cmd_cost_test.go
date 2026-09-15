@@ -6,6 +6,8 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+
+	"github.com/rossoctl/cortex/authbridge/authlib/usage"
 )
 
 // fakeUsageServer answers GET /v1/usage with body and 404s everything else, so a
@@ -485,5 +487,194 @@ func TestRunCost_APositiveTotalStillPrints(t *testing.T) {
 	}
 	if strings.Contains(got, "negative") {
 		t.Errorf("output carries a caveat with nothing to act on:\n%s", got)
+	}
+}
+
+// TestRunCost_DisclosesADamagedLedgerRead.
+//
+// usage.Snapshot.Degraded says the answer is MISSING ROWS. The server populates it and logs
+// a warning; nothing in cmd/abctl read it, so a damaged read printed a total byte-identical
+// to a clean one — a short figure under priced:true with no caveat anywhere in it, which is
+// the failure the field's own doc says it exists to prevent.
+//
+// The default path: --window defaults to today, and today is one of the two windows the
+// durable cost ledger serves, which is the only place the field can be populated.
+func TestRunCost_DisclosesADamagedLedgerRead(t *testing.T) {
+	srv := fakeUsageServer(t, `{"window":"today","totals":{"requests":318,`+
+		`"costMicros":4170000,"pricedRequests":318,"priceableRequests":318},"priced":true,`+
+		`"degraded":{"skippedLines":3,"truncatedDays":1}}`)
+	defer srv.Close()
+
+	var out, errOut strings.Builder
+	if code := runCost([]string{"--endpoint", srv.URL}, &out, &errOut); code != 0 {
+		t.Fatalf("exit = %d, want 0; stderr = %s", code, errOut.String())
+	}
+	got := out.String()
+	// The figure stays: it is short, not wrong, and withholding it would report a day of
+	// known spend as unavailable.
+	if !strings.Contains(got, "$4.17") {
+		t.Errorf("output withheld a figure that is short rather than unknown:\n%s", got)
+	}
+	// Both counters, named. "Incomplete" alone gives an operator nothing to act on.
+	for _, want := range []string{"SHORT", "3", "1 day file"} {
+		if !strings.Contains(got, want) {
+			t.Errorf("output missing %q — the damage is not disclosed:\n%s", want, got)
+		}
+	}
+}
+
+// TestRunCost_ADamagedReadIsNotSpelledAsAnInexactOne.
+//
+// usage.Snapshot.Degraded's doc is explicit that this is a DIFFERENT claim from
+// Totals.IncompleteRequests and that the two must not be merged or shown with one marker:
+// that counter says a figure the answer CARRIES is inexact, this says rows are missing from
+// the sum. Both live in this fixture, and each has to be recognisable on its own.
+func TestRunCost_ADamagedReadIsNotSpelledAsAnInexactOne(t *testing.T) {
+	srv := fakeUsageServer(t, `{"window":"today","totals":{"requests":318,`+
+		`"costMicros":4170000,"pricedRequests":300,"priceableRequests":318,`+
+		`"incompleteRequests":7},"priced":true,"degraded":{"skippedLines":3}}`)
+	defer srv.Close()
+
+	var out, errOut strings.Builder
+	runCost([]string{"--endpoint", srv.URL}, &out, &errOut)
+	got := out.String()
+
+	// Three caveat lines, three claims, one each. Merged into one line — or one dropped —
+	// this count is wrong.
+	if n := strings.Count(got, "\n  ! "); n != 3 {
+		t.Errorf("got %d caveat lines, want 3 (damaged, inexact, coverage):\n%s", n, got)
+	}
+	// The inexactness line still says what it always said, in its own words.
+	if !strings.Contains(got, "inexact figure") {
+		t.Errorf("the inexactness caveat lost its own wording:\n%s", got)
+	}
+	// And the damage line does not borrow them.
+	dmg := ""
+	for _, l := range strings.Split(got, "\n") {
+		if strings.Contains(l, "SHORT") {
+			dmg = l
+		}
+	}
+	if dmg == "" {
+		t.Fatalf("no damage line at all:\n%s", got)
+	}
+	if strings.Contains(dmg, "inexact") {
+		t.Errorf("the damage line is worded as an inexactness caveat: %q", dmg)
+	}
+	// The damage line leads: it is the only one of the three saying the SUM is incomplete.
+	if i, j := strings.Index(got, "SHORT"), strings.Index(got, "inexact figure"); i > j {
+		t.Errorf("the damage line follows the inexactness one (%d > %d):\n%s", i, j, got)
+	}
+}
+
+// TestRunCost_ACleanReadCarriesNoDamageLine is the mirror, and it is the half that keeps the
+// disclosure worth reading: a permanent warning with nothing to act on is what teaches an
+// operator to ignore the one signal that matters.
+func TestRunCost_ACleanReadCarriesNoDamageLine(t *testing.T) {
+	srv := fakeUsageServer(t, `{"window":"today","totals":{"requests":318,`+
+		`"costMicros":4170000,"pricedRequests":318,"priceableRequests":318},"priced":true}`)
+	defer srv.Close()
+
+	var out, errOut strings.Builder
+	runCost([]string{"--endpoint", srv.URL}, &out, &errOut)
+	if got := out.String(); strings.Contains(got, "SHORT") {
+		t.Errorf("a clean read carries a damage caveat:\n%s", got)
+	}
+}
+
+// TestRunCost_JSONCarriesTheDamageDisclosure.
+//
+// The machine path is the one this matters most on: a human can read the server's log line
+// if they know to look, a script cannot. It was also the reader with no other way to tell a
+// short total from a complete one — priced:true and a plausible figure look identical.
+//
+// Verbatim field names, because the schema rule is one vocabulary from parser to aggregate
+// to ledger to CLI.
+func TestRunCost_JSONCarriesTheDamageDisclosure(t *testing.T) {
+	srv := fakeUsageServer(t, `{"window":"today","totals":{"requests":318,`+
+		`"costMicros":4170000,"pricedRequests":318,"priceableRequests":318},"priced":true,`+
+		`"degraded":{"skippedLines":3,"truncatedDays":1}}`)
+	defer srv.Close()
+
+	var out, errOut strings.Builder
+	if code := runCost([]string{"--endpoint", srv.URL, "--json"}, &out, &errOut); code != 0 {
+		t.Fatalf("exit = %d, want 0; stderr = %s", code, errOut.String())
+	}
+	var decoded struct {
+		Degraded *struct {
+			SkippedLines  int64 `json:"skippedLines"`
+			TruncatedDays int64 `json:"truncatedDays"`
+		} `json:"degraded"`
+	}
+	if err := json.Unmarshal([]byte(out.String()), &decoded); err != nil {
+		t.Fatalf("--json output is not valid JSON: %v\n%s", err, out.String())
+	}
+	if decoded.Degraded == nil {
+		t.Fatalf("--json dropped the damage disclosure entirely:\n%s", out.String())
+	}
+	if decoded.Degraded.SkippedLines != 3 || decoded.Degraded.TruncatedDays != 1 {
+		t.Errorf("degraded = %+v, want skippedLines 3 and truncatedDays 1:\n%s",
+			*decoded.Degraded, out.String())
+	}
+}
+
+// TestRunCost_JSONOmitsTheDamageDisclosureWhenTheReadWasClean.
+//
+// The pointer's whole point: absence means the read was clean, so a clean answer has to be
+// byte-identical to what this printed before the field existed. Zeros in an always-present
+// object would read as "checked, fine" — the same false reassurance as $0.00 over unpriced
+// traffic.
+func TestRunCost_JSONOmitsTheDamageDisclosureWhenTheReadWasClean(t *testing.T) {
+	srv := fakeUsageServer(t, `{"window":"today","totals":{"requests":2,`+
+		`"costMicros":250000,"pricedRequests":2,"priceableRequests":2},"priced":true}`)
+	defer srv.Close()
+
+	var out, errOut strings.Builder
+	if code := runCost([]string{"--endpoint", srv.URL, "--json"}, &out, &errOut); code != 0 {
+		t.Fatalf("exit = %d, want 0", code)
+	}
+	if strings.Contains(out.String(), "degraded") {
+		t.Errorf("--json emitted \"degraded\" for a clean read:\n%s", out.String())
+	}
+}
+
+// TestCostDegradedText_NamesWhatEachKindOfDamageLost.
+//
+// Each branch on its own, because the three sentences make different claims and the
+// unbounded one is the point: a skipped line is one request, an abandoned file is a day.
+//
+// The zero-counter case is a disclosure too — presence is the claim, not the counters, since
+// the field is a pointer so that a clean read serialises nothing.
+func TestCostDegradedText_NamesWhatEachKindOfDamageLost(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		in   usage.Degraded
+		want []string
+		not  []string
+	}{
+		{"lines only", usage.Degraded{SkippedLines: 3},
+			[]string{"SHORT", "3 unreadable lines"}, []string{"day file", "unbounded"}},
+		{"one line", usage.Degraded{SkippedLines: 1},
+			[]string{"1 unreadable line;"}, []string{"lines"}},
+		{"days only", usage.Degraded{TruncatedDays: 2},
+			[]string{"SHORT", "2 day files", "unbounded"}, []string{"unreadable line"}},
+		{"both", usage.Degraded{SkippedLines: 3, TruncatedDays: 1},
+			[]string{"3 unreadable lines", "1 day file"}, nil},
+		{"neither", usage.Degraded{},
+			[]string{"SHORT", "without saying how much"}, []string{"unreadable line", "day file"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got := costDegradedText(&tc.in)
+			for _, w := range tc.want {
+				if !strings.Contains(got, w) {
+					t.Errorf("%q missing %q", got, w)
+				}
+			}
+			for _, n := range tc.not {
+				if strings.Contains(got, n) {
+					t.Errorf("%q contains %q, which does not apply", got, n)
+				}
+			}
+		})
 	}
 }

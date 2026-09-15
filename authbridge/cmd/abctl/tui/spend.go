@@ -239,6 +239,27 @@ type spendSummary struct {
 	// different question about a different span, and one figure must never wear another's
 	// qualification.
 	TodayIncomplete int64
+	// TodayDegraded is the ledger's own disclosure that the read behind TodayUSD was
+	// INCOMPLETE: rows the day needed could not be read at all, so the figure is SHORT by
+	// an amount nothing in the response can state. nil means the read was clean.
+	//
+	// A THIRD claim about the day's figure, not a variant of the other two, and the one
+	// nothing in cmd/abctl consumed. usage.Snapshot.Degraded was added, the server populates
+	// it, and it reached no client — so a damaged read still printed a figure
+	// byte-identical to a clean one, which is the failure its own doc says it exists to
+	// prevent. It matters most HERE: this is the strip's only ledger-backed reading, and the
+	// only window that can populate the field at all.
+	//
+	// Carried as the wire's own POINTER rather than unpacked into counters, so absence keeps
+	// meaning "the read was clean" all the way to the renderer. See snapshotDamaged for why
+	// presence rather than the counters is the claim.
+	//
+	// Set only alongside HasToday, so an unpriced or ring-served day leaves it nil: those
+	// paths publish no figure, so there is no total for it to qualify. A damaged read of a
+	// day that priced nothing is therefore disclosed by the Cost pane and `abctl cost` and
+	// not by the strip — the strip has no reading to attach it to, and an unattached caveat
+	// on this line is the misattribution moneyFigure exists to end.
+	TodayDegraded *usage.Degraded
 
 	SavedUSD float64 // set once tool-prune savings are aggregated
 	HasSaved bool
@@ -573,6 +594,17 @@ func (m *model) applyTodayFigure(out *spendSummary) {
 	// And the day's exactness, which is a different claim from its coverage: a day can be
 	// fully covered and still be a floor, because one truncated stream is enough.
 	out.TodayIncomplete = snap.Totals.IncompleteRequests
+	// And the ledger's own damage disclosure, which is a THIRD claim: coverage says how much
+	// of the traffic the figure covers, exactness says whether the figure it covers is the
+	// real number, and this says rows are missing from the sum entirely. A day can be fully
+	// covered, wholly exact, and still short — a skipped line is spend that happened and is
+	// not in the total.
+	//
+	// Copied as the pointer, so nil keeps meaning "the read was clean" rather than becoming
+	// zeros the renderer has to interpret. This is the one field on this whole path that
+	// only a ledger-backed window can populate, which is why it hangs off the today figure
+	// and off nothing else. See spendSummary.TodayDegraded.
+	out.TodayDegraded = snap.Degraded
 }
 
 // spendTodayTickIsCurrent reports whether a today tick belongs to the live chain.

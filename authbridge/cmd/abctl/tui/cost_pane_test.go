@@ -2007,3 +2007,160 @@ func TestPaneKeys_CostPaneNamesEveryAxisAndSaysItWinsOverTheGlobalG(t *testing.T
 			globalG, gDesc, body)
 	}
 }
+
+// damagedTodaySnapshot is a LEDGER-BACKED "today" answer that lost rows: the fixture whose
+// absence hid the defect. Only a ledger window can populate usage.Snapshot.Degraded, and
+// "today" is this pane's DEFAULT window (costPaneWindows[0]), so this is the ordinary case
+// rather than an exotic one.
+//
+// Shaped like the real thing: ONE bucket spanning the window, which is what ledgerSnapshot
+// returns, and no UnpricedBy — a per-minute ledger row cannot distinguish the unpriced pairs
+// from the priced ones, so the ledger never sends it.
+func damagedTodaySnapshot(d *usage.Degraded) *usage.Snapshot {
+	return &usage.Snapshot{
+		Window:        usage.WindowToday,
+		BucketSeconds: 86_400,
+		Group:         usage.GroupModel,
+		Totals: usage.Counts{
+			Requests: 400, Tokens: 120_000,
+			CostMicros: 12_500_000, PricedRequests: 300, PriceableRequests: 400,
+			IncompleteRequests: 7,
+		},
+		Buckets: []usage.Bucket{{Series: map[string]usage.Counts{
+			"claude-opus-5": {Requests: 400, CostMicros: 12_500_000,
+				PricedRequests: 300, PriceableRequests: 400},
+		}}},
+		Priced:   true,
+		Degraded: d,
+	}
+}
+
+// TestRenderCostPane_DisclosesADamagedLedgerRead.
+//
+// usage.Snapshot.Degraded says the answer is MISSING ROWS. The server populates it and logs
+// a warning, and it reached no client in cmd/abctl at all — so a damaged read rendered a
+// figure byte-identical to a clean one, which is the failure the field's own doc says it
+// exists to prevent, on this pane's default window.
+func TestRenderCostPane_DisclosesADamagedLedgerRead(t *testing.T) {
+	snap := damagedTodaySnapshot(&usage.Degraded{SkippedLines: 3, TruncatedDays: 1})
+	got := renderCostPane(snap, usage.GroupModel, 120, 40)
+
+	// The figure stays: it is short, not unknown, and withholding it would report a day of
+	// known spend as unavailable.
+	if !strings.Contains(got, "$12.5000") {
+		t.Errorf("the pane withheld a figure that is short rather than unknown:\n%s", got)
+	}
+	for _, want := range []string{"SHORT", "3 unreadable lines", "1 day file"} {
+		if !strings.Contains(got, want) {
+			t.Errorf("pane missing %q — the damage is not disclosed:\n%s", want, got)
+		}
+	}
+}
+
+// TestRenderCostPane_ACleanReadCarriesNoDamageCaveat is the mirror, and the half that keeps
+// the disclosure worth reading: a permanent caveat with nothing to act on is what teaches an
+// operator to ignore the one that matters.
+func TestRenderCostPane_ACleanReadCarriesNoDamageCaveat(t *testing.T) {
+	got := renderCostPane(damagedTodaySnapshot(nil), usage.GroupModel, 120, 40)
+	for _, banned := range []string{"SHORT", "ledger", damagedMarker} {
+		if strings.Contains(got, banned) {
+			t.Errorf("a clean read renders %q:\n%s", banned, got)
+		}
+	}
+}
+
+// TestRenderCostPane_DamageIsNotMergedWithInexactness.
+//
+// usage.Snapshot.Degraded's doc forbids merging the two claims or showing them under one
+// marker: IncompleteRequests says a figure the total CARRIES is a floor, Degraded says rows
+// are missing from the sum. The fixture has both, and each has to be separately legible.
+func TestRenderCostPane_DamageIsNotMergedWithInexactness(t *testing.T) {
+	snap := damagedTodaySnapshot(&usage.Degraded{SkippedLines: 3})
+	got := renderCostPane(snap, usage.GroupModel, 120, 40)
+
+	// The inexactness caveat keeps its own words and its own numbers.
+	if !strings.Contains(got, "7 of 300 priced figures are lower bounds") {
+		t.Errorf("the inexactness caveat was displaced by the damage one:\n%s", got)
+	}
+	// And the damage caveat does not borrow them: no "lower bound" wording, and it says the
+	// shortfall cannot be stated, which is the whole difference.
+	var dmg string
+	for _, l := range strings.Split(got, "\n") {
+		if strings.Contains(l, "SHORT") {
+			dmg = l
+		}
+	}
+	if dmg == "" {
+		t.Fatalf("no damage caveat at all:\n%s", got)
+	}
+	if strings.Contains(dmg, "lower bound") {
+		t.Errorf("the damage caveat is worded as an inexactness one: %q", dmg)
+	}
+	// It LEADS the caveats: it is the only one of the three that says the sum itself is
+	// incomplete, where the others qualify a figure the sum contains.
+	iDmg := strings.Index(got, "SHORT")
+	iCov := strings.Index(got, "covers 300 of 400")
+	iInc := strings.Index(got, "lower bounds")
+	if !(iDmg < iCov && iCov < iInc) {
+		t.Errorf("caveats out of order (damaged %d, coverage %d, inexact %d):\n%s",
+			iDmg, iCov, iInc, got)
+	}
+}
+
+// TestRenderCostPane_ADamagedUnpricedReadStillSaysSo.
+//
+// "Nothing in this window carried a cost" is a claim about the rows that were READ, and a
+// damaged read may have lost the priced ones. Without the disclosure on this path a corrupt
+// day file renders as a quiet day — the most reassuring possible spelling of a data loss.
+func TestRenderCostPane_ADamagedUnpricedReadStillSaysSo(t *testing.T) {
+	snap := &usage.Snapshot{
+		Window: usage.WindowToday, Priced: false, Group: usage.GroupModel,
+		Totals:   usage.Counts{Requests: 400, PriceableRequests: 400},
+		Degraded: &usage.Degraded{TruncatedDays: 1},
+	}
+	got := renderCostPane(snap, usage.GroupModel, 120, 40)
+	if !strings.Contains(got, "unavailable") {
+		t.Errorf("an unpriced window stopped saying so:\n%s", got)
+	}
+	if !strings.Contains(got, "SHORT") {
+		t.Errorf("a damaged read of an unpriced day reads as a quiet day:\n%s", got)
+	}
+}
+
+// TestRenderCostPane_FitsEveryWidthWithADamagedRead.
+//
+// The damage sentence is now the longest prose the pane emits, and the pane's own headings
+// reach 35 cells, so a caveat that never wrapped would still have fitted the fixtures that
+// switch it off. costWidthFloors reaches 16.
+func TestRenderCostPane_FitsEveryWidthWithADamagedRead(t *testing.T) {
+	snap := damagedTodaySnapshot(&usage.Degraded{SkippedLines: 1_234_567, TruncatedDays: 89})
+	snap.PricedBy = map[string]int64{"authoritative": 200, "bundled": 60, "configured": 40}
+	for _, w := range costWidthFloors {
+		for _, h := range []int{60, 40, 24, 20, 16, 8, 4} {
+			got := renderCostPane(snap, usage.GroupModel, w, h)
+			for i, line := range strings.Split(got, "\n") {
+				if lw := lipgloss.Width(line); lw > w {
+					t.Errorf("w=%d h=%d line %d is %d columns: %q", w, h, i, lw, line)
+				}
+			}
+			if n := len(strings.Split(got, "\n")); h > 0 && n > h {
+				t.Errorf("w=%d h=%d produced %d lines:\n%s", w, h, n, got)
+			}
+		}
+	}
+}
+
+// TestRenderCostPane_ADisclosureWithNoCountersIsStillADisclosure.
+//
+// The pane half of the presence rule. usage.Snapshot.Degraded is a pointer so a clean read
+// serialises NOTHING; a present object with zero counters therefore still reports damage,
+// and the sentence says so without inventing a number.
+func TestRenderCostPane_ADisclosureWithNoCountersIsStillADisclosure(t *testing.T) {
+	got := renderCostPane(damagedTodaySnapshot(&usage.Degraded{}), usage.GroupModel, 120, 40)
+	if !strings.Contains(got, "SHORT") {
+		t.Errorf("a counterless disclosure reads as a clean read:\n%s", got)
+	}
+	if !strings.Contains(got, "without saying how much") {
+		t.Errorf("the pane invented or omitted a count it was not given:\n%s", got)
+	}
+}

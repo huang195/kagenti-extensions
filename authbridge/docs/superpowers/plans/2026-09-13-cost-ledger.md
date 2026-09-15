@@ -79,8 +79,13 @@
 >
 > **The config block gained a key and a floor.** `cost_ledger` is
 > `enabled *bool` + `dir string` + `retention_days int`; a non-zero `retention_days`
-> below 7 is **refused at load** rather than clamped, because `window=7d` is served from
-> these files, and `0` still means the package default of 30. It is **not
+> below **8** is **refused at load** rather than clamped, because `window=7d` is served
+> from these files and a rolling 7×24h span touches EIGHT local day files unless it begins
+> exactly at midnight. The floor is derived from the window
+> (`minCostLedgerRetentionDays = usage.Window7dLocalDays`) rather than written as a
+> literal — as a literal it said 7, shipped, and admitted the partial week it existed to
+> refuse, while the paragraph beside it already said eight. `0` still means the package
+> default of 30. It is **not
 > hot-reloadable**: the reloader holds no reference to it and the writer is opened once at
 > startup, so every key here takes effect on restart. Say that where an operator will read
 > it — someone who edits `enabled: false` in a live config has every reason to believe the
@@ -720,6 +725,17 @@ Expected: PASS.
 **Interfaces:**
 - Produces: `func (w *Writer) Query(from, to time.Time) ([]Row, error)`, and `func Fold(rows []Row, group usage.Group) (usage.Counts, map[string]usage.Counts)`.
 - Task 3 calls both; Task 4's CLI calls them too.
+
+> **SUPERSEDED — both signatures shipped wider than this.** `Fold` returns a THIRD value,
+> `int64`: the cost no series entry carries. Gateway-priced responses from endpoints
+> `inference-parser` cannot read have no model, so `group=model` skips them while the total
+> keeps them, and a client summing the breakdown got less than the total with nothing
+> saying why. It is counted in the loop that decides what to skip rather than re-derived by
+> the caller, because only that loop knows which rows were dropped. Surfaces as
+> `Snapshot.UngroupedCostMicros`, absent when the breakdown reconciles.
+>
+> `Query` also stopped being the reader to call — see the banner. `Window` stitches the
+> open minute; `Query` is the disk half alone.
 
 **Why `Fold` lives here and not in `usage`:** it folds `Row`s, which `usage` does not know about. It returns `usage.Counts` and a `usage.Group`-keyed series so the caller's shape matches `/v1/usage` exactly and the HTTP layer does not branch on where the data came from.
 

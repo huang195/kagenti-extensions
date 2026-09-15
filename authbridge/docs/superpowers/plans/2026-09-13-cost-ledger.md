@@ -1,6 +1,17 @@
 # Cost Ledger Implementation Plan (commit 5)
 
-> **STATUS: implemented.** Landed as `90fe5ff7`.
+<!-- Commit references in this document point into TWO pull requests, not one. The work was
+     reviewed as a single branch and then split: authlib and the proxy binary into the
+     aggregate/ledger PR, the abctl surfaces into the PR stacked on it, and these documents
+     into a third. Every SHA below was repointed after that split and verified to resolve.
+     Four commits were split in half and are cited as `<one-half>` / `<other-half>`, labelled
+     (core) and (abctl), so either PR can be reached from here.
+
+     THREE SHAs ARE DELIBERATELY UNREACHABLE: cbe34bbc, c5b1f596 and 4765644f appear in text
+     explaining that an earlier banner pointed at them wrongly. They are commits from an
+     abandoned branch, and rewriting them would delete the correction they exist to record. -->
+
+> **STATUS: implemented.** Landed as `6c7c7fe0` (core) / `9f0e35b0` (abctl).
 >
 > An earlier revision of this banner cited `4765644f`, which is not an ancestor of this
 > branch: it is the same change on an abandoned branch that was never merged. A banner
@@ -10,18 +21,18 @@
 > **Five later commits changed what this plan describes.** Each is noted again at the
 > place where this plan says the thing that changed:
 >
-> - `2d1f58c0` — the open minute. This plan says the in-memory usage ring supplies it.
+> - `ae2c7f41` — the open minute. This plan says the in-memory usage ring supplies it.
 >   It does not and could not; `Writer.pending()` does, and `Window()` stitches. Until
 >   that commit `window=today` under-reported, silently and indefinitely once traffic
 >   stopped. `costledger/row.go`'s package doc names this plan's claim as the error an
 >   earlier draft made and gives four reasons the ring cannot be the source.
-> - `23e4b7ac` — `Record` was taken off the request path entirely. No IO at all now,
+> - `97104114` — `Record` was taken off the request path entirely. No IO at all now,
 >   not "one append per minute roll".
-> - `79857c7d` — a corrupt ledger line is skipped and reading continues, rather than
+> - `85aa46d9` — a corrupt ledger line is skipped and reading continues, rather than
 >   ending the day's read at that point.
-> - `80b3f38d` — the `agent` column, which this plan deliberately ships empty, is
+> - `6870ad3b` — the `agent` column, which this plan deliberately ships empty, is
 >   populated and part of the row key.
-> - `d39ee754` — the ring-versus-ledger difference this plan treats as an internal
+> - `758e0148` (core) / `168b1478` (abctl) — the ring-versus-ledger difference this plan treats as an internal
 >   detail became a user-visible disclosure on `/v1/usage` and in `costledger`'s doc.
 >
 > **Line numbers drift.** Every `file.go:NN` below was accurate when written and many
@@ -30,17 +41,17 @@
 > ---
 >
 > **SECOND SWEEP, 2026-09-15. "Five later commits" is an undercount: eighteen have
-> touched `authlib/costledger` since `90fe5ff7`.** The five above are the ones that
+> touched `authlib/costledger` since `6c7c7fe0` (core) / `9f0e35b0` (abctl).** The five above are the ones that
 > reversed a *claim*; these changed the *code this plan prints*, so an implementer
 > copying a block out of it would write something the tree has already rejected. Each is
 > repeated at the block it affects.
 >
-> - `87185852` and `7f44e714` — **the admission guard.** This plan's `Record` drops
+> - `f49803b2` and `3481e040` — **the admission guard.** This plan's `Record` drops
 >   everything with a nil `Inference`. The shipped predicate is "this event is inference
 >   **or** somebody priced it", so a response the parser could not read but the gateway
 >   charged for is recorded, with `Model: ""` and no token counts. Task 1 Step 4 and
 >   `TestWriter_NonInferenceTrafficIsIgnored` both describe the old rule.
-> - `25961adc` — **the write path no longer rolls back, and retention gained a floor.**
+> - `47cbd8af` — **the write path no longer rolls back, and retention gained a floor.**
 >   No `Stat`, no `Truncate`; the injected `dayFile` interface omits both so no future
 >   edit can quietly reintroduce them, because a rollback computed from a size can
 >   destroy rows *another* writer appended. A torn append costs one line, fenced off with
@@ -49,21 +60,21 @@
 >   everything including today (`TestPrune_AForwardClockStepDoesNotDeleteTheLedger`), and
 >   the cutoff is `ref` minus `retainDays-1`, so `retainDays` **files** survive counting
 >   today rather than `retainDays+1`.
-> - `77866e8e` — **the day zone is pinned and the append is fsynced.** One `store.loc`
+> - `eecd52b7` — **the day zone is pinned and the append is fsynced.** One `store.loc`
 >   decides every day boundary, on write, on read and on prune, because a row filed under
 >   a date no query for that local day visits is written, retained and invisible. `Window`
 >   drops a disk row for the held minute on **equality**, not "at or after": the earlier
 >   `>=` discarded every newer disk row (measured: 250,000 micros returned instead of
 >   1,250,000).
-> - `a7202f63` — **nothing is lost silently.** `Dropped()`, `SkippedLines()` and
+> - `dd6e4703` — **nothing is lost silently.** `Dropped()`, `SkippedLines()` and
 >   `TruncatedDays()` are exported; the last two are **gauges for the most recent read**,
 >   not cumulative counters, which is why `sessionapi` samples them *after* `Window` and
 >   not before.
-> - `108e0fa5` — **label length and per-minute cardinality are capped** (`maxLabelLen`
+> - `7fd5885e` — **label length and per-minute cardinality are capped** (`maxLabelLen`
 >   96, `maxLabelsPerMinute` 64, overflow folded into `(other)`). The labels come off a
 >   request, so their length and their count are chosen off-host; capping on the write
 >   side is also what makes a line longer than the reader's `maxLineBytes` unreachable.
-> - `f5d52045` — **`ledgerSnapshot` now emits `Snapshot.Degraded`**, a pointer carrying
+> - `1c714e68` — **`ledgerSnapshot` now emits `Snapshot.Degraded`**, a pointer carrying
 >   the two gauges above, so a day that lost lines no longer produces a response
 >   byte-identical to a clean one.
 >
@@ -109,7 +120,7 @@
 - **The ledger holds NO prompt content.** Hosts, model names, counts, dollars, timestamps. Nothing else, ever. This is a user-facing promise in the docs.
 - **The ring and the ledger must never both own a minute.** The ledger holds only *closed* minutes on disk. A restart mid-minute loses ≤60s and that is documented, not hidden.
 
-  **The second half of this constraint as originally written — "the in-memory ring supplies the open one" — is wrong, and following it is what produced the defect `2d1f58c0` fixed.** The open minute comes from THIS package's own accumulator: `Writer.pending()` returns it and `Window()` stitches the two halves. `ledgerSnapshot` never reads the ring at all. `costledger/row.go`'s package doc names this claim as the error an earlier draft of that doc made, and gives four reasons the ring cannot be the source — it prices independently via `usage.Aggregator.costOf`, its request denominator counts MCP and health traffic this package excludes, it is only 6h deep so a minute held overnight has already rotated out of it, and it knows nothing about what has been flushed, which would make ownership a timing question rather than a provable boundary. Read that doc before touching either side of the seam.
+  **The second half of this constraint as originally written — "the in-memory ring supplies the open one" — is wrong, and following it is what produced the defect `ae2c7f41` fixed.** The open minute comes from THIS package's own accumulator: `Writer.pending()` returns it and `Window()` stitches the two halves. `ledgerSnapshot` never reads the ring at all. `costledger/row.go`'s package doc names this claim as the error an earlier draft of that doc made, and gives four reasons the ring cannot be the source — it prices independently via `usage.Aggregator.costOf`, its request denominator counts MCP and health traffic this package excludes, it is only 6h deep so a minute held overnight has already rotated out of it, and it knows nothing about what has been flushed, which would make ownership a timing question rather than a provable boundary. Read that doc before touching either side of the seam.
 - **On by default for `--local`, off in Kubernetes.** Writing files inside a pod is wrong; the central collector is the right sink there.
 - **"Today" means local midnight to now, in the machine's timezone.** A laptop crosses timezones and a UTC day would reset mid-afternoon.
 - **Never `$0.00` for an unknown cost.** Unpriced minutes contribute no cost and are visible as the priced/priceable gap.
@@ -132,7 +143,7 @@ Cost: the ledger decodes each event's cost record itself, via `costevent.Record`
 
 **The `agent` column stays empty until commit 6** (it needs `EventClient` from the User-Agent). Write the field, leave it `""`, and let commit 6 populate it. Do not omit the field — a schema that gains a column later is worse than one that has an empty column now.
 
-That commit is `80b3f38d` and it landed: the column is populated and is part of the row key, so two agents on one endpoint and model in one minute are two rows. It kept `""` as the storage for *absence* rather than adopting the aggregator's display string `"unknown"` — a durable file must not bake a display value into a field where it becomes permanently indistinguishable from an agent that really called itself that — and `labelFor` maps `""` back to `"unknown"` at the query boundary, so `group=agent` returns the same key whether it was served from the ring or from disk.
+That commit is `6870ad3b` and it landed: the column is populated and is part of the row key, so two agents on one endpoint and model in one minute are two rows. It kept `""` as the storage for *absence* rather than adopting the aggregator's display string `"unknown"` — a durable file must not bake a display value into a field where it becomes permanently indistinguishable from an agent that really called itself that — and `labelFor` maps `""` back to `"unknown"` at the query boundary, so `group=agent` returns the same key whether it was served from the ring or from disk.
 
 ---
 
@@ -1410,7 +1421,7 @@ func (s *Server) ledgerSnapshot(spec usage.Spec, sessionID string, group usage.G
 ```
 
 Three things about that body are not what shipped, and the first is the whole point of
-`2d1f58c0`:
+`ae2c7f41`:
 
 - **`s.ledger.Window(...)`, never `Query(...)`.** `Query` answers only for what has been
   flushed, so it systematically omits the minute currently accumulating — and omits it
@@ -1443,7 +1454,7 @@ another, twelve lines apart and in the wrong order.
 `UnpricedBy`/`PricedBy` are not reconstructed here — for the reason in the third bullet above,
 which is firmer than "leave it for whoever needs it": `PricedBy` *is* reconstructible from the
 row key, `UnpricedBy` is not, and emitting one without the other reads as "no pricing gaps
-here". `Snapshot.Degraded` **is** populated, which this task did not anticipate — `f5d52045`
+here". `Snapshot.Degraded` **is** populated, which this task did not anticipate — `1c714e68`
 added it so a day whose read lost lines stops producing a response byte-identical to a clean
 one. Sample its two gauges **after** `Window`, never before: they report the most recent read,
 so reading them first hands back the previous caller's answer as this one's.
@@ -1677,7 +1688,7 @@ Set `HasToday` **only** when the response's `window` is actually `today`. If the
 **The one false tick, kept visible.** Nothing owned the open minute when this commit landed:
 the ring did not supply it, this package did not yet hold it out, and `ledgerSnapshot` read
 `Query` — so `window=today` under-reported by up to a minute, and by everything since the last
-event once traffic stopped. `2d1f58c0` closed it by making the writer's own accumulator the
+event once traffic stopped. `ae2c7f41` closed it by making the writer's own accumulator the
 source and `Window()` the stitch. Left as a struck-through tick rather than edited to pass,
 because the interesting failure is not the missing code: it is that a self-review restated the
 plan's own wrong constraint and ticked it. A checklist item copied from a constraint can only

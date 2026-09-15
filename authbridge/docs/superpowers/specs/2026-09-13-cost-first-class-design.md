@@ -1,5 +1,16 @@
 # Cost as a first-class citizen
 
+<!-- Commit references in this document point into TWO pull requests, not one. The work was
+     reviewed as a single branch and then split: authlib and the proxy binary into the
+     aggregate/ledger PR, the abctl surfaces into the PR stacked on it, and these documents
+     into a third. Every SHA below was repointed after that split and verified to resolve.
+     Four commits were split in half and are cited as `<one-half>` / `<other-half>`, labelled
+     (core) and (abctl), so either PR can be reached from here.
+
+     THREE SHAs ARE DELIBERATELY UNREACHABLE: cbe34bbc, c5b1f596 and 4765644f appear in text
+     explaining that an earlier banner pointed at them wrongly. They are commits from an
+     abandoned branch, and rewriting them would delete the correction they exist to record. -->
+
 **Date:** 2026-09-13
 **Issues:** closes [#950](https://github.com/rossoctl/cortex/issues/950),
 [#952](https://github.com/rossoctl/cortex/issues/952),
@@ -26,9 +37,9 @@
 > here would have been vendor list price.
 >
 > The last two of those arrived late, and a reader of an earlier revision of this
-> banner was told they were missing: the Cost pane landed in `a1e662c4` and the
+> banner was told they were missing: the Cost pane landed in `c86507ca` and the
 > `agent` grouping — `usage.GroupAgent`, `pipeline.EventClient`, the ledger's
-> `agent` column — in `80b3f38d`. Both are in the tree. A banner that understates
+> `agent` column — in `6870ad3b`. Both are in the tree. A banner that understates
 > what shipped defeats this convention exactly as thoroughly as one that overstates
 > it, so this is recorded rather than quietly corrected.
 >
@@ -108,7 +119,7 @@
 >    an exact number), `Snapshot.Degraded` (a pointer, so absent ≠ zero: how many ledger
 >    lines and day files a read lost) and `Snapshot.IncompleteBy` (which *way* a figure
 >    is inexact). **All three now reach abctl** — `IncompleteBy` was producer-side only when
->    the line above was written, and `b7740254` closed it in `--json`, the human summary and
+>    the line above was written, and `20022a75` closed it in `--json`, the human summary and
 >    the Cost pane. Closing it exposed a worse defect than the missing field: the pane had
 >    been asserting "N of M priced figures are lower bounds — so the real total is higher"
 >    over EVERY inexact figure, which is false for an approximation and false on the pane's
@@ -676,8 +687,8 @@ followed by their own fixes — the writer coming off the request path, the open
 supplied at all, a corrupt ledger line no longer discarding the rest of its day. Rows 1, 2 and 7
 did not land in this form: 1 and 2 were superseded upstream (see the banner), and 7 — tool-prune's
 resolver, `Avoided` end to end — did not land at all, which is why the `avoided*` fields are absent
-and why the Cost pane has no `AVOIDED` section. Rows 3, 4, 5 and 6 map to `cf74f28a`, `49279b22`,
-`90fe5ff7` and `80b3f38d`; the Cost pane is `a1e662c4`, an eighth commit this table does not list.
+and why the Cost pane has no `AVOIDED` section. Rows 3, 4, 5 and 6 map to `d3fb2ca7`, `b97dbc29` (abctl) / `003a30f8` (core),
+`6c7c7fe0` (core) / `9f0e35b0` (abctl) and `6870ad3b`; the Cost pane is `c86507ca`, an eighth commit this table does not list.
 
 | commit | content | effect |
 |---|---|---|

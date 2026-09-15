@@ -1,7 +1,18 @@
 # Cost Aggregation Implementation Plan (commit 3)
 
-> **STATUS: implemented.** Landed as `cf74f28a`, plus four follow-ups — `3c0fe57e`,
-> `08d350d1`, `80e4b679` and `3cc6b790`.
+<!-- Commit references in this document point into TWO pull requests, not one. The work was
+     reviewed as a single branch and then split: authlib and the proxy binary into the
+     aggregate/ledger PR, the abctl surfaces into the PR stacked on it, and these documents
+     into a third. Every SHA below was repointed after that split and verified to resolve.
+     Four commits were split in half and are cited as `<one-half>` / `<other-half>`, labelled
+     (core) and (abctl), so either PR can be reached from here.
+
+     THREE SHAs ARE DELIBERATELY UNREACHABLE: cbe34bbc, c5b1f596 and 4765644f appear in text
+     explaining that an earlier banner pointed at them wrongly. They are commits from an
+     abandoned branch, and rewriting them would delete the correction they exist to record. -->
+
+> **STATUS: implemented.** Landed as `d3fb2ca7`, plus four follow-ups — `5d004725`,
+> `a6b356c4`, `e9baee2a` and `cf4ab175`.
 >
 > An earlier revision of this banner cited `cbe34bbc`, which is not an ancestor of this
 > branch: it is the same change on an abandoned branch that was never merged. A banner
@@ -13,9 +24,9 @@
 > aggregator was wrong. Each is noted again where this plan states the thing that
 > changed:
 >
-> - `GroupSession` was deferred here and landed in `49279b22`, which also added the
+> - `GroupSession` was deferred here and landed in `b97dbc29` (abctl) / `003a30f8` (core), which also added the
 >   `bucket.bySession` accumulator this plan says was not needed.
-> - `GroupAgent` was deferred here and landed in `80b3f38d`, along with `byAgent`.
+> - `GroupAgent` was deferred here and landed in `6870ad3b`, along with `byAgent`.
 > - `ParseGroup`'s error string therefore names two more values than the one this plan
 >   prescribes.
 >
@@ -32,7 +43,7 @@
 > task's whole deliverable is documentation, so a stale prescription here is a stale
 > comment there:
 >
-> - **Costing is `authlib/costing`, not `inference-parser`.** `3cc6b790` moved the
+> - **Costing is `authlib/costing`, not `inference-parser`.** `cf4ab175` moved the
 >   attribution: a gateway's cost-header semantics are vendor-specific knowledge with no
 >   place in a provider-shaped body parser, so the decision lives in its own package and
 >   the parser *calls* it at the point the token counters are final. The paragraph this
@@ -52,11 +63,11 @@
 > it does, and leaks an axis the block exists to make explicit.
 >
 > **`Counts` has gained a field since**, and the constraint that says every new one must be
-> summed in `Add` held: `IncompleteRequests` (`d82d1a70`, `589615c7`) counts the priced
+> summed in `Add` held: `IncompleteRequests` (`4d0c1046`, `4e2b81d9`) counts the priced
 > requests whose figure is a floor rather than an exact number, and `Add` sums it
 > *alongside* `PricedRequests` rather than out of it, because it is a subset disclosure and
-> not a deduction. `Snapshot` gained `IncompleteBy` (`47b992f8`), which says which *way*
-> each of those figures is inexact, and `Degraded` (`f5d52045`), which a ledger-backed
+> not a deduction. `Snapshot` gained `IncompleteBy` (`acde75ae`), which says which *way*
+> each of those figures is inexact, and `Degraded` (`1c714e68`), which a ledger-backed
 > window uses to admit that its read lost rows. None of that contradicts this plan; it is
 > listed so a reader does not take the field table below for the current one.
 >
@@ -585,8 +596,8 @@ Add cases for `GroupModel` and `GroupEndpoint` alongside the existing ones, and 
 ```
 
 That is the string this commit wrote. **It is not the string in the tree**, because two later
-commits added values and each extended the message with them — `session` in `49279b22` and
-`agent` in `80b3f38d`. The shipped string names both. Adding a `ParseGroup` case without
+commits added values and each extended the message with them — `session` in `b97dbc29` (abctl) / `003a30f8` (core) and
+`agent` in `6870ad3b`. The shipped string names both. Adding a `ParseGroup` case without
 extending this message is the drift to watch for: the endpoint answers 400 for a value it
 does not accept and then fails to name a value it does.
 
@@ -754,8 +765,8 @@ Replace the paragraph beginning "costMicros is populated from the per-request fi
 // budget rather than computing one of its own.
 ```
 
-**Do not paste that block as it stands** — three of its claims were corrected by `3c0fe57e`
-and `3cc6b790` and the banner's second sweep gives the reasoning: the settling component is
+**Do not paste that block as it stands** — three of its claims were corrected by `5d004725`
+and `cf4ab175` and the banner's second sweep gives the reasoning: the settling component is
 `authlib/costing`, which the parser *calls*; cost used to be decided in **two** places, not
 four; and `litellm-budget-track` **amends** the settled record rather than consuming it. The
 `group` line above it is likewise two values short of the shipped one. Left in place because
@@ -845,7 +856,7 @@ Assisted-By: Claude (Anthropic AI) <noreply@anthropic.com>"
 **Deferred by design:** `GroupAgent` needs `EventClient`, which is commit 6. `GroupSession` needs no new accumulator — the aggregator already keys per-session rings — but the *grouping* value is only meaningful once #949 lands, so it is not added here; `series()` is where it would go.
 
 **Both deferrals were subsequently reversed, and the second sentence above is wrong.**
-`GroupSession` landed in `49279b22` and `GroupAgent` in `80b3f38d`. The reversal of the
+`GroupSession` landed in `b97dbc29` (abctl) / `003a30f8` (core) and `GroupAgent` in `6870ad3b`. The reversal of the
 *timing* is argued in the spend-strip plan's Task 4: the reasoning here was about what the
 numbers would *mean* on a laptop, and applying an interpretation caveat to the mechanism was
 the mistake — the sessions pane needs per-session cost now, and the #949 caveat belongs in the
@@ -854,7 +865,7 @@ docs rather than in a missing feature.
 The claim that it needs **no new accumulator is simply false**, and the per-session rings are
 why it looks true. A per-session ring answers "what did session X cost" when you ask for that
 session; it cannot answer "break the all-sessions window down BY session", which is what a
-sessions list needs in one request instead of one per row. `49279b22` therefore added
+sessions list needs in one request instead of one per row. `b97dbc29` (abctl) / `003a30f8` (core) therefore added
 `bucket.bySession` *and* a `sessionID` parameter on `foldInto` to feed it — the first change to
 that signature since the coverage-counter fix. The lesson generalises: the aggregator holds
 marginals, and "there is already a ring keyed on it" is never evidence that a breakdown by it

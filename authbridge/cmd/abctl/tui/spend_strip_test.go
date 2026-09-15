@@ -177,14 +177,97 @@ func TestRenderSpendStrip_ShowsTodayWhenAvailable(t *testing.T) {
 
 func TestRenderSpendStrip_WideCharacterSafety(t *testing.T) {
 	// footer.go:88-92 records the bug: a budget computed in display columns but
-	// sliced by rune index overflowed on any wide character. The strip's own text
-	// is ASCII, but the width arithmetic must be column-based regardless, because
-	// the next figure added may not be.
-	s := spendSummary{WindowUSD: 1.12, WindowLabel: "1h", BurnPerMin: 0.0187, Priced: true}
-	for w := 1; w <= 60; w++ {
-		if gw := lipgloss.Width(renderSpendStrip(s, w)); gw > w {
-			t.Fatalf("width %d: rendered %d columns", w, gw)
+	// sliced by rune index overflowed on any wide character. The strip's own chrome is
+	// ASCII, but the width arithmetic must be column-based regardless.
+	//
+	// It is not hypothetical either: WindowLabel is server-supplied and reaches the line
+	// verbatim whenever parseWindowSpan cannot read it as a duration (spend.go), so the wide
+	// character can arrive off the wire. The ASCII case alone proved only the loop bound —
+	// this test was named for behaviour it never exercised. Each CJK glyph below is TWO
+	// display columns and ONE rune, so any len()- or rune-based budget renders wider than it
+	// claims and these cases catch it.
+	for _, tc := range []struct {
+		name string
+		s    spendSummary
+	}{
+		{"ascii", spendSummary{WindowUSD: 1.12, WindowLabel: "1h", BurnPerMin: 0.0187, Priced: true}},
+		{"cjk window label", spendSummary{WindowUSD: 1.12, WindowLabel: "一時間", BurnPerMin: 0.0187, Priced: true}},
+		{"cjk label under a today headline", spendSummary{
+			WindowUSD: 1.12, WindowLabel: "過去一時間", BurnPerMin: 0.0187, Priced: true,
+			TodayUSD: 4.17, HasToday: true,
+		}},
+		{"cjk in the unpriced path", spendSummary{
+			WindowLabel: "過去一時間", HasSnapshot: true, Unpriced: 12, Priceable: 318,
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			for w := 1; w <= 60; w++ {
+				got := renderSpendStrip(tc.s, w)
+				if gw := lipgloss.Width(got); gw > w {
+					t.Fatalf("width %d: rendered %d columns: %q", w, gw, got)
+				}
+				if strings.Contains(got, "\n") {
+					t.Fatalf("width %d: strip contains a newline: %q", w, got)
+				}
+			}
+		})
+	}
+}
+
+// The strip's width guarantee is expressed in lipgloss.Width, and lipgloss.Width measures
+// the WIDEST LINE: lipgloss.Width("abc\nabcdef") is 6, not 10. So a WindowLabel carrying a
+// newline sails through fitStripFigures' budget check and renderSpendStrip returns a
+// TWO-LINE string — the exact "a wrapped chrome line costs a row of the table below it"
+// failure its own godoc opens with.
+//
+// Reachable, not theoretical: spendSummary copies snap.Window verbatim when parseWindowSpan
+// cannot read it as a duration, and that field is server-supplied JSON. Fixed at the
+// boundary, in spendSummary, rather than guarded at each use — a wire string is sanitised
+// once, where it enters. Asserted here because this is where the consequence shows.
+func TestSpendSummary_SanitisesTheServersWindowLabel(t *testing.T) {
+	m := &model{}
+	m.spend.snap = &usage.Snapshot{
+		Window: "1h\nEVIL",
+		Totals: usage.Counts{Requests: 1, CostMicros: 1_120_000, PricedRequests: 1, PriceableRequests: 1},
+		Priced: true,
+	}
+
+	s := m.spendSummary()
+	// Errorf, not Fatalf: the label check is the cause and the loop below is the
+	// consequence, and a reader of a failure wants both. Stopping at the cause would let
+	// someone "fix" this by trimming the label in the renderer and never learn that the
+	// two-line output was the thing that mattered.
+	if strings.ContainsAny(s.WindowLabel, "\n\r\x1b") {
+		t.Errorf("WindowLabel = %q still carries a control character straight off the wire", s.WindowLabel)
+	}
+	for _, w := range []int{120, 100, 80, 64, 48, 32, 24, 16, 8, 1} {
+		got := renderSpendStrip(s, w)
+		if strings.Contains(got, "\n") {
+			t.Errorf("width %d: strip rendered two lines and stole a row from the table: %q", w, got)
 		}
+		if gw := lipgloss.Width(got); gw > w {
+			t.Errorf("width %d: rendered %d columns: %q", w, gw, got)
+		}
+	}
+}
+
+// An escape sequence is the same defect with a worse payload: it can reposition the cursor,
+// recolour the pane, or erase the coverage warning it is rendered beside. CWE-150, the same
+// reason sanitizeLabel exists for the usage pane's model keys.
+func TestSpendSummary_NeutralisesAnEscapeSequenceInTheWindowLabel(t *testing.T) {
+	m := &model{}
+	m.spend.snap = &usage.Snapshot{
+		Window: "1h\x1b[2J\x1b[H",
+		Totals: usage.Counts{Requests: 1, CostMicros: 1_120_000, PricedRequests: 1, PriceableRequests: 1},
+		Priced: true,
+	}
+
+	s := m.spendSummary()
+	if strings.Contains(s.WindowLabel, "\x1b") {
+		t.Errorf("WindowLabel = %q carries an ESC; it will be written straight to the terminal", s.WindowLabel)
+	}
+	if got := renderSpendStrip(s, 120); strings.Contains(got, "\x1b[2J") {
+		t.Errorf("strip %q clears the screen on behalf of the server", got)
 	}
 }
 

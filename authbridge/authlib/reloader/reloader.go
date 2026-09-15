@@ -332,6 +332,17 @@ func validateReloadable(active, next *config.Config) error {
 	if !reflect.DeepEqual(active.CostLedger, next.CostLedger) {
 		diffs = append(diffs, "cost_ledger.*")
 	}
+	// session.* has the same shape, and it was missing for the same reason: nobody
+	// checked. Every consumer of the block reads it exactly once at startup —
+	// session.New(lim.TTL, lim.MaxEvents, lim.MaxSessions) in each cmd main, and
+	// forwardproxy.Server.SessionIDHeaders assigned before ListenAndServe — so there
+	// is no live object for a reload to reach here either. Not one field of it is
+	// reloadable, which is why the whole block is compared rather than a subset.
+	// DeepEqual because Enabled is a *bool and IDHeaders a []string, and the
+	// nil-versus-empty distinction on IDHeaders is load-bearing (see SessionConfig).
+	if !reflect.DeepEqual(active.Session, next.Session) {
+		diffs = append(diffs, "session.*")
+	}
 	if len(diffs) > 0 {
 		return fmt.Errorf("unreloadable field changed, pod restart required: %v", diffs)
 	}

@@ -167,6 +167,16 @@ func (s *Server) handleInbound(stream extprocv3.ExternalProcessor_ProcessServer,
 		Shared:    s.Shared,
 		StartedAt: time.Now(),
 	}
+	// Pin the calling agent HERE, at construction, from the headers as the CLIENT sent
+	// them — the same line forwardproxy's serveOutbound carries, for the same reason.
+	// pctx.Headers is this listener's own copy of the wire headers and plugins write to
+	// it, while ClientInfo's memo fills on first READ — which without this line is
+	// recordInboundSession below, downstream of the whole pipeline. A plugin that
+	// rewrote User-Agent would re-file this request's spend under a name of its
+	// choosing, and this path's request, response and denial events could disagree
+	// depending on which asked first. Latent while no plugin touches that header — and
+	// silent on the day one does, which is why it is pinned rather than watched.
+	pctx.ResolveClient()
 
 	originalHeaders := pctx.Headers.Clone()
 	action := s.InboundPipeline.Run(ctx, pctx)
@@ -192,6 +202,11 @@ func (s *Server) handleInboundBody(stream extprocv3.ExternalProcessor_ProcessSer
 		Shared:    s.Shared,
 		StartedAt: time.Now(),
 	}
+	// At construction, as in handleInbound: this is a second Context for the same
+	// request, built one Envoy message later because a plugin wanted the body, and it
+	// feeds the same three recorders. A pin on one entry point only would leave the
+	// guarantee holding for body-less requests and not for the ones that carry a body.
+	pctx.ResolveClient()
 
 	originalHeaders := pctx.Headers.Clone()
 	action := s.InboundPipeline.Run(ctx, pctx)
@@ -495,6 +510,12 @@ func (s *Server) handleOutbound(stream extprocv3.ExternalProcessor_ProcessServer
 		Shared:    s.Shared,
 		StartedAt: time.Now(),
 	}
+	// At construction, as in handleInbound, and BEFORE the SkipHosts gate below —
+	// exactly where forwardproxy's serveOutbound puts it relative to its own skip
+	// check. Adjacency to the literal is the property being kept: a pin placed after
+	// an early return is a pin a later short-circuit can step in front of. The cost on
+	// a skipped host is one header lookup for a Context that records nothing.
+	pctx.ResolveClient()
 
 	// SkipHosts short-circuit: forward the request as a transparent
 	// proxy without running the pipeline or recording a session event.
@@ -537,6 +558,10 @@ func (s *Server) handleOutboundBody(stream extprocv3.ExternalProcessor_ProcessSe
 		Shared:    s.Shared,
 		StartedAt: time.Now(),
 	}
+	// At construction, as in handleOutbound, and for the reason handleInboundBody
+	// states: the body-phase entry point builds its own Context and reaches the same
+	// outbound recorders.
+	pctx.ResolveClient()
 
 	// SkipHosts short-circuit: see handleOutbound for rationale. The
 	// body-phase entry point needs the same gate because Envoy may

@@ -69,6 +69,13 @@ func (p *InferenceParser) OnRequest(_ context.Context, pctx *pipeline.Context) p
 	// Messages. No Invocation is recorded when the parser doesn't apply
 	// (unrecognized path, empty body, or non-JSON body) — operators infer
 	// "inference-parser is in this pipeline" from config, not per-event rows.
+	//
+	// LEAVING Extensions.Inference NIL IS THE POINT on both arms below, and it is not the
+	// same thing as ignoring the request. Populating it for an endpoint this parser cannot
+	// read would assert a model and a message list that were never on the wire, and every
+	// downstream policy plugin reads those as facts. So the extension stays absent — and
+	// the RESPONSE side settles the cost regardless, from the gateway's own header, which
+	// needs neither a model nor a body. See the nil-extension guard in OnResponseFrame.
 	var ext *pipeline.InferenceExtension
 	switch endpointPath(pctx) {
 	case "/v1/chat/completions", "/v1/completions", "/chat/completions", "/completions", bobPath:
@@ -79,7 +86,12 @@ func (p *InferenceParser) OnRequest(_ context.Context, pctx *pipeline.Context) p
 		return pipeline.Action{Type: pipeline.Continue}
 	}
 	if ext == nil {
-		slog.Debug("inference-parser: no/invalid body, skipping", "path", pctx.Path)
+		// "no telemetry", not "skipping": this request is still charged if the gateway
+		// says it cost something. The old wording ("no/invalid body, skipping") described
+		// the whole request as dropped, which is what the code used to do and is now the
+		// wrong half of what it does — an operator reading it while hunting for missing
+		// spend would rule out the one path that still records some.
+		slog.Debug("inference-parser: no/invalid body; no request telemetry, response still priced from the gateway header", "path", pctx.Path)
 		return pipeline.Action{Type: pipeline.Continue}
 	}
 
@@ -146,6 +158,10 @@ func parseOpenAIRequest(body []byte) *pipeline.InferenceExtension {
 // the streaming path has already populated state.
 func (p *InferenceParser) OnResponse(_ context.Context, pctx *pipeline.Context) pipeline.Action {
 	if pctx.Extensions.Inference == nil {
+		// Priced anyway. Same rule as the OnResponseFrame guard below, which carries the
+		// full argument: whether this parser understood the REQUEST decides what can be
+		// parsed, never what the gateway may charge.
+		p.settleCost(pctx)
 		return pipeline.Action{Type: pipeline.Continue}
 	}
 	ext := pctx.Extensions.Inference
@@ -257,6 +273,36 @@ const streamStateKey = "inference-parser/stream-state"
 // code path for both shapes.
 func (p *InferenceParser) OnResponseFrame(_ context.Context, pctx *pipeline.Context, frame []byte, last bool) pipeline.Action {
 	if pctx.Extensions.Inference == nil {
+		// THE FOURTH BODY-LESS PATH, and the one that is not about a body at all.
+		//
+		// The three guards further down handle a response whose BODY we could not read.
+		// This one handles a response whose REQUEST we never parsed: OnRequest populates
+		// Extensions.Inference only for the six OpenAI spellings and the Anthropic
+		// Messages path, and leaves it nil for /v1/embeddings, /v1/rerank,
+		// /v1/moderations, anything else the gateway mounts, and any request whose body
+		// was empty or not JSON. Returning here made all of that free — the gateway's
+		// figure was on the response headers and nothing read it, so the spend was in no
+		// /v1/usage total, no ledger and no budget. See settleCost for why nil is safe.
+		//
+		// EVERY path, not an allowlist of the ones that look priceable. The predicate that
+		// decides whether money moves is "the gateway reported a cost", which
+		// costing.headerCost evaluates off the response headers; a second list of paths
+		// here would be the same omission this fixes, one release later. A plain proxied
+		// response with no cost header publishes nothing, because with no extension there
+		// is no usage to model and settleCost's own gate then finds neither a figure nor a
+		// saving to report.
+		//
+		// On last only, so an unparsed endpoint settles where every other path does — at
+		// end of stream — rather than on whichever frame arrived first. Every listener
+		// terminates with RunResponseFrame(..., nil, true), so the arm is always reached.
+		//
+		// No Skip and no Observe row: the body may be perfectly fine and simply not ours,
+		// so "no_response_body" would be a false diagnostic, and there is no model to name
+		// in a matched_ row. OnRequest records nothing for this traffic either — the
+		// invocation timeline stays as quiet as it was.
+		if last {
+			p.settleCost(pctx)
+		}
 		return pipeline.Action{Type: pipeline.Continue}
 	}
 	ext := pctx.Extensions.Inference

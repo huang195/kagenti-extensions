@@ -56,12 +56,24 @@ type batch struct {
 //
 // NOTHING HERE TOUCHES DISK ON THE REQUEST PATH. Record is called inside
 // session.Store.Append, under the store's write lock, with every other request in the
-// proxy waiting behind it; all it does is take a mutex, fold into a map, and hand any
-// IO to a single background goroutine over a buffered channel that drops rather than
-// blocks. Constraint 5 — a ledger failure must never break the proxy — was previously
-// true only for ledger FAILURE and only by discipline, since the per-minute append and
-// the once-a-day prune both ran inline. It is now true for ledger LATENCY too, and by
+// proxy waiting behind it; it takes a mutex, folds into a map, and hands any IO to a
+// single background goroutine over a buffered channel that drops rather than blocks.
+// Constraint 5 — a ledger failure must never break the proxy — was previously true
+// only for ledger FAILURE and only by discipline, since the per-minute append and the
+// once-a-day prune both ran inline. It is now true for ledger LATENCY too, and by
 // construction.
+//
+// It is NOT, however, constant work. An earlier version of this paragraph said "all
+// it does is take a mutex, fold into a map", and that was wrong for the one call in
+// sixty that closes a minute: that call also runs takeLocked, which walks the whole
+// accumulator and allocates a slice of every row in it, under mu, inside the session
+// store's write lock. The honest statement is that the work is BOUNDED — the
+// accumulator holds at most maxLabelsPerMinute rows, so the walk is at most 64
+// entries and the allocation at most 64 rows, once a minute. It is bounded because
+// foldLocked caps it; before that cap the same walk was O(distinct labels), and the
+// labels are request-chosen, so a caller could make one request in sixty pay for an
+// arbitrarily large map (50,000 keys was measured). Anything added to this path has
+// to keep that bound.
 //
 // The cost of the hand-off is a brief window in which a just-closed minute is in
 // neither half: it has left the map and its batch has not yet been written. That is
@@ -241,9 +253,15 @@ func (w *Writer) Record(_ string, e *pipeline.SessionEvent) {
 	}
 	r := Row{
 		At: minute,
+		// TRUNCATED, both of them, and this is not cosmetic: Model is the model name
+		// straight off the parsed request body and Host is set by whatever the workload
+		// asked for, so their lengths are chosen off-host and both are written to an
+		// append-only file. One over-long line permanently ends every future read of that
+		// day at its offset. See maxLabelLen for the measurement and the arithmetic.
+		//
 		// Host is the event's field name; endpoint is what it means here. See Row.Endpoint.
-		Endpoint: e.Host,
-		Model:    e.Inference.Model,
+		Endpoint: truncateLabel(e.Host),
+		Model:    truncateLabel(e.Inference.Model),
 		// The calling coding agent, and part of the row KEY — two agents hitting the
 		// same endpoint and model in the same minute are two rows, not one, or a
 		// per-agent breakdown could not be reconstructed from the file at all.
@@ -251,7 +269,12 @@ func (w *Writer) Record(_ string, e *pipeline.SessionEvent) {
 		// agentLabel rather than Label() directly, because the ledger stores absence as
 		// "" where the live aggregator displays it as "unknown". See Row.Agent for why
 		// the two representations differ and why they still mean the same thing.
-		Agent: agentLabel(e.Client),
+		//
+		// Truncated as well. pipeline.maxClientLen already caps the retained User-Agent
+		// at 128, so this is not the unbounded case Model is — but the ring truncates the
+		// same label to maxLabelLen before it becomes a byAgent key, so cutting at 96 here
+		// is what keeps group=agent spelled identically whichever half answers.
+		Agent: truncateLabel(agentLabel(e.Client)),
 		Counts: usage.Counts{
 			Requests:         1,
 			InputTokens:      int64(e.Inference.InputTokens),
@@ -274,7 +297,12 @@ func (w *Writer) Record(_ string, e *pipeline.SessionEvent) {
 	// The figure authlib/costing settled. Record, not Decode: an unpriced record
 	// still exists and carries provenance, and later it carries savings.
 	if ev, ok := costevent.Record(e); ok {
-		r.Provenance = ev.Provenance
+		// Truncated for completeness rather than against a known threat: provenance is
+		// authored by this process's own pricing code, not by a caller. It is the fourth
+		// field of the row key, so leaving one of the four uncapped would leave the
+		// line-length bound maxLabelLen states resting on a promise about a sibling
+		// package instead of on the arithmetic.
+		r.Provenance = truncateLabel(ev.Provenance)
 		if ev.Priced() {
 			r.CostMicros = ev.Micros()
 			r.PricedRequests = 1
@@ -316,11 +344,14 @@ func (w *Writer) Record(_ string, e *pipeline.SessionEvent) {
 
 // add folds one row into the open minute and hands off any work that touches disk.
 //
-// Everything here is memory: one mutex, one map operation, and at most one
-// non-blocking channel send. No open, no write, no directory listing. That is the
-// property that matters, because this runs inside session.Store.Append under the
-// store's WRITE LOCK — every other request in the proxy is waiting behind it — and
-// the store's own comment says a Recorder must be cheap.
+// Everything here is memory: one mutex, one map operation, at most one bounded walk
+// of the accumulator (only on the call that closes a minute — see closeMinuteLocked)
+// and at most one non-blocking channel send. No open, no write, no directory listing,
+// and no logging. That is the property that matters, because this runs inside
+// session.Store.Append under the store's WRITE LOCK — every other request in the
+// proxy is waiting behind it — and the store's own comment says a Recorder must be
+// cheap. "Bounded" is doing real work in that sentence: it holds only because
+// foldLocked caps the accumulator at maxLabelsPerMinute.
 func (w *Writer) add(minute time.Time, r Row) {
 	w.mu.Lock()
 	var out batch
@@ -353,14 +384,34 @@ func (w *Writer) add(minute time.Time, r Row) {
 	w.enqueue(out)
 }
 
-// foldLocked accumulates one row into the open minute. Caller holds mu.
+// foldLocked accumulates one row into the open minute, capping distinct rows at
+// maxLabelsPerMinute. Caller holds mu.
+//
+// CARDINALITY IS BOUNDED HERE and nowhere else, so this is the only thing standing
+// between a request-chosen model string and unbounded growth of both the map and the
+// batch takeLocked copies out of it under the same lock. Past the cap a row folds
+// into overflowKey rather than being dropped: coarsely-attributed spend is a worse
+// answer than exact spend and a better one than missing spend, and a total that
+// still adds up is what lets a client's "(other)" band reconcile against it.
 func (w *Writer) foldLocked(r Row) {
-	if cur, ok := w.rows[r.key()]; ok {
+	k := r.key()
+	if cur, ok := w.rows[k]; ok {
 		cur.Add(r.Counts)
 		return
 	}
+	// Reserve the LAST slot for overflowKey, exactly as usage.addLabel does: switching
+	// to it only once the map is already full would make the overflow row itself the
+	// (cap+1)th entry, so the map would settle one over the bound it claims.
+	if len(w.rows) >= maxLabelsPerMinute-1 {
+		k = overflowKey
+		if cur, ok := w.rows[k]; ok {
+			cur.Add(r.Counts)
+			return
+		}
+		r = overflow(r)
+	}
 	row := r
-	w.rows[r.key()] = &row
+	w.rows[k] = &row
 }
 
 // closeMinuteLocked takes the open minute's rows, opens the next one, and returns

@@ -193,10 +193,18 @@ func TestQuery_FragmentConcatenatedWithTheNextAppendCostsOneLine(t *testing.T) {
 	}
 }
 
-// A line past maxLineBytes cannot be skipped — a scanner will not buffer it, so it
-// cannot step over it. Documented consequence: that day's read ends there. Asserted
-// so the behaviour is a decision rather than a surprise, and so the rows BEFORE it
-// are known to survive.
+// A line past maxLineBytes ends that day's read, and this asserts the LAST-RESORT
+// guard, not a tolerated outcome.
+//
+// It used to bless the truncation on a false premise — that a line this long is
+// "damage of a kind no ledger write can produce". It was: Model went to disk uncapped,
+// so one request naming a megabyte-long model wrote a single valid line past this
+// limit and permanently destroyed the rest of that day ($3.00 of a $3.25 day,
+// measured). The write path now caps every label, so a line this long can only come
+// from a file something else corrupted —
+// TestRecord_LabelsAreCappedSoALineCanNeverExceedTheReadLimit is the half that keeps
+// this unreachable from a request, and this half only says the reader stays bounded
+// and keeps what preceded the damage.
 func TestQuery_LineBeyondTheBufferLimitEndsThatDay(t *testing.T) {
 	dir := t.TempDir()
 	base := time.Date(2026, 9, 13, 9, 0, 0, 0, time.Local)
@@ -213,6 +221,80 @@ func TestQuery_LineBeyondTheBufferLimitEndsThatDay(t *testing.T) {
 	}
 	if len(got) != 1 || got[0].CostMicros != 100 {
 		t.Errorf("got %+v, want the one row that preceded the oversized line", got)
+	}
+}
+
+// The C1 fix, stated as the arithmetic the read-side guard now rests on: whatever a
+// request puts in the label fields, the line this package writes stays far below
+// maxLineBytes, so readDay's unskippable-line path is not reachable from a request.
+func TestRecord_LabelsAreCappedSoALineCanNeverExceedTheReadLimit(t *testing.T) {
+	dir := t.TempDir()
+	now := at
+	w := newTestWriter(t, dir, func() time.Time { return now })
+
+	// Every label at maxLineBytes+64, the shape that destroyed a day: a model name off
+	// the request body, a Host, a User-Agent and a provenance.
+	huge := strings.Repeat("x", maxLineBytes+64)
+	e := costedEvent(t, huge, huge, 0.25, 100, 50)
+	e.Client = &pipeline.EventClient{Raw: huge}
+	setProvenance(t, e, huge)
+	w.Record("s1", e)
+
+	now = at.Add(time.Minute)
+	if err := w.Flush(); err != nil {
+		t.Fatalf("Flush: %v", err)
+	}
+
+	b := readAllBytes(t, dir)
+	if len(b) >= maxLineBytes {
+		t.Fatalf("one row serialized to %d bytes; readDay refuses to buffer %d and cannot "+
+			"step over it, so this row would end every future read of that day", len(b), maxLineBytes)
+	}
+	rows := readAllRows(t, dir)
+	if len(rows) != 1 {
+		t.Fatalf("got %d rows, want 1: %+v", len(rows), rows)
+	}
+	for name, got := range map[string]string{
+		"Endpoint": rows[0].Endpoint, "Model": rows[0].Model,
+		"Agent": rows[0].Agent, "Provenance": rows[0].Provenance,
+	} {
+		if len(got) != maxLabelLen {
+			t.Errorf("%s is %d bytes on disk, want it capped at %d", name, len(got), maxLabelLen)
+		}
+	}
+}
+
+// The whole C1 measurement, end to end: one hostile label followed by real spend, and
+// the day's total must survive. This is the assertion the old blessing test made
+// impossible to write.
+func TestQuery_AHostileLabelCannotDestroyTheRestOfTheDay(t *testing.T) {
+	dir := t.TempDir()
+	now := at
+	w := newTestWriter(t, dir, func() time.Time { return now })
+
+	// Minute 0: the attempt.
+	w.Record("s1", costedEvent(t, "gw", strings.Repeat("x", maxLineBytes+64), 0.25, 100, 50))
+	// Minutes 1..5: ordinary priced traffic, $0.25 + 5 x $0.60 = $3.25 in all.
+	for i := 1; i <= 5; i++ {
+		now = at.Add(time.Duration(i) * time.Minute)
+		e := costedEvent(t, "gw", "opus", 0.60, 100, 50)
+		e.At = now
+		w.Record("s1", e)
+	}
+	now = at.Add(6 * time.Minute)
+	if err := w.Flush(); err != nil {
+		t.Fatalf("Flush: %v", err)
+	}
+
+	rows, err := w.Query(at.Add(-time.Hour), now)
+	if err != nil {
+		t.Fatalf("Query: %v", err)
+	}
+	totals, _ := Fold(rows, usage.GroupNone)
+	if want := int64(3_250_000); totals.CostMicros != want {
+		t.Errorf("CostMicros = %d, want %d; 250000 is the measured loss — the oversized "+
+			"line ended the day's read and took every later minute with it",
+			totals.CostMicros, want)
 	}
 }
 

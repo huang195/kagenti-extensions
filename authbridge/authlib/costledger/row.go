@@ -146,3 +146,83 @@ type key struct {
 func (r Row) key() key {
 	return key{r.Endpoint, r.Model, r.Agent, r.Provenance}
 }
+
+// maxLabelLen bounds one label ON DISK, and it is the same 96 bytes
+// usage.maxLabelLen applies to the same two request-controlled fields — the value
+// is matched deliberately rather than chosen again, so a model name is spelled
+// identically in the ring and in the ledger and group=model answers the same from
+// either source.
+//
+// Load-bearing here for a reason the ring does not have: these strings are WRITTEN
+// TO AN APPEND-ONLY FILE that is retained for retentionDays. Model comes straight
+// off the parsed request body, so a workload chooses its length. Uncapped, one
+// request with a model name longer than maxLineBytes produced a line readDay cannot
+// buffer and cannot step over, which ENDED that day's read at that offset — every
+// row appended after it, for the rest of the day, unreadable from then on, on every
+// future read, invisible in the API's totals and unfixable because the file is
+// append-only. Measured: $3.00 of a $3.25 day gone to one 1 MiB model name.
+//
+// So the cap is on the WRITE side, where it is absolute. Four labels at 96 bytes
+// plus a timestamp and the numeric counters put the longest line this package can
+// emit at well under a kilobyte, three orders of magnitude below maxLineBytes —
+// which is what turns readDay's over-long-line guard from a live failure mode into
+// the last-resort guard for a file some other process corrupted.
+// TestRecord_LabelsAreCappedSoALineCanNeverExceedTheReadLimit pins the arithmetic.
+const maxLabelLen = 96
+
+// truncateLabel caps one label. A byte cut, matching usage.truncateLabel and
+// pipeline's maxClientLen exactly — including its documented willingness to split a
+// multi-byte rune, because two truncation rules for one string that appears in both
+// places would be a worse trade than the occasional replacement character.
+func truncateLabel(s string) string {
+	if len(s) <= maxLabelLen {
+		return s
+	}
+	return s[:maxLabelLen]
+}
+
+// maxLabelsPerMinute caps how many DISTINCT rows one open minute accumulates, and
+// it is usage.maxLabelsPerBucket's 64, again matched rather than re-chosen.
+//
+// TIGHTER THAN THE RING'S, and knowingly: usage applies 64 per axis, to independent
+// marginals, while the key here is the (endpoint, model, agent, provenance) JOINT
+// tuple, so 64 bounds the product rather than each factor. That is the bound this
+// package needs, because the map is not the only cost — every entry is also copied
+// into a batch by takeLocked on a minute roll, which happens INSIDE
+// session.Store.Append's write lock, and it becomes a durable line. Unbounded, a
+// caller varying the model string per request grew both: 50,000 keys held for one
+// minute at 200 bytes each was measured, with an O(N) walk and allocation in front
+// of the request that closed the minute.
+//
+// FOLDED, NOT DROPPED, past the cap — see overflowKey. A deployment busy enough to
+// exceed 64 joint labels in one minute loses attribution DETAIL and no dollars,
+// which is the right direction; raising this one constant is the fix if a real
+// deployment ever does.
+const maxLabelsPerMinute = 64
+
+// overflowLabel collects everything past maxLabelsPerMinute. usage.overflowLabel's
+// spelling, so a client that renders both sources shows one "(other)" band and not
+// two.
+//
+// NOT A REAL LABEL, and no more spoofable-looking than the axes it replaces: a
+// caller can send "(other)" as its model and land in this row, exactly as it can
+// send another agent's name. The cap is a memory bound, not an authorization
+// boundary.
+const overflowLabel = "(other)"
+
+// overflowKey is the one reserved accumulator slot every label past the cap folds
+// into.
+//
+// ALL FOUR fields, not just the request-controlled two: the key is a tuple, so
+// keeping any real field would let the overflow row multiply on that axis and defeat
+// the bound it exists to enforce. The consequence is that a capped minute reports its
+// excess as "(other)" on every axis at once, which reads as "cardinality was capped
+// here" rather than as a plausible endpoint that spent money.
+var overflowKey = key{overflowLabel, overflowLabel, overflowLabel, overflowLabel}
+
+// overflow rewrites a row's identity onto overflowKey, keeping At and every counter.
+// The dollars are unchanged; only the attribution is coarsened.
+func overflow(r Row) Row {
+	r.Endpoint, r.Model, r.Agent, r.Provenance = overflowLabel, overflowLabel, overflowLabel, overflowLabel
+	return r
+}

@@ -31,6 +31,7 @@ var globalKeys = keyGroup{
 	bindings: []keyBinding{
 		{"?", "this help"},
 		{"↑↓ / jk", "scroll this help"},
+		{"$ · C", "cost pane (session views)"},
 		{"P", "plugin catalog (session views)"},
 		{"p", "pause/resume stream"},
 		{"g / G", "jump to top / bottom"},
@@ -121,6 +122,14 @@ var paneKeys = map[paneID]keyGroup{
 			{"esc", "back"},
 		},
 	},
+	paneCost: {
+		title: "COST (this pane)",
+		bindings: []keyBinding{
+			{"w", "cycle window (today/7d/1h)"},
+			{"g", "cycle breakdown (model/endpoint/session)"},
+			{"esc", "back"},
+		},
+	},
 	paneCatalog: {
 		title: "PLUGIN CATALOG (this pane)",
 		bindings: []keyBinding{
@@ -136,7 +145,7 @@ var paneKeys = map[paneID]keyGroup{
 // the overlay is stable across openings (Go map iteration is random).
 var otherPaneOrder = []paneID{
 	paneNamespaces, panePods, paneSessions, paneEvents,
-	paneDetail, paneUsage, panePipeline, panePluginDetail, paneCatalog,
+	paneDetail, paneUsage, paneCost, panePipeline, panePluginDetail, paneCatalog,
 }
 
 // helpKeyColWidth is the fixed width of the key column so descriptions

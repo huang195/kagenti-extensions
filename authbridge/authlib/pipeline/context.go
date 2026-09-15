@@ -141,6 +141,10 @@ type Context struct {
 	// write it could re-file another program's spend under a name of its choosing,
 	// and a listener that could write it would be a second source of a truth the
 	// context already holds in Headers.
+	//
+	// WHEN the memo is filled is part of the guarantee rather than an implementation
+	// detail: see ResolveClient, which listeners call at construction so the answer
+	// predates every plugin.
 	client       *EventClient
 	clientParsed bool
 
@@ -303,6 +307,14 @@ type Context struct {
 // one of several context-construction sites and serialize a clean empty value,
 // whereas an accessor over Headers cannot be.
 //
+// "Once" is a claim about WHICH ANSWER, and on its own it is weaker than it sounds:
+// the memo fills on the FIRST CALL, and the first call is at an event-construction
+// site downstream of the pipeline. Headers is mutable and plugins write to it, so a
+// plugin that rewrote User-Agent would change what an event is attributed to, and
+// which recording site asked first would decide the answer. What makes "once" an
+// ordering guarantee too is ResolveClient, which the listeners call at construction:
+// see there for the guarantee in full, and for what holds on a Context that skips it.
+//
 // NOT goroutine-safe, and that is correct: a Context belongs to one request and
 // the pipeline runs its phases sequentially. Said explicitly because the
 // surrounding type does have fields other goroutines read.
@@ -323,6 +335,32 @@ func (c *Context) ClientInfo() *EventClient {
 	}
 	return c.client
 }
+
+// ResolveClient pins ClientInfo's answer to the User-Agent AS THE CLIENT SENT IT.
+//
+// Listeners call it immediately after building a Context from the request, and that call
+// is the whole of the ordering guarantee: the label is resolved before the pipeline runs,
+// so no plugin can change what an event is attributed to, and no recording site can get a
+// different answer by asking first or last. Attribution keys cost — see EventClient — and
+// "which program spent this" must not depend on call order.
+//
+// A named call rather than a bare `_ = pctx.ClientInfo()` at each site, so the line reads
+// as the invariant it is and a later reader cannot mistake it for a leftover. Deleting it
+// is a behaviour change, and the tests in forwardproxy's client_test.go say so.
+//
+// It does NOT replace the memo, and the memo is deliberately still lazy. An accessor over
+// Headers answers correctly at a construction site that forgets this call — one answer,
+// for the life of the context, from the headers as they stood when something first asked —
+// where a listener-assigned field would have serialized a clean empty value instead. What
+// a forgotten call costs is only the ordering half: on such a Context the answer is
+// pre-plugin by coincidence rather than by construction.
+//
+// Call it AFTER Headers is populated. Called before, it pins nil and the request's own
+// User-Agent is lost — which is why this is a listener's call to make at construction and
+// not something a constructor could do earlier.
+//
+// Idempotent: the second call is the memo's own no-op.
+func (c *Context) ResolveClient() { _ = c.ClientInfo() }
 
 // PeerCertificate returns the verified peer leaf certificate from
 // the TLS connection state, or nil when the connection was plaintext

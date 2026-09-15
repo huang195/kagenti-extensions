@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
+	"io"
 	"log/slog"
 	"os"
 	"path/filepath"
@@ -114,18 +115,32 @@ func (s *store) append(rows []Row) error {
 	return firstErr
 }
 
-// appendTarget is what appendBytes needs of a day file: append the bytes, and undo
-// them if the append was partial.
+// dayFile is what writeLinesTo needs of an open day file: append the bytes, get them
+// onto the device, close.
 //
-// An interface rather than *os.File so the recovery path is testable — ENOSPC is
-// not something a unit test can arrange, and the recovery is the whole point of
-// this being one Write instead of N. See TestAppendBytes_ShortWriteIsRolledBack.
-type appendTarget interface {
-	Write([]byte) (int, error)
-	Truncate(int64) error
+// An interface rather than *os.File so the failure path is testable — ENOSPC is not
+// something a unit test can arrange, and surviving one is the whole point of this being
+// a single Write instead of N. See TestWriteLines_ATornAppendDoesNotRollBackAnotherWritersRows.
+//
+// DELIBERATELY NARROWER THAN *os.File: no Truncate, and no Stat to derive a size from.
+// That absence IS the fix rather than an oversight — see appendBytes for why nothing on
+// this path may ever shorten a day file — so keep both out of here and no future edit
+// can quietly reintroduce the rollback.
+type dayFile interface {
+	Write(b []byte) (int, error)
+	Sync() error
+	Close() error
 }
 
-// writeLines appends one day's rows as JSON lines.
+// writeLines appends one day's rows as JSON lines to the day file at path.
+func writeLines(path string, rows []Row) error {
+	return writeLinesTo(rows, func() (dayFile, error) {
+		return os.OpenFile(path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, fileMode)
+	})
+}
+
+// writeLinesTo is writeLines with the opening of the day file injected, so a test can
+// put a file that fails part-way through a write where the real one goes.
 //
 // Marshalled in full FIRST and written ONCE, which is what keeps a day file
 // syntactically intact under a failure. Encoding straight to the file, a row at a
@@ -134,7 +149,7 @@ type appendTarget interface {
 // error at that offset. readDay resyncs past one now, but not producing the damage
 // beats tolerating it, and a laptop filling its disk is exactly when someone asks
 // what things cost.
-func writeLines(path string, rows []Row) error {
+func writeLinesTo(rows []Row, open func() (dayFile, error)) error {
 	var buf bytes.Buffer
 	// json.Encoder writes one object per line and terminates each with a newline,
 	// which is exactly the JSON-lines shape readDay decodes.
@@ -149,17 +164,11 @@ func writeLines(path string, rows []Row) error {
 		}
 	}
 
-	f, err := os.OpenFile(path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, fileMode)
+	f, err := open()
 	if err != nil {
 		return err
 	}
-	// The size to roll back TO. Taken from the handle rather than from a Stat on the
-	// path so a concurrent rename cannot make it describe a different file.
-	var size int64
-	if info, serr := f.Stat(); serr == nil {
-		size = info.Size()
-	}
-	werr := appendBytes(f, size, buf.Bytes())
+	werr := appendBytes(f, buf.Bytes())
 	if werr == nil {
 		// FSYNCED, so a nil error means the bytes are on the device rather than in the
 		// page cache. Without this, Writer.Close's whole reason for existing — "an orderly
@@ -179,24 +188,58 @@ func writeLines(path string, rows []Row) error {
 	return werr
 }
 
-// appendBytes writes b in one call and rolls the file back to size if that write
-// was partial.
+// appendBytes writes b in ONE call and, if that write landed only partly, appends a
+// single newline so the fragment cannot swallow whatever is appended next. IT NEVER
+// SHORTENS THE FILE.
 //
-// os.File.Write reports an error whenever it wrote fewer bytes than asked, and on a
-// full disk the bytes it DID write are in the file. Truncating back to where the
-// file started leaves it exactly as it was — this minute's cost is lost either way,
-// and the choice is only whether the loss is one minute or the rest of the day.
-func appendBytes(f appendTarget, size int64, b []byte) error {
+// It used to roll back. os.File.Write reports an error whenever it wrote fewer bytes
+// than asked and the bytes it DID write are in the file, so this took the file's size
+// before the write and Truncate'd back to it afterwards, on the reasoning that losing
+// this minute beats leaving a corrupt line.
+//
+// THAT ROLLBACK COULD DESTROY ROWS THIS WRITER NEVER WROTE. The size was read before
+// the write and used after it, and a day file is not private to one writer:
+// ~/.cortex/cost is a fixed default that every proxy on the host opens, so a second
+// proxy — a spare on another port, an overlapping restart — can append in that window,
+// and Close's inline-write branch could do it from inside this process. Anything that
+// landed in between sat inside the range being truncated away, so one bad minute took
+// the rest of the day with it, and the file said nothing about it afterwards.
+//
+// A ROLLBACK THAT CAN BE WRONG IS WORSE THAN NO ROLLBACK, because of what the two
+// failures cost. Not rolling back leaves one undecodable line: readDay steps over it and
+// COUNTS it, and the count reaches a caller on Writer.SkippedLines, so the loss is
+// bounded at that line and it is visible. Rolling back over another writer's rows
+// deletes committed history with no error, no count and nothing left in the file to say
+// it happened. Bounded and reported beats unbounded and silent, and that is the whole
+// trade.
+//
+// Hence the newline. A torn write ends mid-row, and with no terminator the NEXT append
+// concatenates onto that fragment and makes its first row unreadable too — so one byte
+// fences the damage to the fragment alone. Best effort: the write that just tore will
+// often refuse this too, and then the file is merely back to the bounded case above. It
+// can only ever ADD a byte, which is what makes it safe to attempt on a file another
+// writer has open.
+//
+// NO LOCK, and that is a decision rather than an omission. With nothing on this path
+// that shortens a file, concurrent writers can only append: each flush is one write to
+// an O_APPEND handle, so rows land whole and interleaved instead of over one another.
+// See TestWriteLines_ConcurrentWritersDoNotLoseEachOthersRows. What two writers still
+// cannot do is make each other's TOTALS right — two processes pricing the same traffic
+// would double-count it — but that is a question about who may write a ledger, not
+// about whether a write destroys what is already in it.
+func appendBytes(f io.Writer, b []byte) error {
 	n, err := f.Write(b)
 	if err == nil {
 		return nil
 	}
-	if n > 0 {
-		if terr := f.Truncate(size); terr != nil {
-			// Nothing further to do: the caller logs, and readDay will resync past the
-			// fragment. Reported as the primary error because a file left mid-row is worse
-			// news than the write that failed.
-			return fmt.Errorf("costledger: partial write of %d bytes could not be rolled back: %w", n, terr)
+	if n > 0 && n < len(b) && b[n-1] != '\n' {
+		// Ended mid-row. A tear that happened to land on a line boundary needs nothing.
+		if _, ferr := f.Write([]byte{'\n'}); ferr != nil {
+			// Reported together with the write that tore, because the consequence outlives
+			// this call: the next row appended to this file is unreadable too, and only the
+			// skipped-line count will show it.
+			return fmt.Errorf("costledger: torn append of %d bytes could not be fenced off with a "+
+				"newline (%v), so the next row appended to this file will be unreadable too: %w", n, ferr, err)
 		}
 	}
 	return err
@@ -329,13 +372,45 @@ type dayIssues struct {
 //
 // Returns the first error but keeps going, for the reason append does: one
 // undeletable file must not leave the rest of the backlog in place.
+//
+// THE CUTOFF IS FLOORED AT THE NEWEST DAY FILE'S OWN DATE, which is what stops a
+// wrong clock from deleting the ledger. It used to be today-minus-retention and
+// nothing else, so a host whose clock STEPPED FORWARD past the window — NTP
+// correcting after a resume, a restored VM image, a dead CMOS battery — put every
+// existing file behind the cutoff and unlinked all of them, TODAY'S INCLUDED. This
+// runs synchronously in New, i.e. at the one moment a laptop's clock is least
+// trustworthy. See TestPrune_AForwardClockStepDoesNotDeleteTheLedger.
+//
+// Deleting nothing is always recoverable and deleting today is not, so where the two
+// available readings of "how old is this file" disagree, the older reference wins and
+// fewer files go. A file only ever goes when it is past the window under BOTH
+// readings — the clock's day and the newest day the ledger itself has on disk.
+//
+// A FLOOR RATHER THAN A PLAUSIBILITY THRESHOLD because no threshold can separate the
+// two cases. From the directory alone, "the clock jumped 40 days" and "this ledger was
+// idle for 40 days" look identical, and one of them is a legitimate prune. The floor is
+// sound either way: everything it still deletes is past the window relative to real
+// recorded activity.
+//
+// The cost is that retention is measured from the ledger's newest DATA rather than
+// from the clock, so an ARCHIVE nothing writes to any more keeps its last retainDays
+// files instead of emptying out. The disk bound is unchanged — at most retainDays
+// files survive, because they all have to sit within the window ending at the newest
+// one — and the moment writing resumes, today becomes the newest day and the old era
+// ages out normally.
 func (s *store) prune(now time.Time) error {
-	cutoff := s.dayOf(now).AddDate(0, 0, -(s.retainDays - 1))
 	entries, err := os.ReadDir(s.dir)
 	if err != nil {
 		return err
 	}
-	var firstErr error
+	// Datable names only, and their days, so the newest is known BEFORE anything is
+	// unlinked. Never touches a file it cannot date; see the doc above.
+	type dayEntry struct {
+		name string
+		day  time.Time
+	}
+	var days []dayEntry
+	var newest time.Time
 	for _, e := range entries {
 		if e.IsDir() {
 			continue
@@ -350,10 +425,43 @@ func (s *store) prune(now time.Time) error {
 		if perr != nil {
 			continue
 		}
-		if !day.Before(cutoff) {
+		days = append(days, dayEntry{name: name, day: day})
+		if day.After(newest) {
+			newest = day
+		}
+	}
+	if len(days) == 0 {
+		return nil
+	}
+
+	// The day retention is counted back from: the OLDER of what the clock says today is
+	// and the newest day the ledger has written. They are the same day on a healthy host,
+	// so this changes nothing there.
+	ref := s.dayOf(now)
+	if newest.Before(ref) {
+		ref = newest
+		if gap := s.dayOf(now).Sub(newest); gap > time.Duration(s.retainDays-1)*24*time.Hour {
+			// Worth a line: on a healthy host the newest day file IS today, so a gap wider
+			// than the whole retention window means either the clock is wrong or the ledger
+			// has not been written to in longer than it retains. Said at Warn because the
+			// first of those is a host fault an operator wants to know about, and neither is
+			// visible anywhere else.
+			slog.Warn("costledger: the clock is further ahead of the newest day file than "+
+				"retention could explain; keeping day files rather than deleting cost history",
+				"clockDay", s.dayOf(now).Format(dayLayout), "newestDayFile", newest.Format(dayLayout),
+				"retainDays", s.retainDays,
+				"cause", "the host clock stepped forward, or this ledger has been idle longer than its retention",
+				"effect", "retention is measured back from the newest day file instead of from the clock")
+		}
+	}
+	cutoff := ref.AddDate(0, 0, -(s.retainDays - 1))
+
+	var firstErr error
+	for _, d := range days {
+		if !d.day.Before(cutoff) {
 			continue
 		}
-		if rerr := os.Remove(filepath.Join(s.dir, name)); rerr != nil && firstErr == nil {
+		if rerr := os.Remove(filepath.Join(s.dir, d.name)); rerr != nil && firstErr == nil {
 			firstErr = rerr
 		}
 	}

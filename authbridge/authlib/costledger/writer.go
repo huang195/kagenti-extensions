@@ -107,10 +107,12 @@ type Writer struct {
 	// closed reports that the writer goroutine has STOPPED, so submit writes inline
 	// and enqueue counts instead of queueing work nobody will collect.
 	//
-	// Set after wg.Wait, never before. It used to be set before close(quit), which
-	// armed submit's inline-write branch while the goroutine was still draining: two
-	// writeLines on one day file, each holding a size from its own Stat, so a partial
-	// write in one rolled the file back over rows the other had just appended.
+	// Set after wg.Wait, never before. Early, it counts a racing Record as dropped while
+	// its rows could still have been written, and it arms submit's inline-write branch
+	// while the goroutine is still draining — two writeLines on one day file, which used
+	// to mean one rolling the file back over rows the other had just appended (see
+	// appendBytes, which no longer truncates) and still means two writers where the
+	// design has one.
 	closed atomic.Bool
 	// closeOnce guards the shutdown, and closeErr carries its result to every later
 	// caller. A shutdown path that retries Close must not be told nil the second time
@@ -879,10 +881,13 @@ func (w *Writer) Close() error {
 		// a Record that raced this shutdown — is written here.
 		w.drainAndWrite()
 
-		// AFTER wg.Wait AND after the drain above. Setting it earlier armed submit's
-		// inline-write branch while the goroutine was still draining, so two writeLines
-		// could run on one day file, each with a size from its own Stat — and a partial
-		// write in either rolled the file back over the other's rows.
+		// AFTER wg.Wait AND after the drain above, for two reasons. Setting it earlier makes
+		// enqueue count every racing Record as DROPPED while those rows could still have
+		// been written — the flag is what tells the request path the goroutine has gone. It
+		// also armed submit's inline-write branch while the goroutine was still draining, so
+		// two writeLines could run on one day file at once; that no longer destroys anything
+		// (appendBytes never shortens a file, and each flush is one append), but it is still
+		// two goroutines doing this Writer's IO and accounting when the design says one does.
 		w.closed.Store(true)
 
 		// From here nothing can reach disk, so whatever is left is LOST and has to be
@@ -904,9 +909,11 @@ func (w *Writer) Close() error {
 // drainAndWrite writes every batch currently queued and returns when the queue is
 // empty.
 //
-// The writer goroutine must already have STOPPED. Two goroutines in writeLines on one
-// day file each take their rollback size from their own Stat, so a partial write in
-// one truncates away rows the other appended.
+// The writer goroutine must already have STOPPED, so this and it are never both in
+// store.append. That used to be a data-loss rule — each writeLines took a rollback size
+// from its own Stat, so a partial write in one truncated away rows the other had
+// appended — and appendBytes no longer truncates at all, which leaves it as the
+// one-writer invariant run() documents rather than a correctness cliff.
 func (w *Writer) drainAndWrite() {
 	for {
 		select {

@@ -107,9 +107,16 @@
 >    `Counts.IncompleteRequests` (how many of a total's figures are a floor rather than
 >    an exact number), `Snapshot.Degraded` (a pointer, so absent ≠ zero: how many ledger
 >    lines and day files a read lost) and `Snapshot.IncompleteBy` (which *way* a figure
->    is inexact). The first two reach abctl. `IncompleteBy` was producer-side only as of
->    the commit this note was written against, so every abctl surface rendered one
->    undifferentiated inexactness marker; check whether a later commit closed that.
+>    is inexact). **All three now reach abctl** — `IncompleteBy` was producer-side only when
+>    the line above was written, and `b7740254` closed it in `--json`, the human summary and
+>    the Cost pane. Closing it exposed a worse defect than the missing field: the pane had
+>    been asserting "N of M priced figures are lower bounds — so the real total is higher"
+>    over EVERY inexact figure, which is false for an approximation and false on the pane's
+>    own default window, where a ledger row carries no reason at all. It now names a
+>    direction only where the response named one, and says so plainly when it cannot.
+>
+>    A fourth disclosure joined them: `Snapshot.UngroupedCostMicros`, the cost no series
+>    entry carries, so a breakdown that does not add up says so instead of just being short.
 > 8. **The Cost pane mock-up is a picture of the design, not of the pane.** Shipped
 >    headings are `TOTAL`, `BY <group>`, `WHERE IT WENT (tokens, not dollars)` — the
 >    parenthetical is *in the heading* — and `COVERAGE`. There is no `AVOIDED` section
@@ -123,8 +130,12 @@
 >    traffic. Markers are never what gets dropped. A fifth figure was added: how long
 >    ago the strip last polled, when that answer is stale.
 > 10. **Retention is configurable but floored, and the config is restart-only.** A
->     non-zero `cost_ledger.retention_days` below 7 is refused at load, because
->     `window=7d` is served from these files; `0` still means 30. And `CostLedgerConfig`
+>     non-zero `cost_ledger.retention_days` below **8** is refused at load, because
+>     `window=7d` is served from these files and a rolling 7×24h touches EIGHT local day
+>     files unless it happens to begin at midnight. The floor is derived
+>     (`usage.Window7dLocalDays`) rather than written as its own number — as a literal it
+>     said 7 and admitted the partial week it existed to refuse; `0` still means 30. And
+>     `CostLedgerConfig`
 >     is **not** hot-reloadable — the reloader has no reference to it and the writer is
 >     opened once at startup, so every key takes effect on restart.
 > 11. **Persisted UI state is a `cost:` section in `~/.cortex/abctl-config.yaml`**, the

@@ -187,6 +187,49 @@ type Snapshot struct {
 	// Summed from the raw buckets alongside Totals, so it is unaffected by the
 	// requested resolution.
 	PricedBy map[string]int64 `json:"pricedBy,omitempty"`
+	// Degraded reports that this answer is known to be MISSING ROWS, and is absent
+	// whenever it is not.
+	//
+	// A DIFFERENT CLAIM from Totals.IncompleteRequests, and the two must not be merged.
+	// That counter says a figure this response CARRIES is inexact — a floor, or an
+	// approximation — and the request is still counted and still priced. This field says
+	// rows the answer needed could not be read at all, so the total is short by an
+	// amount nothing here can state. One qualifies a number; the other says a number is
+	// missing from the sum.
+	//
+	// A POINTER, so a clean read serialises nothing rather than zeros a client has to
+	// interpret. Absence means the read was clean; presence means look at it. Zeros in
+	// an always-present object would read as "checked, fine" from a producer that never
+	// checked, which is the same class of false reassurance as a $0.00 over unpriced
+	// traffic.
+	//
+	// Only a ledger-backed window can populate it. The ring is memory: it has no lines
+	// to fail to decode and no files to abandon, so a duration window leaves this nil
+	// and that absence is the truth rather than a gap in the reporting.
+	Degraded *Degraded `json:"degraded,omitempty"`
+}
+
+// Degraded is what a ledger read could not deliver.
+//
+// It exists because the alternative was silence. The ledger already skipped a corrupt
+// line rather than discarding the rest of the day, and already abandoned a file it
+// could not scan — both strictly better than the behaviour they replaced. But the
+// response looked IDENTICAL to a clean one: a short dollar total labelled priced:true
+// with no caveat anywhere in it, which is the exact failure this branch keeps refusing
+// in every other place it appears.
+//
+// The counters are GAUGES for the most recent read, not cumulative totals. One corrupt
+// line re-read on every /v1/usage poll would make a running count climb forever over a
+// single piece of damage, and a client watching it would infer an outage that is not
+// happening.
+type Degraded struct {
+	// SkippedLines is how many rows could not be decoded and were passed over. Each is
+	// spend that happened and is not in the total.
+	SkippedLines int64 `json:"skippedLines,omitempty"`
+	// TruncatedDays is how many day files were abandoned part-way. Worse than a skipped
+	// line by an unbounded amount: the rest of that file is missing, and a file holds a
+	// whole day.
+	TruncatedDays int64 `json:"truncatedDays,omitempty"`
 }
 
 // ParseWindow validates a window parameter against the storage resolution.

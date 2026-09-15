@@ -4,6 +4,8 @@ import (
 	"encoding/json"
 	"io"
 	"net/http"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -548,5 +550,81 @@ func TestHandleUsage_SessionWithDurationWindowStillWorks(t *testing.T) {
 	status, body := fetchUsage(t, ts.URL, "?window=10m&session=s1")
 	if status != http.StatusOK {
 		t.Fatalf("status = %d, want 200: %s", status, body)
+	}
+}
+
+// TestHandleUsage_ACorruptLedgerLineIsDisclosedInTheResponse closes the last step of the
+// skip-don't-discard change.
+//
+// The ledger skipping a corrupt line rather than throwing away the rest of the day is
+// strictly better than what it replaced — but until the count reached the wire, the
+// response was byte-identical to a clean one: a short dollar total under priced:true,
+// with nothing anywhere in it saying rows were missing. A client cannot caveat what it
+// cannot see, so the improvement was invisible to every consumer.
+func TestHandleUsage_ACorruptLedgerLineIsDisclosedInTheResponse(t *testing.T) {
+	when := time.Now().Add(-2 * time.Minute)
+	// An explicit dir rather than newTestLedger's hidden t.TempDir(), because this test
+	// has to reach the day file the writer produced.
+	dir := t.TempDir()
+	led, lerr := costledger.New(dir, costledger.WithClock(func() time.Time { return when }))
+	if lerr != nil {
+		t.Fatalf("costledger.New: %v", lerr)
+	}
+	t.Cleanup(func() { _ = led.Close() })
+
+	recordCostedMinute(t, led, when, "gw", "opus", 0.25)
+	if err := led.Flush(); err != nil {
+		t.Fatalf("Flush: %v", err)
+	}
+	// A line the decoder cannot read, appended to the day file the ledger just wrote.
+	// Deliberately a MID-file corruption with a good row BEFORE it, so the response has a
+	// real total to be short of rather than nothing at all.
+	entries, derr := os.ReadDir(dir)
+	if derr != nil || len(entries) == 0 {
+		t.Fatalf("no day file to corrupt (err=%v, entries=%d)", derr, len(entries))
+	}
+	f, oerr := os.OpenFile(filepath.Join(dir, entries[0].Name()), os.O_APPEND|os.O_WRONLY, 0o600)
+	if oerr != nil {
+		t.Fatalf("open day file: %v", oerr)
+	}
+	if _, werr := f.WriteString("{this is not a row\n"); werr != nil {
+		t.Fatalf("append garbage: %v", werr)
+	}
+	if cerr := f.Close(); cerr != nil {
+		t.Fatalf("close: %v", cerr)
+	}
+
+	ts, _ := newTestServer(t, WithUsage(usage.New()), WithCostLedger(led))
+	status, body := fetchUsage(t, ts.URL, "?window=today")
+	if status != http.StatusOK {
+		t.Fatalf("status = %d, want 200: %s", status, body)
+	}
+	var snap usage.Snapshot
+	if err := json.Unmarshal([]byte(body), &snap); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if snap.Degraded == nil {
+		t.Fatalf("a day file with an undecodable line answered with no degraded block; "+
+			"the total is short and the response does not say so: %s", body)
+	}
+	if snap.Degraded.SkippedLines < 1 {
+		t.Errorf("degraded.skippedLines = %d, want at least 1", snap.Degraded.SkippedLines)
+	}
+}
+
+// TestHandleUsage_ACleanLedgerReadCarriesNoDegradedBlock is the other half, and it is
+// the half that makes the field worth having: zeros on every clean read would train a
+// reader to ignore it.
+func TestHandleUsage_ACleanLedgerReadCarriesNoDegradedBlock(t *testing.T) {
+	led := ledgerWithOneCostedMinute(t, time.Now().Add(-2*time.Minute), "gw", "opus", 0.25)
+	ts, _ := newTestServer(t, WithUsage(usage.New()), WithCostLedger(led))
+
+	status, body := fetchUsage(t, ts.URL, "?window=today")
+	if status != http.StatusOK {
+		t.Fatalf("status = %d, want 200: %s", status, body)
+	}
+	if strings.Contains(body, "degraded") {
+		t.Errorf("a clean read serialised a degraded block; absence is how a client tells "+
+			"clean from damaged: %s", body)
 	}
 }

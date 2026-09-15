@@ -249,9 +249,11 @@ func TestRunCost_JSONCarriesProvenanceAndTheNamedGaps(t *testing.T) {
 	}
 }
 
-// Both maps are omitempty, so a response carrying neither prints exactly what it printed
+// All three maps are omitempty, so a response carrying none prints exactly what it printed
 // before — a null or an empty object would make a script that checks for presence read
-// "there were no gaps", which is a claim the ledger path in particular cannot make.
+// "there were no gaps", which is a claim the ledger path in particular cannot make. For
+// incompleteBy the misreading would be worse: absence there is not even a claim that the
+// figures ARE exact, only that this window does not record which way they are not.
 func TestRunCost_JSONOmitsTheMapsWhenTheServerSentNone(t *testing.T) {
 	srv := fakeUsageServer(t, `{"window":"today","totals":{"requests":2,`+
 		`"costMicros":250000,"pricedRequests":2,"priceableRequests":2},"priced":true}`)
@@ -261,7 +263,7 @@ func TestRunCost_JSONOmitsTheMapsWhenTheServerSentNone(t *testing.T) {
 	if code := runCost([]string{"--endpoint", srv.URL, "--json"}, &out, &errOut); code != 0 {
 		t.Fatalf("exit = %d, want 0", code)
 	}
-	for _, absent := range []string{"pricedBy", "unpricedBy"} {
+	for _, absent := range []string{"pricedBy", "unpricedBy", "incompleteBy"} {
 		if strings.Contains(out.String(), absent) {
 			t.Errorf("--json emitted %q for a response that carried none:\n%s", absent, out.String())
 		}
@@ -676,5 +678,193 @@ func TestCostDegradedText_NamesWhatEachKindOfDamageLost(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+// TestRunCost_JSONCarriesWhichWayTheTotalIsInexact.
+//
+// usage.Snapshot.IncompleteBy says WHICH WAY a figure is inexact; Totals.IncompleteRequests
+// says only HOW MANY. Those are different claims about money — "at least $12.40" is a bound
+// that will be exceeded and usually a transient failure worth chasing, "roughly $12.40" is a
+// standing property of a gateway — and the field reached no client in cmd/abctl at all, so a
+// script could read the count and had to render the two identically.
+func TestRunCost_JSONCarriesWhichWayTheTotalIsInexact(t *testing.T) {
+	srv := fakeUsageServer(t, `{"window":"today","totals":{"requests":10,`+
+		`"costMicros":1240000,"pricedRequests":10,"priceableRequests":10,`+
+		`"incompleteRequests":4},"priced":true,`+
+		`"incompleteBy":{"output-uncounted":3,"split-unreported":1}}`)
+	defer srv.Close()
+
+	var out, errOut strings.Builder
+	if code := runCost([]string{"--endpoint", srv.URL, "--json"}, &out, &errOut); code != 0 {
+		t.Fatalf("exit = %d, want 0; stderr = %s", code, errOut.String())
+	}
+	var decoded struct {
+		IncompleteBy map[string]int64 `json:"incompleteBy"`
+		Totals       struct {
+			IncompleteRequests int64 `json:"incompleteRequests"`
+		} `json:"totals"`
+	}
+	if err := json.Unmarshal([]byte(out.String()), &decoded); err != nil {
+		t.Fatalf("--json output is not valid JSON: %v\n%s", err, out.String())
+	}
+	if decoded.IncompleteBy["output-uncounted"] != 3 || decoded.IncompleteBy["split-unreported"] != 1 {
+		t.Errorf("incompleteBy = %v, want the reason split the server reported; without it a "+
+			"script cannot tell \"at least $1.24\" from \"roughly $1.24\":\n%s",
+			decoded.IncompleteBy, out.String())
+	}
+	// VERBATIM keys, not a friendlier spelling of them: the whole point of the shared schema
+	// is that the CLI, /v1/usage and pricing.ReasonOutputUncounted say the same words.
+	if strings.Contains(out.String(), "outputUncounted") || strings.Contains(out.String(), "lowerBound") {
+		t.Errorf("--json re-keyed the reasons into a vocabulary of its own:\n%s", out.String())
+	}
+	// The count still stands beside the split. It is the field both window kinds populate,
+	// and dropping it in favour of the map would lose exactness on a ledger window entirely.
+	if decoded.Totals.IncompleteRequests != 4 {
+		t.Errorf("totals.incompleteRequests = %d, want 4 alongside the split",
+			decoded.Totals.IncompleteRequests)
+	}
+}
+
+// TestRunCost_HumanSummarySaysWhichWayTheTotalIsInexact.
+//
+// The count line says the total is not exact; these lines say in which direction, and that is
+// the difference between a figure a reader should treat as a floor and one they should treat
+// as fuzzy in both directions. Both grammatical numbers are exercised — three of one reason,
+// one of the other — because a caveat about money that reads as a typo is a caveat an
+// operator learns to discount.
+func TestRunCost_HumanSummarySaysWhichWayTheTotalIsInexact(t *testing.T) {
+	srv := fakeUsageServer(t, `{"window":"today","totals":{"requests":10,`+
+		`"costMicros":1240000,"pricedRequests":10,"priceableRequests":10,`+
+		`"incompleteRequests":4},"priced":true,`+
+		`"incompleteBy":{"output-uncounted":3,"split-unreported":1}}`)
+	defer srv.Close()
+
+	var out, errOut strings.Builder
+	if code := runCost([]string{"--endpoint", srv.URL}, &out, &errOut); code != 0 {
+		t.Fatalf("exit = %d, want 0; stderr = %s", code, errOut.String())
+	}
+	got := out.String()
+	// The floor: named, counted, and with the direction stated.
+	if !strings.Contains(got, "3 are LOWER BOUNDS") {
+		t.Errorf("the summary does not say three figures are lower bounds:\n%s", got)
+	}
+	if !strings.Contains(got, "real total is higher") {
+		t.Errorf("the summary states a floor without saying which way it is wrong:\n%s", got)
+	}
+	// The approximation: singular, and explicitly NOT given a direction.
+	if !strings.Contains(got, "1 is an APPROXIMATION") {
+		t.Errorf("the summary does not name the approximate figure, or names it in the plural:\n%s", got)
+	}
+	if !strings.Contains(got, "no known direction") {
+		t.Errorf("the summary presents an approximation as if it had a direction:\n%s", got)
+	}
+	// The count line survives above them: the split explains it, it does not replace it.
+	if !strings.Contains(got, "4 of 10 priced requests carry an inexact figure") {
+		t.Errorf("the split displaced the count it qualifies:\n%s", got)
+	}
+	// Order: the count, then the reasons under it.
+	if strings.Index(got, "inexact figure") > strings.Index(got, "LOWER BOUNDS") {
+		t.Errorf("the reasons print above the count they belong to:\n%s", got)
+	}
+}
+
+// TestRunCost_AnUnknownInexactnessReasonIsPrintedNotDropped.
+//
+// IncompleteBy's counts sum to Totals.IncompleteRequests by contract, so a key this build
+// does not recognise cannot be quietly skipped: a reader subtracting what was printed from
+// the count would conclude the remainder were EXACT figures, which is the reading the whole
+// disclosure exists to prevent. A newer proxy naming a third reason is the case — an older
+// abctl against a newer sidecar is the normal deployment, not an exotic one.
+func TestRunCost_AnUnknownInexactnessReasonIsPrintedNotDropped(t *testing.T) {
+	srv := fakeUsageServer(t, `{"window":"today","totals":{"requests":10,`+
+		`"costMicros":1240000,"pricedRequests":10,"priceableRequests":10,`+
+		`"incompleteRequests":2},"priced":true,`+
+		`"incompleteBy":{"rate-card-stale":2}}`)
+	defer srv.Close()
+
+	var out, errOut strings.Builder
+	if code := runCost([]string{"--endpoint", srv.URL}, &out, &errOut); code != 0 {
+		t.Fatalf("exit = %d, want 0; stderr = %s", code, errOut.String())
+	}
+	got := out.String()
+	if !strings.Contains(got, "rate-card-stale") {
+		t.Errorf("an unrecognised reason was dropped, so 2 of the inexact figures now read as "+
+			"exact:\n%s", got)
+	}
+	if !strings.Contains(got, "2 inexact under") {
+		t.Errorf("the unrecognised reason lost its count:\n%s", got)
+	}
+}
+
+// TestRunCost_AbsentReasonsPrintNothingAndClaimNoDirection.
+//
+// The DEFAULT path for this command: "today" is ledger-backed, and a persisted per-minute row
+// carries IncompleteRequests without the reason, because the reason is no part of that row's
+// key. usage.Snapshot.IncompleteBy's doc is explicit that absence is not a claim of
+// exactness — so the count line must still print, and nothing may invent a direction for it.
+func TestRunCost_AbsentReasonsPrintNothingAndClaimNoDirection(t *testing.T) {
+	srv := fakeUsageServer(t, `{"window":"today","totals":{"requests":10,`+
+		`"costMicros":1240000,"pricedRequests":10,"priceableRequests":10,`+
+		`"incompleteRequests":4},"priced":true}`)
+	defer srv.Close()
+
+	var out, errOut strings.Builder
+	if code := runCost([]string{"--endpoint", srv.URL}, &out, &errOut); code != 0 {
+		t.Fatalf("exit = %d, want 0; stderr = %s", code, errOut.String())
+	}
+	got := out.String()
+	if !strings.Contains(got, "4 of 10 priced requests carry an inexact figure") {
+		t.Errorf("absence of the reasons suppressed the inexactness caveat itself, which reads "+
+			"as an exact total:\n%s", got)
+	}
+	for _, banned := range []string{"LOWER BOUND", "APPROXIMATION", "no known direction",
+		"real total is higher", "inexact under"} {
+		if strings.Contains(got, banned) {
+			t.Errorf("the summary says %q for a window that does not record which way its "+
+				"figures are inexact:\n%s", banned, got)
+		}
+	}
+}
+
+// TestCostIncompleteReasonLines_OrdersTheFloorFirstAndSaysNothingForNone is the unit-level
+// pin on the two rules the rendering has to keep: a fixed order (the floor first, because it
+// is the stronger claim and the one with a direction) and NOTHING at all for an empty map.
+//
+// Directly on the helper because the order of two lines and the emptiness of a slice are
+// awkward to assert through a whole command's output, and because a map's iteration order is
+// randomised — a table here fails on the first run that shuffles, where a substring check on
+// the rendered page might not.
+func TestCostIncompleteReasonLines_OrdersTheFloorFirstAndSaysNothingForNone(t *testing.T) {
+	if got := costIncompleteReasonLines(nil); got != nil {
+		t.Errorf("costIncompleteReasonLines(nil) = %v, want nothing: absence is not a claim "+
+			"about direction in either direction", got)
+	}
+	if got := costIncompleteReasonLines(map[string]int64{}); got != nil {
+		t.Errorf("costIncompleteReasonLines(empty) = %v, want nothing", got)
+	}
+	got := costIncompleteReasonLines(map[string]int64{
+		"split-unreported": 2,
+		"output-uncounted": 5,
+		"unlabelled":       1,
+		"zz-unknown":       3,
+		"aa-unknown":       4,
+	})
+	if len(got) != 5 {
+		t.Fatalf("got %d lines, want 5 (three known reasons and two unknown): %v", len(got), got)
+	}
+	wantPrefixes := []string{
+		"5 are LOWER BOUNDS",
+		"2 are APPROXIMATIONS",
+		"1 carries a caveat",
+		"4 inexact under \"aa-unknown\"",
+		"3 inexact under \"zz-unknown\"",
+	}
+	for i, want := range wantPrefixes {
+		if !strings.HasPrefix(got[i], want) {
+			t.Errorf("line %d = %q, want it to start %q — the floor leads, then the "+
+				"approximation, then the unnamed caveat, then unknown keys in a stable order",
+				i, got[i], want)
+		}
 	}
 }

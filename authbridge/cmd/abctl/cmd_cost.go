@@ -7,9 +7,11 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"sort"
 	"strings"
 	"time"
 
+	"github.com/rossoctl/cortex/authbridge/authlib/pricing"
 	"github.com/rossoctl/cortex/authbridge/authlib/usage"
 	"github.com/rossoctl/cortex/authbridge/cmd/abctl/apiclient"
 )
@@ -40,8 +42,9 @@ func runCost(args []string, stdout, stderr io.Writer) int {
 	fs := flag.NewFlagSet("abctl cost", flag.ContinueOnError)
 	fs.SetOutput(stderr)
 	asJSON := fs.Bool("json", false,
-		"emit the totals, their provenance, the coverage gaps and any incomplete-read "+
-			"disclosure as JSON, with usage.Counts' own field names")
+		"emit the totals, their provenance, the coverage gaps, which way any inexact "+
+			"figure is inexact and any incomplete-read disclosure as JSON, with "+
+			"usage.Counts' own field names")
 	window := fs.String("window", usage.WindowToday,
 		"window to report: today, 7d, or a duration such as 1h or 6h")
 	endpoint := fs.String("endpoint", "",
@@ -128,15 +131,16 @@ Flags:
 }
 
 // costJSON is the --json shape: the window actually served plus the totals
-// verbatim, the two maps that say where the totals came from and what they miss, and the
-// ledger's own admission when the read that produced them was incomplete.
+// verbatim, the three maps that say where the totals came from, what they miss and which
+// way any inexact figure in them is inexact, and the ledger's own admission when the read
+// that produced them was incomplete.
 //
 // Totals is usage.Counts embedded, NOT re-keyed and NOT re-cased. An unattended
 // workload parses this, and the whole point of the shared schema is that the CLI,
 // /v1/usage and the ledger on disk say the same words for the same quantity. A
 // friendlier spelling here would be a fourth vocabulary for the same numbers.
 //
-// PricedBy and UnpricedBy are INCLUDED rather than the self-description being
+// PricedBy, UnpricedBy and IncompleteBy are INCLUDED rather than the self-description being
 // corrected, and the choice is deliberate. Both readings were available: drop the
 // "verbatim" claim and admit this is a subset, or make the claim true. The claim is worth
 // making true, because it is the human path's own reasoning applied to the machine path —
@@ -144,9 +148,9 @@ Flags:
 // $12.40 modelled from a shipped vendor-list table are not equally trustworthy figures",
 // and the TUI, the Cost pane and the human summary all label the difference. A scripted
 // consumer, the one nobody eyeballs, was the only reader that could not tell a modelled
-// total from a billed one, and could not name a coverage gap it was told the size of.
-// Both are omitempty on the wire, so a response that carries neither is byte-identical to
-// what this printed before.
+// total from a billed one, could not name a coverage gap it was told the size of, and could
+// not tell "at least $X" from "roughly $X". All three are omitempty on the wire, so a
+// response that carries none of them is byte-identical to what this printed before.
 //
 // Degraded is on this struct for exactly that argument taken one step further: it is the
 // only field here that says the totals are INCOMPLETE rather than merely qualified, and a
@@ -173,6 +177,33 @@ type costJSON struct {
 	// unpriced pairs from the priced ones. Compare Totals.PricedRequests with
 	// Totals.PriceableRequests for that, exactly as the human summary does.
 	UnpricedBy map[string]int64 `json:"unpricedBy,omitempty"`
+	// IncompleteBy says WHICH WAY an inexact figure is inexact, keyed on the reason —
+	// "output-uncounted" for a lower bound (a stream died before its output count, so the
+	// true figure is HIGHER), "split-unreported" for an approximation (a gateway reported
+	// only a total, so it is off in no known direction), "unlabelled" for a caveat whose
+	// kind the producer did not name.
+	//
+	// Here for the reason PricedBy and UnpricedBy are, applied to the one qualification a
+	// script could see but not read: Totals.IncompleteRequests answers HOW MANY and
+	// collapses "at least $X" into "roughly $X". Those are different claims about money —
+	// a floor will be exceeded and is usually a transient failure worth chasing, an
+	// approximation is a standing property of a gateway that holds for every request it
+	// answers — and an unattended consumer forced to present them identically renders a
+	// permanent caveat as an incident. The human summary splits them out; this is the same
+	// split for the reader nobody eyeballs.
+	//
+	// VERBATIM, with usage.Snapshot's own key spellings and its own field name: the schema
+	// rule is one vocabulary from parser to aggregate to ledger to CLI, so a reason string
+	// here has to be the reason string on the wire and in pricing.ReasonOutputUncounted.
+	//
+	// ABSENT IS NOT A CLAIM OF EXACTNESS, and a consumer must not read it as one. It is
+	// never present on a ledger-backed window — "today" and "7d", this command's default
+	// and its only durable windows — because the reason is no part of a persisted row's
+	// key, so a per-minute row cannot say which way its inexact figures were inexact.
+	// Totals.IncompleteRequests is the field that answers exactness on both window kinds.
+	// omitempty for that reason as much as for tidiness: a response carrying no reasons is
+	// byte-identical to what this printed before.
+	IncompleteBy map[string]int64 `json:"incompleteBy,omitempty"`
 	// Degraded says the totals above are MISSING ROWS — a day file that lost lines, or one
 	// whose scan was abandoned part-way — so CostMicros is short by an amount nothing in
 	// this document can state. See costDegradedText for the claim in full and for why it is
@@ -196,12 +227,13 @@ func writeCostJSON(snap *usage.Snapshot, stdout, stderr io.Writer) int {
 	enc := json.NewEncoder(stdout)
 	enc.SetIndent("", "  ")
 	out := costJSON{
-		Window:     snap.Window,
-		Priced:     snap.Priced,
-		Totals:     snap.Totals,
-		PricedBy:   snap.PricedBy,
-		UnpricedBy: snap.UnpricedBy,
-		Degraded:   snap.Degraded,
+		Window:       snap.Window,
+		Priced:       snap.Priced,
+		Totals:       snap.Totals,
+		PricedBy:     snap.PricedBy,
+		UnpricedBy:   snap.UnpricedBy,
+		IncompleteBy: snap.IncompleteBy,
+		Degraded:     snap.Degraded,
 	}
 	if err := enc.Encode(out); err != nil {
 		fmt.Fprintf(stderr, "abctl cost: writing JSON: %v\n", err)
@@ -281,6 +313,19 @@ func writeCostSummary(snap *usage.Snapshot, stdout io.Writer) {
 	if t.IncompleteRequests > 0 {
 		fmt.Fprintf(stdout, "  ! %s of %s priced requests carry an inexact figure — the total is not exact\n",
 			plainCount(t.IncompleteRequests), plainCount(t.PricedRequests))
+		// WHICH WAY, indented under the count that says HOW MANY. "At least $12.40" and
+		// "roughly $12.40" are different claims about money, and the line above can only
+		// make the weaker one: a floor will be exceeded, where an approximation is off in
+		// no known direction.
+		//
+		// Nothing at all when the reasons are absent — which is the COMMON case here, since
+		// today and 7d are ledger-backed and a persisted row has no reason column. Absence
+		// is not exactness (the line above still stands) and it is not silence about
+		// something known; there is nothing to say, so this says nothing rather than
+		// printing a reason it does not have.
+		for _, line := range costIncompleteReasonLines(snap.IncompleteBy) {
+			fmt.Fprintf(stdout, "    · %s\n", line)
+		}
 	}
 	if gap := t.PriceableRequests - t.PricedRequests; gap > 0 {
 		fmt.Fprintf(stdout, "  ! %s of %s priceable requests unpriced — the total covers only the priced ones\n",
@@ -348,6 +393,94 @@ func plainPlural(n int64) string {
 		return ""
 	}
 	return "s"
+}
+
+// costIncompleteReasons is the prose for each reason usage.Snapshot.IncompleteBy keys on,
+// in the ORDER this command prints them: the floor first, because it is the stronger claim
+// and the one with a direction, then the approximation, then a caveat whose kind nobody
+// named.
+//
+// The keys come from pricing rather than being spelled here, so the strings this matches on
+// are the same constants the producer writes. "unlabelled" is the exception and has to be a
+// literal: usage keeps that key unexported (usage.Snapshot.IncompleteBy's own doc names it),
+// and inventing a second spelling of it is precisely the drift the shared-vocabulary rule
+// exists to stop.
+//
+// Both grammatical numbers written out rather than assembled from plainPlural, because these
+// sentences change more than an "s": "1 is a lower bound" against "2 are lower bounds", and a
+// caveat about money that reads as a typo is a caveat an operator discounts.
+var costIncompleteReasons = []struct {
+	key      string
+	singular string
+	plural   string
+}{
+	{
+		key: pricing.ReasonOutputUncounted,
+		singular: "1 is a LOWER BOUND — a stream ended before its output count arrived, " +
+			"so the real total is higher",
+		plural: "%s are LOWER BOUNDS — a stream ended before its output count arrived, " +
+			"so the real total is higher",
+	},
+	{
+		key: pricing.ReasonSplitUnreported,
+		singular: "1 is an APPROXIMATION — a gateway reported only a total, so the figure is " +
+			"off in no known direction; a standing property of that gateway, not an incident",
+		plural: "%s are APPROXIMATIONS — a gateway reported only a total, so the figures are " +
+			"off in no known direction; a standing property of that gateway, not an incident",
+	},
+	{
+		key: "unlabelled",
+		singular: "1 carries a caveat whose kind its producer did not name — no direction " +
+			"can be read into it",
+		plural: "%s carry a caveat whose kind their producer did not name — no direction " +
+			"can be read into them",
+	},
+}
+
+// costIncompleteReasonLines renders IncompleteBy as one line per reason, or nothing at all
+// when there are no reasons.
+//
+// Nothing, not a line saying so. Absence is the normal case on this command's own default
+// window — "today" and "7d" are ledger-backed and a persisted row has no reason column — and
+// usage.Snapshot.IncompleteBy's doc is explicit that absence is NOT a claim of exactness.
+// The count line above states the inexactness on both window kinds; this only ever adds
+// which way, and where that is unknown it adds nothing rather than guessing a direction.
+//
+// A reason this build does not recognise is PRINTED, under its own key, never dropped. The
+// map's counts sum to Counts.IncompleteRequests by contract, so a dropped key would leave a
+// reader's own subtraction implying some of those figures were exact — the one reading this
+// whole disclosure exists to prevent. Unknown keys are sorted so the output is stable for a
+// reader diffing two runs.
+func costIncompleteReasonLines(by map[string]int64) []string {
+	if len(by) == 0 {
+		return nil
+	}
+	var out []string
+	known := make(map[string]bool, len(costIncompleteReasons))
+	for _, r := range costIncompleteReasons {
+		known[r.key] = true
+		n, ok := by[r.key]
+		if !ok || n <= 0 {
+			continue
+		}
+		if n == 1 {
+			out = append(out, r.singular)
+			continue
+		}
+		out = append(out, fmt.Sprintf(r.plural, plainCount(n)))
+	}
+	var rest []string
+	for k := range by {
+		if !known[k] && by[k] > 0 {
+			rest = append(rest, k)
+		}
+	}
+	sort.Strings(rest)
+	for _, k := range rest {
+		out = append(out, fmt.Sprintf("%s inexact under %q, a reason this build does not know",
+			plainCount(by[k]), k))
+	}
+	return out
 }
 
 // costWindowLabel tidies a duration window for reading and passes anything else

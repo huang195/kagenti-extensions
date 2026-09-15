@@ -913,3 +913,38 @@ func TestWriter_UnrecognisedAgentStoresItsRawLabel(t *testing.T) {
 		t.Errorf("Agent = %q, want the raw UA", rows[0].Agent)
 	}
 }
+
+// TestRecord_PricedImpliesPriceable pins the subset relation the coverage arithmetic
+// depends on.
+//
+// A body-less response carrying the gateway's own cost header is PRICED with no parsed
+// token counts, so the model-and-tokens test that sets PriceableRequests does not fire.
+// Before the fix that left PricedRequests=1 against PriceableRequests=0, which inverts
+// the subset and makes every consumer's `priceable - priced` gap NEGATIVE — failing
+// their `> 0` test, so the coverage warning disappeared exactly when there was
+// something to warn about.
+func TestRecord_PricedImpliesPriceable(t *testing.T) {
+	dir := t.TempDir()
+	w := newTestWriter(t, dir, func() time.Time { return at })
+	// in=0, out=0 so TotalTokens is 0: a body-less response the gateway priced by header,
+	// which is exactly the traffic "Charge a body-less response that carries a cost
+	// header" started charging.
+	w.Record("s1", costedEvent(t, "gw.example", "claude-sonnet-5", 0.25, 0, 0))
+	if err := w.Flush(); err != nil {
+		t.Fatalf("Flush: %v", err)
+	}
+	rows := readAllRows(t, dir)
+	if len(rows) != 1 {
+		t.Fatalf("got %d rows, want 1", len(rows))
+	}
+	r := rows[0]
+	if r.PricedRequests != 1 {
+		t.Fatalf("PricedRequests = %d, want 1 — the cost header is the whole point of this case", r.PricedRequests)
+	}
+	if r.PriceableRequests < r.PricedRequests {
+		t.Errorf("PriceableRequests = %d against PricedRequests = %d: priced must be a SUBSET of "+
+			"priceable, or every consumer's priceable-minus-priced gap goes NEGATIVE, fails its `> 0` "+
+			"test, and suppresses the coverage warning exactly when there is something to warn about",
+			r.PriceableRequests, r.PricedRequests)
+	}
+}

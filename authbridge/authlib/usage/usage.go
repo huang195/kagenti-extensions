@@ -302,8 +302,9 @@ type bucket struct {
 // coming from a single place.
 //
 // Traffic neither path could price contributes no cost and is visible as the gap
-// between Counts.PricedRequests and Counts.Requests; Snapshot.UnpricedBy names the
-// endpoint/model pairs involved. See
+// between Counts.PricedRequests and Counts.PriceableRequests — NOT against
+// Counts.Requests, which counts traffic that could never have carried a price and so
+// never reaches parity; Snapshot.UnpricedBy names the endpoint/model pairs involved. See
 // docs/superpowers/specs/2026-09-09-pricing-consolidation-design.md.
 type eventCost struct {
 	micros int64

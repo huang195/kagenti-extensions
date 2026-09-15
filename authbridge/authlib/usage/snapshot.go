@@ -142,10 +142,15 @@ type Snapshot struct {
 	// was free".
 	//
 	// True does NOT mean every request was priced. Compare Totals.PricedRequests
-	// against Totals.Requests: cost comes from a plugin that may not be in the
-	// pipeline for all traffic, and once rates are per-endpoint a deployment can
+	// against Totals.PriceableRequests: cost comes from a plugin that may not be in
+	// the pipeline for all traffic, and once rates are per-endpoint a deployment can
 	// price some endpoints and not others. Where those differ the dollar total
 	// covers only the priced subset, and a client showing it must say so.
+	//
+	// PRICEABLE, not Requests. Requests counts every proxied response — MCP tool
+	// calls, health checks, tunnels — none of which can ever carry a price, so that
+	// denominator makes a correctly configured deployment report itself incomplete
+	// forever. See Counts.PriceableRequests, which exists for this.
 	//
 	// Nor does it mean the total is EXACT. Totals.IncompleteRequests counts priced
 	// requests whose figure is a lower bound (a stream truncated before its output

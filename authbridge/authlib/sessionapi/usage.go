@@ -158,11 +158,20 @@ import (
 // settled record to enforce a budget rather than computing a figure of its own.
 //
 // Requests that arrive with no settled figure contribute no cost and appear as the gap
-// between totals.pricedRequests and totals.requests. Where those differ the
+// between totals.pricedRequests and totals.priceableRequests. Where those differ the
 // dollar total covers only the priced subset, so a client rendering it must
 // present it as partial rather than complete. priced:false means nothing at all
 // was priced — render "cost unavailable", never $0.00, which would read as "this
 // traffic was free".
+//
+// PRICEABLE is the denominator, never requests. requests counts every proxied
+// response, including MCP tool calls, health checks and tunnels, none of which can
+// ever carry a price — so priced-over-requests never reaches parity and a client
+// obeying it would mark every total "partial" forever, which trains a reader to
+// ignore the one caveat that matters. This paragraph named the wrong pair until it
+// was corrected; the agreeing statement is on totals.priceableRequests, and both this
+// endpoint's own clients (abctl's spend strip and `abctl cost`) use the priceable
+// pair.
 //
 // Traffic that carries no settled figure is still priced here, from the process
 // rate table: the pricing resolver has landed, so modelled rates are no longer

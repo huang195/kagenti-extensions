@@ -394,10 +394,44 @@ type dayIssues struct {
 //
 // The cost is that retention is measured from the ledger's newest DATA rather than
 // from the clock, so an ARCHIVE nothing writes to any more keeps its last retainDays
-// files instead of emptying out. The disk bound is unchanged — at most retainDays
-// files survive, because they all have to sit within the window ending at the newest
-// one — and the moment writing resumes, today becomes the newest day and the old era
-// ages out normally.
+// files instead of emptying out. The moment writing resumes, today becomes the newest
+// day and the old era ages out normally.
+//
+// THE FUTURE END IS PRUNED TOO, AND THE TWO DIRECTIONS ARE NOT SYMMETRIC.
+//
+// A file dated in the PAST beyond the window is ordinary: history ages out, which is
+// what retention is for, and the only real question is whether the clock or the ledger's
+// own newest day is the better reading of "now" — which the floor above answers.
+//
+// A file dated in the FUTURE cannot be ordinary. A day file exists only because
+// something wrote a row it dated that day, so a date ahead of the clock means the clock
+// was ahead when that row was written and has since been corrected. Nothing could ever
+// reclaim it: the floor only ever LOWERS the reference day, and a future date is never
+// Before a cutoff derived from it, so ONE skewed write left that file in the directory
+// for as long as the directory lived and the guarantee "at most retainDays files
+// survive" quietly stopped holding. Ordinary retention kept advancing, which is why this
+// was a leak rather than a freeze, and why nothing surfaced it.
+//
+// THE HORIZON IS A WHOLE RETENTION WINDOW AHEAD, not tomorrow, because the near future
+// is not evidence of anything. A clock a few seconds fast across midnight writes a real
+// minute of spend into tomorrow's file, and a clock that steps BACK — a restored VM
+// snapshot, an NTP correction after a resume — makes several days of genuine history
+// look future-dated. Everything within retainDays of the clock's day is swept by
+// ordinary retention as the clock advances into it, so it needs no rule here; only a
+// file that would outlive the entire window is deleted. See
+// TestPrune_ADayFileWithinTheWindowAheadOfTheClockIsKept.
+//
+// What that costs, stated rather than left to be discovered: while such a file exists
+// the surviving set spans [cutoff, horizon], so the disk bound is twice retainDays
+// rather than exactly retainDays — bounded and said out loud, where before it was
+// unbounded and silent. Reaching the bound takes one skewed write per day of it.
+//
+// The residual is a clock that steps BACKWARD BY MORE THAN THE WHOLE WINDOW (a dead RTC
+// reading 1970, a long-stale snapshot): its genuine files read as artefacts here and are
+// deleted. Deliberate, and the lesser harm — while that clock stands, no window it can
+// express reaches those rows anyway, so what is lost is data already unreadable, and the
+// removal is logged at Warn naming the file. Fixing the clock before the next prune
+// keeps them.
 func (s *store) prune(now time.Time) error {
 	entries, err := os.ReadDir(s.dir)
 	if err != nil {
@@ -455,11 +489,29 @@ func (s *store) prune(now time.Time) error {
 		}
 	}
 	cutoff := ref.AddDate(0, 0, -(s.retainDays - 1))
+	// The other end of the window. Measured from the CLOCK's day rather than from ref: ref
+	// is deliberately the older of the two readings, and using it here would move the
+	// horizon backwards on an idle ledger and start condemning days that are merely newer
+	// than the last one written. See the doc above for why this end exists at all and why
+	// it sits a whole retention window out.
+	horizon := s.dayOf(now).AddDate(0, 0, s.retainDays)
 
 	var firstErr error
 	for _, d := range days {
-		if !d.day.Before(cutoff) {
+		future := d.day.After(horizon)
+		if !d.day.Before(cutoff) && !future {
 			continue
+		}
+		if future {
+			// Worth a line per file, and there can only be a handful: a day file dated past the
+			// whole retention window is a host-clock fault, and it is the only case here where
+			// what is deleted is not simply old.
+			slog.Warn("costledger: deleting a day file dated further ahead than retention could "+
+				"ever reclaim; its rows were written by a clock that was wrong",
+				"file", d.name, "clockDay", s.dayOf(now).Format(dayLayout),
+				"horizon", horizon.Format(dayLayout), "retainDays", s.retainDays,
+				"cause", "the host clock was stepped forward when those rows were recorded, or has since stepped back",
+				"effect", "those rows are unreadable by any window this clock can express and are now gone")
 		}
 		if rerr := os.Remove(filepath.Join(s.dir, d.name)); rerr != nil && firstErr == nil {
 			firstErr = rerr

@@ -4,12 +4,14 @@ import (
 	"encoding/json"
 	"fmt"
 	"math"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/rossoctl/cortex/authbridge/authlib/costevent"
 	"github.com/rossoctl/cortex/authbridge/authlib/pipeline"
+	"github.com/rossoctl/cortex/authbridge/authlib/pricing"
 )
 
 // fixedClock returns a controllable now, so bucket boundaries are exact rather
@@ -747,6 +749,53 @@ func inferenceEvent(model string, in, cacheRead, cacheWrite, out, reasoning int,
 			TotalTokens:      in + cacheRead + cacheWrite + out,
 			PresentKinds:     kinds,
 		},
+	}
+}
+
+// TestFoldInto_CarriesEveryCountsField is the STRUCTURAL guard behind the warning in
+// Counts.Add's own doc: a hand-written summation of this struct is where a field added to
+// it goes missing, and the copy that hand-summed the fields once silently dropped
+// PricedRequests under a comment saying every field had to be carried.
+//
+// foldInto still constructs a Counts by hand — the per-request values have to come from
+// somewhere — but it no longer RE-ENUMERATES the token split, which it used to build twice
+// in one function: once as `split` and again field by field inside the literal. Add carries
+// that half now, so a field added to Counts and wired into Add reaches the bucket with no
+// edit here.
+//
+// Reflection rather than a list of names, because a list is the thing that goes stale. One
+// event carrying every countable field non-zero, and every field of the bucket total must
+// come back non-zero: a new field lands here as a failure until it is either populated in
+// the fold or deliberately accounted for.
+func TestFoldInto_CarriesEveryCountsField(t *testing.T) {
+	now := time.Now().Truncate(BucketWidth)
+	a := New(WithClock(func() time.Time { return now }))
+
+	// Every field at once, which takes one carefully built event: a 5xx (Errors) that
+	// nonetheless carries a full token split (the five token fields, PresentKinds, Tokens)
+	// and a published cost record that is settled, priced and disclosed inexact (CostMicros,
+	// PricedRequests, PriceableRequests, IncompleteRequests). Nothing here is decorative.
+	e := inferenceEvent("claude-opus-5", 100, 2000, 50, 30, 12, 0b11111)
+	e.At = now
+	e.StatusCode = 500
+	raw, err := json.Marshal(costevent.Event{
+		CostUSD: 0.005, Source: costevent.SourceUsageFallback, Provenance: "configured",
+		Settled: true, Incomplete: true, IncompleteReason: pricing.ReasonOutputUncounted,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	e.Plugins = map[string]json.RawMessage{costevent.Key: raw}
+
+	a.Record("s1", e)
+	totals := a.Snapshot(10*BucketWidth, BucketWidth, "s1", GroupNone).Totals
+
+	v := reflect.ValueOf(totals)
+	for i := 0; i < v.NumField(); i++ {
+		if v.Field(i).IsZero() {
+			t.Errorf("Counts.%s came back zero: the fold does not carry it, so this field is absent from every /v1/usage total. Carry it in foldInto (the token split rides along via Counts.Add) or, if one event genuinely cannot populate it, say so here.",
+				v.Type().Field(i).Name)
+		}
 	}
 }
 

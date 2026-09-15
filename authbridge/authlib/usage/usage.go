@@ -124,6 +124,12 @@ type Counts struct {
 	// gateway reported only a total. costevent.Event.IncompleteReason carries which, per
 	// request; this counter is the aggregate's answer to "is this dollar total exact".
 	//
+	// HOW MANY, not in which way. The two readings are different claims about money — a
+	// floor means the real figure is higher, an approximation means it is off in no known
+	// direction — and this counter cannot tell them apart because it is one number.
+	// Snapshot.IncompleteBy carries the split, keyed on the reason, and its counts sum to
+	// this one.
+	//
 	// A SUBSET of PricedRequests, never a sibling of it. Their dollars are in CostMicros
 	// and the requests are in PricedRequests, because both of those are true; the
 	// disclosure rides alongside instead of subtracting from either. That is the same
@@ -290,6 +296,19 @@ type bucket struct {
 	// same counts but a coverage gap, and a client needs it whichever grouping it
 	// asked for.
 	byUnpriced map[string]Counts
+	// byIncomplete tallies inexact figures by WHICH WAY they are inexact, keyed on
+	// costevent.Event.IncompleteReason. Outside the Group machinery for the same
+	// reason as the two above: it qualifies the dollar total, so a client needs it
+	// whichever grouping it asked for.
+	//
+	// Counts.IncompleteRequests answers how many; this answers in which way, and the
+	// two are different claims about money. A floor (a stream that died before its
+	// output count) means the real figure is HIGHER — "at least $X" — while an
+	// approximation (a gateway reporting only a total) means it is off in NO KNOWN
+	// DIRECTION — "roughly $X". A client that can only see the count has to render
+	// both the same way, which is how a permanent property of a gateway comes to read
+	// as an incident.
+	byIncomplete map[string]Counts
 }
 
 // eventCost is one event's settled cost, decoded once per Record and passed to
@@ -325,6 +344,13 @@ type eventCost struct {
 	// only the claim of exactness is withdrawn. See Counts.IncompleteRequests and
 	// costevent.Event.Incomplete.
 	incomplete int64
+	// incompleteReason names WHICH WAY micros is inexact — pricing.ReasonOutputUncounted
+	// for a floor, pricing.ReasonSplitUnreported for an approximation — so the aggregate
+	// can report the two separately instead of collapsing them into the counter's one
+	// bit. Empty for an exact figure, and never empty when incomplete is 1: see
+	// unlabelledReason for the case where the producer disclosed the caveat and not the
+	// reason.
+	incompleteReason string
 	// priceable is 1 when the request carried a model and tokens, so it belongs in
 	// the coverage denominator whether or not a rate was found.
 	priceable int64
@@ -363,7 +389,7 @@ func (a *Aggregator) costOf(e *pipeline.SessionEvent) eventCost {
 			// An event from a producer predating the field. It is a settled figure,
 			// so the honest label is authoritative-or-modelled-unknown rather than
 			// silently claiming either.
-			prov = "unlabelled"
+			prov = unlabelledLabel
 		}
 		ec := eventCost{micros: ce.Micros(), priced: 1, priceable: 1, provenance: prov}
 		if ce.Incomplete {
@@ -373,6 +399,15 @@ func (a *Aggregator) costOf(e *pipeline.SessionEvent) eventCost {
 			// adjusting any of the three would be the worse answer, and
 			// Counts.IncompleteRequests for what a client does with this.
 			ec.incomplete = 1
+			// The REASON travels with the count, because a floor and an approximation are
+			// different claims about money — see bucket.byIncomplete. The producer sends
+			// both fields together (costing.Settle sets neither alone), so an empty reason
+			// here means an event from a producer predating IncompleteReason; labelled
+			// rather than dropped, for the reason unlabelledLabel gives.
+			ec.incompleteReason = ce.IncompleteReason
+			if ec.incompleteReason == "" {
+				ec.incompleteReason = unlabelledLabel
+			}
 		}
 		return ec
 	}
@@ -436,11 +471,29 @@ func (a *Aggregator) costOf(e *pipeline.SessionEvent) eventCost {
 	// reaching this fallback is priced prompt-only exactly as it would have been by the
 	// producer — so leaving the test on one side of the fork would disclose the caveat
 	// for one of the two ways a figure can arrive and not the other.
-	if pricing.IncompleteReason(e.Inference) != "" {
-		ec.incomplete = 1
+	//
+	// The reason is kept, not just the bit: this arm has the actual answer in hand —
+	// pricing.IncompleteReason returns which of the two it is — and throwing it away here
+	// would make a fallback-priced window unable to say what a producer-priced one can.
+	if reason := pricing.IncompleteReason(e.Inference); reason != "" {
+		ec.incomplete, ec.incompleteReason = 1, reason
 	}
 	return ec
 }
+
+// unlabelledLabel is the reserved key for a caveat a producer disclosed WITHOUT saying
+// which kind it was: an event from a version predating the field that names it.
+//
+// One spelling for both maps that need one — PricedBy's provenance and IncompleteBy's
+// reason — because it is the same situation in both: the producer stated the fact and not
+// the label. It cannot collide with a real value; pricing's reasons are hyphenated
+// lowercase ("output-uncounted", "split-unreported") and its provenance levels are
+// ("authoritative", "configured", "discovered", "bundled").
+//
+// LABELLED, never dropped, so IncompleteBy's counts sum to Counts.IncompleteRequests. A
+// client subtracting the map from the counter to find "the rest" must get zero; silently
+// omitting a row would make that difference read as requests whose figures are exact.
+const unlabelledLabel = "unlabelled"
 
 // Aggregator is a fixed ring of per-minute buckets. Safe for concurrent use.
 //
@@ -770,18 +823,31 @@ func (a *Aggregator) foldInto(ring []bucket, t time.Time, sessionID string, e *p
 		PricedRequests:     ec.priced,
 		IncompleteRequests: ec.incomplete,
 		PriceableRequests:  ec.priceable,
-		InputTokens:        split.InputTokens,
-		CacheReadTokens:    split.CacheReadTokens,
-		CacheWriteTokens:   split.CacheWriteTokens,
-		OutputTokens:       split.OutputTokens,
-		ReasoningTokens:    split.ReasoningTokens,
-		PresentKinds:       split.PresentKinds,
 	}
+	// The split is CARRIED rather than re-enumerated. Add is the one summation over
+	// Counts' fields, for the reason its own doc gives — the copy that hand-summed them
+	// silently missed PricedRequests when it was added — and re-listing six of them here
+	// was the same exposure at the same distance: a field added to Counts and wired into
+	// Add would still have been dropped on the floor by this literal, and nothing would
+	// have failed.
+	//
+	// Behaviour-identical, not merely equivalent-looking: split is only ever built from
+	// the token counters above, so every other field is zero on one side of Add's `+=`,
+	// and PresentKinds is `0 | x`. Errors is set below and so is unaffected by the order.
+	one.Add(split)
 	if ec.unpricedKey != "" {
 		addLabel(&b.byUnpriced, truncateLabel(ec.unpricedKey), Counts{Requests: 1})
 	}
 	if ec.provenance != "" {
 		addLabel(&b.byProvenance, truncateLabel(ec.provenance), Counts{Requests: 1})
+	}
+	// Keyed on the reason, counted per request: Counts.IncompleteRequests above says how
+	// many figures are inexact, and this says in which way — "at least $X" versus "roughly
+	// $X", which are different claims about money. Non-empty exactly when incomplete is 1
+	// (costOf labels an unlabelled caveat rather than dropping it), so these counts sum to
+	// IncompleteRequests.
+	if ec.incompleteReason != "" {
+		addLabel(&b.byIncomplete, truncateLabel(ec.incompleteReason), Counts{Requests: 1})
 	}
 	if e.StatusCode >= 400 || e.Phase == pipeline.SessionDenied {
 		one.Errors = 1

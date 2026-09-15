@@ -187,6 +187,36 @@ type Snapshot struct {
 	// Summed from the raw buckets alongside Totals, so it is unaffected by the
 	// requested resolution.
 	PricedBy map[string]int64 `json:"pricedBy,omitempty"`
+	// IncompleteBy counts the priced requests whose figure is INEXACT, keyed by WHICH WAY
+	// it is inexact — "output-uncounted" for a lower bound (a stream that died before its
+	// output count, so the true figure is HIGHER), "split-unreported" for an approximation
+	// (a gateway reporting only a total, so it is off in no known direction), or
+	// "unlabelled" for a caveat a producer disclosed without naming its kind. See
+	// pricing.ReasonOutputUncounted and pricing.ReasonSplitUnreported.
+	//
+	// Totals.IncompleteRequests answers HOW MANY; this answers IN WHICH WAY, and the two
+	// are different claims about money. "At least $12.40" and "roughly $12.40" cannot be
+	// rendered the same way: one is a bound that will be exceeded and is usually a
+	// transient failure worth chasing, the other a standing property of a gateway that
+	// holds for every request it answers. A client that can see only the count has to
+	// present them identically, which is how a permanent caveat comes to read as an
+	// incident.
+	//
+	// Its counts SUM to Totals.IncompleteRequests. An inexact figure whose producer named
+	// no reason is counted under "unlabelled" rather than omitted, so a client subtracting
+	// the map from the counter gets zero and cannot mistake a dropped row for a request
+	// whose figure is exact.
+	//
+	// Present only when something was inexact — and never present at all on a
+	// LEDGER-backed window, where a per-minute row carries IncompleteRequests but not the
+	// reason: the reason is no part of that row's (endpoint, model, agent, provenance) key,
+	// so a persisted row cannot say which way its inexact figures were inexact. Absence is
+	// therefore not a claim that every figure is exact; Totals.IncompleteRequests answers
+	// that, and both window kinds populate it.
+	//
+	// Summed across the window from the raw buckets, so it is unaffected by the requested
+	// resolution, exactly like Totals and the two maps above.
+	IncompleteBy map[string]int64 `json:"incompleteBy,omitempty"`
 	// Degraded reports that this answer is known to be MISSING ROWS, and is absent
 	// whenever it is not.
 	//
@@ -528,6 +558,15 @@ func (a *Aggregator) Snapshot(window, resolution time.Duration, sessionID string
 						out.PricedBy = make(map[string]int64, len(src.byProvenance))
 					}
 					out.PricedBy[k] += v.Requests
+				}
+				// Same shape, same reason: summed from the raw buckets so the caveat's
+				// breakdown is unaffected by the requested resolution, and left nil rather
+				// than emitted empty so absence is not read as "checked, all exact".
+				for k, v := range src.byIncomplete {
+					if out.IncompleteBy == nil {
+						out.IncompleteBy = make(map[string]int64, len(src.byIncomplete))
+					}
+					out.IncompleteBy[k] += v.Requests
 				}
 			}
 		}

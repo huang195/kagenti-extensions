@@ -345,6 +345,31 @@ func startOfToday(t *testing.T) time.Time {
 	return spec.From
 }
 
+// insideToday is an instant `into` after today began, CLAMPED TO NOW so it is always inside
+// the window a window=today request will actually serve.
+//
+// The clamp is the whole helper. "today" is a boundary, not a length, so during the first
+// `into` of any local day the offset lands in the FUTURE: the row is outside [From, now], the
+// total comes back zero, and the test fails as though routing or grouping were broken. Two
+// tests each carried their own version of this guard and a third carried none. MEASURED with
+// the third: this suite under TZ=Asia/Beirut at 00:20 local, where a three-hour offset put
+// the fixture at 03:00 while window=today ended at 00:20, and
+// TestHandleUsage_ALedgerWindowSaysWhichGroupingItCouldApply reported
+// "totals.costMicros = 0, want 1000000" — an assertion about grouping, failing for a reason
+// that has nothing to do with grouping, on two mornings' worth of clock a day.
+//
+// Clamping to now rather than skipping: the row still lands in today's day file at an instant
+// the request covers, so the test measures what it is for. Only the OFFSET is approximate,
+// and no assertion depends on it.
+func insideToday(t *testing.T, into time.Duration) time.Time {
+	t.Helper()
+	at := startOfToday(t).Add(into)
+	if now := time.Now(); at.After(now) {
+		return now
+	}
+	return at
+}
+
 // mustZone loads a real zone, FAILING rather than skipping when it cannot.
 //
 // t.Fatalf, deliberately: a skip would report success for a test that never ran the code it
@@ -378,15 +403,27 @@ func mustZone(t *testing.T, name string) *time.Location {
 // begins at 01:00 on 2026-03-08 — an hour and fifty-eight minutes outside it, on the wrong
 // date, in the wrong day file.
 func TestStartOfToday_TheFixtureAnchorLandsInsideTheWindowItIsQueriedWith(t *testing.T) {
-	// The live clock, which is what the fixtures actually use.
+	// The live clock, which is what the fixtures actually use, and BOTH ends of the window.
+	// The lower bound is the boundary defect; the upper bound is the clamp, which matters for
+	// the first hours of every local day and is what TZ=Asia/Beirut at 00:20 found.
 	spec, err := usage.ParseWindowSpec(usage.WindowToday, time.Now())
 	if err != nil {
 		t.Fatalf("ParseWindowSpec: %v", err)
 	}
-	at := startOfToday(t).Add(2 * time.Minute)
-	if at.Before(spec.From) {
-		t.Errorf("the anchor fixtures are written at (%v) is before window=today begins (%v), "+
-			"so their rows are filed under a day the request never reads", at, spec.From)
+	for _, into := range []time.Duration{2 * time.Minute, 3 * time.Hour} {
+		at := insideToday(t, into)
+		if at.Before(spec.From) {
+			t.Errorf("the anchor %v after the day began (%v) is before window=today begins (%v), "+
+				"so a row written there is filed under a day the request never reads",
+				into, at, spec.From)
+		}
+		// Re-read rather than reusing spec.To: it can only have moved later, so this cannot
+		// fail for having taken time.
+		if now := time.Now(); at.After(now) {
+			t.Errorf("the anchor %v after the day began (%v) is in the future (now %v), so a row "+
+				"written there falls outside the window and the total comes back zero",
+				into, at, now)
+		}
 	}
 
 	// America/Havana shifts AT 00:00, so 2026-03-08 has no midnight at all.
@@ -739,14 +776,9 @@ func TestHandleUsage_ACorruptLedgerLineIsDisclosedInTheResponse(t *testing.T) {
 	// crosses the day boundary for the first two minutes of every day: the row lands in
 	// yesterday's day file while window=today asks about this one, and the test fails for
 	// a reason that has nothing to do with what it is checking. `today` is a boundary, not a
-	// length, so a fixture near it has to be anchored to the boundary rather than to now —
-	// and to the SAME boundary, which is why startOfToday delegates.
-	when := startOfToday(t).Add(2 * time.Minute)
-	if now := time.Now(); when.After(now) {
-		// Guards the other end: inside the first two minutes of the day the anchor would be
-		// in the future, and a future row falls outside [start of day, now].
-		when = now
-	}
+	// length, so a fixture near it has to be anchored to the boundary rather than to now, and
+	// to the SAME boundary — see insideToday, which also handles the other end.
+	when := insideToday(t, 2*time.Minute)
 	// An explicit dir rather than newTestLedger's hidden t.TempDir(), because this test
 	// has to reach the day file the writer produced.
 	dir := t.TempDir()

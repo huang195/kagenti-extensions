@@ -725,45 +725,94 @@ func TestRecord_AfterCloseIsCountedRatherThanParkedInTheQueue(t *testing.T) {
 	}
 }
 
-// The other half of J2: a batch that reaches the queue between Close's drain and the
-// point at which enqueue starts counting is unwritable, and so is a row a racing
-// Record folds back into the accumulator after Close's Flush emptied it. Both are
-// hand-seeded here, because the real race is a few instructions wide.
-func TestClose_CountsWhatIsLeftInTheQueueAndTheAccumulator(t *testing.T) {
+// The other half of J2: a row a Record folds back into the accumulator AFTER Close's
+// Flush has emptied it can never be written by anyone, so Close has to count it.
+//
+// THE RACE IS DRIVEN, not simulated: the clock is called on the writer goroutine, so a
+// clock parked there until quit closes runs its Record at exactly the moment Close is
+// past its Flush and not yet at its accounting. Asserting abandon()'s return value
+// instead would not pin the thing that was broken — Close ignoring what abandon found —
+// and a mutation proved it: dropping the Add left that assertion passing.
+func TestClose_CountsARowThatRacedItsFlush(t *testing.T) {
+	dir := t.TempDir()
+	var wp atomic.Pointer[Writer]
+	var armed, parked, raced atomic.Bool
+	// Built here rather than on the writer goroutine, so no t.Fatalf can fire off-test.
+	late := costedEvent(t, "gw", "m", 0.25, 100, 50)
+
+	clock := func() time.Time {
+		w := wp.Load()
+		if w == nil || !armed.CompareAndSwap(false, true) {
+			return at
+		}
+		parked.Store(true)
+		select {
+		case <-w.quit:
+			// Close has flushed and asked the goroutine to stop. A Record landing now is one
+			// that raced the shutdown: the accumulator was emptied a moment ago, so this row
+			// exists only in a map nothing will ever write.
+			w.Record("s1", late)
+			raced.Store(true)
+		case <-time.After(5 * time.Second):
+		}
+		return at
+	}
+
+	w, err := New(dir, WithClock(clock), WithSettleInterval(time.Millisecond))
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	wp.Store(w)
+	for deadline := time.Now().Add(2 * time.Second); !parked.Load(); {
+		if time.Now().After(deadline) {
+			t.Fatal("the writer goroutine never reached the clock; the settle tick is not running")
+		}
+		time.Sleep(time.Millisecond)
+	}
+
+	if cerr := w.Close(); cerr != nil {
+		t.Fatalf("Close: %v", cerr)
+	}
+	if !raced.Load() {
+		t.Fatal("the racing Record never ran; this test is not measuring what it claims")
+	}
+	if got := w.Dropped(); got != 1 {
+		t.Errorf("Dropped() = %d, want 1; the row is in no queue, no file and no map, and "+
+			"Dropped() is the only signal that says so", got)
+	}
+	if held, _ := w.pending(); len(held) != 0 {
+		t.Errorf("the accumulator still holds %d rows after Close; they would be counted twice "+
+			"if a later Flush wrote them", len(held))
+	}
+}
+
+// abandon's own arithmetic, over both places a row can be stranded. Separate from the
+// test above because that one can only stage the accumulator half.
+func TestAbandon_CountsTheQueueAndTheAccumulator(t *testing.T) {
 	dir := t.TempDir()
 	now := at
 	w, err := New(dir, WithClock(func() time.Time { return now }), WithSettleInterval(0))
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
-
-	// Two rows the writer goroutine will never see, exactly as a send landing in the
-	// window Close cannot close would leave them. Queued before Close so the drain
-	// WRITES them; the accumulator row below is the one Close has to count.
-	w.Record("s1", costedEvent(t, "gw", "opus", 0.25, 100, 50))
-	w.Record("s1", costedEvent(t, "gw", "sonnet", 0.25, 100, 50))
-
 	if cerr := w.Close(); cerr != nil {
 		t.Fatalf("Close: %v", cerr)
 	}
-	// Close flushed both, so nothing is lost yet.
-	if got := w.Dropped(); got != 0 {
-		t.Fatalf("Dropped() = %d before anything was lost", got)
-	}
 
-	// Now the two states Close has to account for, seeded directly.
-	w.ops <- batch{rows: []Row{{At: at, Endpoint: "gw", Model: "haiku"}}}
+	// One batch of two rows stranded in the queue, one row stranded in the accumulator.
+	w.ops <- batch{rows: []Row{
+		{At: at, Endpoint: "gw", Model: "haiku"},
+		{At: at, Endpoint: "gw", Model: "sonnet"},
+	}}
 	w.mu.Lock()
 	w.rows[key{endpoint: "gw", model: "opus"}] = &Row{At: at, Endpoint: "gw", Model: "opus"}
 	w.mu.Unlock()
 
-	// A second Close is a no-op (closeOnce), so drive the accounting directly — this is
-	// the code Close runs after wg.Wait.
-	if lost := w.abandon(); lost != 2 {
-		t.Errorf("abandon() = %d, want 2 (one queued row, one held row)", lost)
+	if lost := w.abandon(); lost != 3 {
+		t.Errorf("abandon() = %d, want 3 (two queued rows, one held row)", lost)
 	}
 	if held, _ := w.pending(); len(held) != 0 {
-		t.Errorf("the accumulator still holds %d rows after abandon; they would be counted twice", len(held))
+		t.Errorf("the accumulator still holds %d rows after abandon", len(held))
 	}
 }
 
@@ -1043,6 +1092,13 @@ func TestRecord_ARowTimestampedInAnotherZoneIsStillFiledUnderTheLedgerDay(t *tes
 	if len(rows) != 1 {
 		t.Errorf("got %d rows querying the ledger day the spend happened on, want 1", len(rows))
 	}
+	// And the stored timestamp itself carries the ledger zone, so every line in a day
+	// file prints one offset. store.dayOf would find this row either way — it normalises
+	// on the way to the filename — so without this the normalisation in Record is a line
+	// no test pins.
+	if body := readAllBytes(t, dir); !bytesContains(body, "-07:00") {
+		t.Errorf("the row's timestamp does not carry the ledger zone's offset: %s", body)
+	}
 }
 
 // The read half of the same rule: the same instants spelled in a different zone must
@@ -1062,17 +1118,28 @@ func TestQuery_WindowBoundsInAnotherZoneReadTheSameDayFiles(t *testing.T) {
 		t.Fatalf("Flush: %v", err)
 	}
 
-	local, err := w.Query(dayOf(evening), evening.Add(time.Hour))
+	// A window entirely inside the ledger day whose UTC dates are BOTH the next day:
+	// 23:00 and 23:50 at UTC-7 are 06:00 and 06:50 on the 14th. A day walk reading the
+	// caller's zone therefore visits only 2026-09-14 and never opens the file the row is
+	// in. A window that spanned both dates would mask that, which is what an earlier
+	// version of this test did — proved by mutation.
+	from, to := evening.Add(-30*time.Minute), evening.Add(20*time.Minute)
+	local, err := w.Query(from, to)
 	if err != nil {
 		t.Fatalf("Query in the ledger zone: %v", err)
 	}
-	utc, err := w.Query(dayOf(evening).UTC(), evening.Add(time.Hour).UTC())
+	utc, err := w.Query(from.UTC(), to.UTC())
 	if err != nil {
 		t.Fatalf("Query in UTC: %v", err)
 	}
-	if len(local) != 1 || len(utc) != len(local) {
+	if len(local) != 1 {
+		t.Fatalf("got %d rows querying in the ledger zone, want 1; the premise of this test "+
+			"is that the row is there", len(local))
+	}
+	if len(utc) != len(local) {
 		t.Errorf("the ledger zone returned %d rows and UTC returned %d over the same "+
-			"instants; the day walk must not depend on the caller's zone", len(local), len(utc))
+			"instants; the day walk must not depend on how the caller spelled the window",
+			len(local), len(utc))
 	}
 }
 

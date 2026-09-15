@@ -99,10 +99,15 @@ func TestCostOf_DecodesTheLegacyProducerKey(t *testing.T) {
 
 // TestCountsAddFoldsPricedRequests is why coverage is a counter and not a
 // boolean: buckets are summed when a client asks for a coarser resolution, and
-// a bool cannot express "12 of 40 requests in this window were priced".
+// a bool cannot express "12 of 40 PRICEABLE requests in this window were priced".
+//
+// Priceable, not Requests. The gap a client renders is
+// PriceableRequests-minus-PricedRequests; taking it against Requests counts every
+// health check and tool call as unpriced traffic and never reaches zero. See both
+// fields' godoc.
 func TestCountsAddFoldsPricedRequests(t *testing.T) {
-	a := Counts{Requests: 10, CostMicros: 500, PricedRequests: 4}
-	a.Add(Counts{Requests: 5, CostMicros: 250, PricedRequests: 3})
+	a := Counts{Requests: 10, CostMicros: 500, PricedRequests: 4, PriceableRequests: 9}
+	a.Add(Counts{Requests: 5, CostMicros: 250, PricedRequests: 3, PriceableRequests: 6})
 
 	if a.Requests != 15 {
 		t.Errorf("Requests = %d, want 15", a.Requests)
@@ -113,7 +118,10 @@ func TestCountsAddFoldsPricedRequests(t *testing.T) {
 	if a.PricedRequests != 7 {
 		t.Errorf("PricedRequests = %d, want 7", a.PricedRequests)
 	}
-	if unpriced := a.Requests - a.PricedRequests; unpriced != 8 {
+	if a.PriceableRequests != 15 {
+		t.Errorf("PriceableRequests = %d, want 15", a.PriceableRequests)
+	}
+	if unpriced := a.PriceableRequests - a.PricedRequests; unpriced != 8 {
 		t.Errorf("unpriced = %d, want 8", unpriced)
 	}
 }
@@ -796,20 +804,43 @@ func TestCounts_PresentKindsFoldsByOr(t *testing.T) {
 	// the window total must be able to tell "no cache writes happened" from "nothing
 	// here reports cache writes" -- otherwise a blank column is unreadable.
 	//
-	// The two operands are deliberately DISJOINT (0b0110 | 0b1001 == 0b1111, and
-	// neither operand equals the union), because that is what makes this test pin
-	// `|=` specifically. When one operand is a superset of the other -- as an earlier
-	// version of this test had it -- max() and an `if == 0` guard both yield the
-	// right answer, so the assertion said nothing about which operator was used.
-	// Verified by mutation: max() survives a superset pair and dies against this one.
-	a := New()
-	a.Record("s1", inferenceEvent("reports-cache-only", 0, 200, 5, 0, 0, 0b0110))
-	a.Record("s1", inferenceEvent("reports-io-only", 10, 0, 0, 5, 0, 0b1001))
+	// TWO operand shapes, because no single pair pins `|=` on its own and each kills
+	// a different mutation of Counts.Add:
+	//
+	//	disjoint     0b0110, 0b1001 -> 0b1111. Neither operand equals the union, so
+	//	             outright assignment (`|=` -> `=`) dies here. A superset pair --
+	//	             which an earlier version of this test used -- would not even do
+	//	             that, and max() and an `if == 0` guard both survive it.
+	//	overlapping  0b1001, 0b1001 -> 0b1001. `+=` CARRIES into a bit nothing
+	//	             reported (0b10010, the Reasoning bit), so it dies here. Against a
+	//	             disjoint pair `+` and `|` are arithmetically identical, which is
+	//	             why the pair above cannot pin the operator Add's own godoc warns
+	//	             about ("Do not pattern-match on the `+=` below").
+	//
+	// The overlapping case is the one that matters in production: two Output-only
+	// responses in a bucket fold to the Reasoning bit, and a consumer then prints
+	// "reasoning (of output) 0" -- a reported zero where nothing reported reasoning
+	// at all, exactly the set-versus-zero confusion PresentKinds exists to resolve.
+	// Carries can also overflow the uint8 and clear real bits.
+	for _, tc := range []struct {
+		name       string
+		first, snd uint8
+		want       uint8
+	}{
+		{"disjoint kills assignment", 0b0110, 0b1001, 0b1111},
+		{"overlapping kills addition", 0b1001, 0b1001, 0b1001},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			a := New()
+			a.Record("s1", inferenceEvent("first-reporter", 0, 200, 5, 0, 0, tc.first))
+			a.Record("s1", inferenceEvent("second-reporter", 10, 0, 0, 5, 0, tc.snd))
 
-	snap := a.Snapshot(10*time.Minute, BucketWidth, "s1", GroupNone)
+			snap := a.Snapshot(10*time.Minute, BucketWidth, "s1", GroupNone)
 
-	if got := snap.Totals.PresentKinds; got != 0b1111 {
-		t.Errorf("PresentKinds = %#b, want %#b (union of what any response reported)", got, 0b1111)
+			if got := snap.Totals.PresentKinds; got != tc.want {
+				t.Errorf("PresentKinds = %#b, want %#b (union of what any response reported)", got, tc.want)
+			}
+		})
 	}
 }
 

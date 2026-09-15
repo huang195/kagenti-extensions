@@ -2,13 +2,39 @@ package pricing
 
 import "math"
 
-// maxCostMicros bounds a single request's cost.
+// MaxCostMicros bounds a single request's cost.
 //
 // float64 counts every integer exactly only up to 2^53, so a total beyond that cannot
 // round-trip through int64 meaningfully even when it fits. $9 billion for one request
 // is unreachable by any legitimate traffic and is the point past which a figure is a
 // bug rather than a bill.
-const maxCostMicros = 1 << 53
+//
+// EXPORTED so the one bound serves every producer of a micros figure. costevent's
+// header path accepts any finite non-negative float, and its Micros() conversion was
+// unguarded — so a header of 1e13 saturated to MaxInt64 and two such requests wrapped
+// usage.Counts.Add to a NEGATIVE total. A second bound declared over there would be
+// free to drift from this one; there is only ever one answer to "past which figure is
+// this a bug".
+const MaxCostMicros = 1 << 53
+
+// MicrosFromUSD converts a dollar figure to integer micros — millionths of a dollar —
+// reporting false when the result is not a usable ledger figure.
+//
+// The one conversion, because there is one bound. Both callers previously wrote
+// `int64(math.Round(usd * 1e6))` by hand and only this package's checked the range;
+// see MaxCostMicros for what the unchecked one produced.
+//
+// ok is false for NaN, an infinity, a negative figure, or anything above
+// MaxCostMicros. A caller must treat that as UNPRICED and not as a large number: a
+// clamped figure is a wrong number wearing a right label, and the ring forgets it in
+// six hours while the durable ledger keeps it for thirty days with no repair path.
+func MicrosFromUSD(usd float64) (int64, bool) {
+	micros := math.Round(usd * 1e6)
+	if math.IsNaN(micros) || math.IsInf(micros, 0) || micros > MaxCostMicros || micros < 0 {
+		return 0, false
+	}
+	return int64(micros), true
+}
 
 // Cost prices u at r, returning integer micros — millionths of a dollar.
 //
@@ -40,7 +66,6 @@ func Cost(r Rates, u Usage) (int64, bool) {
 	}
 	eff := r.At(u.PromptTotal())
 	var usd float64
-	var micros float64
 	for i, n := range u.tokens() {
 		if n < 0 {
 			return 0, false
@@ -62,13 +87,9 @@ func Cost(r Rates, u Usage) (int64, bool) {
 		}
 		usd += float64(n) * eff.Base[i]
 	}
-	micros = math.Round(usd * 1e6)
-	// Bound-checked before conversion. Each RATE is validated above, but a finite
-	// rate times a large token count still accumulates past int64: the conversion
-	// would then be undefined and return ok=true with a garbage ledger figure, which
-	// is worse than reporting the request unpriced.
-	if math.IsNaN(micros) || math.IsInf(micros, 0) || micros > maxCostMicros || micros < 0 {
-		return 0, false
-	}
-	return int64(micros), true
+	// Bound-checked before conversion, in MicrosFromUSD. Each RATE is validated above,
+	// but a finite rate times a large token count still accumulates past int64: the
+	// conversion would then be undefined and return ok=true with a garbage ledger
+	// figure, which is worse than reporting the request unpriced.
+	return MicrosFromUSD(usd)
 }

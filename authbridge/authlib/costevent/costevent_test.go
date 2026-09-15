@@ -2,9 +2,11 @@ package costevent
 
 import (
 	"encoding/json"
+	"math"
 	"testing"
 
 	"github.com/rossoctl/cortex/authbridge/authlib/pipeline"
+	"github.com/rossoctl/cortex/authbridge/authlib/pricing"
 )
 
 // eventWith builds a SessionEvent carrying raw JSON under the cost-event key.
@@ -125,6 +127,53 @@ func TestMicros(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			if got := (Event{CostUSD: tc.usd}).Micros(); got != tc.want {
 				t.Errorf("Micros() = %d, want %d", got, tc.want)
+			}
+		})
+	}
+}
+
+// A figure too large for the micros unit is UNPRICED, not saturated.
+//
+// Micros() was `int64(math.Round(CostUSD * 1e6))` with no bound at all, while
+// pricing.Cost guarded the identical conversion and called the unguarded form "a
+// garbage ledger figure". The producer's header path accepts any finite non-negative
+// float, so a gateway reporting 1e13 saturated to MaxInt64 and TWO such requests
+// wrapped usage.Counts.Add to −2 micros. The ring forgets that in six hours; the
+// durable ledger keeps it thirty days with no repair path.
+//
+// Not clamped to the bound either. A clamped figure is a wrong number wearing a right
+// label, and Priced() has to agree with Micros() or a consumer adds a zero to its total
+// while counting the request as covered.
+func TestMicros_OutOfRangeIsUnpricedNotSaturated(t *testing.T) {
+	// EXACTLY at the bound is still a figure: the check is `> MaxCostMicros`, and
+	// 2^53 micros round-trips through float64 exactly, which is the whole reason the
+	// bound sits there.
+	atBound := Event{CostUSD: float64(pricing.MaxCostMicros) / 1e6, Settled: true}
+	if !atBound.Priced() {
+		t.Error("Priced() = false at exactly MaxCostMicros; the bound is inclusive")
+	}
+	if got := atBound.Micros(); got != pricing.MaxCostMicros {
+		t.Errorf("Micros() = %d at the bound, want %d", got, pricing.MaxCostMicros)
+	}
+
+	// One dollar past it. (One MICRO past is unrepresentable: 2^53+1 rounds back to
+	// 2^53 in a float64 — which is the property the bound is chosen for.)
+	for _, tc := range []struct {
+		name string
+		usd  float64
+	}{
+		{"a dollar past the bound", float64(pricing.MaxCostMicros)/1e6 + 1},
+		{"the header figure that saturated MaxInt64", 1e13},
+		{"an infinity", math.Inf(1)},
+		{"not a number", math.NaN()},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			e := Event{CostUSD: tc.usd, Settled: true}
+			if e.Priced() {
+				t.Error("Priced() = true for a figure the micros unit cannot hold; it must read as unpriced, not as money")
+			}
+			if got := e.Micros(); got != 0 {
+				t.Errorf("Micros() = %d, want 0 — neither saturated nor clamped to the bound", got)
 			}
 		})
 	}

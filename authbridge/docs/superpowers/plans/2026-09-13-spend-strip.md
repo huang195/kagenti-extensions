@@ -1,7 +1,36 @@
 # Spend Strip Implementation Plan (commit 4)
 
-> **STATUS: implemented.** Landed as `c5b1f596`. The SPAN column it specifies was
-> subsequently removed and ACTIVE moved last — see the commit that did so for why.
+> **STATUS: implemented.** Landed as `b23bb152`. The SPAN column it specifies was
+> subsequently removed and ACTIVE moved last (`daa0bf04`) — see that commit for why.
+>
+> An earlier revision of this banner cited `c5b1f596`, which is not an ancestor of this
+> branch: it is the same change on an abandoned branch that was never merged. A banner
+> pointing at an unreachable commit is worse than no banner, because a reviewer who
+> looks it up concludes the doc is describing someone else's tree.
+>
+> **Three things this plan promises did not ship in the shape it describes**, and each
+> is noted again where the plan says it:
+>
+> - **No wall-time column, under any name.** The File Structure table calls it `AGE`;
+>   Task 4 calls it `SPAN`. No column called `AGE` ever existed — `SPAN` is what was
+>   built, and `daa0bf04` removed it. The shipped columns are
+>   `ID / UPDATED / EVENTS / TOKENS / COST / ACTIVE`. `UPDATED` is last-event age via
+>   `relTime`, not wall time, and that is precisely why `SPAN` went: `SPAN` measured
+>   `UpdatedAt - CreatedAt`, so an idle session reported the length of its idleness and
+>   said almost the same thing as `UPDATED` two columns to its left.
+> - **No `sessionSpan` method.** `(*model).sessionCost` exists; `sessionSpan` does not,
+>   and never did on this branch (`grep -rn sessionSpan cmd/abctl/` finds nothing).
+> - **The strip does not fold into the title bar below 20 rows.** It is simply not
+>   drawn, and the header stays a bare `styleTitle.Render(title)` with no figure. The
+>   test comment that said otherwise was corrected to "yields its row"; this plan was
+>   not.
+>
+> Also superseded: `b23bb152` closed a latent bug the plan does not mention (the window
+> figure was rendered whenever a today figure existed, even for a window that priced
+> nothing) and `8bdb9c55` supplied the "today" figure Task 4 Step 5 sets up.
+>
+> **Line numbers drift.** Every `file.go:NN` below was accurate when written and many
+> have moved. Read them as "roughly here" and find the symbol by name.
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
@@ -50,7 +79,7 @@ So this commit ships a two-figure strip (window spend + burn rate) that later co
 | `cmd/abctl/tui/spend_strip_test.go` | **new** — width table, unpriced states | 2 |
 | `cmd/abctl/tui/app.go` | insert the strip in `paneView`; model field | 3 |
 | `cmd/abctl/tui/keys.go` | `layout()` height budget | 3 |
-| `cmd/abctl/tui/sessions_pane.go` | `COST` and `AGE` columns | 4 |
+| `cmd/abctl/tui/sessions_pane.go` | `COST` and `AGE` columns — `COST` only; see the banner | 4 |
 | `cmd/abctl/tui/sessions_pane_test.go` | column contents, unpriced session | 4 |
 
 ---
@@ -758,6 +787,11 @@ func TestSpendStripVisible_ShownOnTheDataPanes(t *testing.T) {
 func TestSpendStripVisible_FoldsAwayOnAShortTerminal(t *testing.T) {
 	// The spec's rule: below 20 rows the strip folds into the title bar rather
 	// than spending a row the table needs more.
+	//
+	// "Folds into the title bar" is the spec's phrase and NOT what this asserts or
+	// what shipped: below the threshold the strip is not drawn and the title carries
+	// no figure. The shipped comment says "yields its row" for that reason. The
+	// assertion itself is right — this only ever tested that the row is given back.
 	m := &model{height: 19}
 	m.pane = paneEvents
 	if m.spendStripVisible() {
@@ -805,9 +839,17 @@ In `spend_strip.go`:
 ```go
 // spendStripMinHeight is the terminal height at which the strip earns its row.
 //
-// Below it the row is worth more to the table than to the chrome, so the figure
-// folds into the title bar instead. 20 rows is roughly where an events table
-// stops being able to show a turn's request and response together.
+// Below it the row is worth more to the table than to the chrome, so the strip
+// yields it entirely rather than shrink the body further. 20 rows is roughly where
+// an events table stops being able to show a turn's request and response together.
+//
+// The spec asks for the today figure to fold into the title bar at that point, and
+// this doc comment originally repeated that. It does not happen: below the threshold
+// nothing is drawn and the header is a bare styleTitle.Render(title). Carrying a
+// figure into the title means budgeting title width against a pane name and an
+// endpoint that already compete for it — a second degradation ladder, not a reuse of
+// this one — so the honest subset shipped and the headline is lost on a short
+// terminal. Say "yields its row", not "folds", anywhere this is described.
 const spendStripMinHeight = 20
 
 // spendStripVisible reports whether the strip takes a row in the current layout.
@@ -897,6 +939,8 @@ A render call nothing asserts on is the failure mode here. Verify by deletion: c
 **Interfaces:**
 - Consumes: `spendState.snap` (Task 1), `usage.Snapshot.Buckets[].Series` keyed by session id.
 - Produces: `usage.GroupSession Group = "session"`; `(*model).sessionCost(id string) (usd float64, priced bool)` and `(*model).sessionSpan(id string) time.Duration`.
+
+`sessionCost` shipped. **`sessionSpan` was never written**, because the column it would have fed never needed a method: `SPAN` was `UpdatedAt - CreatedAt` read straight off the session row, and `daa0bf04` then removed the column. Nothing computes a session span in abctl today. Recorded because a reader looking for the helper should learn it is absent by design, not go looking for a deletion.
 
 **Why this reverses an earlier decision:** the plan for commit 3 (`2026-09-13-cost-aggregation.md`) deferred `GroupSession`, reasoning that the grouping is only meaningful once #949 can tell concurrent agent sessions apart. That reasoning was about *interpretation*, and it was wrong to apply it to the *mechanism*: the sessions pane needs per-session cost now, and a `bySession` label map on the all-sessions ring is what makes it one request instead of N. The #949 caveat still holds for what the numbers *mean* on a laptop — several agents may share the `"default"` bucket — and that limitation belongs in the docs, not in a missing feature.
 
@@ -1133,11 +1177,13 @@ Assisted-By: Claude (Anthropic AI) <noreply@anthropic.com>"
 
 ## Self-Review
 
-**Spec coverage for commit 4:** always-on strip in the chrome (Tasks 2–3) ✓; header placement above the body (Task 3) ✓; degradation by whole figures (Task 2) ✓; never `$0.00` for unknown (Tasks 2, 4) ✓; fold below 20 rows (Task 3) ✓; sessions pane `COST` + wall time (Task 4) ✓.
+**Spec coverage for commit 4:** always-on strip in the chrome (Tasks 2–3) ✓; header placement above the body (Task 3) ✓; degradation by whole figures (Task 2) ✓; never `$0.00` for unknown (Tasks 2, 4) ✓; ~~fold below 20 rows (Task 3) ✓~~; sessions pane `COST` + wall time (Task 4) — `COST` ✓, wall time ✗.
+
+**Two ticks corrected.** *Fold below 20 rows*: the row is yielded, which is the half of that requirement that carries the terminal-height argument; the today figure is NOT carried into the title bar, so the headline is lost rather than preserved. *Wall time*: `SPAN` shipped and `daa0bf04` removed it as near-redundant with `UPDATED`, so no wall-time figure is on the sessions list at all. Both were ticked because the task was done as written; neither was checked against what the spec asked the task to achieve. That gap — tick the step, not the requirement — is what let a plan marked implemented overstate two deliverables at once.
 
 **Deliberately not in this commit, and not faked:** the "today" headline (needs commit 5's ledger) and the "saved" figure (needs commit 7's `Avoided`). Task 1's struct carries both fields and Task 2 has passing tests for both render paths, so the later commits supply data only.
 
-**Type consistency:** `spendSummary` floats are dollars; `usage.Counts.CostMicros` is millionths and every conversion is an explicit `/1e6`. `sessionSpan` returns `time.Duration`. `renderSpendStrip(s spendSummary, width int) string` is the single signature Task 3 calls.
+**Type consistency:** `spendSummary` floats are dollars; `usage.Counts.CostMicros` is millionths and every conversion is an explicit `/1e6`. ~~`sessionSpan` returns `time.Duration`.~~ (No `sessionSpan` shipped — see Task 4.) `renderSpendStrip(s spendSummary, width int) string` is the single signature Task 3 calls, and is what shipped.
 
 **Deviation from the commit-3 plan, ruled here:** `GroupSession` was deferred there and lands here, with the reasoning in Task 4's Why. If commit 3 has already shipped when this is implemented, that is a `ParseGroup` case and a `series` arm added on top of it, not a conflict.
 

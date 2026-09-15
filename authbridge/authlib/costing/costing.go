@@ -227,9 +227,15 @@ type Settled struct {
 	// HasModelled, so a response row can show its own cost on a call where the total came
 	// from the gateway and the table has no opinion on the whole.
 	//
-	// PromptUSD + OutputUSD == ModelledUSD to the micro, by construction: both halves
-	// resolve at the same prompt size over a complementary tier partition, and each rounds
-	// to micros on its own, so the partition can differ from the whole in the last place.
+	// PromptUSD + OutputUSD can differ from ModelledUSD IN THE LAST PLACE, and a caller
+	// comparing them needs a tolerance rather than equality. Both halves resolve at the
+	// same prompt size over a complementary tier partition, so they agree on the
+	// arithmetic — but each is rounded to micros on its own and the whole is rounded
+	// separately, so two rounded halves need not sum to the rounded whole. costing_test.go
+	// uses a 1e-6 tolerance for exactly this reason.
+	//
+	// This paragraph used to open by claiming equality "to the micro, by construction" and
+	// then deny it two lines later. The denial was the true half.
 	// Neither sums to CostUSD, which may be the gateway's; comparing their sum against a
 	// reported total is a drift measurement, and ModelledUSD is the figure kept for it.
 	OutputUSD float64

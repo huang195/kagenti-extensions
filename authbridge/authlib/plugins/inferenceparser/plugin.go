@@ -293,6 +293,19 @@ func (p *InferenceParser) OnResponseFrame(_ context.Context, pctx *pipeline.Cont
 		// is no usage to model and settleCost's own gate then finds neither a figure nor a
 		// saving to report.
 		//
+		// THE DISPATCH IS PATH-AGNOSTIC; THE COVERAGE IS AS WIDE AS THE HEADER AND NO WIDER,
+		// and the two are not the same claim. A streamed response on an unparsed endpoint
+		// reports 0 — LiteLLM's placeholder, since the total is unknown when headers are
+		// sent — and with the endpoint unparsed there is no usage to fall back to either, so
+		// NO FIGURE EXISTS ANYWHERE for it and nothing is published. That is the boundary,
+		// not an oversight: a settled zero would count unpriced traffic as free and a
+		// modelled one would be invented. Streaming is not a carve-out — a POSITIVE header
+		// on a stream is charged here like any other, and an implausible one is refused and
+		// disclosed, because costing's cap reads the nil extension and never the
+		// Content-Type. The only thing that widens this row is teaching the parser the
+		// dialect. See reverseproxy's StreamedUnparsedEndpoint_CoverageBoundary, which
+		// states all three outcomes through a real listener.
+		//
 		// On last only, so an unparsed endpoint settles where every other path does — at
 		// end of stream — rather than on whichever frame arrived first. Every listener
 		// terminates with RunResponseFrame(..., nil, true), so the arm is always reached.

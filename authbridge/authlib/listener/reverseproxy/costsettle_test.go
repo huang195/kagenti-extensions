@@ -10,6 +10,7 @@ import (
 	"sync"
 	"testing"
 
+	"github.com/rossoctl/cortex/authbridge/authlib/costevent"
 	"github.com/rossoctl/cortex/authbridge/authlib/costing"
 	"github.com/rossoctl/cortex/authbridge/authlib/pipeline"
 	"github.com/rossoctl/cortex/authbridge/authlib/plugins/inferenceparser"
@@ -39,14 +40,15 @@ import (
 // goroutine that wrote it — the mutex here is the synchronisation edge, which is why the
 // snapshot is taken in-pass rather than after the client's ReadAll.
 type costProbe struct {
-	mu      sync.Mutex
-	settled costing.Settled
-	loaded  bool
+	mu         sync.Mutex
+	settled    costing.Settled
+	loaded     bool
 	prompt     int
 	output     int
 	total      int
 	completion string
 	skips      int
+	record     bool
 	frames     int
 	lastSeen   bool
 }
@@ -75,7 +77,16 @@ func (p *costProbe) OnResponseFrame(_ context.Context, pctx *pipeline.Context, _
 		p.completion = ext.Completion
 	}
 	p.skips = noBodySkips(pctx)
+	_, p.record = pctx.Extensions.Custom[costevent.Key+pipeline.PluginEventSuffix]
 	return pipeline.Action{Type: pipeline.Continue}
+}
+
+// published reports whether a cost record reached the context. Read from the canonical
+// concern-named key, which is the one a consumer is meant to read.
+func (p *costProbe) published() bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.record
 }
 
 func (p *costProbe) snapshotCost() (costing.Settled, bool, int, int, int) {
@@ -277,6 +288,90 @@ func TestReverseProxy_BufferedResponseToStreamRequest_ParsesTheEnvelope(t *testi
 	}
 	if skips != 0 {
 		t.Errorf("no_response_body Skip rows = %d, want 0 — the response carried a body", skips)
+	}
+}
+
+// TestReverseProxy_StreamedUnparsedEndpoint_CoverageBoundary states, through the real
+// listener, exactly how far the "settle every path" fix reaches on a STREAMED response to
+// an endpoint the parser cannot read — /v1/responses, /v1/complete, an Azure deployment
+// path, anything off the dialect list.
+//
+// The dispatch is path-agnostic: the extension is nil, the terminal frame settles, and
+// what happens next is decided by the cost header alone. So coverage is exactly "did the
+// gateway report a figure", and streaming does not narrow it:
+//
+//   - A positive figure on a stream is charged. Streaming is NOT a carve-out.
+//   - An implausible figure on a stream is refused and DISCLOSED. The cap reads the nil
+//     extension, never the Content-Type, so it covers streamed and buffered alike.
+//   - A ZERO on a stream buys nothing, and nothing is published. That is not a gap in this
+//     code: 0 is the placeholder LiteLLM stamps because the total is unknown when headers
+//     are sent, and with the endpoint unparsed there is no usage to model either. No figure
+//     exists ANYWHERE for that response. Publishing a settled zero would count unpriced
+//     traffic as free; modelling one would invent it. The honest record is none, and the
+//     only thing that would widen coverage here is teaching the parser the dialect.
+func TestReverseProxy_StreamedUnparsedEndpoint_CoverageBoundary(t *testing.T) {
+	for _, tc := range []struct {
+		name         string
+		costHeader   string
+		wantPriced   bool
+		wantUSD      float64
+		wantRejected string
+	}{{
+		name:       "positive figure on a stream is charged",
+		costHeader: "0.0025",
+		wantPriced: true,
+		wantUSD:    0.0025,
+	}, {
+		name:         "implausible figure on a stream is refused and disclosed",
+		costHeader:   "50000",
+		wantRejected: costevent.RejectedImplausible,
+	}, {
+		name:       "placeholder zero on a stream is no figure at all",
+		costHeader: "0",
+	}} {
+		t.Run(tc.name, func(t *testing.T) {
+			backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				w.Header().Set("Content-Type", "text/event-stream")
+				w.Header().Set(costing.ResponseCostHeader, tc.costHeader)
+				w.WriteHeader(http.StatusOK)
+				flusher := w.(http.Flusher)
+				fmt.Fprint(w, "data: {\"type\":\"response.output_text.delta\",\"delta\":\"hi\"}\n\n")
+				flusher.Flush()
+			}))
+			defer backend.Close()
+
+			probe := &costProbe{}
+			srv, err := NewServer(costPipeline(t, probe), nil, backend.URL, nil)
+			if err != nil {
+				t.Fatalf("NewServer: %v", err)
+			}
+			proxy := httptest.NewServer(srv.Handler())
+			defer proxy.Close()
+
+			// /v1/responses is off the parser's dialect list, so Extensions.Inference stays
+			// nil and this is the unparsed-endpoint path.
+			postThrough(t, proxy.URL, "/v1/responses", `{"model":"gpt-4o","input":"hi","stream":true}`)
+
+			settled, loaded, _, _, _ := probe.snapshotCost()
+			if !loaded {
+				t.Fatal("no Settled stored: the unparsed-endpoint path did not settle at all")
+			}
+			if settled.Priced != tc.wantPriced {
+				t.Errorf("Priced = %v, want %v (settled = %+v)", settled.Priced, tc.wantPriced, settled)
+			}
+			if settled.CostUSD != tc.wantUSD {
+				t.Errorf("CostUSD = %v, want %v", settled.CostUSD, tc.wantUSD)
+			}
+			if settled.RejectedReason != tc.wantRejected {
+				t.Errorf("RejectedReason = %q, want %q", settled.RejectedReason, tc.wantRejected)
+			}
+			// A record is published when there is something to say — a figure or a refusal —
+			// and only then. The zero row is the coverage boundary: no figure, no record.
+			wantRecord := tc.wantPriced || tc.wantRejected != ""
+			if got := probe.published(); got != wantRecord {
+				t.Errorf("published a cost record = %v, want %v", got, wantRecord)
+			}
+		})
 	}
 }
 

@@ -211,6 +211,7 @@ func (s *Server) recordTunnelOpened(pctx *pipeline.Context, reason pipeline.Tunn
 		// not, which is why it is a parameter rather than something derived
 		// here from host shape.
 		TunnelReason: reason,
+		Client:       pctx.ClientInfo(),
 	}
 	// Always record the tunnel-open so passthrough/non-bridged tunnels (no
 	// plugin activity) are still visible. For a TLS-bridged call abctl folds

@@ -243,8 +243,34 @@ type bucket struct {
 	// redundant. That is deliberate: a uniform call site in foldInto cannot fall out
 	// of step with itself, and one key costs nothing.
 	bySession map[string]Counts
-	byStatus  map[string]Counts
-	byPlugin  map[string]Counts
+	// byAgent tallies by the coding agent that made the request, as
+	// pipeline.EventClient.Label reports it ("claude-code/2.1.14").
+	//
+	// NO INFERENCE GUARD, unlike byMethod. It is folded for every event, so MCP, A2A
+	// and tool traffic are attributed here too — which means this axis has a
+	// DIFFERENT DENOMINATOR from group=model's, exactly as byEndpoint does. A client
+	// putting a per-agent table beside a per-model one will not see the request counts
+	// reconcile, and that is correct rather than a bug. Deliberate: "what did this
+	// agent cost me" has to include the tool calls it made, not only its LLM turns.
+	//
+	// Bounded by maxLabelsPerBucket and maxLabelLen like every other label map, and
+	// here the bound is load-bearing for the same reason bySession's is: the key is
+	// derived from a REQUEST HEADER, so both its length and its cardinality are set
+	// off-host. Capped twice on the way in — pipeline.maxClientLen when the header is
+	// first retained, then truncateLabel at the addLabel call in foldInto.
+	//
+	// The value is CLIENT-ASSERTED AND TRIVIALLY SPOOFABLE, so this is a display axis
+	// and never a basis for a policy decision; see pipeline.EventClient.
+	//
+	// An event with no client folds under the reserved "unknown" bucket rather than ""
+	// — Label() is nil-safe and answers that — because a blank key renders as a blank
+	// row, which reads as a rendering bug rather than as unattributed traffic.
+	// "unknown" is NOT an agent name and a consumer must not present it as one. An
+	// agent that WAS reported but matched no known name keeps its raw User-Agent
+	// instead, so a new coding agent never pools in with untagged traffic.
+	byAgent  map[string]Counts
+	byStatus map[string]Counts
+	byPlugin map[string]Counts
 	// byProvenance tallies priced requests by where their figure came from, so a
 	// total can disclose how much of it is a gateway's own number versus modelled
 	// from a rate table. Like byUnpriced, kept outside the Group machinery: it
@@ -761,6 +787,12 @@ func (a *Aggregator) foldInto(ring []bucket, t time.Time, sessionID string, e *p
 	if e.Host != "" {
 		addLabel(&b.byEndpoint, truncateLabel(e.Host), one)
 	}
+	// UNCONDITIONAL, where byMethod and byEndpoint are guarded on a non-empty value.
+	// Label() is nil-safe and answers "unknown" for an event that carried no client,
+	// so there is no empty key to guard against — and folding unconditionally is what
+	// makes this axis's series sum to the bucket total. That is also what gives it a
+	// different denominator from group=model's; see byAgent.
+	addLabel(&b.byAgent, truncateLabel(e.Client.Label()), one)
 	if e.StatusCode > 0 {
 		addLabel(&b.byStatus, strconv.Itoa(e.StatusCode), one)
 	} else if e.Phase == pipeline.SessionDenied {

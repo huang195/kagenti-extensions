@@ -175,6 +175,39 @@ func New(dir string, opts ...Option) (*Writer, error) {
 	return w, nil
 }
 
+// agentLabel is the ledger's STORAGE-side spelling of pipeline.EventClient.Label:
+// the same label for a client that exists, and "" instead of "unknown" for one that
+// does not.
+//
+// It exists so the durable file stays lossless. Label() answers "unknown" because it
+// serves a display surface where a blank row reads as a bug; a file retained for days
+// must not bake that display string into a field, where it becomes permanently
+// indistinguishable from an agent that really did call itself that. labelFor puts the
+// display string back at the query boundary, so nothing a client sees differs. See
+// Row.Agent.
+func agentLabel(c *pipeline.EventClient) string {
+	if c == nil {
+		return ""
+	}
+	// Label() can answer "unknown" for a NON-nil client too: an event built by hand
+	// with an empty EventClient, and — reachable from off-host — a caller that sends
+	// literally "User-Agent: unknown", which parses to Raw="unknown" with no name.
+	// Both normalise back to "" so there is exactly ONE representation of absence on
+	// disk, rather than a file that has to be read two ways.
+	//
+	// That folds a caller claiming to be "unknown" in with genuinely unattributed
+	// traffic, which is the collision EventClient.Label documents and deliberately
+	// does not defend against: the axis is spoofable by construction, so the same
+	// caller could instead claim "claude-cli/2.1.14" and land in a real agent's row.
+	// Normalising is the safe direction — it cannot fabricate a row for an agent that
+	// does not exist — and it keeps the ledger's answer identical to the ring's, which
+	// buckets that same request under "unknown" as well.
+	if l := c.Label(); l != unknownAgentLabel {
+		return l
+	}
+	return ""
+}
+
 // Record implements session.Recorder.
 //
 // Never returns an error and never touches disk: this runs on the synchronous
@@ -211,6 +244,14 @@ func (w *Writer) Record(_ string, e *pipeline.SessionEvent) {
 		// Host is the event's field name; endpoint is what it means here. See Row.Endpoint.
 		Endpoint: e.Host,
 		Model:    e.Inference.Model,
+		// The calling coding agent, and part of the row KEY — two agents hitting the
+		// same endpoint and model in the same minute are two rows, not one, or a
+		// per-agent breakdown could not be reconstructed from the file at all.
+		//
+		// agentLabel rather than Label() directly, because the ledger stores absence as
+		// "" where the live aggregator displays it as "unknown". See Row.Agent for why
+		// the two representations differ and why they still mean the same thing.
+		Agent: agentLabel(e.Client),
 		Counts: usage.Counts{
 			Requests:         1,
 			InputTokens:      int64(e.Inference.InputTokens),

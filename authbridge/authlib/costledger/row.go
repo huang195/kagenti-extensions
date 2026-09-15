@@ -105,11 +105,29 @@ type Row struct {
 	// same field under the same name.
 	Endpoint string `json:"endpoint,omitempty"`
 	Model    string `json:"model,omitempty"`
-	// Agent identifies the calling coding agent, as "name/version".
+	// Agent identifies the calling coding agent, as "name/version" —
+	// "claude-code/2.1.14" — or as its raw User-Agent when the parser did not
+	// recognise it. Populated from pipeline.EventClient.Label; see Writer.Record.
 	//
-	// EMPTY until the change that captures the client from the User-Agent. The
-	// field ships now, unpopulated, because a schema that gains a column later is
-	// worse for every reader than one that has an empty column from the start.
+	// CLIENT-ASSERTED AND TRIVIALLY SPOOFABLE, because it is derived from a request
+	// header: a cost-attribution and display key, never an authorization subject.
+	// Nothing may branch on it.
+	//
+	// EMPTY means the request carried no User-Agent. Stored as "" rather than as the
+	// display string "unknown" deliberately, and this is the one representation choice
+	// in this file a reader joining the ledger to /v1/usage has to know about:
+	//
+	//   - This is a DURABLE file. Writing "unknown" into it would permanently destroy
+	//     the difference between "no agent was recorded" and "an agent that reported
+	//     itself as unknown", for every future reader of every retained day. "" plus
+	//     omitempty is lossless and costs no bytes.
+	//   - The live aggregator's series uses "unknown" instead, because its keys are
+	//     display strings a client renders directly, where a "" key is a blank row that
+	//     reads as a rendering bug.
+	//   - labelFor maps "" to "unknown" at the query boundary, so group=agent answers
+	//     IDENTICALLY whether it was served from the ring or from this file. The two
+	//     sources differ in representation and agree in meaning; nothing a client sees
+	//     differs.
 	Agent string `json:"agent,omitempty"`
 	// Provenance is part of the KEY, not a summary of the row: one minute can mix a
 	// gateway's own figures with modelled ones, and a single provenance per row

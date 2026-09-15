@@ -249,6 +249,7 @@ func (s *Server) recordInboundSession(pctx *pipeline.Context) {
 		Host:        pctx.Host,
 		HTTPMethod:  pctx.Method,
 		HTTPPath:    pctx.Path,
+		Client:      pctx.ClientInfo(),
 	}
 	s.Sessions.Append(sid, ev)
 }
@@ -296,6 +297,7 @@ func (s *Server) recordInboundReject(pctx *pipeline.Context, action pipeline.Act
 			Message: message,
 		},
 		Duration: pipeline.DurationSince(pctx.StartedAt),
+		Client:   pctx.ClientInfo(),
 	}
 	s.Sessions.Append(inboundSessionID(pctx), ev)
 }
@@ -352,6 +354,7 @@ func (s *Server) recordOutboundReject(pctx *pipeline.Context, action pipeline.Ac
 			Message: message,
 		},
 		Duration: pipeline.DurationSince(pctx.StartedAt),
+		Client:   pctx.ClientInfo(),
 	}
 	s.Sessions.Append(sid, ev)
 }
@@ -391,6 +394,7 @@ func (s *Server) recordInboundResponseSession(pctx *pipeline.Context) {
 		HTTPMethod:  pctx.Method,
 		HTTPPath:    pctx.Path,
 		Duration:    pipeline.DurationSince(pctx.StartedAt),
+		Client:      pctx.ClientInfo(),
 	}
 	s.Sessions.Append(sid, ev)
 }
@@ -423,6 +427,7 @@ func (s *Server) recordOutboundResponseSession(pctx *pipeline.Context) {
 		HTTPMethod:  pctx.Method,
 		HTTPPath:    pctx.Path,
 		Duration:    pipeline.DurationSince(pctx.StartedAt),
+		Client:      pctx.ClientInfo(),
 	}
 	// Auth / Plugins alone qualify for recording; matches the widened
 	// gate in recordInboundSession so outbound denials and plugin-public
@@ -470,6 +475,7 @@ func (s *Server) recordOutboundSession(pctx *pipeline.Context) {
 		Host:        pctx.Host,
 		HTTPMethod:  pctx.Method,
 		HTTPPath:    pctx.Path,
+		Client:      pctx.ClientInfo(),
 	}
 	if ev.MCP != nil || ev.Inference != nil || ev.Invocations != nil || plugins != nil {
 		s.Sessions.Append(sid, ev)

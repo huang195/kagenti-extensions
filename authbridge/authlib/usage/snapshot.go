@@ -46,8 +46,26 @@ const (
 	// and this axis reports per-id rather than per-agent cost. That is a property of
 	// the current session bucketing, not of this grouping.
 	GroupSession Group = "session"
-	GroupStatus  Group = "status"
-	GroupPlugin  Group = "plugin"
+	// GroupAgent breaks totals down by the coding agent that made the request, as
+	// "name/version" — the axis #952 asks for, since "what did today cost" is only
+	// actionable once it says which agent spent it. It is also what GroupSession
+	// cannot answer while several concurrent agents share one session id (#949).
+	//
+	// The key is parsed from the request's User-Agent, so it is CLIENT-ASSERTED AND
+	// TRIVIALLY SPOOFABLE: a display and cost-attribution axis, never an authorization
+	// input. A caller that lies here mis-attributes its own spend and nothing else.
+	//
+	// Its accumulator has NO INFERENCE GUARD, so this series counts MCP and tool
+	// traffic too and its request denominator differs from GroupModel's — the same
+	// property GroupEndpoint has. See the byAgent field for the full reasoning.
+	//
+	// An event that carried no User-Agent lands under the reserved key "unknown",
+	// which is NOT an agent name; an agent that was reported but is not recognised
+	// lands under its raw User-Agent, so a new coding agent is visible the day someone
+	// runs it rather than after a parser update ships.
+	GroupAgent  Group = "agent"
+	GroupStatus Group = "status"
+	GroupPlugin Group = "plugin"
 )
 
 // ParseGroup validates a group parameter. Empty means GroupNone.
@@ -67,6 +85,8 @@ func ParseGroup(s string) (Group, error) {
 		return GroupEndpoint, nil
 	case GroupSession:
 		return GroupSession, nil
+	case GroupAgent:
+		return GroupAgent, nil
 	case GroupStatus:
 		return GroupStatus, nil
 	case GroupPlugin:
@@ -76,7 +96,7 @@ func ParseGroup(s string) (Group, error) {
 	// over an unauthenticated endpoint, and reflecting arbitrary query input
 	// into a response body is how a reflected-content issue starts. The valid
 	// set is short enough that naming it is more useful than quoting the input.
-	return "", errors.New("unknown group (want none, model, endpoint, session, status, plugin; method is accepted as an alias for model)")
+	return "", errors.New("unknown group (want none, model, endpoint, session, agent, status, plugin; method is accepted as an alias for model)")
 }
 
 // Snapshot is the wire shape of GET /v1/usage.
@@ -496,6 +516,8 @@ func (b *bucket) series(g Group) map[string]Counts {
 		src = b.byEndpoint
 	case GroupSession:
 		src = b.bySession
+	case GroupAgent:
+		src = b.byAgent
 	case GroupStatus:
 		src = b.byStatus
 	case GroupPlugin:

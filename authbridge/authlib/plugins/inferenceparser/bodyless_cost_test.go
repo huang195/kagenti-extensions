@@ -101,8 +101,12 @@ func bodylessSites() []bodylessSite {
 			p.OnResponse(context.Background(), pctx)
 		},
 	}, {
-		// plugin.go OnResponseFrame, application/json one-shot arm. This is the arm
-		// extproc's header-only branch lands on for a non-streaming request.
+		// plugin.go OnResponseFrame, one-shot arm: the listener buffered the response and
+		// there was nothing in it. This is the arm a 204/304 takes on both proxy listeners.
+		// It is NOT reached on extproc today — that listener's response-header phase returns
+		// early to ask Envoy for a buffered body (server.go:616) whenever any plugin reads a
+		// body, and for a header-only response Envoy then sends no body message at all, so
+		// nothing dispatches a terminal frame. See TestCapabilities_ReadsBodyDecidesTheExtprocBranch.
 		name: "OnResponseFrame/json-one-shot-empty-frame",
 		drive: func(p *InferenceParser, pctx *pipeline.Context) {
 			p.OnResponseFrame(context.Background(), pctx, nil, true)
@@ -303,5 +307,40 @@ func TestBodylessResponse_StreamPlaceholderZeroPublishesNothing(t *testing.T) {
 	}
 	if n := skipRows(pctx); n != 1 {
 		t.Errorf("no_response_body Skip rows = %d, want 1", n)
+	}
+}
+
+// TestCapabilities_ReadsBodyDecidesTheExtprocBranch pins the premise the comments above and
+// in settleCost now rest on, and the reason the body-less fix does not reach extproc.
+//
+// ReadsBody is undirected, so it counts toward NeedsRequestBody and NeedsResponseBody alike
+// (pipeline.NeedsRequestBody says why). Any pipeline containing this parser therefore reports
+// NeedsBody() == true unconditionally — and extproc's handleResponseHeaders returns on
+// exactly that condition, before the RunResponse and the header-only
+// RunResponseFrame(nil, true) below it. That branch is dead for every shipped pipeline, so on
+// extproc a response with no body at all — 204, 304, an error status ended on headers —
+// dispatches nothing: Envoy sends no ResponseBody message for it, whatever ModeOverride was
+// asked for, and the cost is never settled and no response row is recorded.
+//
+// The fix belongs in that listener, not here: gate the early return on the response headers'
+// end_of_stream, mirroring the request side's requestHasBody guard at server.go:113. This
+// test fails if ReadsBody is dropped, which would silently move which branch runs.
+func TestCapabilities_ReadsBodyDecidesTheExtprocBranch(t *testing.T) {
+	p := NewInferenceParser()
+	if !p.Capabilities().ReadsBody {
+		t.Fatal("ReadsBody = false; the listeners would stop buffering response bodies and every token count would vanish")
+	}
+	pipe, err := pipeline.New([]pipeline.Plugin{p})
+	if err != nil {
+		t.Fatalf("New pipeline: %v", err)
+	}
+	if !pipe.NeedsBody() {
+		t.Error("NeedsBody() = false for a pipeline holding only this parser; extproc would take its header-only response branch instead of asking Envoy to buffer")
+	}
+	if !pipe.NeedsResponseBody() {
+		t.Error("NeedsResponseBody() = false; the response body would never be buffered")
+	}
+	if !pipe.HasStreamingResponders() {
+		t.Error("HasStreamingResponders() = false; the listeners would call OnResponse instead of OnResponseFrame and no terminal frame would ever arrive")
 	}
 }

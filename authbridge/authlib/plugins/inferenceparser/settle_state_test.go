@@ -61,8 +61,9 @@ func TestSettleCost_NothingToSayDoesNotLatch(t *testing.T) {
 // TestSettleCost_LatchesOncePublished is the mirror, and it is what stops the test above
 // being satisfied by deleting the latch.
 //
-// extproc really does dispatch a terminal frame twice, once for headers and once for the
-// buffered body. Once a figure is out, a repeat dispatch must not produce a second one:
+// A terminal frame can arrive twice — extproc runs its whole buffered dispatch once per
+// ResponseBody message, see settleCost. Once a figure is out, a repeat dispatch must not
+// produce a second one:
 // double-counting money is not recoverable from a later correction, because the ledger file
 // has already been written.
 func TestSettleCost_LatchesOncePublished(t *testing.T) {

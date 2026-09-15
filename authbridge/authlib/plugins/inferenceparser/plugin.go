@@ -307,8 +307,12 @@ func (p *InferenceParser) OnResponseFrame(_ context.Context, pctx *pipeline.Cont
 		// states all three outcomes through a real listener.
 		//
 		// On last only, so an unparsed endpoint settles where every other path does — at
-		// end of stream — rather than on whichever frame arrived first. Every listener
-		// terminates with RunResponseFrame(..., nil, true), so the arm is always reached.
+		// end of stream — rather than on whichever frame arrived first. Both proxy listeners
+		// always terminate with RunResponseFrame(..., nil, true), so the arm is reached
+		// whenever a response has any body phase at all. On extproc it is reached from the
+		// body phase only: for a response with NO body that listener dispatches nothing —
+		// see TestCapabilities_ReadsBodyDecidesTheExtprocBranch, which names the gap and
+		// where it has to be closed.
 		//
 		// No Skip and no Observe row: the body may be perfectly fine and simply not ours,
 		// so "no_response_body" would be a false diagnostic, and there is no model to name

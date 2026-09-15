@@ -256,8 +256,9 @@ func TestUnparsedEndpoint_NonTerminalFrameSettlesNothing(t *testing.T) {
 }
 
 // TestUnparsedEndpoint_SettlesExactlyOnce guards the money against the listener behaviour
-// settleCost's idempotence key exists for: extproc dispatches a terminal frame twice, once
-// for headers and once for the buffered body.
+// settleCost's idempotence key exists for: a repeated terminal dispatch, which extproc
+// produces once per ResponseBody message when Envoy delivers a body in more than one (see
+// settleCost for why the old "once for headers, once for the body" reading was wrong).
 //
 // Asserted on this path specifically because it is the path with no extension to inspect —
 // the other paths' finalize functions are assignments and are self-idempotent, while here
@@ -273,7 +274,7 @@ func TestUnparsedEndpoint_SettlesExactlyOnce(t *testing.T) {
 		t.Fatal("no cost record published on the first terminal frame")
 	}
 
-	// The second dispatch extproc really does make. Also the buffered hook, since a
+	// The second terminal dispatch. Also the buffered hook, since a
 	// pipeline that ran both must not charge twice either.
 	p.OnResponseFrame(context.Background(), pctx, nil, true)
 	p.OnResponse(context.Background(), pctx)

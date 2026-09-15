@@ -22,15 +22,27 @@ import (
 //
 //  1. The open minute is read FIRST. Its rows cannot then be missed by a flush
 //     landing between the two reads — the failure mode of reading disk first.
-//  2. Disk rows at or after that minute are DROPPED. The writer's ownership rule
+//  2. Disk rows for EXACTLY that minute are DROPPED. The writer's ownership rule
 //     (see the Writer doc) says there are none; if a concurrent flush produced some
 //     between step 1 and step 3, they are the same rows step 1 already holds, and
 //     this is what stops them being added twice.
 //  3. Only then are the day files read.
 //
-// So the arithmetic is: every minute below the open one comes from disk, the open
-// one comes from memory, and neither can supply the other's. TestWindow_* covers
-// each step, including a hand-seeded overlap that step 2 has to absorb.
+// So the arithmetic is: every minute other than the open one comes from disk, the
+// open one comes from memory, and neither can supply the other's. TestWindow_*
+// covers each step, including a hand-seeded overlap that step 2 has to absorb.
+//
+// STEP 2 IS AN EQUALITY, and it used to be "at or after", justified by the claim that
+// a concurrent flush could only ever produce rows step 1 already holds. That claim was
+// FALSE. A flush landing between pending() and Query() can advance the writer several
+// minutes, and those newer minutes are on disk and NOT in the pending snapshot, which
+// was taken before them — so dropping everything at or above the held minute dropped
+// real spend. Measured: writer holding minute M, one disk row at M+1, Window returned
+// 250,000 micros instead of 1,250,000. It is also reachable with no race at all
+// whenever two processes share cost_ledger.dir, which the ~/.cortex/cost default makes
+// plausible: the other process's newer minutes are simply on disk while this one holds
+// an older one. Equality is the only overlap the ownership rule can actually produce,
+// so it is the only one to absorb.
 func (w *Writer) Window(from, to time.Time) ([]Row, error) {
 	fromMin, toMin := span(from, to)
 	pending, open := w.pending()
@@ -42,7 +54,7 @@ func (w *Writer) Window(from, to time.Time) ([]Row, error) {
 	if !open.IsZero() {
 		kept := rows[:0]
 		for _, r := range rows {
-			if !r.At.Truncate(time.Minute).Before(open) {
+			if r.At.Truncate(time.Minute).Equal(open) {
 				continue
 			}
 			kept = append(kept, r)
@@ -79,7 +91,13 @@ func (w *Writer) Query(from, to time.Time) ([]Row, error) {
 	var skipped, truncated int64
 	// Walk dates rather than globbing the directory: the read stays bounded by the
 	// span the caller asked for instead of by how long the ledger has been running.
-	for d := dayOf(fromMin); !d.After(dayOf(toMin)); d = d.AddDate(0, 0, 1) {
+	//
+	// store.dayOf, not the package dayOf: the day boundary is the LEDGER's, so a caller
+	// handing this a UTC window gets the same day files as one handing it the equivalent
+	// local window. The package dayOf preserves its argument's zone, so it answered
+	// whichever day the caller happened to spell — and near midnight that is a different
+	// file from the one the row was written to.
+	for d := w.store.dayOf(fromMin); !d.After(w.store.dayOf(toMin)); d = d.AddDate(0, 0, 1) {
 		rows, issues, err := w.store.readDay(d)
 		if err != nil {
 			return nil, err

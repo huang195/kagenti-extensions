@@ -489,6 +489,38 @@ func TestWindow_DropsADiskRowForTheHeldMinute(t *testing.T) {
 	}
 }
 
+// J3, the case step 2 used to swallow: a disk row for a minute ABOVE the one held.
+//
+// Step 2 dropped everything "at or after" the held minute, justified by the claim that
+// a concurrent flush could only produce rows the pending snapshot already had. False —
+// a flush landing between pending() and Query() can advance the writer several minutes,
+// and those newer minutes are on disk and NOT in a snapshot taken before them. Measured
+// as $1.00 dropped from $1.25. Two processes sharing cost_ledger.dir reach the same
+// state with no race at all, which the ~/.cortex/cost default makes plausible.
+func TestWindow_KeepsADiskRowAboveTheHeldMinute(t *testing.T) {
+	dir := t.TempDir()
+	now := at
+	w := newTestWriter(t, dir, func() time.Time { return now })
+	// Minute M, held in memory: $0.25.
+	w.Record("s1", costedEvent(t, "gw", "m", 0.25, 100, 50))
+
+	// Minute M+1, on disk: $1.00. What a flush that advanced the writer between Window's
+	// two reads leaves behind, or what another process writing the same directory does.
+	next := at.Truncate(time.Minute).Add(time.Minute)
+	writeDay(t, dir, next, line(next, "gw", "m", 1, 100, 50, 1_000_000))
+
+	rows, err := w.Window(at.Add(-time.Hour), next.Add(time.Hour))
+	if err != nil {
+		t.Fatalf("Window: %v", err)
+	}
+	totals, _ := Fold(rows, usage.GroupNone)
+	if want := int64(1_250_000); totals.CostMicros != want {
+		t.Errorf("CostMicros = %d, want %d; 250000 is the measured loss — a minute above "+
+			"the held one is not the held one and must not be dropped as an overlap",
+			totals.CostMicros, want)
+	}
+}
+
 // The held minute is not always in the window asked for. An idle proxy at 00:05
 // still holds yesterday's last minute, and that spend is yesterday's.
 func TestWindow_ExcludesAHeldMinuteOutsideTheRange(t *testing.T) {

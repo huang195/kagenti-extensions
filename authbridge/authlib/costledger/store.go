@@ -42,25 +42,49 @@ type store struct {
 	dir string
 	// retainDays is how many day files survive prune. Zero means the default.
 	retainDays int
+	// loc is the zone the ledger's DAY BOUNDARY is defined in, and the single answer
+	// to "which day does this instant belong to" for every part of this file.
+	//
+	// It is the Writer's clock zone, which is time.Local in production because every
+	// producer and every reader derives its timestamps from time.Now(). It exists
+	// because path() used to name the file from the ROW's own zone while readDay is
+	// called with a day derived from the CALLER's, and the two agreed only by the
+	// coincidence that nothing in the pipeline calls .UTC(). One that did would file a
+	// row near midnight under a date no query for that local day ever visits: written,
+	// retained for 30 days, and invisible to every read. Deciding it in one place makes
+	// the agreement structural instead of a convention nobody wrote down.
+	loc *time.Location
 }
 
-// newStore prepares dir, creating it if needed.
-func newStore(dir string, retainDays int) (*store, error) {
+// newStore prepares dir, creating it if needed. A nil loc means time.Local.
+func newStore(dir string, retainDays int, loc *time.Location) (*store, error) {
 	if dir == "" {
 		return nil, fmt.Errorf("costledger: no directory configured")
 	}
 	if retainDays <= 0 {
 		retainDays = defaultRetentionDays
 	}
+	if loc == nil {
+		loc = time.Local
+	}
 	if err := os.MkdirAll(dir, dirMode); err != nil {
 		return nil, fmt.Errorf("costledger: cannot create %s: %w", dir, err)
 	}
-	return &store{dir: dir, retainDays: retainDays}, nil
+	return &store{dir: dir, retainDays: retainDays, loc: loc}, nil
+}
+
+// dayOf is the package dayOf resolved in the STORE's zone. The one place the day
+// boundary is decided, so path, readDay, prune and Query's day walk cannot disagree.
+func (s *store) dayOf(t time.Time) time.Time {
+	return dayOf(t.In(s.loc))
 }
 
 // path is the day file a timestamp belongs to.
+//
+// dayOf-derived rather than formatting t directly, so the name is explicitly the
+// LEDGER DAY of t rather than whatever date t's own zone happens to print.
 func (s *store) path(t time.Time) string {
-	return filepath.Join(s.dir, t.Format(dayLayout)+".jsonl")
+	return filepath.Join(s.dir, s.dayOf(t).Format(dayLayout)+".jsonl")
 }
 
 // append writes rows to whichever day files they belong to.
@@ -136,6 +160,19 @@ func writeLines(path string, rows []Row) error {
 		size = info.Size()
 	}
 	werr := appendBytes(f, size, buf.Bytes())
+	if werr == nil {
+		// FSYNCED, so a nil error means the bytes are on the device rather than in the
+		// page cache. Without this, Writer.Close's whole reason for existing — "an orderly
+		// stop loses nothing" — was false for a host that lost power seconds after the
+		// stop, and the doc said otherwise. Softening the doc was the alternative; syncing
+		// is better, because the promise is the thing callers use Flush and Close FOR.
+		//
+		// The cost is one fsync per closed minute, on the writer goroutine, never on a
+		// request path. Reported rather than swallowed: a sync that fails is a durability
+		// claim that cannot be made, and Flush and Close are the two callers that exist to
+		// hear it.
+		werr = f.Sync()
+	}
 	if cerr := f.Close(); cerr != nil && werr == nil {
 		werr = cerr
 	}
@@ -277,8 +314,13 @@ type dayIssues struct {
 	truncated bool
 }
 
-// prune deletes day files older than the retention window, measured back from
-// now's LOCAL day.
+// prune deletes day files older than the retention window, measured back from now's
+// ledger day.
+//
+// retainDays FILES SURVIVE, counting today: the cutoff is today minus retainDays-1,
+// so a 3-day retention keeps today and the two days before it. It used to be today
+// minus retainDays, an inclusive range that kept retainDays+1 files — off by one
+// against what the option and the config field both say the number means.
 //
 // Never touches a file it cannot date: an unrecognised name in the directory is
 // left alone rather than deleted, because this runs against a path an operator
@@ -288,7 +330,7 @@ type dayIssues struct {
 // Returns the first error but keeps going, for the reason append does: one
 // undeletable file must not leave the rest of the backlog in place.
 func (s *store) prune(now time.Time) error {
-	cutoff := dayOf(now).AddDate(0, 0, -s.retainDays)
+	cutoff := s.dayOf(now).AddDate(0, 0, -(s.retainDays - 1))
 	entries, err := os.ReadDir(s.dir)
 	if err != nil {
 		return err
@@ -302,7 +344,9 @@ func (s *store) prune(now time.Time) error {
 		if filepath.Ext(name) != ".jsonl" {
 			continue
 		}
-		day, perr := time.ParseInLocation(dayLayout, name[:len(name)-len(".jsonl")], now.Location())
+		// s.loc, not now's zone: the names were WRITTEN in s.loc, so that is the only
+		// zone they can be read back in without the cutoff comparing two different days.
+		day, perr := time.ParseInLocation(dayLayout, name[:len(name)-len(".jsonl")], s.loc)
 		if perr != nil {
 			continue
 		}

@@ -635,11 +635,17 @@ func TestWriter_FlushStraddlingMidnightSplitsByDay(t *testing.T) {
 // which is how a unit test stands in for a filesystem that has stopped responding:
 // nothing drains w.ops, so enqueue reaches its default arm for real.
 //
-// Built by hand because New always starts the goroutine, and w.store is deliberately
-// left nil — add, foldLocked and enqueue are pure memory, so a change that started
-// writing from the request path would nil-panic here rather than pass quietly.
-func stalledWriter(depth int, clock func() time.Time) *Writer {
+// Built by hand because New always starts the goroutine. The store is real but nothing
+// drains the queue, so no batch ever reaches it: the temp directory stays empty, and
+// the test asserts that below.
+func stalledWriter(t *testing.T, depth int, clock func() time.Time) *Writer {
+	t.Helper()
+	s, err := newStore(t.TempDir(), 0, clock().Location())
+	if err != nil {
+		t.Fatalf("newStore: %v", err)
+	}
 	return &Writer{
+		store:      s,
 		now:        clock,
 		rows:       map[key]*Row{},
 		ops:        make(chan batch, depth),
@@ -658,7 +664,7 @@ func stalledWriter(depth int, clock func() time.Time) *Writer {
 func TestRecord_DropsRatherThanBlocksWhenTheWriterCannotKeepUp(t *testing.T) {
 	const depth, events = 4, 20
 	now := at
-	w := stalledWriter(depth, func() time.Time { return now })
+	w := stalledWriter(t, depth, func() time.Time { return now })
 
 	// Each new minute closes the previous one, so this is one queued batch of one row
 	// per event after the first, and the last minute stays in the accumulator.
@@ -678,6 +684,11 @@ func TestRecord_DropsRatherThanBlocksWhenTheWriterCannotKeepUp(t *testing.T) {
 	held, _ := w.pending()
 	if got := int64(len(w.ops)) + w.Dropped() + int64(len(held)); got != events {
 		t.Errorf("accounted for %d rows of %d recorded", got, events)
+	}
+	// And the premise: with nothing draining the queue, nothing reached disk. If it had,
+	// Record would be doing IO on the request path.
+	if entries, _ := os.ReadDir(w.store.dir); len(entries) != 0 {
+		t.Errorf("%d files written with no writer goroutine running; Record touched disk", len(entries))
 	}
 }
 
@@ -869,6 +880,152 @@ func TestPrune_OnADayRollRunsThroughTheWriter(t *testing.T) {
 
 	if _, serr := os.Stat(old); !os.IsNotExist(serr) {
 		t.Errorf("the 10-day-old file survived a day roll under a 3-day retention: %v", serr)
+	}
+}
+
+// N4: prunedDay used to advance when the batch carrying pruneAt was BUILT, on the
+// request path, before the prune had run. A batch the queue dropped, or a prune that
+// failed, therefore disarmed retention for the rest of that day — permanently, on a
+// laptop proxy that may not restart for weeks, which is the exact case day-roll pruning
+// exists for.
+func TestPrune_StaysArmedUntilAPruneActuallyRuns(t *testing.T) {
+	dir := t.TempDir()
+	now := at
+	w, err := New(dir, WithClock(func() time.Time { return now }),
+		WithRetentionDays(3), WithSettleInterval(0))
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	t.Cleanup(func() { _ = w.Close() })
+
+	next := dayOf(at).AddDate(0, 0, 1).Add(9 * time.Hour)
+	w.mu.Lock()
+	first := w.pruneDueLocked(next)
+	w.mu.Unlock()
+	if first.IsZero() {
+		t.Fatal("no prune armed on a day roll; the premise of this test is that one is due")
+	}
+
+	// The batch carrying it never landed, so nothing was pruned. The next minute has to
+	// ask again — this used to answer "already done" forever.
+	w.mu.Lock()
+	second := w.pruneDueLocked(next.Add(time.Minute))
+	w.mu.Unlock()
+	if second.IsZero() {
+		t.Error("retention disarmed for the day by a prune that never ran; the files past " +
+			"the window would stay until the next restart or the next midnight")
+	}
+
+	// And once one HAS run it stops asking, or every minute pays a directory listing.
+	w.markPruned(next)
+	w.mu.Lock()
+	third := w.pruneDueLocked(next.Add(2 * time.Minute))
+	w.mu.Unlock()
+	if !third.IsZero() {
+		t.Error("retention re-armed after a successful prune; that is a ReadDir every minute")
+	}
+}
+
+// retainDays is what the option and the config field both call "how many day files
+// survive", and prune kept retainDays + 1 of them: the cutoff was inclusive at both
+// ends of the range.
+func TestPrune_KeepsExactlyRetainDaysFiles(t *testing.T) {
+	dir := t.TempDir()
+	const retain = 3
+	s, err := newStore(dir, retain, time.Local)
+	if err != nil {
+		t.Fatalf("newStore: %v", err)
+	}
+	for i := 0; i < 7; i++ {
+		if werr := os.WriteFile(s.path(at.AddDate(0, 0, -i)), []byte("{}\n"), 0o600); werr != nil {
+			t.Fatalf("seed: %v", werr)
+		}
+	}
+
+	if perr := s.prune(at); perr != nil {
+		t.Fatalf("prune: %v", perr)
+	}
+
+	entries, rerr := os.ReadDir(dir)
+	if rerr != nil {
+		t.Fatalf("readdir: %v", rerr)
+	}
+	if len(entries) != retain {
+		names := make([]string, 0, len(entries))
+		for _, e := range entries {
+			names = append(names, e.Name())
+		}
+		t.Errorf("%d files survived a %d-day retention (%v), want %d — today and the %d before it",
+			len(entries), retain, names, retain, retain-1)
+	}
+}
+
+// N7: the day a row is FILED under and the day a reader LOOKS in have to be decided by
+// one zone. path() named the file from the row's own zone while the day walk used the
+// caller's, and they agreed only because nothing in the pipeline calls .UTC(). One that
+// does writes a row near midnight to a file no query for that local day ever opens.
+//
+// In testZone (UTC-7), 23:30 local is 06:30 the NEXT day in UTC, so the two zones
+// disagree about which day this instant belongs to — which is the point.
+func TestRecord_ARowTimestampedInAnotherZoneIsStillFiledUnderTheLedgerDay(t *testing.T) {
+	dir := t.TempDir()
+	evening := time.Date(2026, 9, 13, 23, 30, 0, 0, testZone)
+	now := evening
+	w := newTestWriter(t, dir, func() time.Time { return now })
+
+	e := costedEvent(t, "gw", "m", 0.25, 100, 50)
+	e.At = evening.UTC() // the same instant, from a producer that normalised to UTC
+	w.Record("s1", e)
+	now = evening.Add(time.Minute)
+	if err := w.Flush(); err != nil {
+		t.Fatalf("Flush: %v", err)
+	}
+
+	if _, err := os.Stat(filepath.Join(dir, "2026-09-13.jsonl")); err != nil {
+		t.Errorf("the row was not filed under the ledger day: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(dir, "2026-09-14.jsonl")); err == nil {
+		t.Error("the row was filed under its own zone's date, which is a file no query " +
+			"for that ledger day visits")
+	}
+	// The assertion that matters: a query for that ledger day finds it.
+	rows, err := w.Query(dayOf(evening), evening.Add(time.Hour))
+	if err != nil {
+		t.Fatalf("Query: %v", err)
+	}
+	if len(rows) != 1 {
+		t.Errorf("got %d rows querying the ledger day the spend happened on, want 1", len(rows))
+	}
+}
+
+// The read half of the same rule: the same instants spelled in a different zone must
+// read the same day files, or the answer depends on how the caller wrote the window
+// down.
+func TestQuery_WindowBoundsInAnotherZoneReadTheSameDayFiles(t *testing.T) {
+	dir := t.TempDir()
+	evening := time.Date(2026, 9, 13, 23, 30, 0, 0, testZone)
+	now := evening
+	w := newTestWriter(t, dir, func() time.Time { return now })
+	// costedEvent stamps its own At, so put this one in the evening explicitly.
+	e := costedEvent(t, "gw", "m", 0.25, 100, 50)
+	e.At = evening
+	w.Record("s1", e)
+	now = evening.Add(time.Minute)
+	if err := w.Flush(); err != nil {
+		t.Fatalf("Flush: %v", err)
+	}
+
+	local, err := w.Query(dayOf(evening), evening.Add(time.Hour))
+	if err != nil {
+		t.Fatalf("Query in the ledger zone: %v", err)
+	}
+	utc, err := w.Query(dayOf(evening).UTC(), evening.Add(time.Hour).UTC())
+	if err != nil {
+		t.Fatalf("Query in UTC: %v", err)
+	}
+	if len(local) != 1 || len(utc) != len(local) {
+		t.Errorf("the ledger zone returned %d rows and UTC returned %d over the same "+
+			"instants; the day walk must not depend on the caller's zone", len(local), len(utc))
 	}
 }
 
@@ -1065,7 +1222,7 @@ func TestPendingMinute_IsNeverAlsoOnDisk(t *testing.T) {
 // operator-configured path is the one unrecoverable mistake available here.
 func TestWriter_PruneDropsOldDaysAndSparesUnknownNames(t *testing.T) {
 	dir := t.TempDir()
-	s, err := newStore(dir, 3)
+	s, err := newStore(dir, 3, time.Local)
 	if err != nil {
 		t.Fatalf("newStore: %v", err)
 	}

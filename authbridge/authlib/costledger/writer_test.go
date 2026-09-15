@@ -1104,37 +1104,49 @@ func TestRecord_ARowTimestampedInAnotherZoneIsStillFiledUnderTheLedgerDay(t *tes
 // The read half of the same rule: the same instants spelled in a different zone must
 // read the same day files, or the answer depends on how the caller wrote the window
 // down.
+// The window STRADDLES the ledger midnight, which is the shape that catches it. A
+// window inside one ledger day does not: store.path normalises the walk's dates on the
+// way to a filename, so at UTC-7 a walk over UTC days lands on the right single file by
+// arithmetic accident (UTC midnight maps back to the previous ledger day). What it
+// cannot do is produce the right SET — a walk in UTC covers one date here where the
+// ledger covers two, so one of the two files is never opened. An earlier version of
+// this test used a single-day window and the mutation survived it.
 func TestQuery_WindowBoundsInAnotherZoneReadTheSameDayFiles(t *testing.T) {
 	dir := t.TempDir()
-	evening := time.Date(2026, 9, 13, 23, 30, 0, 0, testZone)
-	now := evening
+	midnight := time.Date(2026, 9, 14, 0, 0, 0, 0, testZone)
+	before := midnight.Add(-30 * time.Minute) // 23:30 on the 13th, ledger zone
+	after := midnight.Add(30 * time.Minute)   // 00:30 on the 14th, ledger zone
+	now := before
 	w := newTestWriter(t, dir, func() time.Time { return now })
-	// costedEvent stamps its own At, so put this one in the evening explicitly.
-	e := costedEvent(t, "gw", "m", 0.25, 100, 50)
-	e.At = evening
-	w.Record("s1", e)
-	now = evening.Add(time.Minute)
+
+	for _, when := range []time.Time{before, after} {
+		// costedEvent stamps its own At, so place each event explicitly.
+		e := costedEvent(t, "gw", "m", 0.25, 100, 50)
+		e.At = when
+		now = when
+		w.Record("s1", e)
+	}
+	now = after.Add(time.Minute)
 	if err := w.Flush(); err != nil {
 		t.Fatalf("Flush: %v", err)
 	}
+	// Two ledger days, two files — the premise.
+	for _, want := range []string{"2026-09-13.jsonl", "2026-09-14.jsonl"} {
+		if _, err := os.Stat(filepath.Join(dir, want)); err != nil {
+			t.Fatalf("missing %s: %v", want, err)
+		}
+	}
 
-	// A window entirely inside the ledger day whose UTC dates are BOTH the next day:
-	// 23:00 and 23:50 at UTC-7 are 06:00 and 06:50 on the 14th. A day walk reading the
-	// caller's zone therefore visits only 2026-09-14 and never opens the file the row is
-	// in. A window that spanned both dates would mask that, which is what an earlier
-	// version of this test did — proved by mutation.
-	from, to := evening.Add(-30*time.Minute), evening.Add(20*time.Minute)
-	local, err := w.Query(from, to)
+	local, err := w.Query(before, after)
 	if err != nil {
 		t.Fatalf("Query in the ledger zone: %v", err)
 	}
-	utc, err := w.Query(from.UTC(), to.UTC())
+	utc, err := w.Query(before.UTC(), after.UTC())
 	if err != nil {
 		t.Fatalf("Query in UTC: %v", err)
 	}
-	if len(local) != 1 {
-		t.Fatalf("got %d rows querying in the ledger zone, want 1; the premise of this test "+
-			"is that the row is there", len(local))
+	if len(local) != 2 {
+		t.Fatalf("got %d rows querying in the ledger zone, want 2 across the two day files", len(local))
 	}
 	if len(utc) != len(local) {
 		t.Errorf("the ledger zone returned %d rows and UTC returned %d over the same "+

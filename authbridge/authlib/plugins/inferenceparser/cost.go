@@ -35,8 +35,22 @@ import (
 // listener can dispatch a terminal frame twice — extproc does, once for headers and once
 // for the buffered body — and charging twice for one request is the failure that guard
 // exists to prevent. It mirrors the one litellm-budget-track keeps for the same reason.
+// A NIL Extensions.Inference IS A SUPPORTED INPUT, and that is the whole reason this
+// guard reads the way it does. It used to return on nil, which silently made "this
+// parser understood the request" the precondition for charging anything — so
+// /v1/embeddings, /v1/rerank, /v1/moderations, any endpoint not on the request-side
+// allowlist, and any request whose body was empty or unparseable were free of charge
+// however much the gateway said they cost. The spend reached no ledger, no /v1/usage
+// total and no budget, because litellm-budget-track amends a settled record rather than
+// settling its own: no record meant no enforcement.
+//
+// costing.Settle is safe with a nil extension and needs no model to answer. headerCost
+// runs first off the RESPONSE HEADERS alone, and every read of Extensions.Inference below
+// it is behind a nil check — pricing.UsageFromInference(nil) is the zero Usage, which
+// modelledCost refuses outright, so a header-only figure settles and a modelled one
+// cannot be invented. That is what keeps this from charging for traffic nobody priced.
 func (p *InferenceParser) settleCost(pctx *pipeline.Context) {
-	if pctx == nil || pctx.Extensions.Inference == nil {
+	if pctx == nil {
 		return
 	}
 	if st := pipeline.GetState[settledOnce](pctx, costSettledKey); st != nil {

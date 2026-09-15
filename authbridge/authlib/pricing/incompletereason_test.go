@@ -166,9 +166,63 @@ func TestIncompleteReason_MaskAloneCannotDiscriminate(t *testing.T) {
 	}
 }
 
+// tierMicros is what distinctTierRates charges per token in each tier, in micro-dollars.
+//
+// DISTINCT PER TIER, and that is the entire point of the numbers. The floor test below
+// used to charge 1e-6 in all four tiers, which made its expectation a function of the
+// token TOTAL and of nothing else: its 1,000 uncached-input and 500 cache-read tokens
+// priced identically to 500 input and 1,000 cache reads — a 10x error on the real card,
+// and the exact mistake the four-way split exists to prevent — so the assertion stayed
+// green with TierInput and TierCacheRead transposed in Usage.tokens.
+//
+// FOUR PRIMES, no two of which sum to or divide a third, so no transposition can
+// coincide. 1/2/4/8 would not do: a fixture carrying twice as many of the 4-tier's tokens
+// as the 8-tier's prices the same either way round, and a swap of those two would pass.
+// Ordered cache_read < input < cache_write < output so the SHAPE matches a real rate card
+// and nothing here reads as an inverted one; the values themselves are synthetic and are
+// nobody's price list.
+//
+// The SAME four values as authlib/costing's tierMicros, deliberately: 853fedc3 fixed this
+// blindness there first, and one convention across the two suites means a figure copied
+// between them still means the same thing. Not shared through a helper package because a
+// test fixture that two packages import is a third thing to keep honest.
+var tierMicros = map[Tier]float64{
+	TierCacheRead:  3,
+	TierInput:      7,
+	TierCacheWrite: 11,
+	TierOutput:     23,
+}
+
+// distinctTierRates builds a fully-priced table charging tierMicros per token, so a total
+// says WHICH tiers the tokens were priced in and not merely how many there were.
+//
+// The pairwise-distinctness check is a guard on the FIXTURE, not on Cost: distinctness is
+// the property that makes an expectation written against this table tier-sensitive at all,
+// so a future edit that quietly gives two tiers one rate fails here rather than silently
+// restoring the blind spot.
+func distinctTierRates(t *testing.T) Rates {
+	t.Helper()
+	var r Rates
+	seen := make(map[float64]Tier, len(tierMicros))
+	for tier, perToken := range tierMicros {
+		if other, dup := seen[perToken]; dup {
+			t.Fatalf("%v and %v both charge %v micro-dollars per token; two tiers on one rate makes every expectation against this table blind to a swap between them",
+				tier, other, perToken)
+		}
+		seen[perToken] = tier
+		r.Base[tier], r.Set[tier] = perToken*1e-6, true
+	}
+	return r
+}
+
 // A floor must still PRICE. Refusing to price it would be the wrong fix: the prompt cost
 // is real, and dropping it understates spend by more than presenting it as exact ever
 // did. This is the property costing.Settle relies on to publish a figure at all.
+//
+// Priced at each tier's OWN rate, not at a flat per-token one. A floor charged off the
+// wrong tier would be a second error hiding inside a disclosed one, and it is the error
+// that costs real money silently: a long-running agent's traffic is overwhelmingly cache
+// reads, billed as uncached input at 10x on the published card.
 func TestIncompleteReason_FloorStillPrices(t *testing.T) {
 	inf := &pipeline.InferenceExtension{
 		InputTokens: 1000, CacheReadTokens: 500, PromptTokens: 1500,
@@ -176,15 +230,62 @@ func TestIncompleteReason_FloorStillPrices(t *testing.T) {
 	if IncompleteReason(inf) != ReasonOutputUncounted {
 		t.Fatal("fixture is not a floor; the rest of this test proves nothing")
 	}
-	var r Rates
-	for _, tier := range []Tier{TierInput, TierCacheWrite, TierCacheRead, TierOutput} {
-		r.Base[tier], r.Set[tier] = 1e-6, true
-	}
-	micros, ok := Cost(r, UsageFromInference(inf))
+	micros, ok := Cost(distinctTierRates(t), UsageFromInference(inf))
 	if !ok {
 		t.Fatal("Cost refused a floor; a lower bound is still a figure, and dropping it loses real spend")
 	}
-	if micros != 1500 {
-		t.Errorf("micros = %d, want 1500 (1000 input + 500 cache-read at 1e-6)", micros)
+	// Per-tier arithmetic rather than a bare total, so the assertion says which rate each
+	// count is charged at: 1,000 uncached input tokens at the input rate plus 500 cache
+	// reads at the cache-read rate. Transposed, the same two counts come to 6,500.
+	want := int64(1000*tierMicros[TierInput] + 500*tierMicros[TierCacheRead])
+	if micros != want {
+		t.Errorf("micros = %d, want %d — 1000 uncached input tokens at %v/token and 500 cache reads at %v/token, each in its OWN tier",
+			micros, want, tierMicros[TierInput]*1e-6, tierMicros[TierCacheRead]*1e-6)
+	}
+}
+
+// TestIncompleteReason_FloorChargesEachTierAtItsOwnRate pins the transposition directly
+// rather than relying on the floor fixture to catch it incidentally.
+//
+// One fixture per tier, the same 1,000 tokens in each, each expected at its own rate: a
+// swap anywhere between InferenceExtension's field names, UsageFromInference's mapping and
+// Cost's rate lookup moves two of the four figures. This is the pricing-side mirror of
+// authlib/costing's TestSettle_PricesEachTierAtItsOwnRate, one layer down — that one goes
+// through Settle and a Resolver, this one straight through the two functions the mapping
+// actually lives in, so a failure names which of the two layers moved.
+func TestIncompleteReason_FloorChargesEachTierAtItsOwnRate(t *testing.T) {
+	const n = 1000
+	r := distinctTierRates(t)
+	settled := make(map[Tier]int64, len(tierMicros))
+	for _, tc := range []struct {
+		tier Tier
+		inf  pipeline.InferenceExtension
+	}{
+		{TierInput, pipeline.InferenceExtension{InputTokens: n}},
+		{TierCacheWrite, pipeline.InferenceExtension{CacheWriteTokens: n}},
+		{TierCacheRead, pipeline.InferenceExtension{CacheReadTokens: n}},
+		{TierOutput, pipeline.InferenceExtension{OutputTokens: n}},
+	} {
+		t.Run(tc.tier.String(), func(t *testing.T) {
+			inf := tc.inf
+			micros, ok := Cost(r, UsageFromInference(&inf))
+			if !ok {
+				t.Fatalf("Cost reported unpriced for %d %s tokens against a fully-priced table", n, tc.tier)
+			}
+			if want := int64(n * tierMicros[tc.tier]); micros != want {
+				t.Errorf("micros = %d, want %d — %d %s tokens must charge the %s rate (%v/token), and no other tier's",
+					micros, want, n, tc.tier, tc.tier, tierMicros[tc.tier]*1e-6)
+			}
+			settled[tc.tier] = micros
+		})
+	}
+
+	byCost := make(map[int64]Tier, len(settled))
+	for tier, micros := range settled {
+		if other, dup := byCost[micros]; dup {
+			t.Errorf("%v and %v both price %d tokens at %d micros; two tiers charging one rate makes every expectation in this file blind to a swap between them",
+				tier, other, n, micros)
+		}
+		byCost[micros] = tier
 	}
 }

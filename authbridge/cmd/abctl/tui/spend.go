@@ -24,6 +24,21 @@ const spendPollInterval = 20 * time.Second
 // server reads day files off disk for it rather than summing an in-memory ring.
 const spendTodayPollInterval = 5 * time.Minute
 
+// spendStaleAfter is how old the window figure has to be before the strip says so.
+//
+// Twice the poll interval, so one dropped or slow reply is not an alarm and a wedged
+// chain is. Shown only past that threshold, never always: a timestamp beside a healthy
+// figure is noise on a line whose entire budget is width, and noise on an always-on
+// indicator is how a real signal gets ignored.
+//
+// The alternative was what the strip did with spendState.lastFetch, which is maintained
+// on every accepted reply and asserted by six tests: nothing rendered it. A poll chain
+// that stops answering therefore looked exactly like a current reading — no error, no
+// staleness, the last good figure sitting there indefinitely. Note that only the WINDOW
+// chain has a timestamp; the today chain's own age is not tracked, so a wedged today poll
+// is still indistinguishable from a fresh one.
+const spendStaleAfter = 2 * spendPollInterval
+
 // spendWindow is the span the strip REQUESTS, and spendResolution asks for it as
 // a SINGLE bucket. One bucket means the server folds and the client does no
 // arithmetic over buckets — a client-side sum would be a second implementation of
@@ -227,6 +242,13 @@ type spendSummary struct {
 
 	SavedUSD float64 // set once tool-prune savings are aggregated
 	HasSaved bool
+
+	// Age is how long ago the window figure was fetched, and Stale reports that it is
+	// old enough to be worth saying — see spendStaleAfter. Age is only meaningful when
+	// Stale is set; a fresh figure reports neither, because the strip must not carry a
+	// permanent timestamp.
+	Age   time.Duration
+	Stale bool
 }
 
 // spendSummary derives the strip's figures from the last snapshot.
@@ -292,6 +314,14 @@ func (m *model) spendSummary() spendSummary {
 	span, spanOK := parseWindowSpan(snap.Window)
 	if spanOK {
 		out.WindowLabel = formatWindowLabel(span)
+	}
+	// How old this answer is. Read from the clock here rather than recorded on the
+	// snapshot because staleness is a property of NOW, not of the reply: a figure fetched
+	// once and rendered for ten minutes gets older every frame.
+	if !m.spend.lastFetch.IsZero() {
+		if age := time.Since(m.spend.lastFetch); age > spendStaleAfter {
+			out.Age, out.Stale = age, true
+		}
 	}
 	m.applyTodayFigure(&out)
 	if snap.Priced {

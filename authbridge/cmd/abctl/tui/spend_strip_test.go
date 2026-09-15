@@ -4,6 +4,7 @@ import (
 	"context"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/charmbracelet/lipgloss"
 
@@ -773,6 +774,13 @@ func TestRenderSpendStrip_CaveatsObeyTheWidthContract(t *testing.T) {
 			HasSnapshot: true, Unpriced: 12, Priceable: 318, Incomplete: 3,
 			SavedUSD: 0.24, HasSaved: true,
 		}},
+		{"every caveat at once, plus a stale age", spendSummary{
+			TodayUSD: 0.0031, HasToday: true, TodayUnpriced: 399, TodayPriceable: 400, TodayIncomplete: 7,
+			WindowUSD: 1.12, WindowLabel: "1h", BurnPerMin: 0.0187, Priced: true,
+			HasSnapshot: true, Unpriced: 12, Priceable: 318, Incomplete: 3,
+			SavedUSD: 0.24, HasSaved: true,
+			Age: 3 * time.Minute, Stale: true,
+		}},
 		{"cjk window label under a partial day", spendSummary{
 			TodayUSD: 0.0031, HasToday: true, TodayUnpriced: 399, TodayPriceable: 400,
 			WindowUSD: 1.12, WindowLabel: "過去一時間", BurnPerMin: 0.0187, Priced: true,
@@ -794,6 +802,70 @@ func TestRenderSpendStrip_CaveatsObeyTheWidthContract(t *testing.T) {
 				assertStripFits(t, tc.s, w)
 			}
 		})
+	}
+}
+
+// A wedged poll chain must be visible. The strip is always on, so the failure mode is
+// silent: the last good figure keeps rendering and nothing says when it was fetched.
+func TestRenderSpendStrip_AStaleFigureIsDated(t *testing.T) {
+	s := spendSummary{
+		WindowUSD: 1.12, WindowLabel: "1h", Priced: true, HasSnapshot: true, Priceable: 10,
+		Age: 3 * time.Minute, Stale: true,
+	}
+	got := renderSpendStrip(s, 200)
+
+	if !strings.Contains(got, "3m ago") {
+		t.Errorf("strip %q does not date a figure fetched 3m ago", got)
+	}
+	// The figure stays: it is old, not wrong.
+	if !strings.Contains(got, "$1.1200 /1h") {
+		t.Errorf("strip %q withheld a stale figure instead of dating it", got)
+	}
+}
+
+// And a fresh one is not dated, which is the half that keeps the age worth reading.
+func TestRenderSpendStrip_AFreshFigureIsNotDated(t *testing.T) {
+	s := spendSummary{WindowUSD: 1.12, WindowLabel: "1h", Priced: true, HasSnapshot: true, Priceable: 10}
+	got := renderSpendStrip(s, 200)
+
+	if strings.Contains(got, "ago") {
+		t.Errorf("strip %q dates a current figure; a permanent timestamp is noise", got)
+	}
+}
+
+// The age is the LAST figure, so it is the first thing a narrow terminal gives up — unlike
+// a partiality marker, which is undroppable. It is recoverable information: the next poll
+// either lands or the age keeps growing.
+func TestRenderSpendStrip_TheAgeYieldsBeforeAFigure(t *testing.T) {
+	s := spendSummary{
+		TodayUSD: 4.17, HasToday: true, TodayPriceable: 318,
+		WindowUSD: 1.12, WindowLabel: "1h", Priced: true, HasSnapshot: true, Priceable: 10,
+		Age: 3 * time.Minute, Stale: true,
+	}
+	narrow := renderSpendStrip(s, 24)
+
+	if !strings.Contains(narrow, "$4.1700") {
+		t.Errorf("narrow strip %q dropped the headline figure before the age", narrow)
+	}
+	if strings.Contains(narrow, "ago") {
+		t.Errorf("narrow strip %q kept the age at the expense of a reading", narrow)
+	}
+}
+
+func TestFormatSpendAge_RoundsToTheCoarsestUsefulUnit(t *testing.T) {
+	for _, tc := range []struct {
+		in   time.Duration
+		want string
+	}{
+		{45 * time.Second, "45s"},
+		{90 * time.Second, "1m"},
+		{3 * time.Minute, "3m"},
+		{59*time.Minute + 59*time.Second, "59m"},
+		{2 * time.Hour, "2h"},
+	} {
+		if got := formatSpendAge(tc.in); got != tc.want {
+			t.Errorf("formatSpendAge(%v) = %q, want %q", tc.in, got, tc.want)
+		}
 	}
 }
 

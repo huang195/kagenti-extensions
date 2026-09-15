@@ -21,30 +21,109 @@ func costSessionsModel() *model {
 	return m
 }
 
-// sessionsRowCell returns one named column's cell from the first row, addressed by
-// the column's TITLE rather than by an index.
+// sessionsRowCell returns one column's cell from the first row, addressed by the column's
+// TITLE PREFIX rather than by an index.
 //
 // Positional indexing is what makes table.Row dangerous: it is a []string, so
 // inserting a column shifts every reader silently instead of failing to compile.
 // A test that hardcodes an index would keep passing while asserting about the
 // wrong column.
-func sessionsRowCell(t *testing.T, m *model, title string) string {
+//
+// A prefix rather than the whole title because the COST title carries the span its
+// figures cover ("COST/1h") and that span follows the server's answer — see
+// costColumnTitle. Every call site here passes "COST" and keeps working whatever span the
+// fixture's snapshot reports, which is the same reason the production lookup matches by
+// prefix.
+func sessionsRowCell(t *testing.T, m *model, titlePrefix string) string {
 	t.Helper()
 	rows := m.sessionsTbl.Rows()
 	if len(rows) == 0 {
 		t.Fatal("sessions table has no rows")
 	}
 	for i, c := range m.sessionsTbl.Columns() {
-		if c.Title != title {
+		if !strings.HasPrefix(c.Title, titlePrefix) {
 			continue
 		}
 		if i >= len(rows[0]) {
-			t.Fatalf("column %q is at index %d but the row has only %d cells: %v", title, i, len(rows[0]), rows[0])
+			t.Fatalf("column %q is at index %d but the row has only %d cells: %v", c.Title, i, len(rows[0]), rows[0])
 		}
 		return rows[0][i]
 	}
-	t.Fatalf("no %q column in the sessions table (columns: %v)", title, m.sessionsTbl.Columns())
+	t.Fatalf("no column titled %q* in the sessions table (columns: %v)", titlePrefix, m.sessionsTbl.Columns())
 	return ""
+}
+
+// A bare "COST" beside a lifetime TOKENS count is two spans on one row with nothing
+// saying so: a six-hour live session showed six hours of tokens against one hour of
+// dollars, and dividing the two cells fabricated a rate. The header is the only place the
+// span can live.
+func TestSessionsColumns_CostTitleNamesItsSpan(t *testing.T) {
+	title := ""
+	for _, c := range sessionsColumns() {
+		if strings.HasPrefix(c.Title, costColumnPrefix) {
+			title = c.Title
+			break
+		}
+	}
+	if title == "" {
+		t.Fatalf("no COST column in %v", sessionsColumns())
+	}
+	if title == costColumnPrefix {
+		t.Error("COST title is bare; it promises nothing about the span its figures cover, " +
+			"and the TOKENS cell beside it covers a different one")
+	}
+	// The span the strip actually asks for, so the header cannot drift from the poll
+	// window even before a snapshot has answered.
+	if want := "COST/" + formatWindowLabel(spendWindow); title != want {
+		t.Errorf("COST title = %q, want %q", title, want)
+	}
+}
+
+// The declared width is pinned arithmetic (sessionsColumns' 102-column note), so the title
+// has to fit inside it rather than the other way round.
+func TestSessionsColumns_CostTitleFitsTheDeclaredWidth(t *testing.T) {
+	for _, c := range sessionsColumns() {
+		if !strings.HasPrefix(c.Title, costColumnPrefix) {
+			continue
+		}
+		if got := lipgloss.Width(c.Title); got > c.Width {
+			t.Errorf("COST title %q is %d columns in a %d-wide column; bubbles ellipsises the header",
+				c.Title, got, c.Width)
+		}
+		return
+	}
+	t.Fatal("no COST column found")
+}
+
+// The title follows the SNAPSHOT, not the request. The server answers with the span it
+// actually served — a proxy with a shorter ring answers a one-hour request with what it
+// holds — and a header driven off the constant would name an hour over some other span.
+func TestSessionsTable_CostTitleFollowsTheSnapshotsWindow(t *testing.T) {
+	m := costSessionsModel()
+	m.sessions = []session.SessionSummary{{ID: "sess-a", EventCount: 1}}
+	m.spend.snap = &usage.Snapshot{
+		Window: "30m", Priced: true,
+		Buckets: []usage.Bucket{{Series: map[string]usage.Counts{
+			"sess-a": {Requests: 1, CostMicros: 250_000, PricedRequests: 1, PriceableRequests: 1},
+		}}},
+	}
+
+	m.rebuildSessionsTable()
+
+	title := ""
+	for _, c := range m.sessionsTbl.Columns() {
+		if strings.HasPrefix(c.Title, costColumnPrefix) {
+			title = c.Title
+		}
+	}
+	if title != "COST/30m" {
+		t.Errorf("COST title = %q, want %q — the figures were summed over the 30m the server served",
+			title, "COST/30m")
+	}
+	// And the figure still lands in that column, which is what the prefix lookup buys.
+	if got := sessionsRowCell(t, m, costColumnPrefix); got != "$0.2500" {
+		t.Errorf("COST cell = %q, want %q; the re-titled column lost its cell", got, "$0.2500")
+	}
 }
 
 func TestSessionsTable_ShowsCostPerSession(t *testing.T) {
@@ -189,9 +268,19 @@ func TestSessionsTable_EveryRowHasOneCellPerColumn(t *testing.T) {
 // its column is truncated by bubbles with runewidth.Truncate, which would put an
 // ellipsis in the middle of a dollar amount — the one thing #953 rules out.
 func TestSessionsTable_CostFitsItsColumn(t *testing.T) {
+	// Keyed by the title's PREFIX, not the title: COST carries its span now, and a map
+	// keyed on the whole title would look up a missing entry and compare every figure
+	// against a width of zero — an assertion that cannot fail is worse than none.
 	widths := map[string]int{}
 	for _, c := range newSessionsTable().Columns() {
+		if strings.HasPrefix(c.Title, costColumnPrefix) {
+			widths[costColumnPrefix] = c.Width
+			continue
+		}
 		widths[c.Title] = c.Width
+	}
+	if widths[costColumnPrefix] == 0 {
+		t.Fatal("no COST column in the sessions table")
 	}
 	// lipgloss.Width, not len: this measures DISPLAY COLUMNS, which is what bubbles
 	// compares against. The package's trunc and truncStr helpers are both
@@ -228,7 +317,9 @@ func fittedCostWidth(t *testing.T, w int) int {
 			w, len(fitted), len(sessionsColumns()))
 	}
 	for _, c := range fitted {
-		if c.Title == "COST" {
+		// By prefix: the title carries the span its figures cover, so an exact match would
+		// stop finding the column the first time that span changed.
+		if strings.HasPrefix(c.Title, costColumnPrefix) {
 			return c.Width
 		}
 	}

@@ -779,6 +779,81 @@ func TestSpendInvalidate_DisownsTheTodayChain(t *testing.T) {
 	}
 }
 
+// lastFetch was maintained on every accepted reply and asserted by six tests, and no
+// renderer read it — so a poll chain that stopped answering was indistinguishable from a
+// current reading: no error, no staleness, the last good figure sitting there.
+func TestSpendSummary_AWedgedPollChainReportsItsAge(t *testing.T) {
+	m := &model{}
+	m.spend.snap = &usage.Snapshot{
+		Window: "1h",
+		Totals: usage.Counts{Requests: 10, CostMicros: 1_120_000, PricedRequests: 10, PriceableRequests: 10},
+		Priced: true,
+	}
+	m.spend.lastFetch = time.Now().Add(-3 * time.Minute)
+
+	got := m.spendSummary()
+
+	if !got.Stale {
+		t.Fatalf("Stale = false for a figure fetched 3m ago on a %v poll", spendPollInterval)
+	}
+	if got.Age < 2*time.Minute || got.Age > 4*time.Minute {
+		t.Errorf("Age = %v, want about 3m", got.Age)
+	}
+	// The figure itself is unaffected: it is old, not wrong, and withholding it would be
+	// the worse answer.
+	if got.WindowUSD != 1.12 {
+		t.Errorf("WindowUSD = %v; a stale figure was withheld instead of dated", got.WindowUSD)
+	}
+}
+
+// And a healthy figure carries no timestamp. A permanent age on a line whose whole budget
+// is width is noise, and noise on an always-on indicator is how a real signal is learnt to
+// be ignored.
+func TestSpendSummary_AFreshFigureCarriesNoAge(t *testing.T) {
+	// Up to a second short of the threshold, not the threshold itself: time.Since is read
+	// after lastFetch is set, so an age of exactly spendStaleAfter is already past it by
+	// the time spendSummary looks. Pinning the exact boundary would need an injected
+	// clock, and what matters is that a figure inside the window is silent.
+	for _, age := range []time.Duration{0, time.Second, spendPollInterval, spendStaleAfter - time.Second} {
+		m := &model{}
+		m.spend.snap = &usage.Snapshot{
+			Window: "1h",
+			Totals: usage.Counts{Requests: 1, CostMicros: 1_120_000, PricedRequests: 1, PriceableRequests: 1},
+			Priced: true,
+		}
+		m.spend.lastFetch = time.Now().Add(-age)
+
+		if got := m.spendSummary(); got.Stale {
+			t.Errorf("age %v: Stale = true at or below the %v threshold", age, spendStaleAfter)
+		}
+	}
+}
+
+// Before the first reply there is no age to report, and "no poll has answered" must not
+// render as "this figure is infinitely old".
+func TestSpendSummary_NoFetchYetIsNotStale(t *testing.T) {
+	m := &model{}
+	m.spend.snap = &usage.Snapshot{
+		Window: "1h",
+		Totals: usage.Counts{Requests: 1, CostMicros: 1_120_000, PricedRequests: 1, PriceableRequests: 1},
+		Priced: true,
+	}
+	// lastFetch left zero, as invalidate() leaves it.
+
+	if got := m.spendSummary(); got.Stale {
+		t.Error("Stale = true with a zero lastFetch; the age would be measured from the epoch")
+	}
+}
+
+// The threshold is derived from the poll interval, not chosen: "twice the cadence" is what
+// makes one dropped reply quiet and a wedged chain loud, and hardcoding a duration would
+// let the two drift apart the next time the interval moves.
+func TestSpendStaleAfter_IsTwiceThePollInterval(t *testing.T) {
+	if spendStaleAfter != 2*spendPollInterval {
+		t.Errorf("spendStaleAfter = %v, want 2 x the %v poll interval", spendStaleAfter, spendPollInterval)
+	}
+}
+
 // The today poll is deliberately far slower than the window poll: the figure only
 // grows, by one turn at a time, and it is the more expensive answer to compute.
 func TestSpendTodayPollInterval_IsMuchSlowerThanTheWindowPoll(t *testing.T) {

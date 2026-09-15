@@ -3,6 +3,9 @@ package tui
 import (
 	"context"
 	"errors"
+	"fmt"
+	"math"
+	"regexp"
 	"strings"
 	"testing"
 	"time"
@@ -133,9 +136,23 @@ func TestCostPane_CycleGroupNeverYieldsNone(t *testing.T) {
 	// This pane's whole purpose is the breakdown. An ungrouped view of it is the
 	// strip, which is already on screen one row above.
 	//
-	// usage.GroupAgent is deliberately absent from the expected set: it does not
-	// exist. Client identity is not implemented, so there is no per-agent series to
-	// ask for, and naming the constant here would be inventing an axis.
+	// usage.GroupAgent IS in the want-list, and the comment that used to stand here was
+	// wrong on all three of its claims. It read "it does not exist. Client identity is
+	// not implemented, so there is no per-agent series to ask for" — true when the pane
+	// shipped in ddb93fbd, and false since fc1a8271 added the constant and the per-agent
+	// series, and 4cf32e33 put it in costPaneGroups as the fourth position.
+	//
+	// The test stayed green throughout, which is what made it worth fixing rather than
+	// leaving: the closing assertion counts positions instead of naming them — four seen,
+	// four in the cycle — so the agent axis was the one position nothing asserted was
+	// REACHABLE, with a comment telling the next reader that was deliberate.
+	//
+	// This test and TestCostPaneGroups_IncludesAgentLast are complementary; neither
+	// subsumes the other. That one reads the SLICE: membership and the last position,
+	// which is a claim about what a reader is shown first. This one drives cycleGroup and
+	// pins that every position is reachable by pressing the key — a slice can be correct
+	// while the cycle skips an entry, which is exactly the shape of the bug cycleGroup's
+	// own doc records, where matching only GroupNone made the first press a no-op.
 	var s costPaneState
 	seen := map[usage.Group]bool{}
 	for i := 0; i < 12; i++ {
@@ -145,9 +162,13 @@ func TestCostPane_CycleGroupNeverYieldsNone(t *testing.T) {
 		}
 		seen[s.group] = true
 	}
-	for _, want := range []usage.Group{usage.GroupModel, usage.GroupEndpoint, usage.GroupSession} {
+	// By NAME, not only by count: the count assertion below is satisfied by any four
+	// distinct axes, so on its own it cannot notice one being swapped for another.
+	for _, want := range []usage.Group{
+		usage.GroupModel, usage.GroupEndpoint, usage.GroupSession, usage.GroupAgent,
+	} {
 		if !seen[want] {
-			t.Errorf("cycleGroup never yielded %q", want)
+			t.Errorf("cycleGroup never yielded %q; that position of the cycle is unreachable", want)
 		}
 	}
 	if len(seen) != len(costPaneGroups) {
@@ -492,8 +513,11 @@ func TestRenderCostPane_UnpricedSeriesRowSaysSoRatherThanZero(t *testing.T) {
 }
 
 func TestRenderCostPane_FitsEveryWidthAndHeight(t *testing.T) {
+	// The floor is costWidthFloors, which reaches 16. It used to stop at 64, and the
+	// pane's own headings are up to 35 cells — so nothing here could see a heading
+	// overflow, and nothing could see the truncCells budget violation either.
 	snap := pricedSnapshotWithSeries(t, map[string]int64{"a": 100, "b": 200, "c": 300})
-	for _, w := range []int{120, 100, 80, 64} {
+	for _, w := range costWidthFloors {
 		for _, h := range []int{40, 24, 20} {
 			got := renderCostPane(snap, usage.GroupModel, w, h)
 			for i, line := range strings.Split(got, "\n") {
@@ -514,7 +538,7 @@ func TestRenderCostPane_FitsAWideCharacterLabel(t *testing.T) {
 	snap := pricedSnapshotWithSeries(t, map[string]int64{
 		strings.Repeat("日本語", 20): 3_820_000,
 	})
-	for _, w := range []int{120, 80, 64, 40} {
+	for _, w := range costWidthFloors {
 		got := renderCostPane(snap, usage.GroupModel, w, 40)
 		for i, line := range strings.Split(got, "\n") {
 			if lw := lipgloss.Width(line); lw > w {
@@ -1042,7 +1066,7 @@ func TestRenderCostPane_FitsEveryWidthWithEveryCaveatOn(t *testing.T) {
 		UnpricedBy: map[string]int64{"gateway.internal.example.test a-model-with-a-genuinely-long-name": 18},
 		PricedBy:   map[string]int64{"authoritative": 200, "bundled": 60, "configured": 40},
 	}
-	for _, w := range []int{200, 120, 100, 80, 64, 48, 40} {
+	for _, w := range costWidthFloors {
 		for _, h := range []int{60, 40, 24, 20, 16} {
 			got := renderCostPane(snap, usage.GroupModel, w, h)
 			for i, line := range strings.Split(got, "\n") {
@@ -1206,5 +1230,780 @@ func TestCostSeriesLabel_ReservedAgentBucketIsNotRenderedAsAName(t *testing.T) {
 		if got := costSeriesLabel(pipeline.UnknownClientLabel, g); got != pipeline.UnknownClientLabel {
 			t.Errorf("group=%s rewrote a real key %q to %q", g, pipeline.UnknownClientLabel, got)
 		}
+	}
+}
+
+// costWidthFloors are the widths every layout test sweeps.
+//
+// Down to 16, not 40. The bottom of this list used to be 40, and 40 is wider than
+// costTierHeading's 35 display cells — so the headings, which fitCostSections appended
+// RAW, could overflow at every width below 35 with no test able to see it. A pane whose
+// narrowest tested terminal is wider than its longest fixed string is not width-tested.
+var costWidthFloors = []int{200, 120, 100, 80, 64, 48, 40, 34, 32, 30, 24, 20, 16}
+
+// costHostileWidths are the widths the emoji cases panicked at, plus the sweep.
+//
+// 21-26 for "⚠️-model", 28-35 for "gpt-4o ▶️ preview", 21-42 for twelve "❤️" — each is a
+// window where truncCells' per-rune sum under-charged a cluster by exactly enough to
+// push renderCostRows' pad negative. Enumerated rather than sampled, because the bug was
+// invisible at 40 and at 120 and lived only in between.
+func costHostileWidths() []int {
+	var out []int
+	for w := 16; w <= 48; w++ {
+		out = append(out, w)
+	}
+	return out
+}
+
+// TestTruncCells_NeverExceedsItsBudget is the unit-level half of the crash.
+//
+// The caller measures the RESULT with lipgloss.Width. So must this: truncCells used to
+// measure the string it was BUILDING one rune at a time, and for any cluster wider than
+// the sum of its runes — Width("⚠️") is 2, Width("⚠")+Width("️") is 1+0 — that sum
+// under-charged and the result came back up to twice its budget. Twelve "❤️" truncated
+// to 5 returned 9 cells.
+func TestTruncCells_NeverExceedsItsBudget(t *testing.T) {
+	for name, s := range map[string]string{
+		"variation selector 16":  "⚠️-model",
+		"play button":            "gpt-4o ▶️ preview",
+		"repeated heart":         strings.Repeat("❤️", 12),
+		"combining acute accent": "mode\u0301l-cafe\u0301-nai\u0308ve",
+		"CJK":                    strings.Repeat("日本語", 12),
+		"CJK and emoji":          "日本語-⚠️-モデル-❤️",
+		"ZWJ family":             "family-👨‍👩‍👧-model",
+		"plain ASCII":            "a-perfectly-ordinary-model-name",
+	} {
+		t.Run(name, func(t *testing.T) {
+			for n := 1; n <= 48; n++ {
+				got := truncCells(s, n)
+				if w := lipgloss.Width(got); w > n {
+					t.Errorf("truncCells(%q, %d) is %d cells: %q", s, n, w, got)
+				}
+			}
+			if got := truncCells(s, 0); got != "" {
+				t.Errorf("truncCells(%q, 0) = %q, want the empty string", s, got)
+			}
+		})
+	}
+}
+
+// TestTruncCells_KeepsWhatFits is the mirror: the self-correcting loop must not shrink a
+// label that already fitted, or every column in the pane silently loses a cell.
+func TestTruncCells_KeepsWhatFits(t *testing.T) {
+	for _, s := range []string{"input", "日本語", "⚠️", strings.Repeat("❤️", 3)} {
+		w := lipgloss.Width(s)
+		if got := truncCells(s, w); got != s {
+			t.Errorf("truncCells(%q, %d) = %q, want it untouched", s, w, got)
+		}
+		if got := truncCells(s, w+10); got != s {
+			t.Errorf("truncCells(%q, %d) = %q, want it untouched", s, w+10, got)
+		}
+	}
+}
+
+// TestRenderCostPane_DoesNotPanicOnAnEmojiModelName is the reachable crash, driven
+// through the whole pane on wire-derived labels.
+//
+// A model name is workload-chosen and recorded verbatim, so "⚠️-model" is a name a
+// workload can simply pick. renderCostRows padded with
+// strings.Repeat(" ", labelW-Width(lbl)); an over-budget label made that count negative
+// and strings.Repeat panicked — inside View(), which is fatal in bubbletea and leaves the
+// terminal in alt-screen. The same call serves UnpricedBy, so a coverage-gap pair reached
+// it too, which is why both are populated here.
+func TestRenderCostPane_DoesNotPanicOnAnEmojiModelName(t *testing.T) {
+	for name, label := range map[string]string{
+		"variation selector 16": "⚠️-model",
+		"play button":           "gpt-4o ▶️ preview",
+		"repeated heart":        strings.Repeat("❤️", 12),
+		"combining accent":      "mode\u0301l-cafe\u0301",
+		"CJK":                   strings.Repeat("日本語", 12),
+	} {
+		t.Run(name, func(t *testing.T) {
+			snap := &usage.Snapshot{Window: "1h", Priced: true, Group: usage.GroupModel,
+				Totals: usage.Counts{Requests: 10, PriceableRequests: 10, PricedRequests: 4,
+					CostMicros: 1_000_000, InputTokens: 100, OutputTokens: 50,
+					PresentKinds: kindInput | kindOutput},
+				Buckets: []usage.Bucket{{Series: map[string]usage.Counts{
+					label: {Requests: 4, PricedRequests: 4, PriceableRequests: 4, CostMicros: 1_000_000},
+				}}},
+				UnpricedBy: map[string]int64{"gw.example.test " + label: 6},
+			}
+			for _, w := range costHostileWidths() {
+				for _, h := range []int{40, 20, 0} {
+					// A panic here is the defect: View() dying takes abctl with it.
+					got := renderCostPane(snap, usage.GroupModel, w, h)
+					for i, line := range strings.Split(got, "\n") {
+						if lw := lipgloss.Width(line); lw > w {
+							t.Fatalf("w=%d h=%d line %d is %d columns: %q", w, h, i, lw, line)
+						}
+					}
+				}
+			}
+		})
+	}
+}
+
+// TestRenderCostPane_HeadingsAreWidthFitted pins the heading budget on PURE ASCII, so it
+// cannot be mistaken for another spelling of the emoji case.
+//
+// costTierHeading is 35 display cells. fitCostSections appended it raw, so it overflowed
+// at every width below 35 — 20, 24, 30, 32 and 34 all reproduced. Every other line in the
+// pane goes through renderCostRows or wrapCells; the heading was the one that did not.
+func TestRenderCostPane_HeadingsAreWidthFitted(t *testing.T) {
+	if lipgloss.Width(costTierHeading) <= 34 {
+		t.Fatalf("costTierHeading is %d cells; this test needs it wider than the widths it sweeps",
+			lipgloss.Width(costTierHeading))
+	}
+	snap := pricedSnapshotWithSeries(t, map[string]int64{"a": 12_500_000, "b": 900_000})
+	for _, w := range []int{16, 20, 24, 30, 32, 34} {
+		got := renderCostPane(snap, usage.GroupModel, w, 0)
+		for i, line := range strings.Split(got, "\n") {
+			if lw := lipgloss.Width(line); lw > w {
+				t.Errorf("w=%d line %d is %d columns: %q", w, i, lw, line)
+			}
+		}
+		// And a heading that had to be cut still says it was cut, rather than reading as a
+		// shorter heading that means something else.
+		for _, line := range strings.Split(got, "\n") {
+			if strings.HasPrefix(line, "WHERE IT WENT") && lipgloss.Width(line) < lipgloss.Width(costTierHeading) &&
+				!strings.HasSuffix(line, "…") {
+				t.Errorf("w=%d the tier heading was shortened without saying so: %q", w, line)
+			}
+		}
+	}
+}
+
+// TestPaneView_CostPaneErrorRespectsTheHeightBudget: the error branch was the one body
+// path in this pane with no height cap.
+//
+// A server-authored body — a 502 HTML page, an upstream-connect-error chain — wrapped to
+// 42 lines in a 20-row body at w=40. paneView joins without clipping, so the frame grew
+// past the terminal, the footer went off the bottom and the terminal scrolled. Every
+// other path here respects m.bodyHeight.
+func TestPaneView_CostPaneErrorRespectsTheHeightBudget(t *testing.T) {
+	long := "upstream connect error or disconnect/reset before headers: " +
+		strings.Repeat("reset reason: connection failure, transport failure reason: "+
+			"delayed connect error: 111; ", 12)
+	for _, h := range []int{20, 8, 4, 2, 1} {
+		m := newTestModelOnPane(t, paneCost)
+		m.width, m.height = 40, h+3
+		m.layout()
+		m.bodyHeight = h
+		m.costPane.err = errors.New(long)
+
+		got := m.renderCostBody()
+		lines := strings.Split(got, "\n")
+		if len(lines) > h {
+			t.Errorf("h=%d: the error body is %d lines:\n%s", h, len(lines), got)
+		}
+		// It must still SAY what went wrong — a cap that swallowed the diagnostic would be
+		// the failure spend.go records, arriving from the other direction.
+		if !strings.Contains(got, "COST") {
+			t.Errorf("h=%d: the capped error body no longer says the pane is unavailable:\n%s", h, got)
+		}
+		// And a cut body must admit it was cut, or a clipped diagnostic reads as a complete
+		// one. One row buys the first line rather than the admission.
+		if h > 1 && !strings.Contains(got, costTruncated) {
+			t.Errorf("h=%d: the error body was cut without saying so:\n%s", h, got)
+		}
+		for i, l := range lines {
+			if lw := lipgloss.Width(l); lw > m.width {
+				t.Errorf("h=%d line %d is %d columns, terminal is %d: %q", h, i, lw, m.width, l)
+			}
+		}
+	}
+}
+
+// TestRenderCostPane_ASectionWithNoRowsIsDroppedWhole.
+//
+// renderCostRows returns nil when even a one-cell label cannot sit beside the figures,
+// and the "+N more" note was appended regardless. At w=20 with ten series that produced
+// "BY MODEL" followed only by "+2 more, each smaller than the last row" — naming a last
+// row that is not on screen, and reporting 2 elided when all 10 were lost. COVERAGE had
+// the same shape.
+func TestRenderCostPane_ASectionWithNoRowsIsDroppedWhole(t *testing.T) {
+	costs := map[string]int64{}
+	for i := 0; i < 10; i++ {
+		costs[fmt.Sprintf("model-%d-with-a-long-name", i)] = int64(10_000 * (i + 1))
+	}
+	snap := pricedSnapshotWithSeries(t, costs)
+	// The SECTION builders directly, not the assembled pane. At a width this narrow
+	// wrapCells breaks the elision note across three lines, so scanning the rendered pane
+	// for the whole sentence finds nothing whether the bug is present or not — the test
+	// would pass for the wrong reason. Each section's own lines are unambiguous.
+	//
+	// A ROW is identified by its RIGHT column, which is the one thing prose never carries
+	// and the one thing renderCostRows never truncates: costMoney's "$" for the breakdown,
+	// the "x<count>" request tally for COVERAGE. The LABEL is no good as a marker — it is
+	// truncated to a bare "…" at these widths, which is precisely the state under test.
+	rowMarker := regexp.MustCompile(`\$|x[0-9]`)
+	for _, w := range []int{1, 4, 8, 12, 16, 18, 20} {
+		for _, tc := range []struct {
+			name string
+			sec  costSection
+		}{
+			{"BY MODEL", costBreakdownSection(snap, usage.GroupModel, w)},
+			{"COVERAGE", costCoverageSection(snap, w)},
+		} {
+			if len(tc.sec.lines) == 0 {
+				continue // dropped whole, which is the correct answer
+			}
+			var rows int
+			for _, l := range tc.sec.lines {
+				if rowMarker.MatchString(l) {
+					rows++
+				}
+			}
+			if rows == 0 {
+				t.Errorf("w=%d: %s kept its heading and %d lines of prose with no data row at all: %q",
+					w, tc.name, len(tc.sec.lines), tc.sec.lines)
+			}
+		}
+	}
+	// And at a width where rows DO fit, the note is still disclosed — the fix must not have
+	// bought its correctness by dropping the elision note outright.
+	wide := costBreakdownSection(snap, usage.GroupModel, 120)
+	if !strings.Contains(strings.Join(wide.lines, "\n"), "more, each smaller than the last row") {
+		t.Errorf("ten series over a cap of %d disclosed no elision at all:\n%s",
+			costMaxSeriesRows, strings.Join(wide.lines, "\n"))
+	}
+}
+
+// TestCostBar_NaNDrawsNothingRatherThanPanicking.
+//
+// NaN fails BOTH of the range comparisons, so it used to reach int(frac*n+0.5) intact.
+// That conversion is implementation-defined: 0 on arm64, -2^63 on amd64 — where
+// strings.Repeat panics. An architecture-dependent crash is the worst kind to leave in,
+// because it does not reproduce on the machine it was written on.
+func TestCostBar_NaNDrawsNothingRatherThanPanicking(t *testing.T) {
+	// costFrac first, and it is the assertion that actually PINS the guard. Checked
+	// through the returned number rather than through costBar's string, because on arm64
+	// int(NaN) lands on 0 and the string is identical with or without the guard — so a
+	// test that only read costBar's output could not fail on this machine no matter what
+	// was deleted, and the crash lives on amd64.
+	for name, in := range map[string]float64{
+		"NaN":  math.NaN(),
+		"-Inf": math.Inf(-1),
+		"+Inf": math.Inf(1),
+		"-0.5": -0.5,
+		"1.5":  1.5,
+	} {
+		got := costFrac(in)
+		if got != got {
+			t.Errorf("costFrac(%s) returned NaN; int() of it is 0 on arm64 and -2^63 on amd64, "+
+				"where strings.Repeat panics inside View()", name)
+		}
+		if got < 0 || got > 1 {
+			t.Errorf("costFrac(%s) = %v, want it clamped into [0,1]", name, got)
+		}
+	}
+	if got := costFrac(0.25); got != 0.25 {
+		t.Errorf("costFrac(0.25) = %v, want it untouched", got)
+	}
+	for _, n := range []int{1, 6, 28} {
+		got := costBar(math.NaN(), true, n)
+		if lipgloss.Width(got) != n {
+			t.Errorf("costBar(NaN, true, %d) is %d cells, want exactly %d: %q",
+				n, lipgloss.Width(got), n, got)
+		}
+		if strings.Contains(got, "█") {
+			t.Errorf("costBar(NaN, true, %d) drew a share for a figure that is not a number: %q", n, got)
+		}
+	}
+	if got := costBar(math.Inf(-1), true, 10); lipgloss.Width(got) != 10 {
+		t.Errorf("costBar(-Inf, true, 10) is %d cells: %q", lipgloss.Width(got), got)
+	}
+	if got := costBar(math.Inf(1), true, 10); lipgloss.Width(got) != 10 {
+		t.Errorf("costBar(+Inf, true, 10) is %d cells: %q", lipgloss.Width(got), got)
+	}
+}
+
+// TestRenderCostPane_SanitizesTheProvenanceKeys.
+//
+// snap.PricedBy was the one wire-derived string the pane wrote out raw: snap.Window, the
+// series labels, the UnpricedBy keys and the error text all went through sanitizeLabel.
+// A key carrying ESC recolours the pane (CWE-150) and a key carrying a newline both blows
+// the height budget and emits an UNINDENTED body line, which breaks the "every heading is
+// unindented" contract the section logic reads.
+func TestRenderCostPane_SanitizesTheProvenanceKeys(t *testing.T) {
+	hostile := &usage.Snapshot{Window: "1h", Priced: true,
+		Totals:   usage.Counts{Requests: 10, PricedRequests: 10, PriceableRequests: 10, CostMicros: 4_170_000},
+		PricedBy: map[string]int64{"bun\ndled\x1b[31m": 6, "authoritative": 4}}
+	benign := &usage.Snapshot{Window: "1h", Priced: true,
+		Totals:   usage.Counts{Requests: 10, PricedRequests: 10, PriceableRequests: 10, CostMicros: 4_170_000},
+		PricedBy: map[string]int64{"bunxdledxx[31m": 6, "authoritative": 4}}
+
+	got := renderCostPane(hostile, usage.GroupModel, 120, 40)
+	for _, bad := range []string{"\x1b", "\r", "\x00", "\x7f"} {
+		if strings.Contains(got, bad) {
+			t.Errorf("the provenance note still carries %q:\n%q", bad, got)
+		}
+	}
+	ctrl := renderCostPane(benign, usage.GroupModel, 120, 40)
+	if g, w := len(strings.Split(got, "\n")), len(strings.Split(ctrl, "\n")); g != w {
+		t.Errorf("a hostile provenance key rendered %d rows against the benign control's %d — "+
+			"a smuggled newline moved the layout:\n%s", g, w, got)
+	}
+	// Every body line stays indented, which is the contract the section split depends on:
+	// sectionOf reads exactly this, so an unindented line no renderer authored would
+	// silently swallow the section below it.
+	headings := map[string]bool{"TOTAL": true, "BY MODEL": true, costTierHeading: true, "COVERAGE": true}
+	for i, l := range strings.Split(got, "\n") {
+		if i == 0 || l == "" || strings.HasPrefix(l, costIndent) || headings[l] {
+			continue
+		}
+		t.Errorf("line %d is unindented and is not one of this pane's headings — a newline in "+
+			"the provenance note broke the section contract: %q", i, l)
+	}
+}
+
+// TestKey_ReturningFromTheCatalogRestartsTheCostChain is `$` `P` `esc`.
+//
+// The catalog-return arm resumed ONLY paneUsage while resumeCostPolling's comment claimed
+// the two entry points could not drift. They had: the tick in flight when the catalog
+// opened was dropped by costTickMsg's `m.pane != paneCost` guard, nothing rescheduled, and
+// the pane never refreshed again while its freshness line went on counting up.
+func TestKey_ReturningFromTheCatalogRestartsTheCostChain(t *testing.T) {
+	m := newTestModelOnPane(t, paneEvents)
+	m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("$")})
+	if m.pane != paneCost {
+		t.Fatalf("pane = %v after $; test premise is wrong", m.pane)
+	}
+	m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("P")})
+	if m.pane != paneCatalog {
+		t.Fatalf("pane = %v after P; test premise is wrong", m.pane)
+	}
+	dead := m.costPane.tickGen
+
+	_, cmd := m.Update(tea.KeyMsg{Type: tea.KeyEsc})
+
+	if m.pane != paneCost {
+		t.Fatalf("pane = %v after esc, want paneCost", m.pane)
+	}
+	if cmd == nil {
+		t.Fatal("returning to the Cost pane scheduled nothing; its 20s refresh is dead")
+	}
+	if m.costPane.tickGen == dead {
+		t.Error("tickGen unchanged on the way back in; no new chain was started")
+	}
+	if m.costTickIsCurrent(dead) {
+		t.Error("the dropped generation is still accepted; the guard and the resume disagree")
+	}
+}
+
+// TestKey_LeavingTheCostPaneRestartsTheUsageChain is `u` `$` `esc`, and it is a
+// REGRESSION to an existing pane rather than a gap in a new one.
+//
+// Adding paneCost to the `$` opener list made paneUsage one of the panes it can be opened
+// FROM. The Usage tick in flight then fell to usageTickMsg's own `m.pane != paneUsage`
+// guard, and esc landed back on a Usage pane whose 20s refresh was dead — bit for bit the
+// failure the catalog-return arm exists to prevent, arriving through a different door.
+func TestKey_LeavingTheCostPaneRestartsTheUsageChain(t *testing.T) {
+	m := newTestModelOnPane(t, paneSessions)
+	m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("u")})
+	if m.pane != paneUsage {
+		t.Fatalf("pane = %v after u; test premise is wrong", m.pane)
+	}
+	m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("$")})
+	if m.pane != paneCost {
+		t.Fatalf("pane = %v after $; test premise is wrong", m.pane)
+	}
+	dead := m.usage.tickGen
+
+	_, cmd := m.Update(tea.KeyMsg{Type: tea.KeyEsc})
+
+	if m.pane != paneUsage {
+		t.Fatalf("pane = %v after esc, want paneUsage", m.pane)
+	}
+	if cmd == nil {
+		t.Fatal("returning to the Usage pane scheduled nothing; its 20s refresh is dead")
+	}
+	if m.usage.tickGen == dead {
+		t.Error("usage tickGen unchanged on the way back in; no new chain was started")
+	}
+	// And the Cost pane's own chain still ends on the way out, which is the rule the esc
+	// arm already held: a chain against a backgrounded pane polls forever for nothing.
+	if m.costTickIsCurrent(m.costPane.tickGen - 1) {
+		t.Error("a Cost generation from inside the pane is still accepted after esc")
+	}
+}
+
+// TestKey_ReturningFromTheCatalogStillRestartsTheUsageChain guards the arm that already
+// worked, because the fix rewrote it into a switch.
+func TestKey_ReturningFromTheCatalogStillRestartsTheUsageChain(t *testing.T) {
+	m := newTestModelOnPane(t, paneSessions)
+	m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("u")})
+	m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("P")})
+	if m.pane != paneCatalog {
+		t.Fatalf("pane = %v after P; test premise is wrong", m.pane)
+	}
+	dead := m.usage.tickGen
+
+	_, cmd := m.Update(tea.KeyMsg{Type: tea.KeyEsc})
+
+	if m.pane != paneUsage {
+		t.Fatalf("pane = %v after esc, want paneUsage", m.pane)
+	}
+	if cmd == nil || m.usage.tickGen == dead {
+		t.Error("returning to the Usage pane from the catalog started no chain")
+	}
+}
+
+// TestCostMoney_ASubFloorCostIsNotRenderedAsFree.
+//
+// Four decimals only MOVE the threshold — from $0.005 to $0.00005 — they do not remove
+// it, and costMoney's own doc argued the four places exist so a real cost is never shown
+// as free. Every figure under 50 micros printed "$0.0000". 30 micros is an ordinary
+// cache-read-only turn: 100 cache-read tokens at $0.30/MTok.
+//
+// The exact zero keeps "$0.0000", and that is the point of the split rather than a
+// leftover: a settled zero is LEGITIMATELY priced — the producer means "this call was
+// free" — so conflating it with "too small to state" is the one thing this whole surface
+// exists to refuse.
+func TestCostMoney_ASubFloorCostIsNotRenderedAsFree(t *testing.T) {
+	for _, tc := range []struct {
+		micros int64
+		want   string
+	}{
+		{0, "$0.0000"},
+		{1, "<$0.0001"},
+		{30, "<$0.0001"},
+		{49, "<$0.0001"},
+		{50, "$0.0001"},
+		{100, "$0.0001"},
+		{1_120_000, "$1.1200"},
+	} {
+		if got := costMoney(tc.micros); got != tc.want {
+			t.Errorf("costMoney(%d) = %q, want %q", tc.micros, got, tc.want)
+		}
+	}
+	// The spelling matches the sibling formatter rather than inventing a second one.
+	if got, want := costMoney(30), formatUSDCell(0.00003); got != want {
+		t.Errorf("costMoney says %q where formatUSDCell says %q; two spellings for one fact", got, want)
+	}
+}
+
+// TestRenderCostPane_ASubFloorTotalIsNotRenderedAsFree drives the same figure through the
+// pane, because the reviewer saw it in TWO places at once: the TOTAL read "$0.0000" and
+// the breakdown row read "$0.0000" beside a FULL bar and 100.0%.
+func TestRenderCostPane_ASubFloorTotalIsNotRenderedAsFree(t *testing.T) {
+	for _, micros := range []int64{1, 30, 49} {
+		snap := &usage.Snapshot{Window: "today", Priced: true, Group: usage.GroupModel,
+			Totals: usage.Counts{Requests: 1, PricedRequests: 1, PriceableRequests: 1, CostMicros: micros},
+			Buckets: []usage.Bucket{{Series: map[string]usage.Counts{
+				"claude-opus-5": {Requests: 1, PricedRequests: 1, PriceableRequests: 1, CostMicros: micros},
+			}}},
+		}
+		got := renderCostPane(snap, usage.GroupModel, 120, 40)
+		if strings.Contains(got, "$0.0000") {
+			t.Errorf("%d micros rendered as a settled zero:\n%s", micros, got)
+		}
+		if !strings.Contains(got, "<$0.0001") {
+			t.Errorf("%d micros did not say it is below the smallest figure four places can state:\n%s",
+				micros, got)
+		}
+		// And the row still says 100.0% of the total, which it genuinely is — the share was
+		// never the wrong part.
+		if !strings.Contains(sectionOf(t, got, "BY MODEL"), "100.0%") {
+			t.Errorf("%d micros lost its share:\n%s", micros, got)
+		}
+	}
+	// A settled zero is still a settled zero.
+	zero := &usage.Snapshot{Window: "today", Priced: true,
+		Totals: usage.Counts{Requests: 1, PricedRequests: 1, PriceableRequests: 1, CostMicros: 0}}
+	if got := renderCostPane(zero, usage.GroupModel, 120, 40); !strings.Contains(got, "$0.0000") {
+		t.Errorf("an exact zero no longer renders as one; free and too-small now read alike:\n%s", got)
+	}
+}
+
+// TestCostShare_RefusesAPairThatCannotBothBeRight.
+//
+// The zero-denominator guard had no test at all: weakening `whole <= 0` to `whole < 0`
+// survived the entire suite and put "NaN%" in the breakdown, the token tiers and a caveat
+// line at once. The other two refusals are the pane restating a guarantee the server
+// makes and this side never checked.
+func TestCostShare_RefusesAPairThatCannotBothBeRight(t *testing.T) {
+	for _, tc := range []struct {
+		part, whole int64
+		want        string
+	}{
+		{1, 0, ""},     // divide by zero: "NaN%" / "+Inf%"
+		{0, 0, ""},     //
+		{1, -5, ""},    // a negative whole is not a whole
+		{-1, 10, ""},   // a negative share
+		{200, 100, ""}, // above 100%, which the bar has already clamped
+		{25, 100, "25.0%"},
+		{100, 100, "100.0%"},
+	} {
+		if got := costShare(tc.part, tc.whole); got != tc.want {
+			t.Errorf("costShare(%d, %d) = %q, want %q", tc.part, tc.whole, got, tc.want)
+		}
+	}
+}
+
+// TestRenderCostPane_NeverRendersNaNOrInf is the pane-level half: a priced snapshot whose
+// total is zero makes every denominator in the pane zero at once.
+func TestRenderCostPane_NeverRendersNaNOrInf(t *testing.T) {
+	snap := &usage.Snapshot{Window: "today", Priced: true, Group: usage.GroupModel,
+		Totals: usage.Counts{Requests: 2, PricedRequests: 2, PriceableRequests: 2, CostMicros: 0},
+		Buckets: []usage.Bucket{{Series: map[string]usage.Counts{
+			"a": {Requests: 1, PricedRequests: 1, PriceableRequests: 1},
+			"b": {Requests: 1, PricedRequests: 1, PriceableRequests: 1},
+		}}},
+	}
+	got := renderCostPane(snap, usage.GroupModel, 120, 40)
+	for _, bad := range []string{"NaN", "Inf"} {
+		if strings.Contains(got, bad) {
+			t.Errorf("rendered %q:\n%s", bad, got)
+		}
+	}
+}
+
+// TestCostBar_APresentButTinyShareGetsACell.
+//
+// Rounding 0.4% of 28 cells to nothing draws a present-but-tiny series identically to an
+// absent one, and those mean opposite things — an absent share is UNKNOWN. The guard was
+// there; disabling it survived the whole suite.
+func TestCostBar_APresentButTinyShareGetsACell(t *testing.T) {
+	for _, frac := range []float64{0.004, 0.0001, 1e-9} {
+		got := costBar(frac, true, 28)
+		if !strings.Contains(got, "█") {
+			t.Errorf("costBar(%g, true, 28) drew a blank bar, which is what an ABSENT share draws: %q",
+				frac, got)
+		}
+		if lipgloss.Width(got) != 28 {
+			t.Errorf("costBar(%g, true, 28) is %d cells: %q", frac, lipgloss.Width(got), got)
+		}
+	}
+	// And an exact zero is still empty: 0% is a share, and it is not one cell of spend.
+	if got := costBar(0, true, 28); strings.Contains(got, "█") {
+		t.Errorf("costBar(0, true, 28) drew a cell for no spend at all: %q", got)
+	}
+	// An ABSENT share stays blank, which is the distinction the guard protects.
+	if got := costBar(0.5, false, 28); strings.Contains(got, "█") {
+		t.Errorf("costBar drew a bar for an unknown share: %q", got)
+	}
+}
+
+// TestRenderCostPane_WhereItWentKeepsADeclaredButZeroTier is the missing half of the
+// PresentKinds rule.
+//
+// TestRenderCostPane_WhereItWentOmitsAnUnreportedTier pins undeclared-and-zero out, and
+// KeepsAValueWhoseBitIsUnset pins counted-but-undeclared in. Declared-AND-zero — "this
+// traffic wrote no cache", which is a real measurement — had nothing holding it, and
+// dropping the PresentKinds half of the condition survived the suite.
+func TestRenderCostPane_WhereItWentKeepsADeclaredButZeroTier(t *testing.T) {
+	snap := &usage.Snapshot{Window: "today", Priced: true,
+		Totals: usage.Counts{Requests: 1, CostMicros: 1_000_000,
+			PricedRequests: 1, PriceableRequests: 1,
+			InputTokens: 100, OutputTokens: 50,
+			// Declared: all four. Counted: two. The two zeros are an ANSWER.
+			CacheReadTokens: 0, CacheWriteTokens: 0,
+			PresentKinds: kindInput | kindCacheRead | kindCacheWrite | kindOutput,
+		}}
+	sec := sectionOf(t, renderCostPane(snap, usage.GroupModel, 120, 40), "WHERE IT WENT")
+	for _, want := range []string{"cache-read", "cache-write"} {
+		if !strings.Contains(sec, want) {
+			t.Errorf("dropped %q although PresentKinds declared it — reported-as-zero and "+
+				"never-reported are different answers, and that distinction is what PresentKinds "+
+				"is for:\n%s", want, sec)
+		}
+	}
+}
+
+// TestRenderCostPane_ANegativeFigureIsUnpricedNotACredit.
+//
+// The server refuses a negative cost, so the pane was inheriting a guarantee it never
+// restated — and "$-5.0000" in a column of costs reads as a refund nobody issued.
+func TestRenderCostPane_ANegativeFigureIsUnpricedNotACredit(t *testing.T) {
+	snap := &usage.Snapshot{Window: "today", Priced: true, Group: usage.GroupModel,
+		Totals: usage.Counts{Requests: 1, PricedRequests: 1, PriceableRequests: 1, CostMicros: -5_000_000},
+		Buckets: []usage.Bucket{{Series: map[string]usage.Counts{
+			"claude-opus-5": {Requests: 1, PricedRequests: 1, PriceableRequests: 1, CostMicros: -5_000_000},
+		}}},
+	}
+	got := renderCostPane(snap, usage.GroupModel, 120, 40)
+	if strings.Contains(got, "$-") {
+		t.Errorf("rendered a negative dollar figure:\n%s", got)
+	}
+	if !strings.Contains(got, "unavailable") {
+		t.Errorf("an impossible figure was neither shown nor declined:\n%s", got)
+	}
+}
+
+// TestRenderCostPane_AShareAboveOneHundredIsOmittedRatherThanContradictingItsBar.
+//
+// costBar clamps to 100%, so a part exceeding the whole put "200.0%" beside a full bar and
+// left a reader no way to tell which of the two was the lie. The dollar figure stays; only
+// the comparison goes, which is the priority order the pane holds to everywhere.
+func TestRenderCostPane_AShareAboveOneHundredIsOmittedRatherThanContradictingItsBar(t *testing.T) {
+	snap := &usage.Snapshot{Window: "today", Priced: true, Group: usage.GroupModel,
+		Totals: usage.Counts{Requests: 1, PricedRequests: 1, PriceableRequests: 1, CostMicros: 1_000_000},
+		Buckets: []usage.Bucket{{Series: map[string]usage.Counts{
+			"claude-opus-5": {Requests: 1, PricedRequests: 1, PriceableRequests: 1, CostMicros: 2_000_000},
+		}}},
+	}
+	sec := sectionOf(t, renderCostPane(snap, usage.GroupModel, 120, 40), "BY MODEL")
+	if strings.Contains(sec, "200.0%") {
+		t.Errorf("a share above 100%% is rendered beside a bar clamped to 100%%:\n%s", sec)
+	}
+	// The figure is still there: an inconsistent pair costs the comparison, not the money.
+	if !strings.Contains(sec, "$2.0000") {
+		t.Errorf("the row's own figure went with the share:\n%s", sec)
+	}
+}
+
+// TestCostPane_CyclingTheAxisDropsTheSnapshotItWasFetchedFor is the first of two named
+// historical bugs on this branch that had no regression test — removing
+// `m.costPane.snap = nil` from beginCostFetch survived the whole suite.
+//
+// invalidate()'s comment names the failure: the previous axis's series rendering under the
+// NEW heading, a group=model payload sitting under "BY ENDPOINT". It records it as
+// something another pane learned the hard way, which is exactly the kind of claim that
+// needs a test rather than a paragraph.
+func TestCostPane_CyclingTheAxisDropsTheSnapshotItWasFetchedFor(t *testing.T) {
+	m := newTestModelOnPane(t, paneEvents)
+	m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("$")})
+	// A snapshot in hand for the CURRENT axis, exactly as a landed reply leaves it.
+	m.costPane.snap = pricedSnapshotWithSeries(t, map[string]int64{"only-on-the-model-axis": 3_820_000})
+	m.costPane.lastFetch = time.Now()
+	m.costPane.loading = false
+	before := m.costPane.group
+	if !strings.Contains(m.paneView(), "only-on-the-model-axis") {
+		t.Fatalf("the series is not on screen before the cycle; test premise is wrong:\n%s", m.paneView())
+	}
+
+	m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("g")})
+
+	if m.costPane.group == before {
+		t.Fatalf("g did not change the axis; test premise is wrong")
+	}
+	if m.costPane.snap != nil {
+		t.Fatal("cycling the axis kept the snapshot fetched for the previous one")
+	}
+	got := m.paneView()
+	if strings.Contains(got, "only-on-the-model-axis") {
+		t.Errorf("the previous axis's series is still drawn under the new %q heading:\n%s",
+			"BY "+strings.ToUpper(string(m.costPane.group)), got)
+	}
+	if !strings.Contains(got, "loading") {
+		t.Errorf("the pane neither shows the new axis nor says it is fetching it:\n%s", got)
+	}
+}
+
+// TestRenderCostPane_CoverageIsMeasuredAgainstPriceableRequests is the second: swapping
+// the denominator from PriceableRequests to Requests survived the suite, because no
+// fixture in this file ever set the two to different values.
+//
+// The adjacent comment names this as the bug that "left a correctly configured deployment
+// reading a permanent warning with nothing to act on" — Requests counts every proxied
+// response, MCP tool calls and health checks included, while only inference can ever be
+// priced.
+func TestRenderCostPane_CoverageIsMeasuredAgainstPriceableRequests(t *testing.T) {
+	// 900 proxied responses, 10 of them priceable, all 10 priced: FULLY covered.
+	snap := &usage.Snapshot{Window: "today", Priced: true, Group: usage.GroupModel,
+		Totals: usage.Counts{Requests: 900, PriceableRequests: 10, PricedRequests: 10,
+			CostMicros: 4_170_000},
+		Buckets: []usage.Bucket{{Series: map[string]usage.Counts{
+			"claude-opus-5": {Requests: 900, PriceableRequests: 10, PricedRequests: 10, CostMicros: 4_170_000},
+		}}},
+	}
+	got := renderCostPane(snap, usage.GroupModel, 120, 40)
+	if strings.Contains(got, "of 900") {
+		t.Errorf("coverage is measured against every proxied response rather than the priceable ones:\n%s", got)
+	}
+	if strings.Contains(got, "covers") {
+		t.Errorf("a fully priced deployment carries a coverage caveat:\n%s", got)
+	}
+	if strings.Contains(got, "COVERAGE") {
+		t.Errorf("a fully priced deployment rendered a COVERAGE section:\n%s", got)
+	}
+	// The mirror, so the test cannot pass by suppressing the warning outright: a REAL gap
+	// against the same 900 still reports, and reports the priceable denominator.
+	snap.Totals.PricedRequests = 4
+	gap := renderCostPane(snap, usage.GroupModel, 120, 40)
+	if !strings.Contains(gap, "covers 4 of 10 priceable requests") {
+		t.Errorf("a real gap is not reported against the priceable denominator:\n%s", gap)
+	}
+}
+
+// TestCostPane_ARejectedPersistedValueIsNormalisedOnOpen.
+//
+// costView drops a field the pane cannot honour and the pane falls back to its default —
+// but Settings kept the rejected value, so esc wrote it straight back and the file never
+// healed. Every future open re-read a value the pane had already refused.
+func TestCostPane_ARejectedPersistedValueIsNormalisedOnOpen(t *testing.T) {
+	m := newTestModelOnPane(t, paneEvents)
+	saved := recordSaves(t, m)
+	// "6h" is a Usage-pane window this pane never cycles; "status" is a real axis with no
+	// series here. Both are what costView exists to reject.
+	Settings.Cost = CostSettings{Window: "6h", Group: "status"}
+
+	_ = m.openCostPane()
+
+	if Settings.Cost.Window != "" {
+		t.Errorf("Settings.Cost.Window = %q after open, want it cleared — the pane rejected it",
+			Settings.Cost.Window)
+	}
+	if Settings.Cost.Group != "" {
+		t.Errorf("Settings.Cost.Group = %q after open, want it cleared", Settings.Cost.Group)
+	}
+
+	m.Update(tea.KeyMsg{Type: tea.KeyEsc})
+	if len(*saved) != 1 {
+		t.Fatalf("leaving the pane wrote %d times, want exactly 1", len(*saved))
+	}
+	if got := (*saved)[0].Cost; got.Window == "6h" || got.Group == "status" {
+		t.Errorf("esc wrote the rejected value straight back to disk: %+v", got)
+	}
+	// A value the pane DOES honour survives untouched, so the healing is not a reset.
+	Settings.Cost = CostSettings{Window: "7d", Group: "endpoint"}
+	_ = m.openCostPane()
+	if Settings.Cost.Window != "7d" || Settings.Cost.Group != "endpoint" {
+		t.Errorf("a valid persisted view was cleared: %+v", Settings.Cost)
+	}
+}
+
+// TestPaneKeys_CostPaneNamesEveryAxisAndSaysItWinsOverTheGlobalG.
+//
+// The overlay contradicted itself: the GLOBAL group advertised "g / G — jump to top /
+// bottom" while the Cost group advertised "g — cycle breakdown", with nothing saying which
+// wins. Cost wins (keys.go claims it before the global dispatch) and G is genuinely inert
+// there. The axis list had also gone stale — the agent axis was added to costPaneGroups and
+// not to this line.
+func TestPaneKeys_CostPaneNamesEveryAxisAndSaysItWinsOverTheGlobalG(t *testing.T) {
+	g, ok := paneKeys[paneCost]
+	if !ok {
+		t.Fatal("paneKeys has no entry for paneCost")
+	}
+	var gDesc string
+	for _, kb := range g.bindings {
+		if kb.keys == "g" {
+			gDesc = kb.desc
+		}
+	}
+	if gDesc == "" {
+		t.Fatal("the Cost pane's help entry has no [g] binding")
+	}
+	// Every axis the key actually cycles, by name.
+	for _, axis := range costPaneGroups {
+		if !strings.Contains(gDesc, string(axis)) {
+			t.Errorf("[g] is described as %q, which does not name the %q axis it cycles", gDesc, axis)
+		}
+	}
+	// And the contradiction with the global list is resolved somewhere a reader will see.
+	body := helpBodyLines(paneCost)
+	var globalG string
+	for _, kb := range globalKeys.bindings {
+		if strings.Contains(kb.keys, "g") && strings.Contains(kb.desc, "jump") {
+			globalG = kb.desc
+		}
+	}
+	if globalG == "" {
+		t.Fatal("the global group no longer advertises g/G; this test's premise is wrong")
+	}
+	if !strings.Contains(strings.ToLower(globalG), "cost") && !strings.Contains(strings.ToLower(gDesc), "global") {
+		t.Errorf("the overlay lists both %q (global) and %q (Cost) with nothing saying which wins:\n%s",
+			globalG, gDesc, body)
 	}
 }

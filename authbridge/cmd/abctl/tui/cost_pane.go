@@ -194,9 +194,20 @@ func (s *costPaneState) applySettings(cs CostSettings) {
 func (m *model) openCostPane() tea.Cmd {
 	m.costPane.returnPane = m.pane
 	m.pane = paneCost
-	m.costPane.applySettings(Settings.costView())
-	// Shares resumeCostPolling with the catalog-return path so the two entry points
-	// cannot drift on how a chain is started or how the previous one is invalidated.
+	// The NORMALISED view is written back, not merely applied. costView drops a field it
+	// cannot honour and the pane falls back to its default, but Settings still held the
+	// rejected value — so esc persisted it straight back to disk and the file never
+	// healed: every future open re-read a value the pane had already refused. Storing the
+	// normalised form makes the rejection stick, and an empty field is exactly what the
+	// deviations-only convention already means.
+	cs := Settings.costView()
+	Settings.Cost = cs
+	m.costPane.applySettings(cs)
+	// resumeCostPolling is shared with the CATALOG-RETURN path (keys.go's paneCatalog esc
+	// arm), which resumes whichever pane it is returning to. This comment used to claim
+	// the sharing as the reason the two could not drift, while that arm resumed only
+	// paneUsage — so `$` `P` `esc` came back to a Cost pane with a dead chain, its
+	// freshness line counting up forever against a figure nothing would refresh.
 	return m.resumeCostPolling()
 }
 
@@ -332,6 +343,18 @@ const (
 //
 // Only ever applied to LABELS. A figure is never truncated: "$12.5" for a $12.5000
 // session is not a shortened number, it is a different and smaller one.
+//
+// Measured in the same units the CALLER measures, which is the bug this function
+// used to have and the reason it now ends in a correction loop. It built the prefix
+// one RUNE at a time and charged each rune lipgloss.Width(string(r)), while every
+// caller measures the RESULT with lipgloss.Width — and those two disagree wherever a
+// grapheme cluster is wider than the sum of its runes. Variation-selector-16 is the
+// everyday case: Width("⚠️") is 2 while Width("⚠") + Width("️") is 1 + 0. The
+// per-rune sum therefore UNDER-charged, the result came back up to twice its budget,
+// and renderCostRows' pad went negative — `strings: negative Repeat count`, thrown
+// from inside View(), which is fatal in bubbletea and leaves the terminal in
+// alt-screen. Model names are workload-chosen and recorded verbatim, so "⚠️-model"
+// is a name a workload can simply pick.
 func truncCells(s string, n int) string {
 	if n <= 0 {
 		return ""
@@ -343,17 +366,51 @@ func truncCells(s string, n int) string {
 		return "…"
 	}
 	budget := n - 1 // the ellipsis costs one cell
-	var b strings.Builder
+	cells := splitCells(s)
+	kept := 0
 	w := 0
-	for _, r := range s {
-		rw := lipgloss.Width(string(r))
-		if w+rw > budget {
+	for _, c := range cells {
+		cw := lipgloss.Width(c)
+		if w+cw > budget {
 			break
 		}
-		b.WriteRune(r)
-		w += rw
+		kept++
+		w += cw
 	}
-	return b.String() + "…"
+	// Self-correcting, and this is the load-bearing half. Whatever the loop above
+	// believed each cluster cost, the string it produced is what the caller will
+	// measure, so shrink until THAT measurement fits. A future disagreement between
+	// per-cluster and whole-string width then costs a shorter label rather than a
+	// panic.
+	out := strings.Join(cells[:kept], "")
+	for kept > 0 && lipgloss.Width(out+"…") > n {
+		kept--
+		out = strings.Join(cells[:kept], "")
+	}
+	return out + "…"
+}
+
+// splitCells splits s into display clusters: each leading rune together with every
+// zero-width rune that follows it.
+//
+// Not a full Unicode grapheme segmenter — rivo/uniseg is only an INDIRECT dependency
+// here, so importing it would mean editing go.mod, and the self-correcting loop in
+// truncCells is what actually guarantees the budget. What this buys is that the loop
+// rarely has to correct: a combining accent, a variation selector and a ZWJ all carry
+// zero width of their own, so grouping them with the rune they modify makes
+// lipgloss.Width of the GROUP the real cost of the group. A ZWJ emoji sequence still
+// splits into several groups and is over-charged rather than under-charged, which
+// truncates a little early and cannot overflow.
+func splitCells(s string) []string {
+	out := make([]string, 0, len(s))
+	for _, r := range s {
+		if len(out) > 0 && lipgloss.Width(string(r)) == 0 {
+			out[len(out)-1] += string(r)
+			continue
+		}
+		out = append(out, string(r))
+	}
+	return out
 }
 
 // wrapCells word-wraps prose to n display cells per line.
@@ -445,17 +502,52 @@ func renderCostRows(rows []costRow, width int) []string {
 		var b strings.Builder
 		b.WriteString(costIndent)
 		b.WriteString(lbl)
-		b.WriteString(strings.Repeat(" ", labelW-lipgloss.Width(lbl)))
+		// max(..., 0), not the bare subtraction. truncCells guarantees the label fits, so
+		// this can only clamp when that guarantee is broken — and the bare form was how a
+		// broken guarantee reached the screen: strings.Repeat panics on a negative count,
+		// from inside View(), which kills abctl and leaves the terminal in alt-screen.
+		// Defence in depth on purpose: a future measurement bug now degrades to a ragged
+		// column instead of a crash.
+		b.WriteString(strings.Repeat(" ", max(labelW-lipgloss.Width(lbl), 0)))
 		if barW > 0 {
 			b.WriteString(costColGap)
 			b.WriteString(costBar(r.frac, r.hasBar, barW))
 		}
 		b.WriteString(costColGap)
-		b.WriteString(strings.Repeat(" ", rightW-lipgloss.Width(r.right)))
+		// Clamped for the same reason, though rightW is a maximum over these very rows so
+		// it cannot go negative today. The cost of the clamp is nothing; the cost of
+		// relying on that invariant is the pane.
+		b.WriteString(strings.Repeat(" ", max(rightW-lipgloss.Width(r.right), 0)))
 		b.WriteString(r.right)
 		out = append(out, b.String())
 	}
 	return out
+}
+
+// costFrac clamps a share into [0,1], treating NaN as no share.
+//
+// NaN FIRST, and by self-comparison, because NaN fails both range comparisons and would
+// otherwise pass through untouched. int(NaN) is then implementation-defined: 0 on arm64,
+// -2^63 on amd64 — where costBar's strings.Repeat panics, inside View(), which kills
+// abctl. That is an architecture-dependent crash, which is the worst kind to leave in:
+// it does not reproduce on the machine it was written on, so no local test run can find
+// it.
+//
+// Split out of costBar rather than inlined so the guard is DIRECTLY assertable. Inline,
+// deleting the NaN arm is invisible on arm64 — int(NaN) happens to land on 0 there and
+// costBar's output is unchanged — so no test on this machine could pin it. A function
+// returning the clamped number can be checked on any architecture.
+//
+// Zero rather than "unknown": costBar's `has` flag already carries that distinction, and
+// a share that is not a number is not a share.
+func costFrac(frac float64) float64 {
+	if frac != frac || frac < 0 {
+		return 0
+	}
+	if frac > 1 {
+		return 1
+	}
+	return frac
 }
 
 // costBar draws frac of n cells, padded to n so the column after it stays aligned.
@@ -468,12 +560,7 @@ func costBar(frac float64, has bool, n int) string {
 	if !has || n <= 0 {
 		return strings.Repeat(" ", max(n, 0))
 	}
-	if frac < 0 {
-		frac = 0
-	}
-	if frac > 1 {
-		frac = 1
-	}
+	frac = costFrac(frac)
 	filled := int(frac*float64(n) + 0.5)
 	// A non-zero share always gets at least one cell. Rounding 0.4% of 28 cells to
 	// nothing renders a present-but-tiny series identically to an absent one.
@@ -494,7 +581,15 @@ type costSection struct {
 	lines   []string
 }
 
-// costMoney renders micros as dollars to four places.
+// costMicrosFloor is the smallest figure four decimal places can state, in micros:
+// $0.0001. Anything positive below half of it renders as "$0.0000".
+//
+// The sibling of prune_saving.go's usdFloor, in this pane's integer units. Same
+// number, same argument, and deliberately the same SPELLING of the result — see
+// costMoney.
+const costMicrosFloor = 100
+
+// costMoney renders micros as dollars to four places, or says it is below them.
 //
 // Four, not two: a single turn can cost a fraction of a cent, and rounding it to
 // $0.00 would render a real cost as free — the one thing this pane must never do.
@@ -502,16 +597,48 @@ type costSection struct {
 // the server publishes an integer count of millionths, and turning that into a
 // display string is presentation. Multiplying tokens by a rate would be pricing, and
 // pricing does not happen here.
-func costMoney(micros int64) string { return fmt.Sprintf("$%.4f", float64(micros)/1e6) }
+//
+// But four decimals only MOVE the threshold; they do not remove it. Anything under 50
+// micros still printed "$0.0000", and 30 micros is an ordinary cache-read-only turn —
+// 100 cache-read tokens at $0.30/MTok. So a real, priced, non-zero cost read as free,
+// beside a full bar and 100.0%, which is precisely the claim this pane exists to
+// refuse. A settled zero is LEGITIMATE here (the producer means "this call was free"),
+// so "free" and "too small to state" have to render differently or the distinction the
+// whole surface is built on is lost at the last step.
+//
+// "<$0.0001" rather than a new spelling: formatUSDCell already established that form
+// for the same floor in the sessions table, and two conventions for one fact is worse
+// than either.
+func costMoney(micros int64) string {
+	if micros > 0 && micros < costMicrosFloor/2 {
+		return "<" + fmt.Sprintf("$%.4f", float64(costMicrosFloor)/1e6)
+	}
+	return fmt.Sprintf("$%.4f", float64(micros)/1e6)
+}
 
-// costShare renders one published figure as a percentage of another.
+// costShare renders one published figure as a percentage of another, or nothing.
 //
 // Legitimate for the same reason costMoney is: both operands come off the wire, and a
 // ratio of two published numbers is a way of displaying them, not a new measurement.
 // The moment a percentage is taken of something the server did not publish it stops
 // being presentation.
+//
+// Three refusals, and each is a pair of numbers that cannot both be right:
+//
+// whole <= 0 would divide by zero and render "NaN%" or "+Inf%" — in the breakdown, the
+// token tiers and the caveat line at once. Nothing tested this, and weakening it to
+// "whole < 0" survived the whole suite.
+//
+// part < 0 is a negative share. The server refuses negative costs, but this pane never
+// restated that guarantee, and inheriting one silently is how it stops holding.
+//
+// part > whole renders something like "200.0%" beside a bar costBar has clamped to
+// 100% — the number and the glyph then disagree, and a reader has no way to tell which
+// one is the lie. Omitted rather than capped: capping to 100.0% would assert a share
+// that is not the ratio of the two published figures. The row keeps its dollar figure
+// and loses only the comparison, which is the priority order the whole pane holds to.
 func costShare(part, whole int64) string {
-	if whole <= 0 {
+	if whole <= 0 || part < 0 || part > whole {
 		return ""
 	}
 	return fmt.Sprintf("%.1f%%", 100*float64(part)/float64(whole))
@@ -542,6 +669,15 @@ func costTotalSection(snap *usage.Snapshot, width int) costSection {
 		}
 		return sec
 	}
+	// A negative total is not a total. The server refuses negative costs, so this cannot
+	// happen against a correct producer — which is exactly why the pane said "$-5.0000"
+	// when the reviewer made it happen: the guarantee lived entirely on the other side of
+	// the wire and this side never restated it. Treated as unpriced, because that is what
+	// an impossible figure is: not a number to display, and certainly not a credit.
+	if snap.Totals.CostMicros < 0 {
+		add("cost unavailable — the server reported a negative total, which cannot be spend")
+		return sec
+	}
 	// The figure on its own line so the height budget can never cut it, and the
 	// provenance beside it because $12.40 from a gateway's own numbers and $12.40
 	// modelled from a shipped vendor list are not equally trustworthy. provenanceNote
@@ -554,7 +690,7 @@ func costTotalSection(snap *usage.Snapshot, width int) costSection {
 	// below. It is never truncated onto the figure's line, because clipping there would
 	// eat the digits: the figure is the answer, the annotation qualifies it.
 	figure := costIndent + costMoney(snap.Totals.CostMicros)
-	prov := provenanceNote(snap.PricedBy)
+	prov := provenanceNote(costPricedBy(snap.PricedBy))
 	if lipgloss.Width(figure+prov) <= width {
 		sec.lines = append(sec.lines, figure+prov)
 	} else {
@@ -581,6 +717,34 @@ func costTotalSection(snap *usage.Snapshot, width int) costSection {
 			formatCount(int(inc)), formatCount(int(priced))))
 	}
 	return sec
+}
+
+// costPricedBy sanitizes the provenance keys before they reach provenanceNote.
+//
+// snap.PricedBy was the ONE wire-derived string this pane wrote out raw. snap.Window,
+// every series label, every UnpricedBy key and the error text all go through
+// sanitizeLabel; these keys did not, and they are just as much a wire value — a
+// producer that names a pricing level "bun\ndled\x1b[31m" sends ESC straight to the
+// TTY (CWE-150, the hazard this file cites four times), while its newline both blows
+// the height budget and emits an UNINDENTED body line, breaking the "every heading is
+// unindented" contract the section logic and sectionOf both read.
+//
+// Here rather than inside provenanceNote because that function lives in
+// usage_render.go, which this change does not own. Sanitizing at the call site is
+// equivalent for this caller; if the Usage pane ever grows the same note, the fix
+// belongs one level down.
+//
+// Keys are summed rather than overwritten on collision: two raw keys can sanitize to
+// the same string, and the note reports counts.
+func costPricedBy(by map[string]int64) map[string]int64 {
+	if len(by) == 0 {
+		return nil
+	}
+	out := make(map[string]int64, len(by))
+	for k, v := range by {
+		out[sanitizeLabel(k)] += v
+	}
+	return out
 }
 
 // costSeries sums a snapshot's per-label counts across the WHOLE window.
@@ -665,7 +829,10 @@ func costBreakdownSection(snap *usage.Snapshot, group usage.Group, width int) co
 		// parser, so writing it raw to a TTY lets an escape sequence recolour the pane or
 		// erase the very row it is reporting. CWE-150.
 		row := costRow{label: costSeriesLabel(label, group)}
-		if c.PricedRequests == 0 {
+		// A negative figure counts as unpriced, not as a small one: see costTotalSection
+		// for why the pane restates a guarantee the server already makes. "$-5.0000" in a
+		// column of costs reads as a refund nobody issued.
+		if c.PricedRequests == 0 || c.CostMicros < 0 {
 			row.right = "cost unavailable"
 			rows = append(rows, row)
 			continue
@@ -681,7 +848,18 @@ func costBreakdownSection(snap *usage.Snapshot, group usage.Group, width int) co
 		}
 		rows = append(rows, row)
 	}
-	sec.lines = renderCostRows(rows, width)
+	// The rows FIRST, and an empty section when there are none. renderCostRows returns
+	// nil when even a one-cell label cannot sit beside the figures, and appending the
+	// "+N more" note regardless produced a section that was all disclosure and no data:
+	// at w=20 with ten series, "BY MODEL" followed only by "+2 more, each smaller than
+	// the last row" — naming a last row that is not on screen and counting 2 elided when
+	// all 10 were lost. The caller drops a section with no lines, which is the honest
+	// answer: this axis does not fit this terminal.
+	lines := renderCostRows(rows, width)
+	if len(lines) == 0 {
+		return costSection{}
+	}
+	sec.lines = lines
 	if rest := len(labels) - len(shown); rest > 0 {
 		// Disclosed, not silently dropped: a truncated list reads as a complete one, and
 		// the elided rows are the cheap ones only because the sort put them there.
@@ -839,7 +1017,13 @@ func costTokenSection(snap *usage.Snapshot, width int) costSection {
 			right: strings.Repeat(" ", max(countW-lipgloss.Width(count), 0)) + count,
 		})
 	}
-	sec.lines = renderCostRows(rows, width)
+	// Rows first here too, same rule: the caveat below is about the tiers, so it has
+	// nothing to qualify once the label column has collapsed.
+	tierLines := renderCostRows(rows, width)
+	if len(tierLines) == 0 {
+		return costSection{}
+	}
+	sec.lines = tierLines
 	add("Tiers price very differently — a cache read is roughly 0.1x uncached input, a cache " +
 		"write roughly 1.25x, and output the dearest — so the largest share is the first place " +
 		"to look, not the largest cost. Volume only: no per-tier dollars are aggregated " +
@@ -883,7 +1067,6 @@ func costCoverageSection(snap *usage.Snapshot, width int) costSection {
 		add("The pairs are not reported for this window; ask for a duration window such as 1h to name them.")
 		return sec
 	}
-	add("unpriced pairs, largest first — add a rate for each:")
 	pairs := make([]string, 0, len(snap.UnpricedBy))
 	for k := range snap.UnpricedBy {
 		pairs = append(pairs, k)
@@ -909,7 +1092,15 @@ func costCoverageSection(snap *usage.Snapshot, width int) costSection {
 			right: fmt.Sprintf("x%s", formatCount(n)),
 		})
 	}
-	sec.lines = append(sec.lines, renderCostRows(rows, width)...)
+	// The rows before the prose, for the reason costBreakdownSection records: a heading
+	// and an "add a rate for each" instruction over no pairs at all is worse than no
+	// section, because it names an action against a list the reader cannot see.
+	rowLines := renderCostRows(rows, width)
+	if len(rowLines) == 0 {
+		return costSection{}
+	}
+	add("unpriced pairs, largest first — add a rate for each:")
+	sec.lines = append(sec.lines, rowLines...)
 	if rest := len(pairs) - len(shown); rest > 0 {
 		add(fmt.Sprintf("+%d more pair%s, each with fewer requests", rest, plural(rest)))
 	}
@@ -964,7 +1155,7 @@ func renderCostPane(snap *usage.Snapshot, group usage.Group, width, height int) 
 		}
 	}
 	sections = kept
-	if lines, ok := fitCostSections(header, sections, height); ok {
+	if lines, ok := fitCostSections(header, sections, width, height); ok {
 		return strings.Join(lines, "\n")
 	}
 	// Not even the header and the first section fit. The "TOTAL" heading is what goes —
@@ -996,14 +1187,26 @@ func renderCostPane(snap *usage.Snapshot, group usage.Group, width, height int) 
 // height <= 0 means unbounded, which is what a model that has not laid out yet
 // reports. Refusing to render then would leave the pane blank until the first
 // WindowSizeMsg.
-func fitCostSections(header string, sections []costSection, height int) ([]string, bool) {
+//
+// width is a budget for the HEADINGS, and it is here because nothing else fits them.
+// Every body line is emitted through renderCostRows or wrapCells and every figure line
+// is width-checked by its own section, but the heading was appended raw — so
+// costTierHeading, 35 display cells of it, overflowed at every terminal narrower than
+// 35. The existing width tests bottomed out at w=40 and could not see it.
+func fitCostSections(header string, sections []costSection, width, height int) ([]string, bool) {
 	assemble := func(n int, spaced bool) []string {
 		out := []string{header}
 		for _, s := range sections[:n] {
 			if spaced {
 				out = append(out, "")
 			}
-			out = append(out, s.heading)
+			heading := s.heading
+			// width <= 0 is "unmeasured", the same convention height uses: fit nothing rather
+			// than truncate every heading to the empty string.
+			if width > 0 {
+				heading = truncCells(heading, width)
+			}
+			out = append(out, heading)
 			out = append(out, s.lines...)
 		}
 		return out
@@ -1016,6 +1219,33 @@ func fitCostSections(header string, sections []costSection, height int) ([]strin
 		}
 	}
 	return nil, false
+}
+
+// costTruncated is the last line of a body the height budget had to cut.
+//
+// It exists so a clipped diagnostic cannot read as a complete one — the same rule the
+// section budget holds to, where a truncated COVERAGE reads as a full list of gaps.
+const costTruncated = "…(truncated)"
+
+// clampCostLines cuts lines to height, saying on the last line that it did.
+//
+// height <= 0 is unbounded, matching renderCostPane and fitCostSections: a model that
+// has not laid out yet reports zero, and refusing to render then would blank the pane
+// until the first WindowSizeMsg.
+//
+// At height 1 the marker is NOT written. One row buys either the diagnostic's first
+// line or an admission that there were more; the first line is the one that says what
+// went wrong.
+func clampCostLines(lines []string, width, height int) []string {
+	if height <= 0 || len(lines) <= height {
+		return lines
+	}
+	out := make([]string, height)
+	copy(out, lines[:height])
+	if height > 1 {
+		out[height-1] = truncCells(costIndent+costTruncated, width)
+	}
+	return out
 }
 
 // renderCostBody is the pane's body: the rendered answer, or why there is none.
@@ -1041,7 +1271,14 @@ func (m *model) renderCostBody() string {
 		}
 		// No figure of any kind on this path. A stale total drawn beside a failed poll
 		// presents a number nobody can vouch for as the current one.
-		return strings.Join(lines, "\n")
+		//
+		// Capped like every other body path in this pane, which this one was not. The
+		// error text is a SERVER-authored body: a 502 HTML page or an
+		// upstream-connect-error chain wrapped to 42 lines in a 20-row body, paneView
+		// joins without clipping, and the frame then grew past the terminal — footer off
+		// the bottom, terminal scrolling. An unbounded diagnostic is not more informative
+		// than a bounded one; it just takes the rest of the UI with it.
+		return strings.Join(clampCostLines(lines, m.width, m.bodyHeight), "\n")
 	}
 	if m.costPane.snap == nil {
 		// "loading" and "no data" are different answers, exactly as renderUsage

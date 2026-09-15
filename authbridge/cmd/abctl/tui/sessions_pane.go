@@ -56,6 +56,9 @@ func sessionsColumns() []table.Column {
 		{Title: "UPDATED", Width: 14},
 		{Title: "EVENTS", Width: 8},
 		{Title: "TOKENS", Width: 10},
+		// The title names the span, and it is the only thing on the row that can. See
+		// costColumnTitle: TOKENS beside it is the session's LIFETIME count and this is a
+		// ROLLING-window figure, and a bare "COST" promised nothing about either.
 		// 10 columns is exactly "$9999.9999", the widest figure formatUSDCell's fixed 4dp
 		// produces below five figures of dollars. Above that bubbles truncates with
 		// runewidth.Truncate, putting an ellipsis inside a dollar amount — the one thing
@@ -67,9 +70,49 @@ func sessionsColumns() []table.Column {
 		// bubbles clip. Pinned at both levels — TestSessionsTable_CostFitsItsColumn on the
 		// declaration, TestSessionsTable_CostCellIsNeverATruncatedNumber on the fitted
 		// widths — so the trade is visible if the formatter's precision changes.
-		{Title: "COST", Width: 10},
+		{Title: costColumnTitle(""), Width: 10},
 		{Title: "ACTIVE", Width: 8},
 	}
+}
+
+// costColumnPrefix is what every COST title starts with, and it is how the column is
+// FOUND rather than how it is spelled.
+//
+// The title carries a span now, so an exact match on "COST" stops finding the column the
+// moment the span changes — and the two readers that matter, fittedSessionsColumnWidth
+// and the row builder, would silently fall back to "no such column" and render every
+// figure against a width of zero. Matched by prefix so the span can move without either
+// of them noticing.
+const costColumnPrefix = "COST"
+
+// costColumnTitle names the span the COST column's figures actually cover.
+//
+// A bare "COST" promised nothing, and the cell two columns to its left promised something
+// else: TOKENS is the session's LIFETIME total, straight from the session summary, while
+// COST is summed out of the strip's ROLLING-window snapshot. So a six-hour live session
+// showed six hours of tokens against one hour of dollars — understated roughly 6x — and
+// dividing the two cells fabricated a rate that was never a rate. events_pane.go states
+// the rule this breaks in capitals: EVERY CELL IS ROW-LOCAL. This file already refuses a
+// cost lookup for cached-only rows on the argument that "any figure found would cover
+// whatever part of the last hour happens to overlap, not the session the row is about",
+// which applies verbatim to any live session older than the window.
+//
+// windowLabel comes from the SNAPSHOT, via spendSummary, not from the spendWindow
+// constant: the server answers with the span it actually served and nothing may assume
+// the two agree, so a title driven off the request could name an hour over six hours of
+// data. Empty — no poll has answered yet — falls back to naming the span the strip ASKS
+// for, because a bare "COST" is the thing being fixed and a header must say something.
+//
+// "COST/1h" is 7 display columns against a declared width of 10, so the declared widths
+// and the 102-column arithmetic in sessionsColumns are untouched. Below 7 fitted columns
+// bubbles ellipsises the header ("COST…"), which is a terminal at 40 columns, where
+// fitCostCell is already eliding most figures: the span is lost exactly where the numbers
+// are too.
+func costColumnTitle(windowLabel string) string {
+	if windowLabel == "" {
+		windowLabel = formatWindowLabel(spendWindow)
+	}
+	return costColumnPrefix + "/" + windowLabel
 }
 
 // costElision is what a COST cell says when the column it landed in is too narrow to hold
@@ -133,9 +176,14 @@ func fitCostCell(usd float64, inexact bool, width int) string {
 	return cell
 }
 
-// fittedSessionsColumnWidth reports the width the named sessions column is CURRENTLY set
-// to, which after layout() is fitTableColumns' output rather than sessionsColumns'
-// declaration. 0 when there is no such column.
+// fittedSessionsColumnWidth reports the width the sessions column whose title starts with
+// prefix is CURRENTLY set to, which after layout() is fitTableColumns' output rather than
+// sessionsColumns' declaration. 0 when there is no such column.
+//
+// A PREFIX, not the whole title, because the COST title carries its window label and that
+// label follows the server's answer — see costColumnTitle. An exact match would stop
+// resolving the column the first time the server served a span other than the one the
+// strip asked for, and the row builder would then measure every figure against 0.
 //
 // Read from the live table at row-build time rather than computed here, so there is exactly
 // one fitter and the cell measures itself against what the renderer will actually use.
@@ -146,13 +194,43 @@ func fitCostCell(usd float64, inexact bool, width int) string {
 // streamed event repaints them. For that interval a terminal just narrowed can show one
 // clipped figure and one just widened can show one needless ellipsis. Closing it means
 // rebuilding the rows from layout(), which is keys.go's call to make, not this file's.
-func (m *model) fittedSessionsColumnWidth(title string) int {
+func (m *model) fittedSessionsColumnWidth(prefix string) int {
 	for _, c := range m.sessionsTbl.Columns() {
-		if c.Title == title {
+		if strings.HasPrefix(c.Title, prefix) {
 			return c.Width
 		}
 	}
 	return 0
+}
+
+// syncCostColumnTitle re-labels the COST column with the span its cells currently cover.
+//
+// Driven from the snapshot rather than declared once, so the header cannot drift from the
+// data: the strip REQUESTS an hour and the server answers with whatever span it actually
+// served, and the figures in these cells are summed out of that answer.
+//
+// Called from the row builder, which is the only place that knows the cells are about to
+// be rebuilt from a particular snapshot. That leaves the same seam fittedSessionsColumnWidth
+// documents in the other direction: layout() re-fits the columns on WindowSizeMsg and does
+// not rebuild the rows, so a resize can leave the previous title in place until the next
+// sessionsLoadedMsg or streamed event. The title is never WRONG in that interval — it is
+// the span the current figures were summed over — merely older than the width beside it.
+func (m *model) syncCostColumnTitle() {
+	want := costColumnTitle(m.spendSummary().WindowLabel)
+	// A copy: bubbles' Columns() hands back its own slice, so mutating an element in place
+	// would change the live table without the UpdateViewport that SetColumns performs.
+	cols := append([]table.Column(nil), m.sessionsTbl.Columns()...)
+	for i := range cols {
+		if !strings.HasPrefix(cols[i].Title, costColumnPrefix) {
+			continue
+		}
+		if cols[i].Title == want {
+			return
+		}
+		cols[i].Title = want
+		m.sessionsTbl.SetColumns(cols)
+		return
+	}
 }
 
 // newSessionsTable builds an empty sessions table. Columns are fitted to the terminal by
@@ -175,11 +253,14 @@ func (m *model) rebuildSessionsTable() {
 		prev = rows[m.sessionsTbl.Cursor()][0]
 	}
 	now := time.Now()
+	// The header first: these cells are about to be summed out of a particular snapshot,
+	// and the column has to name the span that snapshot covers.
+	m.syncCostColumnTitle()
 	// The width COST was actually FITTED to, not the 10 sessionsColumns declares:
 	// fitTableColumns shrinks it to 5 on a 40-column terminal, and fitCostCell needs the
 	// real number to decide whether a figure fits. Hoisted out of the loop because it is
 	// the same for every row.
-	costWidth := m.fittedSessionsColumnWidth("COST")
+	costWidth := m.fittedSessionsColumnWidth(costColumnPrefix)
 	rows := make([]table.Row, 0, len(m.sessions))
 	for _, s := range m.sessions {
 		if m.filter != "" && !strings.Contains(s.ID, m.filter) {

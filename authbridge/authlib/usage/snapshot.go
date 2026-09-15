@@ -217,6 +217,59 @@ type Snapshot struct {
 	// Summed across the window from the raw buckets, so it is unaffected by the requested
 	// resolution, exactly like Totals and the two maps above.
 	IncompleteBy map[string]int64 `json:"incompleteBy,omitempty"`
+	// UngroupedCostMicros is the part of Totals.CostMicros that NO entry in this
+	// response's series carries — the amount by which summing the breakdown falls short
+	// of the total printed beside it.
+	//
+	// It exists because that shortfall was undisclosed. The dominant instance is a
+	// GATEWAY-PRICED RESPONSE THE INFERENCE PARSER COULD NOT READ: /v1/embeddings and
+	// /v1/rerank are not among the paths it parses, so the event carries no model while the
+	// gateway's own header settles a cost, and that spend counts toward Totals and drops
+	// out of group=model. Per-axis that is the honest answer — there is no model to
+	// attribute it to, and moving it into a made-up bucket or out of the totals would each
+	// be worse. In aggregate it made the response contradict itself with nothing to
+	// explain the difference, which is the same shape as the group=plugin dollar
+	// duplication and the endpoint-versus-model denominator, both of which this API says
+	// out loud.
+	//
+	// WHAT A CLIENT DOES WITH IT: render it as its own residual band — "unattributed", or
+	// the (other) band a table already collapses into — and never present the sum of a
+	// series as the window's total. The arithmetic it restores is exact:
+	// sum(series CostMicros) + UngroupedCostMicros == Totals.CostMicros, for every group
+	// where Group.Reconcilable is true.
+	//
+	// BOTH WINDOW KINDS POPULATE IT, verified rather than assumed — which is why this is
+	// not ledger-only the way Degraded is:
+	//   - a LEDGER window, because such a response is stored as a row with Model "" and
+	//     costledger.labelFor then returns ok=false for group=model. Pinned by
+	//     TestFold_GatewayPricedRowWithNoModelIsDisclosedAsUngrouped.
+	//   - a RING window, because Aggregator.costOf prices any SETTLED cost record whether
+	//     or not the event carries an Inference extension, while foldInto guards byMethod
+	//     on a non-empty model — so the same spend lands in the bucket total and in no
+	//     series entry. Pinned by
+	//     TestSnapshot_GatewayPricedTrafficWithNoModelIsDisclosedAsUngrouped.
+	// A field that appeared on one kind and not the other would be worse than none: a
+	// client would come to trust the reconciliation and then have it break at whichever
+	// window boundary switches storage.
+	//
+	// A POINTER, absent rather than zero on a window whose series accounts for
+	// everything — the Degraded convention, for the reason its doc gives. A zero would
+	// have to carry two meanings: "the breakdown accounts for every dollar" and "this
+	// group offers no reconciliation at all". group=none asks for no series, and
+	// group=plugin's series counts one request once per plugin, so neither sets this; a
+	// client must read Group before concluding anything from its absence. See
+	// Group.Reconcilable.
+	//
+	// COST, not a request count, and not keyed like UnpricedBy. The question it answers is
+	// arithmetic — a breakdown that does not add up to the total above it — and requests
+	// cannot be subtracted from dollars. A key would have to come from a DIFFERENT axis
+	// than the one the client grouped by (the endpoint, for a row with no model), and the
+	// ring cannot produce that key without a label map it does not keep, so the two window
+	// kinds would then disagree about the shape as well as the number.
+	//
+	// Summed from the raw buckets alongside Totals, so it is unaffected by the requested
+	// resolution.
+	UngroupedCostMicros *int64 `json:"ungroupedCostMicros,omitempty"`
 	// Degraded reports that this answer is known to be MISSING ROWS, and is absent
 	// whenever it is not.
 	//
@@ -260,6 +313,56 @@ type Degraded struct {
 	// line by an unbounded amount: the rest of that file is missing, and a file holds a
 	// whole day.
 	TruncatedDays int64 `json:"truncatedDays,omitempty"`
+}
+
+// Reconcilable reports whether a client can reconcile this group's series against
+// Totals — whether sum(series CostMicros) + Snapshot.UngroupedCostMicros equals
+// Totals.CostMicros.
+//
+// FALSE FOR GroupNone, which asks for no breakdown: there is nothing to reconcile, and
+// a residual equal to the entire total would then appear on every group-less request —
+// the default one — and read as a fault.
+//
+// FALSE FOR GroupPlugin, whose series counts one request once per plugin that touched
+// it, so its dollars intentionally sum to MORE than the total (see the note on
+// GroupPlugin's accumulator). Totals-minus-series is not a residual for that axis at
+// all, and it is not merely useless: in a window where some requests touched no plugin
+// and others touched several, the shortfall and the duplication cancel and produce a
+// plausible zero. So it is not computed there rather than computed and clamped.
+//
+// Exported because both producers — Aggregator.Snapshot and the ledger's fold — have to
+// make the same call, and a predicate written twice is a predicate that drifts.
+func (g Group) Reconcilable() bool {
+	switch g {
+	case GroupNone, GroupPlugin:
+		return false
+	}
+	return true
+}
+
+// SetUngroupedCost records the residual and leaves the field ABSENT when there is none.
+//
+// The single implementation of the absent-not-zero rule, called by the ring in Snapshot
+// and by the ledger in sessionapi, so neither can serialise a zero that would read as
+// "checked, complete" from a path that computed nothing. See
+// Snapshot.UngroupedCostMicros.
+func (s *Snapshot) SetUngroupedCost(micros int64) {
+	if micros <= 0 {
+		return
+	}
+	s.UngroupedCostMicros = &micros
+}
+
+// seriesCost is the dollars a label breakdown accounts for.
+//
+// Reads Counts.CostMicros per entry rather than any running total, because the series
+// is what a client sums and this has to be exactly that arithmetic.
+func seriesCost(series map[string]Counts) int64 {
+	var total int64
+	for _, v := range series {
+		total += v.CostMicros
+	}
+	return total
 }
 
 // ParseWindow validates a window parameter against the storage resolution.
@@ -560,6 +663,12 @@ func (a *Aggregator) Snapshot(window, resolution time.Duration, sessionID string
 		Buckets:       make([]Bucket, 0, n),
 	}
 
+	// The dollars no series entry will carry. Accumulated per raw bucket and set once
+	// below, for the reason Totals is: the figure must not change with the resolution the
+	// caller asked for. See Snapshot.UngroupedCostMicros.
+	var ungrouped int64
+	reconcilable := group.Reconcilable()
+
 	for i := n - 1; i >= 0; i-- {
 		t := newest.Add(-time.Duration(i) * BucketWidth)
 		b := Bucket{At: t}
@@ -572,6 +681,17 @@ func (a *Aggregator) Snapshot(window, resolution time.Duration, sessionID string
 			}
 		}
 		out.Totals.Add(b.Counts)
+		if reconcilable {
+			// Derived here rather than counted in foldInto, because THIS is where a group is
+			// chosen: one event is in the byMethod map and out of the byEndpoint one depending
+			// on which labels it carried, so "what this breakdown leaves out" is not a property
+			// of the event and cannot be accumulated at record time. The subtraction is exact
+			// for a reconcilable group — every event lands in at most one entry of the map
+			// being read, so the entries sum to the cost of the events that had a label for
+			// this axis, and the rest is the shortfall. Group.Reconcilable is what keeps
+			// group=plugin, whose entries deliberately double-count, out of this arithmetic.
+			ungrouped += b.Counts.CostMicros - seriesCost(b.Series)
+		}
 		if ring != nil {
 			if src := &ring[slot(t)]; src.start.Equal(t) {
 				for k, v := range src.byUnpriced {
@@ -615,6 +735,9 @@ func (a *Aggregator) Snapshot(window, resolution time.Duration, sessionID string
 	// must render "cost unavailable", a declared-free window must render $0.0000. See
 	// costevent.Event.Settled, and TestPricing_SettledZeroIsNotRePriced, which pins it.
 	out.Priced = out.Totals.PricedRequests > 0
+	// Absent unless there is something to disclose, which is the whole convention: see
+	// SetUngroupedCost.
+	out.SetUngroupedCost(ungrouped)
 
 	// Fold last: totals are summed from the raw buckets above and are unaffected
 	// by grouping width, so a client's summary line agrees with its chart no

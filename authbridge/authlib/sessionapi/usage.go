@@ -315,7 +315,7 @@ func (s *Server) ledgerSnapshot(spec usage.Spec, group usage.Group) (usage.Snaps
 	if err != nil {
 		return usage.Snapshot{}, err
 	}
-	totals, series := costledger.Fold(rows, group)
+	totals, series, ungrouped := costledger.Fold(rows, group)
 	// Read AFTER Window, never before: both counters are gauges for the most recent read,
 	// so sampling them earlier would report the previous caller's answer as this one's.
 	//
@@ -331,7 +331,7 @@ func (s *Server) ledgerSnapshot(spec usage.Spec, group usage.Group) (usage.Snaps
 		slog.Warn("sessionapi: cost ledger read was incomplete — the total is short",
 			"window", spec.Label, "skippedLines", skipped, "truncatedDays", truncated)
 	}
-	return usage.Snapshot{
+	snap := usage.Snapshot{
 		Window:        spec.Label,
 		BucketSeconds: int(spec.To.Sub(spec.From).Seconds()),
 		Group:         group,
@@ -343,7 +343,14 @@ func (s *Server) ledgerSnapshot(spec usage.Spec, group usage.Group) (usage.Snaps
 		// real total and discloses the caveat in Totals.IncompleteRequests. Withholding
 		// the figure would render "cost unavailable" over dollars that are known.
 		Priced: totals.PricedRequests > 0,
-	}, nil
+	}
+	// The dollars the breakdown above does not account for — a gateway-priced response the
+	// inference parser could not read is stored with no model, so it counts toward Totals
+	// and cannot be a group=model key. Set through the setter so a window with nothing to
+	// disclose serialises no field at all, exactly like Degraded; see
+	// usage.Snapshot.UngroupedCostMicros for what a client does with it.
+	snap.SetUngroupedCost(ungrouped)
+	return snap, nil
 }
 
 // writeUsageError returns 400 with the validation message. Every message it can

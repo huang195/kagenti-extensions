@@ -456,14 +456,23 @@ func (m *model) handleKey(msg tea.KeyMsg) tea.Cmd {
 			} else {
 				m.pane = panePipeline
 			}
-			// Returning INTO Usage has to restart its polling chain. The tick
-			// that was in flight when the catalog opened was dropped by the
-			// `m.pane != paneUsage` guard, so without this nothing reschedules
-			// and the 20s auto-refresh is silently dead until the user backs all
-			// the way out and re-enters with `u` — `r` refetches once but starts
-			// no chain.
-			if m.pane == paneUsage {
+			// Returning INTO a polling pane has to restart ITS chain. The tick
+			// that was in flight when the catalog opened was dropped by that
+			// pane's own `m.pane != …` guard, so without this nothing
+			// reschedules and the 20s auto-refresh is silently dead until the
+			// user backs all the way out and re-enters — `r` refetches once but
+			// starts no chain.
+			//
+			// One arm per pane with a chain, and paneCost is the second: with
+			// only the Usage arm here, `$` `P` `esc` came back to a Cost pane
+			// whose chain had been dropped and never rescheduled, its freshness
+			// line counting up ("updated 14m3s ago (every 20s)") against a
+			// figure nothing would ever refresh.
+			switch m.pane {
+			case paneUsage:
 				return m.resumeUsagePolling()
+			case paneCost:
+				return m.resumeCostPolling()
 			}
 		case paneUsage:
 			// Return to whichever pane opened it, from usageState's own field —
@@ -495,6 +504,15 @@ func (m *model) handleKey(msg tea.KeyMsg) tea.Cmd {
 			// settled choice, the same way closing the column picker is — and it is one write
 			// per visit instead of one per keystroke.
 			m.persistSettings()
+			// And restart the chain of the pane being returned TO, for the reason the
+			// catalog arm above does it. `u` `$` `esc` is the live path: opening Cost from
+			// Usage let the Usage tick in flight fall to its own `m.pane != paneUsage`
+			// guard, so esc landed back on a Usage pane whose 20s refresh was dead — a
+			// REGRESSION to an existing pane, introduced by adding paneCost to the openers,
+			// and bit for bit the failure that arm exists to prevent.
+			if m.pane == paneUsage {
+				return m.resumeUsagePolling()
+			}
 		case paneDetail:
 			m.pane = paneEvents
 		case paneEvents:

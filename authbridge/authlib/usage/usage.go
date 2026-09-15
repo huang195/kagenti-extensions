@@ -159,6 +159,22 @@ type Counts struct {
 	//
 	// Priced-versus-priceable is the ratio that answers "is my cost total complete",
 	// and it reaches parity when it should.
+	//
+	// WHAT COUNTS AS PRICEABLE WIDENED, and a client comparing figures across versions
+	// should know. It used to require extractable token counts, so a 2xx inference response
+	// whose usage the parser could not read was invisible: not priced, not priceable, and
+	// absent from UnpricedBy — nine good requests plus one of those read "9/9 priced",
+	// parity, while real spend was missing. That is now counted as priceable-but-unpriced
+	// and named as a gap, which is the honest answer and also a HIGHER priceable figure
+	// for identical traffic. A dashboard tracking the ratio across an upgrade will show
+	// coverage appear to drop; nothing got worse, the denominator stopped lying.
+	//
+	// There is deliberately NO version marker on the wire for this. A field whose meaning
+	// is versioned needs every consumer to branch on the version, and the honest reading is
+	// the same in both: this is the count of requests that could have carried a price. The
+	// change is recorded here, and in the PR that made it, rather than encoded in a
+	// compatibility flag nothing would read — which is the shape of defect this package hit
+	// four times over.
 	PriceableRequests int64 `json:"priceableRequests,omitempty"`
 }
 

@@ -337,3 +337,72 @@ func TestRenderCostSummary(t *testing.T) {
 		})
 	}
 }
+
+// The cell bypassed formatUSDCell and formatted the amount itself, so the floor that
+// exists to stop a real charge printing as free was not applied here. One cache-read-only
+// request is $0.000038 — 100 cache-read tokens at a typical rate — and it rendered "COST
+// $0.0000", which is the exact reading this feature forbids everywhere else.
+func TestRenderCostSummary_SubFloorChargeIsNotRenderedAsFree(t *testing.T) {
+	snap := usage.Snapshot{
+		Priced: true,
+		Totals: usage.Counts{Requests: 1, PriceableRequests: 1, PricedRequests: 1, CostMicros: 38},
+	}
+	got := renderCostSummary(&snap)
+
+	if strings.Contains(got, "$0.0000") {
+		t.Errorf("rendered %q — a real charge printed as free", got)
+	}
+	if want := "COST <$0.0001"; got != want {
+		t.Errorf("rendered %q, want %q from the shared money formatter", got, want)
+	}
+}
+
+// A SETTLED zero still renders as one: the gateway declared the traffic free, which is a
+// known answer and the reason the floor is "below the floor" rather than "any small
+// number". Pins the other side of the line so the fix cannot become "never print zero".
+func TestRenderCostSummary_SettledZeroStillReadsAsZero(t *testing.T) {
+	snap := usage.Snapshot{
+		Priced: true,
+		Totals: usage.Counts{Requests: 1, PriceableRequests: 1, PricedRequests: 1, CostMicros: 0},
+	}
+	if got := renderCostSummary(&snap); got != "COST $0.0000" {
+		t.Errorf("rendered %q, want %q for a settled zero", got, "COST $0.0000")
+	}
+}
+
+// An inexact total must say so here too. usage.Counts.IncompleteRequests means the figure
+// is a lower bound or an approximation, and this cell showed it identically to an exact
+// one — the same floor the CLI already refuses to publish as a total.
+func TestRenderCostSummary_InexactTotalIsMarkedAndCounted(t *testing.T) {
+	snap := usage.Snapshot{
+		Priced: true,
+		Totals: usage.Counts{
+			Requests: 40, PriceableRequests: 40, PricedRequests: 40,
+			CostMicros: 1_842_100, IncompleteRequests: 4,
+		},
+	}
+	got := renderCostSummary(&snap)
+
+	if !strings.Contains(got, inexactMarker+"$1.8421") {
+		t.Errorf("rendered %q — the figure is a lower bound and carries no marker", got)
+	}
+	if !strings.Contains(got, "4 of 40 inexact") {
+		t.Errorf("rendered %q — the pane has room to say how many, and does not", got)
+	}
+}
+
+// And an exact one carries neither, so the marker keeps meaning something.
+func TestRenderCostSummary_ExactTotalCarriesNoMarker(t *testing.T) {
+	snap := usage.Snapshot{
+		Priced: true,
+		Totals: usage.Counts{Requests: 40, PriceableRequests: 40, PricedRequests: 40, CostMicros: 1_842_100},
+	}
+	got := renderCostSummary(&snap)
+
+	if strings.Contains(got, inexactMarker) {
+		t.Errorf("rendered %q — an exact total wears the inexactness marker", got)
+	}
+	if strings.Contains(got, "inexact") {
+		t.Errorf("rendered %q — a caveat with nothing to act on", got)
+	}
+}

@@ -15,6 +15,25 @@ const stripLabel = "SPEND"
 // same spacing the footer's status line uses between its own readings.
 const stripGap = "   "
 
+// inexactMarker precedes a dollar figure that is NOT EXACT: at least one of the priced
+// requests behind it carries a figure the aggregator could not settle exactly
+// (usage.Counts.IncompleteRequests) — a stream that died before its output count, so the
+// amount is a LOWER BOUND, or a gateway that reported only a total. It reads
+// "approximately", and the real number is at least this much.
+//
+// ONE SPELLING, EVERYWHERE. This is the marker the strip puts on the today and window
+// figures, the sessions table puts on its COST cell (see fitCostCell) and the Usage
+// pane puts on its cost cell (see renderCostSummary). A branch that carries a commit
+// titled "Stop publishing a truncated stream's floor as an exact total" had three money
+// surfaces republishing that floor with no annotation at all, and three different
+// annotations would have been barely better: a marker a reader has to learn twice is a
+// marker they learn once and misread thereafter.
+//
+// One display column, so it survives every width the strip's fitter can produce and
+// every width fitTableColumns can leave the COST column at. The burn rate has always
+// worn the same "~" for the same reason — a derived rate is not an exact figure either.
+const inexactMarker = "~"
+
 // partialMarker follows a dollar figure that covers only PART of the traffic it
 // appears to be about: something in the window was priceable and carries no figure, so
 // the real total is LARGER than the number shown.
@@ -69,10 +88,16 @@ func coverageNote(unpriced, priceable int64) string {
 // hour. A caveat attached to its own figure cannot be misread that way, and a figure
 // with no caveat of its own now says so by carrying no marker.
 //
-// Exactness is not this function's business yet; coverage is. Both caveats end up in
-// one parenthetical when both apply.
-func moneyFigure(usd float64, label string, unpriced, priceable int64) stripFigure {
+// Exactness and coverage are separate claims about the same number — whether the figure
+// is the real one, and how much of the traffic it covers — and both can be true at once.
+// They are stated in that order, matching cmd_cost.go, whose comment records why: the
+// exactness caveat qualifies the dollar figure itself, where coverage qualifies how much
+// of the traffic the figure is about.
+func moneyFigure(usd float64, label string, unpriced, priceable, incomplete int64) stripFigure {
 	amount := formatUSDCell(usd)
+	if incomplete > 0 {
+		amount = inexactMarker + amount
+	}
 	// A gap is only readable with a denominator, and a denominator of zero is not a
 	// gap at all — it is a window with nothing to price, which the caller handles.
 	partial := unpriced > 0 && priceable > 0
@@ -80,8 +105,18 @@ func moneyFigure(usd float64, label string, unpriced, priceable int64) stripFigu
 		amount += partialMarker
 	}
 	fig := plainFigure(amount + " " + label)
+	var caveats []string
+	if incomplete > 0 {
+		// No denominator: spendSummary carries the day's and the window's priced counts
+		// nowhere, and the count alone is what a strip has room for. The Cost pane states
+		// the full "N of M priced figures are lower bounds" for a reader who wants it.
+		caveats = append(caveats, fmt.Sprintf("%d inexact", incomplete))
+	}
 	if partial {
-		fig.full = fig.compact + " (" + coverageNote(unpriced, priceable) + ")"
+		caveats = append(caveats, coverageNote(unpriced, priceable))
+	}
+	if len(caveats) > 0 {
+		fig.full = fig.compact + " (" + strings.Join(caveats, ", ") + ")"
 	}
 	return fig
 }
@@ -182,7 +217,8 @@ func renderSpendStrip(s spendSummary, width int) string {
 	if s.HasToday {
 		// Today outranks the rolling window when it exists: it is the figure an
 		// operator is accountable for, and the window is context for it.
-		figures = append(figures, moneyFigure(s.TodayUSD, "today", s.TodayUnpriced, s.TodayPriceable))
+		figures = append(figures, moneyFigure(s.TodayUSD, "today",
+			s.TodayUnpriced, s.TodayPriceable, s.TodayIncomplete))
 	}
 	// Guarded on Priced independently of the branch above, which lets !Priced
 	// through whenever HasToday is set. Without this guard that combination — a
@@ -194,7 +230,8 @@ func renderSpendStrip(s spendSummary, width int) string {
 	// chain, so a fresh session can hold a priced day total beside a rolling hour that
 	// has priced nothing yet. The guard is what makes that state render honestly.
 	if s.Priced {
-		figures = append(figures, moneyFigure(s.WindowUSD, "/"+s.WindowLabel, s.Unpriced, s.Priceable))
+		figures = append(figures, moneyFigure(s.WindowUSD, "/"+s.WindowLabel,
+			s.Unpriced, s.Priceable, s.Incomplete))
 	} else if s.Unpriced > 0 && s.Priceable > 0 {
 		// The window figure is suppressed because nothing in the window was priced, so
 		// its coverage gap has no figure to ride on. It still has to be stated — this is
@@ -205,10 +242,11 @@ func renderSpendStrip(s spendSummary, width int) string {
 		figures = append(figures, plainFigure(coverageNote(s.Unpriced, s.Priceable)+" /"+s.WindowLabel))
 	}
 	if s.BurnPerMin > 0 {
-		// The leading "~" is the same one-cell claim inexactness makes elsewhere: this is
-		// not an exact figure. A rate derived from a partial or inexact window total is
-		// itself a lower bound, and the marker already says so, so it takes no second one.
-		figures = append(figures, plainFigure("~"+formatUSDCell(s.BurnPerMin)+"/min"))
+		// inexactMarker, the same one-cell claim it makes on every other figure: this is
+		// not an exact number. A rate is a quotient of a total that may itself be partial
+		// or inexact, so it is never exact, and it wears the marker unconditionally rather
+		// than taking a second one for each way it can be wrong.
+		figures = append(figures, plainFigure(inexactMarker+formatUSDCell(s.BurnPerMin)+"/min"))
 	}
 	if s.HasSaved {
 		figures = append(figures, plainFigure("saved "+formatUSDCell(s.SavedUSD)))

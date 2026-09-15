@@ -90,6 +90,20 @@ const costElision = "…"
 // fitCostCell renders a priced session's cost for a column exactly width cells wide,
 // eliding rather than letting bubbles clip it.
 //
+// inexact prefixes the figure with inexactMarker: at least one of this session's priced
+// requests carries a figure the aggregator could not settle exactly, so the amount is a
+// LOWER BOUND. Same marker as the strip and the Usage pane, for the reason
+// inexactMarker's own comment gives — one spelling across every money surface. The
+// alternative was what this cell did before: republish a truncated stream's floor as
+// "$0.2546", an exact-looking figure to four decimal places.
+//
+// The marker costs one column, which lowers what this cell can state in full: the
+// declared width is 10, "$9999.9999" is exactly 10, so "~$1234.5678" is 11 and elides
+// even on a wide terminal. Accepted rather than widening the column, because the widths
+// are pinned arithmetic (see sessionsColumns' 102-column note) and an elision is honest
+// where a clipped figure is not — the in-cell ceiling for an INEXACT figure is
+// $999.9999, and above it the cell says "a figure exists and did not fit".
+//
 // bubbles' renderRow is runewidth.Truncate(value, col.Width, "…"), which cuts a money
 // figure from the RIGHT and keeps its LEADING digits: $1234.5678 in the 5-wide column a
 // 40-column terminal leaves comes out "$123…", an amount ten times smaller that still reads
@@ -108,8 +122,11 @@ const costElision = "…"
 // width <= 0 means the caller found no such column — a table whose columns have not been
 // fitted yet. Render the figure: the declared width is 10 and holds everything below five
 // figures of dollars.
-func fitCostCell(usd float64, width int) string {
+func fitCostCell(usd float64, inexact bool, width int) string {
 	cell := formatUSDCell(usd)
+	if inexact {
+		cell = inexactMarker + cell
+	}
 	if width > 0 && lipgloss.Width(cell) > width {
 		return costElision
 	}
@@ -183,8 +200,8 @@ func (m *model) rebuildSessionsTable() {
 		// elision is not blank: blank here would say the cost is unknown when it is known
 		// and merely too wide for this terminal.
 		cost := ""
-		if usd, priced := m.sessionCost(s.ID); priced {
-			cost = fitCostCell(usd, costWidth)
+		if usd, priced, inexact := m.sessionCost(s.ID); priced {
+			cost = fitCostCell(usd, inexact, costWidth)
 		}
 		rows = append(rows, table.Row{
 			s.ID,

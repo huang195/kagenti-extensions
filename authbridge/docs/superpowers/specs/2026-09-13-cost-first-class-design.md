@@ -57,8 +57,80 @@
 >
 > **Line numbers drift.** Every `file.go:NN` citation below was accurate against the
 > tree it was written against, and many have since moved — `fold` alone has travelled
-> from `snapshot.go:159` to `:345`. Read them as "roughly here"; find the symbol by
-> name.
+> from `snapshot.go:159` to `:345` to `:438`. Read them as "roughly here"; find the
+> symbol by name.
+>
+> ---
+>
+> **SECOND SWEEP, 2026-09-15.** Two further review rounds landed fourteen-plus fixes
+> after the banner above was written. Eleven of its claims stopped being true; they are
+> collected here rather than rewritten in place, because in most cases the reasoning is
+> still why the code looks the way it does.
+>
+> 1. **Costing has its own package, `authlib/costing`.** The *Layers* table names
+>    `inference-parser` as the costing site, and *Architecture* gives three reasons the
+>    parser should own the rule. The parser now **calls** `costing.Settle` at the point
+>    the token counters are final; it does not own the rule. `costing`'s package doc
+>    gives the reason this design missed: a gateway's cost-header semantics are
+>    vendor-specific knowledge with no place in a provider-shaped body parser. The
+>    "only the parser knows when usage is final" argument survives intact — it is
+>    exactly why the parser is the *caller* — so the three reasons are left standing.
+> 2. **The history is "two places", not four.** `costing`'s own account is that cost was
+>    decided inside `litellm-budget-track` and again inside the usage aggregator. The
+>    four sites *Architecture* lists are #972's enumeration, which counted two client-side
+>    renderers of a published figure alongside two producers of one. And budget-track now
+>    **amends** the settled record to enforce a budget rather than consuming it.
+> 3. **Delivery row 7 did land — upstream, not here.** `ToolPrune` has no rate table
+>    (its struct says so where the field used to be) and `pruneEvent` "carries FACTS
+>    ONLY"; `pricing.EstimateTokensFromBytes` lives in `authlib/pricing/estimate.go`;
+>    and `costing.Avoided`, called from `inference-parser`, publishes priced savings into
+>    `costevent.Event.Avoided`. What did **not** land is the aggregation of that container
+>    into `usage.Counts` — so the four missing `avoided*`/`prunable*` schema rows and the
+>    pane's missing `AVOIDED` section are still right, but "did not land at all" is not.
+>    A consequence for *Savings, honestly*: its `tui/prune_saving.go:97` and `:104-112`
+>    citations now point at a file whose own header says it does none of that arithmetic.
+> 4. **The counterfactual-invariant test is written**, in `usage/pricing_test.go` as
+>    `TestAggregator_TotalsAreInvariantToAvoidedCost`. It drives a real `Avoided` payload
+>    through `Record` twice and pins every money field across the pair. Not vacuous
+>    either, since `costevent` carries the container.
+> 5. **One client is recognised, not three.** `pipeline.knownClients` maps `claude-cli`
+>    → `claude-code` and nothing else; `opencode` and `codex` are deliberately absent,
+>    because a wrong guess files one agent under another's name where an unrecognised
+>    one still reports under its raw User-Agent and can be identified from the breakdown.
+>    The `EventClient` sketch's comment lists all three as if they were implemented.
+> 6. **The ledger stores an absent client as `""`, not `"unknown"`.** `"unknown"` is
+>    `pipeline.UnknownClientLabel`, applied at the query boundary by
+>    `costledger.labelFor` — a durable file must not bake a display value into a column
+>    where it becomes permanently indistinguishable from an agent that really called
+>    itself that. Corrected inline under *Storage*.
+> 7. **Three `/v1/usage` additions the *API* section does not list**, all additive:
+>    `Counts.IncompleteRequests` (how many of a total's figures are a floor rather than
+>    an exact number), `Snapshot.Degraded` (a pointer, so absent ≠ zero: how many ledger
+>    lines and day files a read lost) and `Snapshot.IncompleteBy` (which *way* a figure
+>    is inexact). The first two reach abctl. `IncompleteBy` was producer-side only as of
+>    the commit this note was written against, so every abctl surface rendered one
+>    undifferentiated inexactness marker; check whether a later commit closed that.
+> 8. **The Cost pane mock-up is a picture of the design, not of the pane.** Shipped
+>    headings are `TOTAL`, `BY <group>`, `WHERE IT WENT (tokens, not dollars)` — the
+>    parenthetical is *in the heading* — and `COVERAGE`. There is no `AVOIDED` section
+>    and no per-tier dollar column. The group cycle is model → endpoint → session →
+>    agent.
+> 9. **The strip's width table is illustrative, not a threshold list.** No width
+>    constant exists: `fitStripFigures` searches figure count × verbosity and drops the
+>    `SPEND` label before it drops a number. Every money figure now wears up to three
+>    one-column claims, composed as `!~$4.1700+` — `!` the ledger read lost rows, `~` at
+>    least one figure in this total is inexact, `+` the figure covers only part of the
+>    traffic. Markers are never what gets dropped. A fifth figure was added: how long
+>    ago the strip last polled, when that answer is stale.
+> 10. **Retention is configurable but floored, and the config is restart-only.** A
+>     non-zero `cost_ledger.retention_days` below 7 is refused at load, because
+>     `window=7d` is served from these files; `0` still means 30. And `CostLedgerConfig`
+>     is **not** hot-reloadable — the reloader has no reference to it and the writer is
+>     opened once at startup, so every key takes effect on restart.
+> 11. **Persisted UI state is a `cost:` section in `~/.cortex/abctl-config.yaml`**, the
+>     YAML file main already writes — not the `~/.cortex/abctl-ui.json` this design
+>     proposed. The banner records that file as superseded upstream; this names what
+>     replaced it.
 
 ## Why
 
@@ -250,8 +322,9 @@ Nothing here needs revising when they arrive: `Counts.Add` sums whatever `Counts
 ledger's `Row` embeds `Counts`, so the storage side follows for free. What is missing is the
 aggregation, not the schema.
 
-`tokens` stays as the sum — **except that it does not always, and `Counts.Tokens`' own godoc is
-where that is stated.** `parsercommon.Fill` prefers the provider's `total_tokens` when one was
+`tokens` stays as the sum — **except that it does not always, and the doc comment on `Counts`'
+split block is where that is stated** (`Tokens` itself carries no godoc; the sentence "Tokens is
+NOT always the sum of the fields below" sits on the four fields that follow it). `parsercommon.Fill` prefers the provider's `total_tokens` when one was
 reported and falls back to summing the split otherwise, so a gateway reporting only a total
 yields a non-zero `tokens` with every split field at 0. Old consumers do keep working, which was
 the point of the sentence; what they cannot do is normalise a stacked bar against `tokens` and
@@ -332,8 +405,16 @@ so that caveat survives a restart instead of being the one thing a persisted tot
 figures with modelled ones, and one `provenance` per row would have to pick a winner. Keying on
 it keeps `PricedBy` reconstructible from the ledger exactly as `/v1/usage` reports it today.
 
-`agent` is `EventClient.Name` and `.Version` joined with `/`, or `"unknown"` when no User-Agent
-was sent — one string, because it is a grouping label rather than structured data at this layer.
+`agent` is `EventClient.Name` and `.Version` joined with `/` — one string, because it is a
+grouping label rather than structured data at this layer.
+
+**On disk an absent client is `""`, not `"unknown"`.** This design said `"unknown"` and the
+code refused it: a durable file must not bake a display value into a column where it becomes
+permanently indistinguishable from an agent that really called itself that. `"unknown"` is
+`pipeline.UnknownClientLabel` and `costledger.labelFor` applies it at the query boundary, so
+`group=agent` returns the same key whether the answer came from the ring or from disk. The
+constant is exported for exactly that reason — two spellings would surface as two rows, each
+holding half the unattributed spend.
 
 Written by the **proxy**, not abctl, for the reason `authlib/usage`'s package doc already gives:
 an aggregate built inside a client starts empty when that client connects, so two operators
@@ -554,9 +635,11 @@ Two debts are stated rather than papered over:
   `remove: []`; assert the response event carries a cost. This is the test whose absence let the
   blank `COST` column ship.
 - **Counterfactual invariant** — `Totals.CostMicros` and `PricedRequests` are unchanged by any
-  number of `Avoided` entries. *Vacuously true on this branch: nothing aggregates `Avoided` into
-  `Counts`, so there is nothing that could perturb them. Still the test to write when the savings
-  work lands.*
+  number of `Avoided` entries. *Written: `usage/pricing_test.go`'s
+  `TestAggregator_TotalsAreInvariantToAvoidedCost` records the same request twice, once with an
+  absurd `Avoided` payload, and asserts every money field is identical. An earlier revision of
+  this line called it vacuous and unwritten; the container exists on `costevent.Event`, so a
+  consumer folding it into spend is a real thing the test forbids.*
 - **One owner** — one golden request; the row figure, the `/v1/usage` total and the ledger line
   quote the same `costMicros`.
 - **`presentKinds` fold** — a model that wrote no cache renders differently from a provider that

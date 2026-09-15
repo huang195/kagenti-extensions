@@ -26,6 +26,65 @@
 >
 > **Line numbers drift.** Every `file.go:NN` below was accurate when written and many
 > have moved. Read them as "roughly here" and find the symbol by name.
+>
+> ---
+>
+> **SECOND SWEEP, 2026-09-15. "Five later commits" is an undercount: eighteen have
+> touched `authlib/costledger` since `90fe5ff7`.** The five above are the ones that
+> reversed a *claim*; these changed the *code this plan prints*, so an implementer
+> copying a block out of it would write something the tree has already rejected. Each is
+> repeated at the block it affects.
+>
+> - `87185852` and `7f44e714` — **the admission guard.** This plan's `Record` drops
+>   everything with a nil `Inference`. The shipped predicate is "this event is inference
+>   **or** somebody priced it", so a response the parser could not read but the gateway
+>   charged for is recorded, with `Model: ""` and no token counts. Task 1 Step 4 and
+>   `TestWriter_NonInferenceTrafficIsIgnored` both describe the old rule.
+> - `25961adc` — **the write path no longer rolls back, and retention gained a floor.**
+>   No `Stat`, no `Truncate`; the injected `dayFile` interface omits both so no future
+>   edit can quietly reintroduce them, because a rollback computed from a size can
+>   destroy rows *another* writer appended. A torn append costs one line, fenced off with
+>   a single newline byte, which the reader then skips and counts. Retention's cutoff is
+>   floored at the newest day file's own date: a forward clock step used to delete
+>   everything including today (`TestPrune_AForwardClockStepDoesNotDeleteTheLedger`), and
+>   the cutoff is `ref` minus `retainDays-1`, so `retainDays` **files** survive counting
+>   today rather than `retainDays+1`.
+> - `77866e8e` — **the day zone is pinned and the append is fsynced.** One `store.loc`
+>   decides every day boundary, on write, on read and on prune, because a row filed under
+>   a date no query for that local day visits is written, retained and invisible. `Window`
+>   drops a disk row for the held minute on **equality**, not "at or after": the earlier
+>   `>=` discarded every newer disk row (measured: 250,000 micros returned instead of
+>   1,250,000).
+> - `a7202f63` — **nothing is lost silently.** `Dropped()`, `SkippedLines()` and
+>   `TruncatedDays()` are exported; the last two are **gauges for the most recent read**,
+>   not cumulative counters, which is why `sessionapi` samples them *after* `Window` and
+>   not before.
+> - `108e0fa5` — **label length and per-minute cardinality are capped** (`maxLabelLen`
+>   96, `maxLabelsPerMinute` 64, overflow folded into `(other)`). The labels come off a
+>   request, so their length and their count are chosen off-host; capping on the write
+>   side is also what makes a line longer than the reader's `maxLineBytes` unreachable.
+> - `f5d52045` — **`ledgerSnapshot` now emits `Snapshot.Degraded`**, a pointer carrying
+>   the two gauges above, so a day that lost lines no longer produces a response
+>   byte-identical to a clean one.
+>
+> **Signatures this plan does not list.** `Writer` also has `Window`, `Dropped`,
+> `SkippedLines`, `TruncatedDays`, and the options `WithRetentionDays` and
+> `WithSettleInterval` — the last because a minute that ends and is followed by no traffic
+> has to be settled by a timer rather than by the next event. `newStore` takes
+> `(dir, retainDays, loc)`; `store` has no `close`; `readDay` returns
+> `([]Row, dayIssues, error)` and scans line by line with `bufio.Scanner` rather than
+> decoding a stream. **`store_test.go` was never created** — the file-layout, retention and
+> corrupt-line tests the File Structure table assigns to it live in `writer_test.go` and
+> `query_test.go`.
+>
+> **The config block gained a key and a floor.** `cost_ledger` is
+> `enabled *bool` + `dir string` + `retention_days int`; a non-zero `retention_days`
+> below 7 is **refused at load** rather than clamped, because `window=7d` is served from
+> these files, and `0` still means the package default of 30. It is **not
+> hot-reloadable**: the reloader holds no reference to it and the writer is opened once at
+> startup, so every key here takes effect on restart. Say that where an operator will read
+> it — someone who edits `enabled: false` in a live config has every reason to believe the
+> writing stopped.
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
@@ -469,7 +528,7 @@ func New(dir string, opts ...Option) (*Writer, error) {
 // roll: this runs on the synchronous session-append path, and the ledger is
 // observability. A failure here must not become a failed request.
 //
-// SUPERSEDED by e1b86747: "beyond one append per minute roll" was still one
+// SUPERSEDED by 23e4b7ac: "beyond one append per minute roll" was still one
 // filesystem write on the request path, and that path holds session.Store's WRITE
 // LOCK, so every other request in the proxy queues behind it. Record now does NO IO
 // at all — one mutex, one map operation, and at most one non-blocking channel send.
@@ -493,6 +552,37 @@ func (w *Writer) Record(_ string, e *pipeline.SessionEvent) {
 	if e.Phase != pipeline.SessionResponse {
 		return
 	}
+
+	// SUPERSEDED by 87185852 and 7f44e714, and this guard is the part of the plan an
+	// implementer must NOT copy. Both halves of it are wrong.
+	//
+	// "Inference == nil" was standing in for "not priceable", and it is not the same
+	// predicate. inference-parser populates Extensions.Inference only for the endpoints
+	// it can read, and leaves it nil for /v1/embeddings, /v1/rerank, /v1/moderations,
+	// anything else a gateway mounts, and any response whose body was empty or
+	// unparseable — while still settling a cost for all of them from the gateway's own
+	// response header, which needs neither a model nor a body. Returning here made every
+	// one of those free: the spend reached no /v1/usage total, no ledger and no budget.
+	// The shipped predicate is "this event is inference OR somebody priced it", named
+	// rather than inlined so the guard reads as that rule instead of as a nest of
+	// negations:
+	//
+	//	ev, hasCost := costevent.Record(e)
+	//	settledCost := hasCost && ev.Priced()
+	//	if e.Inference == nil && !settledCost { return }
+	//
+	// PRICED, not merely present: a record that exists but priced nothing is still
+	// non-inference traffic. The consequence to carry forward is that a row can now hold
+	// Model: "" and no token counts at all; the shipped test is named
+	// TestRecord_APricedResponseWithNoInferenceExtensionIsStillRecorded.
+	// TestWriter_NonInferenceTrafficIsIgnored below still holds, because its fixture
+	// carries no cost record; the shipped test for the other half is
+	// TestRecord_AnUnpricedNonInferenceResponseIsStillIgnored.
+	//
+	// And the phase gate admits SessionDenied as well as SessionResponse. As written it
+	// does not, which made the `e.Phase == pipeline.SessionDenied` arm of the Errors
+	// assignment below unreachable — a denial is a response that happened and can carry
+	// a settled cost.
 
 	minute := e.At.Truncate(time.Minute)
 	r := Row{
@@ -966,7 +1056,7 @@ Add to `store.go`:
 // mid-append, and discarding a whole day because its last line is half-written
 // would turn a 60-second gap into a 24-hour one.
 //
-// SUPERSEDED by d3e771fd, which is the same argument carried one step further. Stopping
+// SUPERSEDED by 79857c7d, which is the same argument carried one step further. Stopping
 // at the bad line only works if the bad line is the LAST one — which it is for a crash
 // mid-append and is not for any other kind of corruption. A bad line in the morning
 // discarded the rest of the day, reintroducing exactly the 24-hour gap this comment
@@ -1323,9 +1413,24 @@ Three things about that body are not what shipped, and the first is the whole po
   other would read as "no pricing gaps here". The gap stays visible as
   `Totals.PricedRequests` against `Totals.PriceableRequests`.
 
-`sessionID` is accepted and echoed but **not filtered on**: the ledger's rows carry no session id, because a session is a laptop-lifetime concept while the ledger is a day-lifetime one. Say so in the godoc rather than silently returning all-sessions data under a session label — and if that seems wrong, the honest alternative is to reject `session` together with a symbolic window, which is also acceptable. Pick one and state it.
+~~`sessionID` is accepted and echoed but **not filtered on**: the ledger's rows carry no session id, because a session is a laptop-lifetime concept while the ledger is a day-lifetime one. Say so in the godoc rather than silently returning all-sessions data under a session label — and if that seems wrong, the honest alternative is to reject `session` together with a symbolic window, which is also acceptable. Pick one and state it.~~
 
-`UnpricedBy`/`PricedBy` are not reconstructed here in this task; `provenance` is in the row key so it is possible, but leave it for whoever needs it and say so, rather than emitting a half-populated map that reads as "no gaps".
+**The alternative offered in that last sentence is what shipped, so read the bullets above and
+disregard this paragraph.** `handleUsage` **rejects** `session=` alongside a symbolic window,
+unconditionally — even where the ring could have answered for one session over six hours —
+because an API whose behaviour depends on whether a deployment happens to have a ledger is one
+a client cannot code against, and the refusal names the fix. Struck through rather than deleted
+because "pick one and state it" is a real thing to hand an implementer; the defect was not the
+choice, it was recording the choice in one place and leaving the alternative asserted in
+another, twelve lines apart and in the wrong order.
+
+`UnpricedBy`/`PricedBy` are not reconstructed here — for the reason in the third bullet above,
+which is firmer than "leave it for whoever needs it": `PricedBy` *is* reconstructible from the
+row key, `UnpricedBy` is not, and emitting one without the other reads as "no pricing gaps
+here". `Snapshot.Degraded` **is** populated, which this task did not anticipate — `f5d52045`
+added it so a day whose read lost lines stops producing a response byte-identical to a clean
+one. Sample its two gauges **after** `Window`, never before: they report the most recent read,
+so reading them first hands back the previous caller's answer as this one's.
 
 **`cmd/authbridge-proxy/main.go`** — construct the ledger only on the `--local` path; nil otherwise. One startup log line either way, naming which and why, in the register of the existing `slog.Info("session tracking enabled", …)` line.
 

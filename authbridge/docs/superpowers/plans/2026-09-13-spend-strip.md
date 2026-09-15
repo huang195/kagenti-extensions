@@ -31,6 +31,50 @@
 >
 > **Line numbers drift.** Every `file.go:NN` below was accurate when written and many
 > have moved. Read them as "roughly here" and find the symbol by name.
+>
+> ---
+>
+> **SECOND SWEEP, 2026-09-15.** The three corrections above still hold — verified: there
+> is no `SPAN` column, `grep -rn sessionSpan cmd/abctl/` still finds nothing, and below 20
+> rows the header is still a bare `styleTitle.Render(title)`. What has changed is
+> everything the strip *renders*, across eight further commits. Five differences an
+> implementer reading the code blocks below would otherwise have to discover:
+>
+> - **`spendStripVisible` split in two, and that split is the answer to the open question
+>   in Task 3 Step 4.** `spendStripReservesRow()` is height-only and is what `layout()`
+>   calls; `spendStripVisible()` is that **and** the pane check, and is what `paneView`
+>   calls. The step asks the implementer to "confirm no pane transition leaves a stale
+>   `bodyHeight`" and offers dropping the pane check from the reservation as the fallback.
+>   That fallback is what shipped, in both halves rather than one. `layout()` now reserves
+>   up to **five** rows, not four: the filter input takes a conditional row too.
+> - **The renderer degrades along two axes, not one.** A figure is a
+>   `stripFigure{full, compact}` pair, and `fitStripFigures` searches count × verbosity —
+>   all N spelled out, all N compact, N-1 spelled out, and so on — then drops the `SPEND`
+>   label before it drops a number. So its parameter is `[]stripFigure`, not `[]string`,
+>   and the caveat's *words* go before any figure does.
+> - **Every money figure wears up to three one-column markers**, composed as
+>   `!~$4.1700+`: `!` the ledger read lost rows, `~` at least one figure in this total is
+>   inexact rather than exact, `+` the figure covers only part of the priceable traffic.
+>   `moneyFigure` is the one place they go on, and `5c8638d7` made the fourth refusal —
+>   a negative total is never rendered as money — cover all six money surfaces rather than
+>   two. Markers are never what a narrow terminal drops; that is why dropping the caveat's
+>   words is safe.
+> - **A fifth figure was added** (`3235b47d`): how long ago the strip last polled, shown
+>   only when that answer is stale. A wedged figure that looks live is worse than a dated
+>   one.
+> - **`spendSummary` gained eight fields.** `HasSnapshot` and `Failed` separate "no poll
+>   has answered yet" from "the poll failed"; `Incomplete` carries the exactness caveat;
+>   and `TodayUnpriced`, `TodayPriceable`, `TodayIncomplete`, `TodayDegraded` exist because
+>   `21afbb4b` found the two figures sharing one set of caveats — the window's coverage gap
+>   was qualifying the day's total and vice versa. Task 1's struct is a strict subset of
+>   the shipped one; its *optional-fields* premise is what made all of that additive, which
+>   is the thing to keep.
+>
+> Two smaller ones on the sessions list: the `COST` column's title is now the dynamic
+> `COST/<window>` (`3235b47d`), found by prefix so the span can change without breaking
+> lookups; and a cell too narrow for its figure renders `…` rather than blank
+> (`f01a003c`), because blank already means "unpriced" and the two must not collide.
+> `858fc445` rebuilds the rows on a resize, not only the columns.
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 

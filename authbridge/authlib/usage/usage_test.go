@@ -53,6 +53,13 @@ func withCost(t *testing.T, e *pipeline.SessionEvent, costUSD float64) *pipeline
 // production key.
 func withLegacyCost(t *testing.T, e *pipeline.SessionEvent, costUSD float64) *pipeline.SessionEvent {
 	t.Helper()
+	// The deprecation warning is the POINT here, not an oversight to be silenced
+	// generally: this helper exists to hold the compatibility path down, and reading the
+	// legacy key is exactly what it must keep doing. Switching to costevent.Key would
+	// leave the frozen spelling untested and re-open the coverage hole this helper was
+	// added to close — every cost fixture once exercised only the legacy key, which meant
+	// nothing proved the production key was decoded at all.
+	//nolint:staticcheck // SA1019: deliberately exercising the deprecated key.
 	return withCostUnderKey(t, e, costUSD, costevent.PluginName)
 }
 

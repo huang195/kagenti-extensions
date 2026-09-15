@@ -1389,7 +1389,9 @@ func TestWriter_RecordsTheAgentLabel(t *testing.T) {
 	w.Record("s1", e)
 
 	now = at.Add(time.Minute)
-	w.Flush()
+	if err := w.Flush(); err != nil {
+		t.Fatalf("Flush: %v", err)
+	}
 
 	rows := readAllRows(t, dir)
 	if len(rows) != 1 {
@@ -1415,7 +1417,9 @@ func TestWriter_TwoAgentsInOneMinuteAreTwoRows(t *testing.T) {
 	w.Record("s1", b)
 
 	now = at.Add(time.Minute)
-	w.Flush()
+	if err := w.Flush(); err != nil {
+		t.Fatalf("Flush: %v", err)
+	}
 
 	if rows := readAllRows(t, dir); len(rows) != 2 {
 		t.Fatalf("got %d rows, want 2 — one per agent", len(rows))
@@ -1434,7 +1438,9 @@ func TestWriter_NoClientStillWritesTheRow(t *testing.T) {
 	w.Record("s1", e)
 
 	now = at.Add(time.Minute)
-	w.Flush()
+	if err := w.Flush(); err != nil {
+		t.Fatalf("Flush: %v", err)
+	}
 
 	rows := readAllRows(t, dir)
 	if len(rows) != 1 {
@@ -1464,7 +1470,9 @@ func TestWriter_AbsentClientStoresTheEmptyString(t *testing.T) {
 	w.Record("s1", e)
 
 	now = at.Add(time.Minute)
-	w.Flush()
+	if err := w.Flush(); err != nil {
+		t.Fatalf("Flush: %v", err)
+	}
 
 	if rows := readAllRows(t, dir); rows[0].Agent != "" {
 		t.Errorf("Agent = %q, want the empty string: the ledger stores absence losslessly", rows[0].Agent)
@@ -1488,7 +1496,9 @@ func TestWriter_UnrecognisedAgentStoresItsRawLabel(t *testing.T) {
 	w.Record("s1", e)
 
 	now = at.Add(time.Minute)
-	w.Flush()
+	if err := w.Flush(); err != nil {
+		t.Fatalf("Flush: %v", err)
+	}
 
 	if rows := readAllRows(t, dir); rows[0].Agent != "SomeNewAgent/9.9" {
 		t.Errorf("Agent = %q, want the raw UA", rows[0].Agent)

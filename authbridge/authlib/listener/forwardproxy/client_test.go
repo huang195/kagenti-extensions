@@ -81,24 +81,52 @@ func TestForwardProxy_BothPhasesCarryTheClient(t *testing.T) {
 // than filled in. A recorder that substituted a placeholder would satisfy the test
 // above and invent an agent for traffic that named none — which in a cost table
 // reads as a real program that spent real money.
+//
+// DISCRIMINATING, not one-sided: both requests go through the same proxy into the same
+// store, and the events have to split into named ones and absent ones. Asserting only
+// "want nil" made this test pass for the wrong reason — deleting the recorders' `Client:`
+// assignment outright left it green, because nil was all it checked for — so the nil it
+// reports now is the absence of the HEADER rather than the absence of the wiring.
+//
+// The nil's Label() is deliberately NOT asserted here. Label is nil-safe by construction,
+// so `ev.Client.Label() == "unknown"` restates pipeline.EventClient.Label's own contract,
+// which its "nil is unknown" table row pins in that package, and it cannot fail for
+// anything a recorder does or omits. What a recorder CAN get wrong is which requests carry
+// a client at all, and that is what the counts below assert.
 func TestForwardProxy_NoUserAgentStaysAbsent(t *testing.T) {
 	store := session.New(5*time.Minute, 100, 0)
 	defer store.Close()
 	_, client, backendURL := newProbedProxy(t, store)
 
+	// The positive control goes first, so both shapes are recorded by the same server into
+	// one view and the comparison is between the two REQUESTS rather than between two runs.
+	getUA(t, client, backendURL, "claude-cli/2.1.14 (external, cli)")
 	getUA(t, client, backendURL, "")
 
 	v := store.View(session.DefaultSessionID)
-	if v == nil || len(v.Events) == 0 {
-		t.Fatalf("expected events, got %+v", v)
+	if v == nil || len(v.Events) < 4 {
+		t.Fatalf("expected a request and a response event from each of two requests, got %+v", v)
 	}
+	var named, absent int
 	for _, ev := range v.Events {
-		if ev.Client != nil {
-			t.Errorf("phase %s: Client = %+v, want nil for a request with no User-Agent", ev.Phase, ev.Client)
+		if ev.Client == nil {
+			absent++
+			continue
 		}
-		if ev.Client.Label() != "unknown" {
-			t.Errorf("phase %s: Label() = %q, want unknown", ev.Phase, ev.Client.Label())
+		named++
+		if ev.Client.Name != "claude-code" || ev.Client.Version != "2.1.14" {
+			t.Errorf("phase %s: Client = %+v, want claude-code/2.1.14", ev.Phase, ev.Client)
 		}
+	}
+	if named == 0 {
+		t.Error("no event carried a client at all; the recorders do not copy pctx.ClientInfo(), so the absence here is missing WIRING and not a missing User-Agent")
+	}
+	if absent == 0 {
+		t.Error("every event carried a client; the UA-less request was given one, and an invented agent in a cost table reads as a real program that spent real money")
+	}
+	if named != absent {
+		t.Errorf("%d events named a client and %d did not; the two requests record the same events, so an uneven split means one phase is attributed and the other is not — which halves or doubles every per-agent figure",
+			named, absent)
 	}
 }
 

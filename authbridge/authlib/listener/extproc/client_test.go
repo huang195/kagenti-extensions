@@ -83,6 +83,18 @@ func TestExtProcRecordersCarryTheClient(t *testing.T) {
 		return v.Events[0]
 	}
 
+	// BOTH DIRECTIONS IN ONE SUBTEST, per recorder. They used to be two loops, and the
+	// absence half asserted only "want nil" — which a recorder that never populates Client
+	// at all satisfies, so deleting the `Client:` assignment left that half green while it
+	// read as coverage of the same contract. Present-then-absent through the same recorder
+	// is what makes each subtest able to fail on its own: the first assertion catches an
+	// unwired call site, the second catches one that fabricates a label for traffic that
+	// named no agent.
+	//
+	// The nil's Label() is deliberately NOT asserted. Label is nil-safe by construction, so
+	// `ev.Client.Label() == "unknown"` restates pipeline.EventClient.Label's own contract —
+	// pinned by its "nil is unknown" table row in that package — and cannot fail for
+	// anything a recorder here does or omits.
 	for _, tc := range recorders {
 		t.Run(tc.name, func(t *testing.T) {
 			ev := firstEvent(t, tc.name, tc.record, newPctx(tc.dir, tc.phase, "claude-cli/2.1.14 (external, cli)"))
@@ -92,20 +104,11 @@ func TestExtProcRecordersCarryTheClient(t *testing.T) {
 			if ev.Client.Name != "claude-code" || ev.Client.Version != "2.1.14" {
 				t.Errorf("%s: Client = %+v, want claude-code/2.1.14", tc.name, ev.Client)
 			}
-		})
-	}
 
-	// Absence stays absence at every recorder too. Asserted alongside the positive
-	// case because a recorder that hardcoded a label would pass the test above and
-	// fabricate an agent for traffic that named none.
-	for _, tc := range recorders {
-		t.Run(tc.name+"/noUserAgentIsNil", func(t *testing.T) {
-			ev := firstEvent(t, tc.name, tc.record, newPctx(tc.dir, tc.phase, ""))
-			if ev.Client != nil {
-				t.Errorf("%s: Client = %+v, want nil for a request with no User-Agent", tc.name, ev.Client)
-			}
-			if ev.Client.Label() != "unknown" {
-				t.Errorf("%s: Label() = %q, want unknown", tc.name, ev.Client.Label())
+			absent := firstEvent(t, tc.name, tc.record, newPctx(tc.dir, tc.phase, ""))
+			if absent.Client != nil {
+				t.Errorf("%s: Client = %+v, want nil for a request with no User-Agent; an invented agent in a cost table reads as a real program that spent real money",
+					tc.name, absent.Client)
 			}
 		})
 	}

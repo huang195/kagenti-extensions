@@ -113,6 +113,32 @@ func TestIncompleteReason(t *testing.T) {
 		},
 		want: ReasonOutputUncounted,
 	}, {
+		// THE FALSE POSITIVE the presence mask used to produce, and the reason this
+		// predicate reads counters instead. Cache counts are a per-kind split: they were
+		// reported, UsageFromInference prices them, and no total was attributed to input —
+		// so there is nothing approximate to disclose. The Input and Output BITS are clear
+		// here, which is all the old mask looked at. The stop reason keeps this off the
+		// floor branch, so the split branch is the one under test.
+		name: "cache-only split with a total is not a totals-only gateway",
+		inf: &pipeline.InferenceExtension{
+			CacheReadTokens: 30000, TotalTokens: 30000,
+			PresentKinds: 1<<1 | 1<<2, // KindCacheRead | KindCacheWrite
+			FinishReason: "end_turn",
+		},
+		want: "",
+	}, {
+		// THE FALSE NEGATIVE, which the mask could never see. Anthropic asserts
+		// Input|Output unconditionally, so both bits are set with both tallies zero; a
+		// total arriving alongside them IS attributed wholly to uncached input by
+		// UsageFromInference, and the mask would have published that as an exact figure.
+		name: "totals-only behind bits a dialect sets unconditionally is still approximate",
+		inf: &pipeline.InferenceExtension{
+			TotalTokens:  1700,
+			PresentKinds: presentInput | presentOutput,
+			FinishReason: "stop",
+		},
+		want: ReasonSplitUnreported,
+	}, {
 		name: "nil extension",
 		inf:  nil,
 		want: "",

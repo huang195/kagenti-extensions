@@ -116,8 +116,13 @@ const (
 // Mirrored rather than imported because parsercommon lives under plugins/internal and
 // is unreachable from here — the same constraint that made
 // pipeline.InferenceExtension.PresentKinds a plain uint8 with the layout written into
-// its doc comment. Only the two bits this file reads are declared, so the mirror cannot
-// drift on a bit nothing here uses.
+// its doc comment.
+//
+// NOTHING IN THIS FILE READS THE MASK ANY MORE. Both predicates that used to were
+// dialect-unreliable — see outputUncounted's block comment and the call site of
+// totalsOnly. The two bits stay declared because the tests that assert what the mask
+// CANNOT discriminate need names for them, and a fixture built from bare shifts would
+// stop saying which kinds it means.
 const (
 	presentInput  uint8 = 1 << 0 // parsercommon.KindInput
 	presentOutput uint8 = 1 << 3 // parsercommon.KindOutput
@@ -153,19 +158,46 @@ func IncompleteReason(inf *pipeline.InferenceExtension) string {
 	if outputUncounted(inf) {
 		return ReasonOutputUncounted
 	}
-	// Neither prompt nor completion exposed, yet a total arrived: a gateway reporting
+	// No counter of any kind carried a figure, yet a total arrived: a gateway reporting
 	// only total_tokens. Gated on the total because with no counters at all there is no
 	// figure to qualify — costing publishes nothing for that request.
 	//
-	// The presence mask IS the right instrument HERE, and is the wrong one above. That
-	// asymmetry is deliberate rather than an inconsistency: this branch asks exactly what
-	// the mask answers — did the provider expose a breakdown at all — while the branch
-	// above asks whether a breakdown that WAS exposed finished arriving, which the mask
-	// cannot see. Do not unify the two on the mask.
-	if inf.PresentKinds&(presentInput|presentOutput) == 0 && inf.TotalTokens > 0 {
+	// THE COUNTERS ARE THE INSTRUMENT HERE, NOT THE PRESENCE MASK. This used to read
+	// `PresentKinds&(presentInput|presentOutput) == 0`, which asked a question neither the
+	// reason nor the arithmetic is about, and got it wrong in both directions:
+	//
+	//	FALSE POSITIVE  A response reporting only cache counts has the Input and Output bits
+	//	                clear, so the mask called it "no split at all" — while a split
+	//	                plainly existed and UsageFromInference priced it, no total-to-input
+	//	                attribution anywhere in sight.
+	//	FALSE NEGATIVE  Anthropic asserts Input|Output unconditionally (see the block comment
+	//	                in outputUncounted), so on the dialect Claude Code speaks the bits are
+	//	                set even when both tallies are zero. A total arriving with them WAS
+	//	                attributed wholly to input and would have been published as exact.
+	//
+	// Both are out of reach on today's dialects — OpenAI gates each bit on a pointer, and
+	// Anthropic's Fill derives TotalTokens FROM the split, so all-zero tiers give a zero
+	// total — which is why nothing observable moves and why the rows pinning it have to
+	// synthesize an extension. The mask is dialect-unreliable in BOTH branches of this
+	// function; it just happened to be harmless in this one.
+	if totalsOnly(inf) {
 		return ReasonSplitUnreported
 	}
 	return ""
+}
+
+// totalsOnly reports the shape ReasonSplitUnreported names: every per-tier counter and both
+// legacy aggregates empty, with a total present.
+//
+// It mirrors UsageFromInference's own last-resort guard deliberately, down to the fields it
+// reads. IncompleteReason's whole job is to say what UsageFromInference DID, so it has to ask
+// that function's question: this is exactly the input on which the whole total is attributed
+// to uncached input, and nothing else is. Asking anything else — a presence mask, a single
+// aggregate — is how the label and the arithmetic drift apart while both look reasonable.
+func totalsOnly(inf *pipeline.InferenceExtension) bool {
+	return inf.InputTokens == 0 && inf.CacheWriteTokens == 0 && inf.CacheReadTokens == 0 &&
+		inf.OutputTokens == 0 && inf.PromptTokens == 0 && inf.CompletionTokens == 0 &&
+		inf.TotalTokens > 0
 }
 
 // outputUncounted reports the floor case: a prompt was counted, nothing generated was,

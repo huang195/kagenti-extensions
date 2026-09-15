@@ -144,11 +144,13 @@ type Writer struct {
 	// late, so the guard is on the write side where it can be absolute rather than on
 	// the read side where it would be a heuristic.
 	flushedThrough time.Time
-	// prunedDay is the local day retention was last enforced for. Pruning once per
-	// day rather than per flush keeps a directory listing off the per-minute path,
-	// and pruning on the DAY ROLL rather than only at startup matters for the case
+	// prunedDay is the ledger day retention was last enforced SUCCESSFULLY for. Pruning
+	// once per day rather than per flush keeps a directory listing off the per-minute
+	// path, and pruning on the DAY ROLL rather than only at startup matters for the case
 	// this is built for: a laptop proxy that runs for weeks without a restart would
 	// otherwise never enforce retention at all.
+	//
+	// "Successfully" is load-bearing — see pruneDueLocked and markPruned.
 	prunedDay time.Time
 }
 
@@ -190,18 +192,26 @@ func New(dir string, opts ...Option) (*Writer, error) {
 	for _, o := range opts {
 		o(w)
 	}
-	s, err := newStore(dir, w.retainDays)
+	now := w.now()
+	// The clock's zone becomes the ledger's day boundary, for both halves of the store.
+	// See store.loc.
+	s, err := newStore(dir, w.retainDays, now.Location())
 	if err != nil {
 		return nil, err
 	}
 	w.store = s
-	now := w.now()
-	w.prunedDay = dayOf(now)
 	if perr := s.prune(now); perr != nil {
 		// Not fatal, and not returned. A ledger that cannot delete an old file is
 		// still a ledger that can record today's spend, and refusing to start the
 		// proxy over it would trade an observability nicety for an outage.
+		//
+		// prunedDay is left ZERO here, so the first minute roll arms retention again. It
+		// used to be set before this call, which meant a failed startup prune disarmed
+		// retention until the next local midnight — on the one path most likely to be
+		// holding files past their window. See pruneDueLocked.
 		slog.Warn("costledger: retention prune failed; old day files remain", "dir", dir, "error", perr)
+	} else {
+		w.prunedDay = s.dayOf(now)
 	}
 	w.wg.Add(1)
 	go w.run()
@@ -266,11 +276,16 @@ func (w *Writer) Record(_ string, e *pipeline.SessionEvent) {
 		return
 	}
 
-	minute := e.At.Truncate(time.Minute)
+	// IN THE LEDGER'S ZONE. The day file this row lands in is named from this
+	// timestamp, and the day walk that reads it back is derived from the reader's
+	// window — so a producer that built At in UTC while a reader asks about a local day
+	// put the row in one file and looked for it in another, losing rows near midnight.
+	// Normalising here pins both sides to store.loc. See store.loc and Query.
+	minute := e.At.In(w.store.loc).Truncate(time.Minute)
 	if e.At.IsZero() {
 		// A zero At would file the row under year 1 and make it invisible to every
 		// query. The aggregator substitutes its own clock for the same reason.
-		minute = w.now().Truncate(time.Minute)
+		minute = w.now().In(w.store.loc).Truncate(time.Minute)
 	}
 	r := Row{
 		At: minute,
@@ -440,7 +455,7 @@ func (w *Writer) foldLocked(r Row) {
 func (w *Writer) closeMinuteLocked(next time.Time) batch {
 	b := w.takeLocked()
 	w.open = next
-	b.pruneAt = w.markPrunedLocked(next)
+	b.pruneAt = w.pruneDueLocked(next)
 	return b
 }
 
@@ -467,8 +482,8 @@ func (w *Writer) takeLocked() batch {
 	return batch{rows: out}
 }
 
-// markPrunedLocked returns the instant retention should be enforced for, or the zero
-// time when it already has been for that local day. Caller holds mu.
+// pruneDueLocked returns the instant retention should be enforced for, or the zero
+// time when it already has been for that ledger day. Caller holds mu.
 //
 // The bookkeeping is here, under the lock, and the ReadDir and the unlinks are not:
 // this used to run store.prune inline, so on the first minute of each new local day
@@ -476,13 +491,34 @@ func (w *Writer) takeLocked() batch {
 // operator-configurable path while every other request in the proxy waited on the
 // session store's write lock. On a slow or hung mount — NFS, FUSE, an encrypted
 // volume spinning up — that is a stall in request handling caused by observability.
-func (w *Writer) markPrunedLocked(at time.Time) time.Time {
-	day := dayOf(at)
-	if !day.After(w.prunedDay) {
+//
+// READS ONLY, and that is the fix for N4. It used to advance prunedDay right here, on
+// the request path, BEFORE the prune had run — so if the batch carrying pruneAt was
+// dropped by a full queue, or the prune itself failed, retention was disarmed for the
+// rest of that day and the files past the window simply stayed. Permanently, on a
+// laptop proxy that may not restart for weeks, which is the exact case day-roll pruning
+// was added for. prunedDay now advances in write, after a prune that actually
+// succeeded; see markPruned. The cost is that a failed prune re-arms on the next
+// minute — a ReadDir on the writer goroutine, never on a request — until one lands.
+func (w *Writer) pruneDueLocked(at time.Time) time.Time {
+	if !w.store.dayOf(at).After(w.prunedDay) {
 		return time.Time{}
 	}
-	w.prunedDay = day
 	return at
+}
+
+// markPruned records that retention has been enforced for at's ledger day.
+//
+// Called from write, on the writer goroutine, after a prune that returned no error.
+// Takes mu only long enough to store a time — the ReadDir and the unlinks are already
+// done by then, so no reader waits on the filesystem.
+func (w *Writer) markPruned(at time.Time) {
+	day := w.store.dayOf(at)
+	w.mu.Lock()
+	if day.After(w.prunedDay) {
+		w.prunedDay = day
+	}
+	w.mu.Unlock()
 }
 
 // pending returns a copy of the open minute's rows and the minute they belong to.
@@ -698,7 +734,11 @@ func (w *Writer) write(b batch) {
 	}
 	if !b.pruneAt.IsZero() {
 		if perr := w.store.prune(b.pruneAt); perr != nil {
+			// Left ARMED. The next minute will ask again, because a day whose prune failed
+			// still has files past the window. See pruneDueLocked.
 			slog.Warn("costledger: retention prune failed; old day files remain", "error", perr)
+		} else {
+			w.markPruned(b.pruneAt)
 		}
 	}
 	if b.done != nil {
@@ -725,7 +765,7 @@ func (w *Writer) settleClosedMinute() {
 	b := w.takeLocked()
 	// A proxy idle across midnight rolls the day without recording anything, so
 	// retention is enforced here too rather than waiting for traffic to resume.
-	b.pruneAt = w.markPrunedLocked(now)
+	b.pruneAt = w.pruneDueLocked(now)
 	w.mu.Unlock()
 	w.write(b)
 }
@@ -818,6 +858,11 @@ var errClosedWhileFlushing = errors.New("costledger: closed while flushing; the 
 // Close is the shutdown flush plus the goroutine's stop — which is also why calling
 // it is what turns "a restart loses up to 60 seconds" into "an orderly stop loses
 // nothing".
+//
+// THAT CLAIM NOW HOLDS AGAINST POWER LOSS TOO. It did not before: writeLines returned
+// as soon as the bytes were in the page cache, so a nil error from Close meant only
+// that the kernel had them. writeLines fsyncs, and this returns the error if it
+// fails — the claim is either true or reported, never assumed.
 //
 // Idempotent, and safe to call on a Writer whose goroutine has already gone. Every
 // call after the first returns the FIRST call's error rather than nil: a shutdown path

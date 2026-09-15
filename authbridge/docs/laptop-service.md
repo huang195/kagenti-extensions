@@ -164,7 +164,7 @@ Two other knobs, same restart rule:
 | Setting | Default | Notes |
 |---|---|---|
 | `cost_ledger.dir` | `~/.cortex/cost` | Must be an absolute path. A relative one is refused, because it would resolve against whatever directory the proxy started from |
-| `cost_ledger.retention_days` | 30 | Minimum **8** when set. `window=7d` is a rolling 7x24h, so it opens *eight* local day files; a retention of 7 answers `window:"7d"` over a partial week with nothing saying so |
+| `cost_ledger.retention_days` | 30 | Minimum **9** when set. `window=7d` is a rolling 7×24h, not seven calendar days, so it can open **nine** local day files: one extra because a rolling span starts part-way through a date, and one more because a spring-forward week is 167 hours, so the span reaches an hour further back. A shorter retention answers `window:"7d"` over a partial week with nothing saying so |
 
 ## `abctl: command not found`
 

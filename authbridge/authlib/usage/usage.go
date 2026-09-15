@@ -332,18 +332,17 @@ func (c *Counts) addInto(dst *int64, v int64) {
 // million is 5x that. A future window growth cannot turn a legitimate response into a
 // refusal.
 //
-// STATED TWICE, WHICH IS A DEBT AND IS RECORDED AS ONE. pricing declares the bound
-// unexported and derives MaxPlausibleRequestCostMicros from it; this package cannot read it
-// and cannot export it from there without editing a package another change owns. Two
-// literals that must agree is exactly the shape that let the retention floor and the window
-// span drift (see config.minCostLedgerRetentionDays), and the fix is to export ONE of them
-// and derive the other — deliberately not done here, because it belongs in the commit that
-// can touch both. Until then: if either moves, move both.
+// DERIVED, NOT RESTATED. This was a second literal carrying the same number, with a comment
+// recording the duplication as a debt and naming the fix: export one and derive the other,
+// in a commit that can touch both packages. This is that commit. pricing.MaxPlausibleTokens
+// is now exported for exactly this, and the debt is paid rather than documented — two
+// literals that must agree is the shape that let config's retention floor drift from the
+// window span it protects, shipping a floor of 7 against a window that opens 8 files.
 //
 // PER FIELD, NOT PER REPORT. Six fields at the bound is 6e7, which is nowhere near an int64
 // and needs no separate sum check; a per-report bound would have to pick between refusing a
 // legitimate large prompt and admitting a forged split, and a per-field one refuses neither.
-const maxPlausibleRequestTokens = 10_000_000
+const maxPlausibleRequestTokens = pricing.MaxPlausibleTokens
 
 // plausibleTokenReport reports whether an event's token counters could have come from a real
 // inference response.

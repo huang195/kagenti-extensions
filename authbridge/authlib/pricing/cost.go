@@ -60,6 +60,11 @@ const (
 	// whole window — so 2,000,000 already covers the worst real call. Ten million is
 	// 5x that, so a future window growth cannot turn a legitimate bill into a
 	// coverage gap.
+	//
+	// EXPORTED AS MaxPlausibleTokens below, because authlib/usage needs the same bound to
+	// refuse an implausible token report and had restated it as a second literal. Two
+	// literals that must agree is the shape that let the retention floor drift from the
+	// window it protects; one definition and one importer is the fix.
 	maxPlausibleTokens = 10_000_000
 
 	// maxPlausibleMicrosPerToken is the highest per-token rate one tier could carry, in
@@ -114,6 +119,22 @@ const (
 // ambiguity at the edge to exclude, and the derivation reads "the most a request could
 // plausibly cost" — that figure is by construction still plausible.
 const MaxPlausibleRequestCostMicros int64 = maxPlausibleTokens * maxPlausibleMicrosPerToken
+
+// MaxPlausibleTokens is the largest token count one request could plausibly report, per
+// field. See maxPlausibleTokens for the derivation — this is that constant, exported.
+//
+// It exists because authlib/usage refuses an implausible token report and needs the same
+// bound: the token fields arrive as a provider-controlled `int` on the wire, so without one
+// a forged response that cannot move the dollar total past $10,000 could still move the
+// token total by 9.2e18, and a client renders the two side by side.
+//
+// ONE DEFINITION, ONE IMPORTER, deliberately. usage restated this as a second literal with a
+// comment recording the duplication as debt — and it was right to: two literals that must
+// agree is precisely the shape that let config's retention floor drift from the window span
+// it protects, shipping a floor of 7 against a window that opens 8 files. Exporting the bound
+// here and deriving there means a future change to the plausible ceiling cannot move one
+// without the other.
+const MaxPlausibleTokens = maxPlausibleTokens
 
 // PlausibleRequestCostUSD reports whether usd could be what ONE inference request cost.
 //

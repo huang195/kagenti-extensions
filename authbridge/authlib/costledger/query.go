@@ -1,6 +1,7 @@
 package costledger
 
 import (
+	"context"
 	"time"
 
 	"github.com/rossoctl/cortex/authbridge/authlib/pipeline"
@@ -17,49 +18,96 @@ import (
 // close; worse, a session whose whole conversation fit inside one minute produced no
 // disk rows at all and rendered as "cost unavailable" over real money.
 //
-// NON-OVERLAP is by construction, in three steps, because a minute counted twice is
-// a worse answer than a minute counted late:
+// NON-OVERLAP IS RECONCILED, NOT ASSUMED, in three steps, because a minute counted
+// twice is a worse answer than a minute counted late:
 //
-//  1. The open minute is read FIRST. Its rows cannot then be missed by a flush
-//     landing between the two reads — the failure mode of reading disk first.
-//  2. Disk rows for EXACTLY that minute are DROPPED. The writer's ownership rule
-//     (see the Writer doc) says there are none; if a concurrent flush produced some
-//     between step 1 and step 3, they are the same rows step 1 already holds, and
-//     this is what stops them being added twice.
-//  3. Only then are the day files read.
+//  1. The accumulator is read FIRST, together with its GENERATION — how many times
+//     rows have left it (see Writer.flushGen). Memory first, because its rows cannot
+//     then be missed by a flush landing between the two reads, which is the failure
+//     mode of reading disk first.
+//  2. The day files are read.
+//  3. The generation is read AGAIN. Unchanged means nothing left the accumulator while
+//     this read ran, so the rows from step 1 are still only in memory and are added.
+//     Changed means they may now be on disk as well — the day-file read may or may not
+//     have seen them — so the MEMORY half is discarded and only what is on disk is
+//     returned.
 //
-// So the arithmetic is: every minute other than the open one comes from disk, the
-// open one comes from memory, and neither can supply the other's. TestWindow_*
-// covers each step, including a hand-seeded overlap that step 2 has to absorb.
+// NOTHING ON DISK IS EVER DROPPED, which is the whole of the arithmetic: this function
+// can only ever ADD to what the day files hold. A row in the accumulator has never been
+// written (every exit from it is counted in flushGen, and add's direct-append paths
+// write rows that were never in the map), so an unmoved generation makes the two halves
+// disjoint by construction rather than by assumption.
 //
-// STEP 2 IS AN EQUALITY, and it used to be "at or after", justified by the claim that
-// a concurrent flush could only ever produce rows step 1 already holds. That claim was
-// FALSE. A flush landing between pending() and Query() can advance the writer several
+// IT USED TO DROP DISK ROWS FOR THE HELD MINUTE, and that silently hid committed money.
+// The rule was: the writer's ownership rule (see the Writer doc) says nothing on disk
+// carries the minute pending() reports, so a disk row for that minute must be the
+// pending rows themselves, landed from a flush that raced the two reads — drop it. The
+// premise holds INSIDE one process lifetime. It does not survive a process boundary, and
+// nothing re-established it at startup: New seeds neither flushedThrough nor open from
+// disk, so the first event after a restart re-opens a minute that already has rows in
+// the day file, and every one of those rows was then dropped as a duplicate. Measured on
+// the ORDINARY restart path — config reload, crash loop, rollout — with process 1
+// recording $1.00 and flushing, and process 2 restarting inside the same minute and
+// recording $0.25:
+//
+//	on disk after p1: 1000000 micros
+//	Window() saw:      250000 micros
+//	Dropped():              0
+//
+// $1.00 gone, with no drop count, no skipped line and no caveat anywhere in the
+// response. Two live processes sharing cost_ledger.dir reach the same state with no
+// restart at all, which the ~/.cortex/cost default makes plausible.
+//
+// A READER CANNOT TELL THOSE TWO STATES APART FROM THE ROWS THEMSELVES. A disk row for
+// the held minute carrying the same (endpoint, model, agent, provenance) key and the
+// same counters is identical whether it is this writer's own racing flush or another
+// writer's committed spend — the common case, since a restart usually resumes the same
+// traffic — so no matching on the row, by key or by counts or by both, can decide it.
+// What CAN be decided exactly is whether THIS writer flushed during THIS read, which is
+// what step 3 asks. So the drop moved from the disk half to the memory half: in the one
+// case where the two might overlap, the copy still in memory goes and the committed copy
+// on disk stays.
+//
+// THE COST is that a flush racing a read can leave the just-flushed minute out of that
+// one answer, when its write has not landed by the time the day files are read — the
+// same microseconds-wide, self-healing gap the Writer doc already documents for a batch
+// in flight. It is bounded by one read and it corrects itself on the next one.
+//
+// SEEDING flushedThrough FROM DISK IN New was the other candidate, and is deliberately
+// not what this does. It would re-establish the ownership rule for a SEQUENTIAL restart
+// and only for that: two live writers over one directory still put a disk row in the
+// minute one of them holds, so a reader would still need a rule for it — this one. It
+// also puts a whole day file's read in New, which must not fail hard (a ledger that
+// cannot read yesterday is still a ledger that can record today), and it would have to
+// be clamped against a future-dated file or it would disable the accumulator outright.
+// Cheaper to stop the reader trusting a promise it cannot verify.
+//
+// THE DROP THAT IS NOW GONE WAS AN EQUALITY, and before that "at or after", justified by
+// the same claim: that a concurrent flush could only ever produce rows step 1 already
+// holds. That claim was FALSE twice over. A flush landing between pending() and Query()
+// can advance the writer several
 // minutes, and those newer minutes are on disk and NOT in the pending snapshot, which
 // was taken before them — so dropping everything at or above the held minute dropped
 // real spend. Measured: writer holding minute M, one disk row at M+1, Window returned
-// 250,000 micros instead of 1,250,000. It is also reachable with no race at all
-// whenever two processes share cost_ledger.dir, which the ~/.cortex/cost default makes
-// plausible: the other process's newer minutes are simply on disk while this one holds
-// an older one. Equality is the only overlap the ownership rule can actually produce,
-// so it is the only one to absorb.
-func (w *Writer) Window(from, to time.Time) ([]Row, error) {
+// 250,000 micros instead of 1,250,000. Recorded here because it is the same mistake
+// twice — a reader deciding what to discard from an invariant it cannot check — and the
+// second fix is what removes the class rather than the instance.
+func (w *Writer) Window(ctx context.Context, from, to time.Time) ([]Row, error) {
 	fromMin, toMin := span(from, to)
-	pending, open := w.pending()
+	pending, _, gen := w.pending()
+	if w.betweenWindowReads != nil {
+		// Test seam. Nil in production; see the field.
+		w.betweenWindowReads()
+	}
 
-	rows, err := w.Query(from, to)
+	rows, err := w.Query(ctx, from, to)
 	if err != nil {
 		return nil, err
 	}
-	if !open.IsZero() {
-		kept := rows[:0]
-		for _, r := range rows {
-			if r.At.Truncate(time.Minute).Equal(open) {
-				continue
-			}
-			kept = append(kept, r)
-		}
-		rows = kept
+	if w.flushGeneration() != gen {
+		// Step 3: the accumulator moved while this read ran, so the snapshot may be on
+		// disk too. Return the disk half alone rather than risk counting a minute twice.
+		return rows, nil
 	}
 	for _, r := range pending {
 		if m := r.At.Truncate(time.Minute); m.Before(fromMin) || m.After(toMin) {
@@ -84,7 +132,23 @@ func (w *Writer) Window(from, to time.Time) ([]Row, error) {
 // that lost lines, or one whose read was abandoned part-way, otherwise produced
 // exactly the same answer as a clean one — a short total labelled priced:true with no
 // caveat anywhere in it.
-func (w *Writer) Query(from, to time.Time) ([]Row, error) {
+//
+// EXPORTED WITH NO NON-TEST CALLER, and it stays that way: it is the named disk half of
+// this package's contract, cited by name from sessionapi's ledgerSnapshot, from
+// config's cost-ledger tests and from usage's snapshot tests as the thing that walks day
+// files. Unexporting it would leave three other packages' documentation naming a method
+// that no longer exists, to save a symbol whose own doc is what tells a reader why
+// Window and not this one.
+//
+// CONTEXT IS HONOURED BETWEEN DAY FILES, not inside one. A 7d window is up to eight
+// os.Open-plus-scan calls against an operator-configured path — an NFS or FUSE mount in
+// the worst case — and the client that asked may be gone before the second one. Checked
+// per day rather than per line because a single day file is bounded (maxLabelsPerMinute
+// x 1440 rows) while the number of them is the caller's to choose, so the per-day check
+// is what bounds the work an abandoned read can still do. A cancelled read returns the
+// context's error and NO rows: a partial day would be a short total with nothing saying
+// it was short, which is the failure SkippedLines exists to stop being invisible.
+func (w *Writer) Query(ctx context.Context, from, to time.Time) ([]Row, error) {
 	fromMin, toMin := span(from, to)
 
 	var out []Row
@@ -98,6 +162,12 @@ func (w *Writer) Query(from, to time.Time) ([]Row, error) {
 	// whichever day the caller happened to spell — and near midnight that is a different
 	// file from the one the row was written to.
 	for d := w.store.dayOf(fromMin); !d.After(w.store.dayOf(toMin)); d = d.AddDate(0, 0, 1) {
+		if err := ctx.Err(); err != nil {
+			// Before the first read too, so a request cancelled while it queued does no IO
+			// at all. The gauges are left alone: they describe the most recent read that
+			// produced an answer, and this one did not.
+			return nil, err
+		}
 		rows, issues, err := w.store.readDay(d)
 		if err != nil {
 			return nil, err

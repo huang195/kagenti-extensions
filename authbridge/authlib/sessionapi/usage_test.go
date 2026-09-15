@@ -1,9 +1,11 @@
 package sessionapi
 
 import (
+	"context"
 	"encoding/json"
 	"io"
 	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
@@ -703,6 +705,40 @@ func TestHandleUsage_ACorruptLedgerLineIsDisclosedInTheResponse(t *testing.T) {
 	}
 	if snap.Degraded.SkippedLines < 1 {
 		t.Errorf("degraded.skippedLines = %d, want at least 1", snap.Degraded.SkippedLines)
+	}
+}
+
+// The request's context reaches the ledger, so a client that hangs up stops the read.
+//
+// The ledger walk is the only unbounded IO this endpoint does: one day file per day in
+// the window, up to eight for window=7d, against an operator-configured path. Handed
+// context.Background() instead, every abandoned request read every one of them to the end
+// for a client that had gone — and a chart that re-requests on each keystroke cancels its
+// own reads constantly.
+//
+// The handler is called directly rather than through httptest, because the assertion is
+// about which context reaches costledger.Window and a real client disconnect cannot be
+// timed against the read.
+func TestHandleUsage_TheRequestContextReachesTheLedgerRead(t *testing.T) {
+	led := ledgerWithOneCostedMinute(t, time.Now().Add(-2*time.Minute), "gw", "opus", 0.25)
+	srv := New(":0", session.New(5*time.Minute, 100, 0), WithUsage(usage.New()), WithCostLedger(led))
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	req := httptest.NewRequest(http.MethodGet, "/v1/usage?window=today", nil).WithContext(ctx)
+	rec := httptest.NewRecorder()
+	srv.handleUsage(rec, req)
+
+	// 503, not 200: the read was abandoned, so there is no total to serve. A 200 here
+	// means the handler passed a context of its own and read the day files anyway.
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Errorf("status = %d, want 503 for a cancelled request; 200 means the request's "+
+			"context never reached the ledger: %s", rec.Code, rec.Body.String())
+	}
+	// Still a JSON body rather than an empty one — net/http would otherwise send an empty
+	// 200 for the rare cancellation whose client is still listening.
+	if !strings.Contains(rec.Body.String(), "cost history unavailable") {
+		t.Errorf("body = %q, want the fixed unavailable message", rec.Body.String())
 	}
 }
 

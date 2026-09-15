@@ -1,6 +1,8 @@
 package costledger
 
 import (
+	"context"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -45,7 +47,7 @@ func TestQuery_SpanInsideOneDay(t *testing.T) {
 	)
 	w := newTestWriter(t, dir, func() time.Time { return base })
 
-	got, err := w.Query(base, base.Add(time.Minute))
+	got, err := w.Query(context.Background(), base, base.Add(time.Minute))
 	if err != nil {
 		t.Fatalf("Query: %v", err)
 	}
@@ -83,7 +85,7 @@ func TestQuery_SpanCrossingLocalMidnight(t *testing.T) {
 		}
 	}
 
-	got, err := w.Query(before, after)
+	got, err := w.Query(context.Background(), before, after)
 	if err != nil {
 		t.Fatalf("Query: %v", err)
 	}
@@ -99,7 +101,7 @@ func TestQuery_MissingDayFileIsNotAnError(t *testing.T) {
 	base := time.Date(2026, 9, 13, 9, 0, 0, 0, time.Local)
 	w := newTestWriter(t, dir, func() time.Time { return base })
 
-	got, err := w.Query(base.AddDate(0, 0, -3), base)
+	got, err := w.Query(context.Background(), base.AddDate(0, 0, -3), base)
 	if err != nil {
 		t.Fatalf("Query over an empty range: %v", err)
 	}
@@ -121,7 +123,7 @@ func TestQuery_TruncatedFinalLineIsSkippedAndTheRestSurvives(t *testing.T) {
 	)
 	w := newTestWriter(t, dir, func() time.Time { return base })
 
-	got, err := w.Query(base, base.Add(time.Hour))
+	got, err := w.Query(context.Background(), base, base.Add(time.Hour))
 	if err != nil {
 		t.Fatalf("Query: %v", err)
 	}
@@ -146,7 +148,7 @@ func TestQuery_CorruptLineMidFileSkipsOnlyThatLine(t *testing.T) {
 	)
 	w := newTestWriter(t, dir, func() time.Time { return base })
 
-	got, err := w.Query(base, base.Add(time.Hour))
+	got, err := w.Query(context.Background(), base, base.Add(time.Hour))
 	if err != nil {
 		t.Fatalf("Query: %v", err)
 	}
@@ -187,7 +189,7 @@ func TestQuery_AnAbandonedDayIsReportedSeparatelyFromSkippedLines(t *testing.T) 
 	)
 	w := newTestWriter(t, dir, func() time.Time { return base })
 
-	if _, err := w.Query(base, base.Add(time.Hour)); err != nil {
+	if _, err := w.Query(context.Background(), base, base.Add(time.Hour)); err != nil {
 		t.Fatalf("Query: %v", err)
 	}
 	if got := w.SkippedLines(); got != 1 {
@@ -212,7 +214,7 @@ func TestQuery_ReadIssuesReportTheLastReadNotAllOfThem(t *testing.T) {
 	w := newTestWriter(t, dir, func() time.Time { return base })
 
 	for i := 0; i < 3; i++ {
-		if _, err := w.Query(base, base.Add(time.Hour)); err != nil {
+		if _, err := w.Query(context.Background(), base, base.Add(time.Hour)); err != nil {
 			t.Fatalf("Query %d: %v", i, err)
 		}
 		if got := w.SkippedLines(); got != 1 {
@@ -224,7 +226,7 @@ func TestQuery_ReadIssuesReportTheLastReadNotAllOfThem(t *testing.T) {
 	// And a clean read clears it, or the gauge would outlive the file it described.
 	clean := base.AddDate(0, 0, -1)
 	writeDay(t, dir, clean, line(clean, "gw", "m", 1, 10, 5, 100))
-	if _, err := w.Query(clean, clean.Add(time.Hour)); err != nil {
+	if _, err := w.Query(context.Background(), clean, clean.Add(time.Hour)); err != nil {
 		t.Fatalf("Query: %v", err)
 	}
 	if got := w.SkippedLines(); got != 0 {
@@ -248,7 +250,7 @@ func TestQuery_FragmentConcatenatedWithTheNextAppendCostsOneLine(t *testing.T) {
 	}
 	w := newTestWriter(t, dir, func() time.Time { return base })
 
-	got, err := w.Query(base, base.Add(time.Hour))
+	got, err := w.Query(context.Background(), base, base.Add(time.Hour))
 	if err != nil {
 		t.Fatalf("Query: %v", err)
 	}
@@ -284,7 +286,7 @@ func TestQuery_LineBeyondTheBufferLimitEndsThatDay(t *testing.T) {
 	)
 	w := newTestWriter(t, dir, func() time.Time { return base })
 
-	got, err := w.Query(base, base.Add(time.Hour))
+	got, err := w.Query(context.Background(), base, base.Add(time.Hour))
 	if err != nil {
 		t.Fatalf("Query must not fail the whole request over one day file: %v", err)
 	}
@@ -339,6 +341,89 @@ func TestRecord_LabelsAreCappedSoALineCanNeverExceedTheReadLimit(t *testing.T) {
 	}
 }
 
+// Control characters in a caller-controlled label never reach the day file.
+//
+// Model is off the request body, Endpoint is the host the workload asked for and Agent is
+// the User-Agent verbatim, so all three carry whatever bytes a caller chose — into a file
+// that is retained for retentionDays, that an operator cats, and that cannot be edited
+// afterwards. An escape sequence there rewrites the terminal of whoever reads it, on every
+// read, for as long as the file exists. CWE-150.
+func TestRecord_ControlCharactersNeverReachADayFile(t *testing.T) {
+	dir := t.TempDir()
+	now := at
+	w := newTestWriter(t, dir, func() time.Time { return now })
+
+	// An SGR sequence that recolours the pane, a newline that breaks a table apart, and a
+	// carriage return that erases the line reporting it.
+	e := costedEvent(t, "gw\x1b[31m", "opus\nnext-line", 0.25, 100, 50)
+	e.Client = &pipeline.EventClient{Raw: "curl/8.4\r\x07"}
+	w.Record("s1", e)
+
+	now = at.Add(time.Minute)
+	if err := w.Flush(); err != nil {
+		t.Fatalf("Flush: %v", err)
+	}
+
+	rows := readAllRows(t, dir)
+	if len(rows) != 1 {
+		t.Fatalf("got %d rows, want 1: %+v", len(rows), rows)
+	}
+	for name, got := range map[string]string{
+		"Endpoint": rows[0].Endpoint, "Model": rows[0].Model, "Agent": rows[0].Agent,
+	} {
+		if hasControlBytes(got) {
+			t.Errorf("%s = %q on disk: a control byte reached a durable row", name, got)
+		}
+		// REPLACED, not dropped: "gw[31m" would read as a plausible hostname and hide the
+		// tampering, which is the whole reason sanitizeLabel substitutes rather than deletes.
+		if !strings.Contains(got, "�") {
+			t.Errorf("%s = %q: the removed bytes left no trace, so tampering is invisible",
+				name, got)
+		}
+	}
+	// The readable part survives — this is sanitisation, not rejection.
+	if !strings.HasPrefix(rows[0].Model, "opus") {
+		t.Errorf("Model = %q, want the label itself kept around the replacement", rows[0].Model)
+	}
+}
+
+// SANITISE THEN CAP, in that order, because the substitution can TRIPLE a label: every
+// replaced byte becomes three of U+FFFD. Capping first and substituting afterwards puts
+// 3 x maxLabelLen bytes on the line for a label that is entirely control bytes, which is
+// the length bound maxLabelLen exists to guarantee — and that bound is what keeps
+// readDay's unskippable-line path out of reach of a request.
+func TestRecord_ASanitisedLabelIsStillCappedInBYTES(t *testing.T) {
+	dir := t.TempDir()
+	now := at
+	w := newTestWriter(t, dir, func() time.Time { return now })
+
+	// Every byte a control byte, comfortably past the cap.
+	hostile := strings.Repeat("\x1b", maxLabelLen+32)
+	e := costedEvent(t, hostile, hostile, 0.25, 100, 50)
+	e.Client = &pipeline.EventClient{Raw: hostile}
+	setProvenance(t, e, hostile)
+	w.Record("s1", e)
+
+	now = at.Add(time.Minute)
+	if err := w.Flush(); err != nil {
+		t.Fatalf("Flush: %v", err)
+	}
+
+	rows := readAllRows(t, dir)
+	if len(rows) != 1 {
+		t.Fatalf("got %d rows, want 1: %+v", len(rows), rows)
+	}
+	for name, got := range map[string]string{
+		"Endpoint": rows[0].Endpoint, "Model": rows[0].Model,
+		"Agent": rows[0].Agent, "Provenance": rows[0].Provenance,
+	} {
+		if len(got) > maxLabelLen {
+			t.Errorf("%s is %d BYTES on disk, want at most %d: the cap was applied before the "+
+				"substitution, so each byte it kept grew to three", name, len(got), maxLabelLen)
+		}
+	}
+}
+
 // The whole C1 measurement, end to end: one hostile label followed by real spend, and
 // the day's total must survive. This is the assertion the old blessing test made
 // impossible to write.
@@ -361,7 +446,7 @@ func TestQuery_AHostileLabelCannotDestroyTheRestOfTheDay(t *testing.T) {
 		t.Fatalf("Flush: %v", err)
 	}
 
-	rows, err := w.Query(at.Add(-time.Hour), now)
+	rows, err := w.Query(context.Background(), at.Add(-time.Hour), now)
 	if err != nil {
 		t.Fatalf("Query: %v", err)
 	}
@@ -382,7 +467,7 @@ func TestQuery_DoesNotSeeTheOpenMinute(t *testing.T) {
 	w := newTestWriter(t, dir, func() time.Time { return now })
 	w.Record("s1", costedEvent(t, "gw", "m", 0.25, 100, 50))
 
-	got, err := w.Query(at.Add(-time.Hour), at)
+	got, err := w.Query(context.Background(), at.Add(-time.Hour), at)
 	if err != nil {
 		t.Fatalf("Query: %v", err)
 	}
@@ -400,11 +485,11 @@ func TestWindow_IncludesTheOpenMinuteWithNothingOnDisk(t *testing.T) {
 	w := newTestWriter(t, dir, func() time.Time { return now })
 	w.Record("s1", costedEvent(t, "gw", "m", 0.25, 100, 50))
 
-	if disk, err := w.Query(at.Add(-time.Hour), at); err != nil || len(disk) != 0 {
+	if disk, err := w.Query(context.Background(), at.Add(-time.Hour), at); err != nil || len(disk) != 0 {
 		t.Fatalf("disk half = %d rows (err %v), want 0 — the premise of this test", len(disk), err)
 	}
 
-	rows, err := w.Window(at.Add(-time.Hour), at)
+	rows, err := w.Window(context.Background(), at.Add(-time.Hour), at)
 	if err != nil {
 		t.Fatalf("Window: %v", err)
 	}
@@ -429,7 +514,7 @@ func TestWindow_CountsAMinuteExactlyOnceAcrossTheFlush(t *testing.T) {
 	w.Record("s1", costedEvent(t, "gw", "m", 0.25, 100, 50))
 
 	from, to := at.Add(-time.Hour), at.Add(time.Hour)
-	before, err := w.Window(from, to)
+	before, err := w.Window(context.Background(), from, to)
 	if err != nil {
 		t.Fatalf("Window while open: %v", err)
 	}
@@ -446,7 +531,7 @@ func TestWindow_CountsAMinuteExactlyOnceAcrossTheFlush(t *testing.T) {
 		t.Fatalf("sync: %v", err)
 	}
 
-	after, err := w.Window(from, to)
+	after, err := w.Window(context.Background(), from, to)
 	if err != nil {
 		t.Fatalf("Window after the roll: %v", err)
 	}
@@ -465,27 +550,134 @@ func TestWindow_CountsAMinuteExactlyOnceAcrossTheFlush(t *testing.T) {
 	}
 }
 
-// Step 2 of Window's non-overlap rule, tested against a state the writer's own
-// invariant forbids: a disk row for the minute currently held. Only a flush racing
-// between Window's two reads can produce it, and when it does those rows are the
-// ones already in hand — so they must be dropped, not added.
-func TestWindow_DropsADiskRowForTheHeldMinute(t *testing.T) {
+// THE RESTART MEASUREMENT, driven through two Writers over one directory because that
+// is what a restart is. Nothing exotic: a config reload, a crash loop or a rollout puts
+// process 2 inside the same minute process 1 was recording, and every row process 1 had
+// already committed was then dropped as a duplicate.
+//
+//	on disk after p1: 1000000 micros
+//	Window() saw:      250000 micros
+//	Dropped():              0
+//
+// The property is one-directional and stated that way on purpose: Window must report AT
+// LEAST what the day files hold, whatever it does with its own memory. See Window for
+// why no rule that reads the disk rows can tell this state from a racing flush, and
+// TestWindow_AFlushRacingTheReadIsCountedExactlyOnce for the other side of the trade.
+func TestWindow_ARestartInTheSameMinuteHidesNothingAlreadyCommitted(t *testing.T) {
 	dir := t.TempDir()
 	now := at
-	w := newTestWriter(t, dir, func() time.Time { return now })
-	w.Record("s1", costedEvent(t, "gw", "m", 0.25, 100, 50))
+	clock := func() time.Time { return now }
 
-	// Hand-seed exactly what a racing flush of the held minute would leave behind.
-	minute := at.Truncate(time.Minute)
-	writeDay(t, dir, minute, line(minute, "gw", "m", 1, 100, 50, 250_000))
+	// Process 1: $1.00 recorded, flushed and stopped inside minute M.
+	p1 := newTestWriter(t, dir, clock)
+	p1.Record("s1", costedEvent(t, "gw", "m", 1.00, 100, 50))
+	if err := p1.Close(); err != nil {
+		t.Fatalf("p1.Close: %v", err)
+	}
+	var committed int64
+	for _, r := range readAllRows(t, dir) {
+		committed += r.CostMicros
+	}
+	if committed != 1_000_000 {
+		t.Fatalf("on disk after p1 = %d micros, want 1000000 — the premise of this test", committed)
+	}
 
-	rows, err := w.Window(at.Add(-time.Hour), at)
+	// Process 2: same directory, same minute, $0.25 of new spend held in memory.
+	p2 := newTestWriter(t, dir, clock)
+	p2.Record("s1", costedEvent(t, "gw", "m", 0.25, 100, 50))
+
+	rows, err := p2.Window(context.Background(), at.Add(-time.Hour), at)
 	if err != nil {
 		t.Fatalf("Window: %v", err)
 	}
 	totals, _, _ := Fold(rows, usage.GroupNone)
-	if totals.CostMicros != 250_000 {
-		t.Errorf("CostMicros = %d, want 250000 counted once, not 500000", totals.CostMicros)
+	if totals.CostMicros < committed {
+		t.Errorf("Window() = %d micros, BELOW the %d already on disk — a committed row is "+
+			"hidden, and nothing reports it: Dropped() = %d, SkippedLines() = %d",
+			totals.CostMicros, committed, p2.Dropped(), p2.SkippedLines())
+	}
+	if want := int64(1_250_000); totals.CostMicros != want {
+		t.Errorf("CostMicros = %d, want %d ($1.00 on disk + $0.25 held); 250000 is the "+
+			"measured loss", totals.CostMicros, want)
+	}
+	if got := p2.Dropped(); got != 0 {
+		t.Errorf("Dropped() = %d, want 0 — nothing was dropped here; the point is that the "+
+			"loss was invisible to every signal the ledger has", got)
+	}
+}
+
+// The other side of that trade: a flush that lands in exactly the gap Window's
+// reconciliation exists for must still be counted ONCE.
+//
+// DRIVEN, not hand-seeded. This test used to write a row for the held minute straight
+// into the day file and assert that Window dropped it — a fixture that is
+// indistinguishable from the restart above, so it pinned the behaviour that hid $1.00.
+// betweenWindowReads lands a real flush between the memory read and the disk read
+// instead, which is the only state the drop was ever justified by, and the assertion
+// becomes about arithmetic rather than about a state nothing produced.
+func TestWindow_AFlushRacingTheReadIsCountedExactlyOnce(t *testing.T) {
+	dir := t.TempDir()
+	now := at
+	w := newTestWriter(t, dir, func() time.Time { return now })
+	w.Record("s1", costedEvent(t, "gw", "m", 0.25, 100, 50))
+	w.Record("s1", costedEvent(t, "gw", "m", 0.25, 100, 50))
+
+	// Flush synchronously, so by the time the day files are read the held minute is
+	// certainly on disk AND certainly still in the snapshot taken a moment earlier.
+	var flushes int
+	w.betweenWindowReads = func() {
+		flushes++
+		if err := w.Flush(); err != nil {
+			t.Errorf("Flush during the read: %v", err)
+		}
+	}
+
+	rows, err := w.Window(context.Background(), at.Add(-time.Hour), at)
+	if err != nil {
+		t.Fatalf("Window: %v", err)
+	}
+	if flushes != 1 {
+		t.Fatalf("the seam fired %d times, want 1 — this test asserts nothing otherwise", flushes)
+	}
+	totals, _, _ := Fold(rows, usage.GroupNone)
+	if want := int64(500_000); totals.CostMicros != want {
+		t.Errorf("CostMicros = %d, want %d counted exactly once; 1000000 means the minute "+
+			"was counted from memory AND from disk, which is the failure the reconciliation "+
+			"exists to prevent", totals.CostMicros, want)
+	}
+	if totals.Requests != 2 {
+		t.Errorf("Requests = %d, want 2 — 4 is the same double count in the denominator",
+			totals.Requests)
+	}
+}
+
+// A cancelled caller stops the day walk instead of reading to the end for nobody. The
+// ledger read is the only unbounded IO this package does on a request path: one
+// os.Open-plus-scan per day in the window, against an operator-configured path.
+func TestQuery_ACancelledContextStopsTheReadBeforeAnyIO(t *testing.T) {
+	dir := t.TempDir()
+	base := time.Date(2026, 9, 13, 9, 0, 0, 0, time.Local)
+	writeDay(t, dir, base, line(base, "gw", "m", 1, 10, 5, 250_000))
+	w := newTestWriter(t, dir, func() time.Time { return base })
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	rows, err := w.Query(ctx, base, base.Add(time.Minute))
+	if !errors.Is(err, context.Canceled) {
+		t.Errorf("Query on a cancelled context: err = %v, want context.Canceled", err)
+	}
+	// NO PARTIAL ANSWER. A short slice with a nil error would be a total missing rows
+	// with nothing saying so, which is the failure SkippedLines exists to make visible.
+	if len(rows) != 0 {
+		t.Errorf("got %d rows, want none: an abandoned read must not return a partial day",
+			len(rows))
+	}
+
+	// And Window, which is what a reader actually calls, propagates it rather than
+	// answering from memory alone.
+	if _, werr := w.Window(ctx, base, base.Add(time.Minute)); !errors.Is(werr, context.Canceled) {
+		t.Errorf("Window on a cancelled context: err = %v, want context.Canceled", werr)
 	}
 }
 
@@ -509,7 +701,7 @@ func TestWindow_KeepsADiskRowAboveTheHeldMinute(t *testing.T) {
 	next := at.Truncate(time.Minute).Add(time.Minute)
 	writeDay(t, dir, next, line(next, "gw", "m", 1, 100, 50, 1_000_000))
 
-	rows, err := w.Window(at.Add(-time.Hour), next.Add(time.Hour))
+	rows, err := w.Window(context.Background(), at.Add(-time.Hour), next.Add(time.Hour))
 	if err != nil {
 		t.Fatalf("Window: %v", err)
 	}
@@ -535,7 +727,7 @@ func TestWindow_ExcludesAHeldMinuteOutsideTheRange(t *testing.T) {
 
 	// "today" as ParseWindowSpec builds it: local midnight to now.
 	now = midnight.Add(5 * time.Minute)
-	rows, err := w.Window(midnight, now)
+	rows, err := w.Window(context.Background(), midnight, now)
 	if err != nil {
 		t.Fatalf("Window: %v", err)
 	}
@@ -553,7 +745,7 @@ func TestQuery_ReversedRangeIsNormalised(t *testing.T) {
 	writeDay(t, dir, base, line(base, "gw", "m", 1, 10, 5, 100))
 	w := newTestWriter(t, dir, func() time.Time { return base })
 
-	got, err := w.Query(base.Add(time.Hour), base)
+	got, err := w.Query(context.Background(), base.Add(time.Hour), base)
 	if err != nil {
 		t.Fatalf("Query: %v", err)
 	}

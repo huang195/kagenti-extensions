@@ -1,7 +1,9 @@
 package sessionapi
 
 import (
+	"context"
 	"encoding/json"
+	"errors"
 	"log/slog"
 	"net/http"
 	"time"
@@ -256,10 +258,27 @@ func (s *Server) handleUsage(w http.ResponseWriter, r *http.Request) {
 		// mislabels a 6-hour figure as a day's.
 		snap = s.usage.Snapshot(usage.MaxWindow, resolution, sessionID, group)
 	default:
-		snap, err = s.ledgerSnapshot(spec, group)
+		// r.Context(), so a client that hangs up stops the read. The ledger walks one day
+		// file per day in the window — up to eight for window=7d, against a path an
+		// operator configured and possibly a slow mount — and without this every abandoned
+		// request kept reading to the end for nobody. See costledger.Query.
+		snap, err = s.ledgerSnapshot(r.Context(), spec, group)
 		if err != nil {
 			// A read failure is not a client error and must not look like one.
-			slog.Warn("sessionapi: cost ledger read failed", "window", spec.Label, "error", err)
+			//
+			// CANCELLATION IS NOT A FAULT, and it is separated out because it would otherwise
+			// be the loudest line in the log on the surface most likely to produce it: a chart
+			// that re-requests on every keystroke cancels its own in-flight reads, and a Warn
+			// per cancelled request would teach an operator to filter out the message that also
+			// reports a genuinely unreadable ledger. The 503 is still written — net/http would
+			// otherwise send an empty 200 body, which is not decodable JSON for the rare
+			// cancellation that is not a vanished client.
+			if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+				slog.Debug("sessionapi: cost ledger read abandoned; the request went away",
+					"window", spec.Label, "error", err)
+			} else {
+				slog.Warn("sessionapi: cost ledger read failed", "window", spec.Label, "error", err)
+			}
 			http.Error(w, `{"error":"cost history unavailable"}`, http.StatusServiceUnavailable)
 			return
 		}
@@ -303,6 +322,10 @@ var errSessionWithSymbolicWindow = usageError{
 // Takes no session id: handleUsage rejects that combination before reaching here,
 // for the reason recorded at the guard.
 //
+// Takes the REQUEST's context, so the day-file walk stops when the caller does. Threaded
+// rather than context.Background() because this is the only work this endpoint does that
+// is neither bounded nor in memory.
+//
 // UnpricedBy and PricedBy are deliberately absent. Provenance IS in the row key, so
 // PricedBy is reconstructible and a later change can add it; UnpricedBy needs the
 // endpoint-and-model pair of the requests that could NOT be priced, which a row
@@ -310,8 +333,8 @@ var errSessionWithSymbolicWindow = usageError{
 // pair. Emitting one map and not the other would read as "no pricing gaps here",
 // which is a claim the rows do not support — the gap is still visible, in
 // Totals.PricedRequests against Totals.PriceableRequests.
-func (s *Server) ledgerSnapshot(spec usage.Spec, group usage.Group) (usage.Snapshot, error) {
-	rows, err := s.ledger.Window(spec.From, spec.To)
+func (s *Server) ledgerSnapshot(ctx context.Context, spec usage.Spec, group usage.Group) (usage.Snapshot, error) {
+	rows, err := s.ledger.Window(ctx, spec.From, spec.To)
 	if err != nil {
 		return usage.Snapshot{}, err
 	}

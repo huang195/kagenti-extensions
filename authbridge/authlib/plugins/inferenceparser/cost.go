@@ -32,11 +32,24 @@ import (
 // settleCost prices the finalized response and publishes the record, exactly once.
 //
 // Called from every finalization path. The idempotence guard is not belt-and-braces: a
-// listener can dispatch a terminal frame twice — extproc does, once for headers and once
-// for the buffered body — and charging twice for one request is the failure that guard
-// exists to prevent. It mirrors the one litellm-budget-track keeps for the same reason,
-// down to WHERE the latch is set: only once there is a figure to publish, never on a pass
-// that had nothing to say. See the two comments at the bottom of this function.
+// listener can dispatch a terminal frame more than once, and charging twice for one request
+// is the failure that guard exists to prevent. It mirrors the one litellm-budget-track
+// keeps for the same reason, down to WHERE the latch is set: only once there is a figure to
+// publish, never on a pass that had nothing to say. See the two comments at the bottom of
+// this function.
+//
+// WHICH LISTENER REPEATS IT — corrected, because this comment used to say extproc dispatches
+// once for headers and once for the buffered body, and it does not. Its response-header
+// phase returns as soon as Pipeline.NeedsBody() is true (extproc/server.go:616), which this
+// plugin's ReadsBody makes unconditionally true, so the header-only dispatch below it is
+// unreachable for any pipeline containing this parser. What extproc really does is run the
+// WHOLE buffered dispatch — terminal frame included — once per ResponseBody message it
+// receives (handleResponseBody -> dispatchBufferedFrames), so a body delivered in more than
+// one message settles once per chunk. That is reachable whenever Envoy is not in buffered
+// mode for the response: a statically configured STREAMED body mode, or a filter with
+// allow_mode_override off, which makes the ModeOverride this listener asks for a no-op.
+// The guard is therefore load-bearing on the shipped configuration; only its old
+// explanation was wrong.
 //
 // A NIL Extensions.Inference IS A SUPPORTED INPUT, and that is the whole reason this
 // guard reads the way it does. It used to return on nil, which silently made "this

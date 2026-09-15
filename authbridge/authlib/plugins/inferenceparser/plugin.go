@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"strings"
 
+	"github.com/rossoctl/cortex/authbridge/authlib/costing"
 	"github.com/rossoctl/cortex/authbridge/authlib/pipeline"
 	"github.com/rossoctl/cortex/authbridge/authlib/plugins"
 	"github.com/rossoctl/cortex/authbridge/authlib/plugins/internal/parsercommon"
@@ -292,9 +293,26 @@ func (p *InferenceParser) OnResponseFrame(_ context.Context, pctx *pipeline.Cont
 		// is no usage to model and settleCost's own gate then finds neither a figure nor a
 		// saving to report.
 		//
+		// THE DISPATCH IS PATH-AGNOSTIC; THE COVERAGE IS AS WIDE AS THE HEADER AND NO WIDER,
+		// and the two are not the same claim. A streamed response on an unparsed endpoint
+		// reports 0 — LiteLLM's placeholder, since the total is unknown when headers are
+		// sent — and with the endpoint unparsed there is no usage to fall back to either, so
+		// NO FIGURE EXISTS ANYWHERE for it and nothing is published. That is the boundary,
+		// not an oversight: a settled zero would count unpriced traffic as free and a
+		// modelled one would be invented. Streaming is not a carve-out — a POSITIVE header
+		// on a stream is charged here like any other, and an implausible one is refused and
+		// disclosed, because costing's cap reads the nil extension and never the
+		// Content-Type. The only thing that widens this row is teaching the parser the
+		// dialect. See reverseproxy's StreamedUnparsedEndpoint_CoverageBoundary, which
+		// states all three outcomes through a real listener.
+		//
 		// On last only, so an unparsed endpoint settles where every other path does — at
-		// end of stream — rather than on whichever frame arrived first. Every listener
-		// terminates with RunResponseFrame(..., nil, true), so the arm is always reached.
+		// end of stream — rather than on whichever frame arrived first. Both proxy listeners
+		// always terminate with RunResponseFrame(..., nil, true), so the arm is reached
+		// whenever a response has any body phase at all. On extproc it is reached from the
+		// body phase only: for a response with NO body that listener dispatches nothing —
+		// see TestCapabilities_ReadsBodyDecidesTheExtprocBranch, which names the gap and
+		// where it has to be closed.
 		//
 		// No Skip and no Observe row: the body may be perfectly fine and simply not ours,
 		// so "no_response_body" would be a false diagnostic, and there is no model to name
@@ -307,47 +325,63 @@ func (p *InferenceParser) OnResponseFrame(_ context.Context, pctx *pipeline.Cont
 	}
 	ext := pctx.Extensions.Inference
 
-	// application/json one-shot: single last=true frame carrying the
-	// complete envelope. Streaming responses arrive as multiple frames
-	// where ext.Stream==true; tell them apart by the request-side flag.
-	if last && !ext.Stream {
-		if len(frame) == 0 {
-			pctx.Skip("no_response_body")
-			// Charged before returning, for the reason spelled out on OnResponse's
-			// identical guard: a positive gateway cost header needs no body at all.
-			//
-			// This is the arm a genuinely body-less response takes in production. The
-			// extproc listener has no body phase for one, so it synthesizes the
-			// terminal frame — RunResponseFrame(ctx, pctx, nil, true) in its
-			// header-only branch — and lands here whenever the REQUEST did not ask
-			// for a stream.
-			p.settleCost(pctx)
-			return pipeline.Action{Type: pipeline.Continue}
+	// WHICH ARM — and why the request's stream flag no longer decides it.
+	//
+	// All three listeners choose their dispatch shape from the RESPONSE Content-Type:
+	// text/event-stream gets one call per SSE event followed by a terminal empty
+	// last=true, anything else gets a single last=true frame holding the whole body
+	// (reverseproxy.modifyResponse, forwardproxy.serveOutbound,
+	// extproc.dispatchBufferedFrames). This used to switch on ext.Stream, which comes off
+	// the REQUEST — so the two disagreed whenever the response's shape was not the one the
+	// request asked for, and the parser then ran the wrong arm over the listener's frames:
+	//
+	//   - Streamed response, non-streaming request: every folded frame was thrown away.
+	//     The terminal frame took the one-shot arm, found it empty, recorded a
+	//     no_response_body Skip on a response that had carried a body, and never called
+	//     finalize — so the usage never reached the extension. LiteLLM stamps 0 in the cost
+	//     header on a stream, so the usage fallback is the ONLY figure available and the
+	//     whole charge was lost.
+	//   - Buffered response, streaming request: the complete envelope was folded as if it
+	//     were one SSE chunk. On the OpenAI dialect that salvages the usage block by
+	//     coincidence (chunk and envelope share the "usage" key) and still loses the
+	//     completion; on the Anthropic dialect "type":"message" matches no stream event, so
+	//     usage, completion and finish reason are all dropped and a false no_response_body
+	//     Skip is recorded. A JSON reply to a streaming request is routine — it is what
+	//     every gateway error page is.
+	//
+	// So the arm is taken from THE SHAPE THAT WAS DISPATCHED, which the listener states
+	// unambiguously in how it calls: a non-terminal frame only ever comes from a per-frame
+	// dispatch. That evidence needs no header and cannot disagree with the caller.
+	if !last {
+		// Mid-stream. Lazily allocate the per-stream scratch and fold this frame into it;
+		// its existence is also what tells the terminal frame below that a stream ran.
+		state := getOrCreateStreamState(pctx)
+		if len(frame) > 0 {
+			foldResponseFrame(pctx, frame, state, ext)
 		}
-		if endpointPath(pctx) == anthropicMessagesPath {
-			parseAnthropicJSON(frame, ext)
-		} else {
-			parseInferenceJSON(frame, ext)
-		}
-		logInferenceFinalized(ext)
-		p.settleCost(pctx)
-		pctx.Observe("matched_" + ext.Model + "_response")
 		return pipeline.Action{Type: pipeline.Continue}
 	}
 
-	// Streaming path. Lazily allocate the per-stream scratch, then fold this
-	// frame into it via the dialect-specific handler.
-	state := getOrCreateStreamState(pctx)
-
-	if len(frame) > 0 {
-		if endpointPath(pctx) == anthropicMessagesPath {
-			foldAnthropicFrame(frame, state, ext)
-		} else {
-			foldOpenAIFrame(frame, state, ext)
-		}
+	// Terminal frame. Three shapes reach here and the state, the Content-Type and the
+	// frame's own framing tell them apart — see carriesSSEFraming for the last of those.
+	state := pipeline.GetState[inferenceStreamState](pctx, streamStateKey)
+	if state == nil && len(frame) > 0 && costing.IsEventStream(pctx) && !carriesSSEFraming(frame) {
+		// A streamed response whose whole content fitted in one event, delivered on the
+		// terminal call: unframed payload, SSE Content-Type, no earlier frames. It folds
+		// like any other chunk — allocate the scratch so it does.
+		state = getOrCreateStreamState(pctx)
 	}
 
-	if last {
+	// Terminal frame of a streamed response. Read the state rather than the frame — the
+	// usage arrived on an earlier chunk and finalize is the only thing that moves it onto
+	// the extension.
+	if state != nil {
+		// A listener is free to carry the last data on the terminal call rather than
+		// sending a separate empty one; fold it before finalizing so that shape is not a
+		// silently dropped chunk.
+		if len(frame) > 0 {
+			foldResponseFrame(pctx, frame, state, ext)
+		}
 		state.finalize(ext)
 		// Empty stream with no body and no chunks — record Skip to
 		// pair the response row with the request row.
@@ -361,20 +395,80 @@ func (p *InferenceParser) OnResponseFrame(_ context.Context, pctx *pipeline.Cont
 		if ext.Completion == "" && ext.FinishReason == "" && ext.TotalTokens == 0 &&
 			len(ext.ToolCalls) == 0 {
 			pctx.Skip("no_response_body")
-			// Same as the two guards above: an empty stream can still carry a gateway
-			// cost header, and the Skip row is a diagnostic rather than a reason to
-			// stop charging. This is the arm a body-less response takes when the
-			// REQUEST asked for a stream — ext.Stream comes off the request, so a
-			// header-only reply to a streaming request arrives here rather than on
-			// the buffered-JSON arm.
+			// Same as the guards above: an empty stream can still carry a gateway cost
+			// header, and the Skip row is a diagnostic rather than a reason to stop
+			// charging.
 			p.settleCost(pctx)
 			return pipeline.Action{Type: pipeline.Continue}
 		}
 		logInferenceFinalized(ext)
 		p.settleCost(pctx)
 		pctx.Observe("matched_" + ext.Model + "_response")
+		return pipeline.Action{Type: pipeline.Continue}
 	}
+
+	// Terminal frame and nothing before it: the listener buffered the response and handed
+	// it over in one piece.
+	if len(frame) == 0 {
+		pctx.Skip("no_response_body")
+		// Charged before returning, for the reason spelled out on OnResponse's
+		// identical guard: a positive gateway cost header needs no body at all.
+		//
+		// This is the arm a genuinely body-less response takes in production — a 204/304,
+		// or an error status ended on headers. It is reached whatever the request asked
+		// for, which is the point: a header-only reply to a streaming request used to land
+		// on the streaming arm and be described there as an "empty stream".
+		p.settleCost(pctx)
+		return pipeline.Action{Type: pipeline.Continue}
+	}
+	if costing.IsEventStream(pctx) {
+		// An SSE body delivered whole, with its wire framing intact — not frame by frame.
+		// Both proxy listeners fall back to the buffered path for a text/event-stream
+		// response when a plugin in the chain declares WritesResponseBody (a body they
+		// must rewrite cannot also be forwarded as it arrives), and then deliver the
+		// entire stream as this one frame. Folding it as a single chunk parses nothing; it
+		// has to go through the SSE reader.
+		if endpointPath(pctx) == anthropicMessagesPath {
+			parseAnthropicSSE(frame, ext)
+		} else {
+			parseInferenceSSE(frame, ext)
+		}
+	} else if endpointPath(pctx) == anthropicMessagesPath {
+		parseAnthropicJSON(frame, ext)
+	} else {
+		parseInferenceJSON(frame, ext)
+	}
+	logInferenceFinalized(ext)
+	p.settleCost(pctx)
+	pctx.Observe("matched_" + ext.Model + "_response")
 	return pipeline.Action{Type: pipeline.Continue}
+}
+
+// carriesSSEFraming reports whether a frame holds RAW SSE WIRE BYTES — it has at least one
+// `data:` field — rather than one payload with the framing already stripped.
+//
+// The question only arises on the terminal call, and the answer decides which parser can
+// read it. A listener that buffered a text/event-stream response hands over the whole wire
+// body, framing included; every per-frame dispatch goes through sseframe.Reader, which
+// strips the framing and hands over the payload alone. Feeding wire bytes to the chunk fold
+// parses nothing, and feeding a bare payload to the SSE reader parses nothing — each of
+// them silently, which is why the shapes are told apart here instead.
+func carriesSSEFraming(frame []byte) bool {
+	if bytes.HasPrefix(bytes.TrimLeft(frame, " \t\r\n"), []byte("data:")) {
+		return true
+	}
+	return bytes.Contains(frame, []byte("\ndata:"))
+}
+
+// foldResponseFrame folds one streamed frame into the running state via the dialect the
+// endpoint speaks. Extracted so the mid-stream and terminal call sites cannot drift apart
+// on which parser a path gets.
+func foldResponseFrame(pctx *pipeline.Context, frame []byte, state *inferenceStreamState, ext *pipeline.InferenceExtension) {
+	if endpointPath(pctx) == anthropicMessagesPath {
+		foldAnthropicFrame(frame, state, ext)
+		return
+	}
+	foldOpenAIFrame(frame, state, ext)
 }
 
 // foldOpenAIFrame folds one OpenAI streaming chunk (data: {choices,usage}) into

@@ -1,6 +1,9 @@
 package pipeline
 
-import "strings"
+import (
+	"strings"
+	"unicode/utf8"
+)
 
 // EventClient identifies the coding agent that made a request, parsed from its
 // User-Agent header.
@@ -38,7 +41,11 @@ type EventClient struct {
 	// Version is the version string that followed the product token, or empty when
 	// the agent was not recognised or sent no version.
 	Version string `json:"version,omitempty"`
-	// Raw is the User-Agent verbatim, capped at maxClientLen.
+	// Raw is the User-Agent as it was sent, sanitised (see sanitizeUA) and capped at
+	// maxClientLen.
+	//
+	// "Verbatim" up to those two rules, which is as verbatim as a string that reaches a
+	// terminal and a durable file can be.
 	//
 	// Kept ALONGSIDE Name rather than only when parsing fails, so a new coding
 	// agent appears in the breakdown the day someone runs it instead of after a
@@ -62,13 +69,125 @@ type EventClient struct {
 // bounded separately, by usage.maxLabelsPerBucket, which applies to byAgent
 // exactly as it does to every other label map.
 //
-// Truncation is a byte cut, which can split a multi-byte rune and leave invalid
-// UTF-8 that a JSON encoder renders as U+FFFD. That is the same behaviour
-// usage.truncateLabel already has, and matching it is deliberate: a UA is
-// effectively always ASCII, and two different truncation rules for two
-// caller-controlled strings is a worse trade than one occasional replacement
-// character.
+// A BYTE cap cut on a RUNE boundary — see capUA. The bound has to be in bytes,
+// because what it bounds is retained memory and the length of a persisted line; the
+// cut has to be on a rune boundary, because the sanitiser below can put multi-byte
+// U+FFFD runes in this string and half of one is invalid UTF-8 in a file other tools
+// parse. costledger.truncateLabel applies the same rule to the same class of string
+// for the same reason. usage.truncateLabel does NOT yet — it still cuts at a byte
+// boundary — and that divergence is named here rather than left to be discovered.
 const maxClientLen = 128
+
+// sanitizeUA replaces every control character in a User-Agent with U+FFFD.
+//
+// THE PRIMARY CHOKE POINT FOR THIS STRING. ParseUserAgent is the one place a header
+// becomes an EventClient, and Label() feeds BOTH consumers of the result — the live
+// usage aggregator and the durable cost ledger. Sanitising per consumer is strictly
+// worse: costledger.sanitizeLabel already did it on the way to disk while the
+// aggregator did not, so the same bytes were neutralised in the file and served intact
+// from /v1/usage, and the next consumer added would have started out unguarded too.
+//
+// THE HEADER IS NOT ALREADY CLEAN, and the reason it looked clean is worth stating
+// because it is not a property of this package. On the forward proxy net/http rejects
+// control bytes in a header value, so a hostile UA never reaches here through that
+// listener — protection by accident, and only there. THE EXT_PROC PATH HAS NO SUCH
+// PARSER: header values arrive from Envoy as protobuf bytes (HeaderValue.RawValue) and
+// are handed over as-is, so on that path this function is the only bound on what a
+// client can put in a string that ends up on a terminal and in a 30-day file. CWE-150.
+//
+// C0, DEL AND C1 — all three, because a C0-only filter is the version of this that
+// looks right and is not. U+009B is the single-character CSI: a terminal decoding
+// UTF-8 treats it exactly as it treats ESC [, so "2J" clears the screen with no
+// ESC byte anywhere in the string. The C1 block is U+0080–U+009F and encodes as
+// 0xC2 0x80–0xC2 0x9F, so nothing below 0x20 appears in it and a byte scan for control
+// bytes steps straight past it.
+//
+// A BYTE THAT IS NOT VALID UTF-8 is replaced too. It is the same character in a pane
+// that is not in UTF-8 mode (a lone 0x9B is CSI in Latin-1), and encoding/json would
+// substitute U+FFFD for it on the way to disk regardless — doing it here means the
+// label held in memory, the label served from /v1/usage and the label on disk are one
+// string rather than three.
+//
+// REPLACED, NOT DROPPED, so tampering stays visible: "claude-cli/1\x1b[31m" reads as
+// "claude-cli/1�[31m" rather than as "claude-cli/1[31m", which nobody would question.
+//
+// THE RULE IS SHARED WITH costledger.sanitizeLabel AND MUST STAY IDENTICAL. That copy
+// is not redundant and does not go away: it is the primary guard for Endpoint, Model
+// and Provenance, which never pass through here, and it is defence in depth for this
+// one on a file that cannot be edited after the fact. Two copies of a five-line rule
+// is the right trade for a durable file; two DIFFERENT rules is not, so a change to
+// either belongs in both.
+func sanitizeUA(s string) string {
+	if !hasControlRunes(s) {
+		// The overwhelmingly common case, and it must not allocate: this runs on the
+		// request path, twice per turn.
+		return s
+	}
+	var b strings.Builder
+	b.Grow(len(s))
+	for i := 0; i < len(s); {
+		r, size := utf8.DecodeRuneInString(s[i:])
+		if isControlRune(r) || (r == utf8.RuneError && size == 1) {
+			b.WriteRune('\uFFFD')
+			i += size
+			continue
+		}
+		b.WriteString(s[i : i+size])
+		i += size
+	}
+	return b.String()
+}
+
+// hasControlRunes reports whether s carries anything sanitizeUA would replace.
+//
+// A RUNE scan rather than a byte scan, because the C1 block cannot be seen from the
+// bytes alone: 0xC2 0x9B is U+009B, and 0x9B on its own is a continuation byte of
+// nothing. Allocation-free either way, and the strings are header-length.
+//
+// An INVALID byte reports true (RuneError at size 1 is the decoder saying "this is not
+// UTF-8"); a legitimately encoded U+FFFD does not, because it decodes at size 3.
+func hasControlRunes(s string) bool {
+	for i := 0; i < len(s); {
+		r, size := utf8.DecodeRuneInString(s[i:])
+		if isControlRune(r) || (r == utf8.RuneError && size == 1) {
+			return true
+		}
+		i += size
+	}
+	return false
+}
+
+// isControlRune reports whether r is a C0 control, DEL, or a C1 control.
+//
+// The one predicate both the scan and the rewrite read, so they cannot disagree about
+// what a control character is. costledger has the same three clauses in the same order.
+func isControlRune(r rune) bool {
+	return r < 0x20 || r == 0x7f || (r >= 0x80 && r <= 0x9f)
+}
+
+// capUA cuts s to at most maxClientLen BYTES, on a rune boundary.
+//
+// The cap stays in bytes because that is what it bounds — retained memory here, and
+// through costledger the length of an appended line. Cutting on a rune boundary only
+// changes WHERE the byte cap lands (by up to three bytes), never that there is one.
+//
+// It matters because of the order in ParseUserAgent: sanitizeUA runs first and can put
+// 3-byte U+FFFD runes in this string, so a byte cut has a one-in-three chance of
+// leaving a fragment of one — invalid UTF-8 in a label that goes to a durable file and
+// to a chart, which is the failure the substitution was meant to avoid rather than
+// cause.
+func capUA(s string) string {
+	if len(s) <= maxClientLen {
+		return s
+	}
+	cut := maxClientLen
+	// Walk back off a continuation byte. At most three steps: no UTF-8 sequence is
+	// longer than four bytes.
+	for cut > 0 && !utf8.RuneStart(s[cut]) {
+		cut--
+	}
+	return s[:cut]
+}
 
 // knownClients maps a lowercased User-Agent product token to a canonical agent
 // name.
@@ -106,11 +225,19 @@ func ParseUserAgent(ua string) *EventClient {
 	if ua == "" {
 		return nil
 	}
-	// Capped before ANY of it is retained or matched against, so nothing derived
-	// from it downstream can exceed the bound. See maxClientLen.
-	if len(ua) > maxClientLen {
-		ua = ua[:maxClientLen]
-	}
+	// SANITISED, THEN CAPPED, and both before ANY of it is retained or matched against,
+	// so nothing derived from it downstream can carry a control character or exceed the
+	// bound. See sanitizeUA for what the first step removes and maxClientLen for what the
+	// second one is for.
+	//
+	// THE ORDER IS LOAD-BEARING, in the same direction as costledger.rowLabel's: a
+	// substitution can triple the string, so capping first would let 128 control bytes
+	// become 384 in a label whose whole purpose is to be bounded. Capping last can land
+	// mid-U+FFFD, which is why capUA cuts on a rune boundary. The transient cost of
+	// sanitising before capping is a builder up to 3x the header — bounded by whatever
+	// the listener already accepted as a header value, and paid only by a request that
+	// sent control bytes in the first place.
+	ua = capUA(sanitizeUA(ua))
 	c := &EventClient{Raw: ua}
 	// The product token is the first whitespace-delimited word, so the trailing
 	// comment Claude Code appends — "(external, cli)" — is ignored rather than
@@ -163,6 +290,13 @@ const UnknownClientLabel = "unknown"
 // not pool with untagged traffic. The empty struct answers "unknown" for the same
 // reason: it can name nothing, and inventing a name for it would put a value in a
 // cost table that no request ever sent.
+//
+// CARRIES NO CONTROL CHARACTERS when the EventClient came from ParseUserAgent, which
+// is the only path a request takes. It is a property of the parser, not of this method
+// — a hand-built EventClient (a test, a future producer) can hold anything its author
+// put there, and this method will join it to a name and hand it on. That is the second
+// reason costledger sanitises again before writing a row rather than trusting this
+// string: the guarantee here is about one code path, and the file is forever.
 //
 // A caller that sends literally "User-Agent: unknown" does land in that reserved
 // bucket, and that collision is not defended against. Reserving the word would buy

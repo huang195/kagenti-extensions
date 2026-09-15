@@ -235,9 +235,29 @@ const costLedgerDirName = "cost"
 // Returns an error rather than falling back to the working directory, for the reason
 // defaultCortexDir does: a cwd fallback drops spend records into whatever directory
 // the proxy happened to start from, including checkouts, with nothing said about it.
+//
+// Which is why a RELATIVE cost_ledger.dir is refused rather than resolved. It used to
+// be returned verbatim, so `dir: cost` produced exactly the failure the paragraph
+// above says this function refuses — resolved against the proxy's working directory,
+// which is not a property of the config and differs between a launchd job, a
+// container, and a shell in a checkout. The same setting would scatter day files
+// across all three, and a query would open one of them and report the others' spend
+// as absent. The comment was making a promise the code did not keep; the code keeps
+// it now.
+//
+// Cleaned on the way out so `/var/lib/cortex/cost/` and `/var/lib//cortex/cost` name
+// one directory rather than three, which matters because the writer's per-day file
+// locking is keyed on the path.
 func costLedgerDir(cfg *config.Config) (string, error) {
 	if cfg != nil && cfg.CostLedger != nil && cfg.CostLedger.Dir != "" {
-		return cfg.CostLedger.Dir, nil
+		dir := cfg.CostLedger.Dir
+		if !filepath.IsAbs(dir) {
+			return "", fmt.Errorf("cost_ledger.dir must be an absolute path, got %q: a relative path "+
+				"resolves against the proxy's working directory, which is not a property of the config — "+
+				"a launchd job, a container and a shell in a checkout would each write a different %q, "+
+				"and a query would report the others' spend as absent", dir, dir)
+		}
+		return filepath.Clean(dir), nil
 	}
 	dir, err := defaultCortexDir()
 	if err != nil {

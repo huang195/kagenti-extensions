@@ -3,6 +3,7 @@ package usage
 import (
 	"encoding/json"
 	"fmt"
+	"math"
 	"strings"
 	"testing"
 	"time"
@@ -136,6 +137,93 @@ func TestSnapshot_GroupsThatCannotReconcileReportNoUngroupedCost(t *testing.T) {
 		}
 	}
 }
+
+// TestSetUngroupedCost_ANegativeResidualIsDisclosedNotDropped covers the case the setter
+// used to discard.
+//
+// `micros <= 0` collapsed two answers: "the breakdown accounts for every dollar", which is
+// the ordinary clean result, and "the breakdown accounts for MORE dollars than the total
+// beside it", which correct code cannot produce. A reconcilable group's series sums to the
+// total or to less than it — every event lands in at most one entry — so a negative residual
+// says this process is wrong about its own arithmetic, either because a Group is marked
+// reconcilable while its series double-counts or because an accumulator counted an event
+// twice. Discarding it meant the one place that could see the fault was the place that
+// deleted the evidence.
+//
+// Each direction asserts what the OTHER field does too. A negative residual that set
+// UngroupedCostMicros would put a bug report in the field clients render as a spend band.
+func TestSetUngroupedCost_ANegativeResidualIsDisclosedNotDropped(t *testing.T) {
+	for _, tc := range []struct {
+		name          string
+		micros        int64
+		wantUngrouped *int64
+		wantOvershoot *int64
+	}{
+		{name: "short breakdown is a residual", micros: 250_000, wantUngrouped: ptr(int64(250_000))},
+		{name: "exact breakdown discloses nothing", micros: 0},
+		{name: "overshooting breakdown is a fault", micros: -250_000, wantOvershoot: ptr(int64(250_000))},
+		{
+			// The magnitude of math.MinInt64 is not representable, so a blind negation returns
+			// the same negative number and publishes the sign confusion the field exists to
+			// avoid. Reachable only from a saturated total.
+			name:          "the residual is the int64 floor",
+			micros:        math.MinInt64,
+			wantOvershoot: ptr(int64(math.MaxInt64)),
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var snap Snapshot
+			snap.SetUngroupedCost(tc.micros)
+			for _, f := range []struct {
+				name      string
+				got, want *int64
+			}{
+				{"UngroupedCostMicros", snap.UngroupedCostMicros, tc.wantUngrouped},
+				{"SeriesOvershootMicros", snap.SeriesOvershootMicros, tc.wantOvershoot},
+			} {
+				switch {
+				case f.want == nil && f.got != nil:
+					t.Errorf("SetUngroupedCost(%d) set %s = %d, want absent", tc.micros, f.name, *f.got)
+				case f.want != nil && f.got == nil:
+					t.Errorf("SetUngroupedCost(%d) left %s absent, want %d — a residual with this "+
+						"sign is a signal, and dropping it is how the fault stays invisible",
+						tc.micros, f.name, *f.want)
+				case f.want != nil && *f.got != *f.want:
+					t.Errorf("SetUngroupedCost(%d) set %s = %d, want %d", tc.micros, f.name, *f.got, *f.want)
+				}
+			}
+		})
+	}
+}
+
+// The overshoot is absent from a clean response and present when it is not, on the same wire
+// rule as every other disclosure here: a client must be able to tell "checked and fine" from
+// "not checked", and a zero cannot say both.
+func TestSnapshot_SeriesOvershootIsOmittedUnlessItHappened(t *testing.T) {
+	var clean Snapshot
+	clean.SetUngroupedCost(0)
+	body, err := json.Marshal(clean)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	if strings.Contains(string(body), "seriesOvershootMicros") {
+		t.Errorf("a clean window serialised the overshoot: %s", body)
+	}
+
+	var broken Snapshot
+	broken.SetUngroupedCost(-1)
+	body, err = json.Marshal(broken)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	if !strings.Contains(string(body), `"seriesOvershootMicros":1`) {
+		t.Errorf("an overshooting window did not serialise the fault: %s — the disclosure only "+
+			"works if it reaches the client", body)
+	}
+}
+
+// ptr is a pointer to a value, for the absent-versus-present tables above.
+func ptr[T any](v T) *T { return &v }
 
 // Summed from the RAW buckets, like Totals: a client that asked for coarser bars must
 // get the same residual as one that asked for fine ones, or the reconciliation would
@@ -398,20 +486,33 @@ func TestParseWindowSpec_FixedLengths(t *testing.T) {
 	}
 }
 
-// testZone is a fixed non-UTC zone for the day-boundary tests.
+// testZone is a REAL zone, seven hours off UTC on every date the tests below use.
 //
 // Not time.Local, which is what the first version of these tests used on both sides
 // of the assertion. On a host where time.Local IS UTC — the default in most CI
 // containers — that made the guard vacuous: an implementation reading
 // time.Date(..., time.UTC) passed, because the expectation was computed in the same
-// zone as the input. Pinning a zone seven hours off UTC means midnight here is 07:00
-// UTC, so a UTC reading lands on the wrong instant on every machine.
-var testZone = time.FixedZone("test", -7*3600)
+// zone as the input. A zone seven hours off UTC means midnight here is 07:00 UTC, so a
+// UTC reading lands on the wrong instant on every machine.
+//
+// AND NOT A time.FixedZone, which is what it was, added under a commit titled "Pin a
+// non-UTC zone, so the local-midnight guard actually guards". A fixed offset does stop a
+// UTC reading passing — but it has NO TRANSITIONS, so it cannot express a local midnight
+// that does not exist, and the guard did not guard: the local-midnight bound shipped in
+// this file's subject, and the same expression shipped in the cost ledger, under that very
+// commit. America/Los_Angeles is -0700 on 2026-09-14 with a real transition table behind
+// it, so it is a drop-in that can fail. The zones whose transitions fall where this one's
+// do not are in dst_test.go, which is where the boundary itself is pinned.
+func testZone(t *testing.T) *time.Location {
+	t.Helper()
+	return mustZone(t, "America/Los_Angeles")
+}
 
-func TestParseWindowSpec_TodayIsLocalMidnightToNow(t *testing.T) {
+func TestParseWindowSpec_TodayIsTheLocalDayStartToNow(t *testing.T) {
 	// The caller's zone, not UTC. A laptop crossing a timezone must not have its day
 	// reset mid-afternoon, and a UTC day would do exactly that.
-	now := time.Date(2026, 9, 14, 15, 30, 0, 0, testZone)
+	zone := testZone(t)
+	now := time.Date(2026, 9, 14, 15, 30, 0, 0, zone)
 	got, err := ParseWindowSpec("today", now)
 	if err != nil {
 		t.Fatalf("ParseWindowSpec: %v", err)
@@ -419,9 +520,13 @@ func TestParseWindowSpec_TodayIsLocalMidnightToNow(t *testing.T) {
 	if !got.Symbolic() {
 		t.Fatal("today reported a fixed length; want symbolic")
 	}
-	wantFrom := time.Date(2026, 9, 14, 0, 0, 0, 0, testZone)
+	// Midnight spelled literally, and correct HERE because 2026-09-14 in this zone is an
+	// ordinary date whose midnight exists and occurs once. It is written out rather than
+	// taken from StartOfLocalDay so the expectation is not the implementation restated. The
+	// dates where midnight is the WRONG answer are in dst_test.go.
+	wantFrom := time.Date(2026, 9, 14, 0, 0, 0, 0, zone)
 	if !got.From.Equal(wantFrom) {
-		t.Errorf("From = %v, want midnight in the caller's zone %v", got.From, wantFrom)
+		t.Errorf("From = %v, want the start of the day in the caller's zone %v", got.From, wantFrom)
 	}
 	// The span is the load-bearing assertion, because it is the one a UTC reading gets
 	// wrong: 15:30 minus midnight is 15h30m in the caller's zone and 22h30m if the
@@ -442,7 +547,7 @@ func TestParseWindowSpec_TodayIsLocalMidnightToNow(t *testing.T) {
 // so a UTC reading reports seven and a half hours of "today" — most of it yesterday
 // evening's spend.
 func TestParseWindowSpec_TodayJustAfterMidnightInANonUTCZone(t *testing.T) {
-	now := time.Date(2026, 9, 14, 0, 30, 0, 0, testZone)
+	now := time.Date(2026, 9, 14, 0, 30, 0, 0, testZone(t))
 	got, err := ParseWindowSpec("today", now)
 	if err != nil {
 		t.Fatalf("ParseWindowSpec: %v", err)
@@ -455,7 +560,12 @@ func TestParseWindowSpec_TodayJustAfterMidnightInANonUTCZone(t *testing.T) {
 func TestParseWindowSpec_TodayJustAfterMidnightIsAShortWindow(t *testing.T) {
 	// The boundary case: at 00:05, "today" is five minutes, not 24 hours. A
 	// fixed-length reading would report yesterday evening's spend as today's.
-	now := time.Date(2026, 9, 14, 0, 5, 0, 0, time.Local)
+	//
+	// A pinned zone, not time.Local: with time.Local the result depends on the TZ the suite
+	// happens to run under, and 00:05 is exactly the wall time that does not exist on some
+	// zones' spring-forward day. Pinning makes the assertion mean the same thing on every
+	// host. dst_test.go is where the zone is the variable under test.
+	now := time.Date(2026, 9, 14, 0, 5, 0, 0, testZone(t))
 	got, err := ParseWindowSpec("today", now)
 	if err != nil {
 		t.Fatalf("ParseWindowSpec: %v", err)
@@ -466,7 +576,7 @@ func TestParseWindowSpec_TodayJustAfterMidnightIsAShortWindow(t *testing.T) {
 }
 
 func TestParseWindowSpec_SevenDaysIsRollingNotCalendar(t *testing.T) {
-	now := time.Date(2026, 9, 14, 15, 30, 0, 0, time.Local)
+	now := time.Date(2026, 9, 14, 15, 30, 0, 0, testZone(t))
 	got, err := ParseWindowSpec("7d", now)
 	if err != nil {
 		t.Fatalf("ParseWindowSpec: %v", err)
@@ -482,41 +592,71 @@ func TestParseWindowSpec_SevenDaysIsRollingNotCalendar(t *testing.T) {
 	}
 }
 
-// A ROLLING WEEK TOUCHES EIGHT DATES, NOT SEVEN, and the difference is a day file the
-// durable ledger has to still hold. The two were confused: the cost ledger's retention
-// floor was the literal 7, so retention_days: 7 loaded cleanly and then answered
-// window:"7d" over a partial week — a figure nothing downstream could tell from a quiet
-// one. Window7dLocalDays is now the single place that says how many days this is, and
-// the floor is derived from it.
+// A ROLLING WEEK TOUCHES EIGHT DATES IN AN ORDINARY WEEK, NOT SEVEN, and the difference is a
+// day file the durable ledger has to still hold. The two were confused: the cost ledger's
+// retention floor was the literal 7, so retention_days: 7 loaded cleanly and then answered
+// window:"7d" over a partial week — a figure nothing downstream could tell from a quiet one.
 //
-// Every hour of the day is checked, midnight included: the count has to be the same at
-// 00:00 — where the eighth date contributes a single instant, and is still a file to
-// open — as at 15:30, because a floor that holds only for part of the day is not a
-// floor.
-func TestParseWindowSpec_SevenDaysTouchesEightLocalDays(t *testing.T) {
+// AT MOST, NOT EXACTLY, which is the assertion this test used to get wrong. Window7dLocalDays
+// is a CEILING of nine: eight is what an ordinary week reaches, nine is what a
+// spring-forward week reaches, and a retention floor has to cover the worst case rather than
+// the common one. Asserting equality here made the constant look like a count and is why it
+// sat at 8 with the nine-date week recorded beside it as a known-wrong note.
+// TestParseWindowSpec_ASpringForwardWeekReachesTheNinthLocalDate is the other half: it pins
+// that the ceiling is REACHED, so this test cannot be satisfied by a bound that is merely
+// large.
+//
+// Every hour of the day is checked, midnight included: the count has to hold at 00:00 —
+// where the eighth date contributes a single instant, and is still a file to open — as at
+// 15:30, because a floor that holds only for part of the day is not a floor.
+//
+// The zone is PINNED to a transition-free week on purpose. Under TZ=America/Santiago an
+// unpinned "now" could land in the 167-hour week and count nine, which is legal against the
+// ceiling but would stop this test measuring the ordinary case it exists for.
+func TestParseWindowSpec_SevenDaysTouchesAtMostWindow7dLocalDays(t *testing.T) {
+	zone := testZone(t)
 	for hour := 0; hour < 24; hour++ {
-		now := time.Date(2026, 9, 14, hour, 30, 0, 0, time.Local)
+		now := time.Date(2026, 9, 14, hour, 30, 0, 0, zone)
 		if hour == 0 {
-			now = time.Date(2026, 9, 14, 0, 0, 0, 0, time.Local)
+			now = time.Date(2026, 9, 14, 0, 0, 0, 0, zone)
 		}
-		spec, err := ParseWindowSpec(Window7d, now)
-		if err != nil {
-			t.Fatalf("ParseWindowSpec(%q) at %v: %v", Window7d, now, err)
-		}
-		// Whole local days from From to To inclusive, which is the walk
-		// costledger.Writer.Query makes over day files.
-		days := 0
-		day := time.Date(spec.From.Year(), spec.From.Month(), spec.From.Day(), 0, 0, 0, 0, spec.From.Location())
-		last := time.Date(spec.To.Year(), spec.To.Month(), spec.To.Day(), 0, 0, 0, 0, spec.To.Location())
-		for ; !day.After(last); day = day.AddDate(0, 0, 1) {
-			days++
-		}
-		if days != Window7dLocalDays {
-			t.Errorf("at %v, window=%q spans %d local days, want Window7dLocalDays = %d — "+
-				"a retention derived from that constant would keep the wrong number of day files",
+		days := localDatesInWindow(t, now)
+		if days > Window7dLocalDays {
+			t.Errorf("at %v, window=%q spans %d local days, more than Window7dLocalDays = %d — "+
+				"the retention floor that agrees with that constant keeps too few day files and "+
+				"the window answers over a partial week",
 				now.Format("15:04"), Window7d, days, Window7dLocalDays)
 		}
+		// And an ordinary week must still reach eight, or the rolling-versus-calendar point
+		// this test was written for has quietly stopped being true.
+		if days != 8 {
+			t.Errorf("at %v, a transition-free week spans %d local days, want 8: seven days of "+
+				"hours across eight dates is what makes the floor bigger than 7",
+				now.Format("15:04"), days)
+		}
 	}
+}
+
+// localDatesInWindow counts the whole local dates a 7d window from now covers, which is the
+// walk costledger.Writer.Query makes over day files.
+//
+// Walked at dayAnchorHour, which is what costledger.dayOf does. It is NOT a walk over local
+// midnights: that expression counts a date twice or skips one in a zone whose transition is
+// at 00:00, and a midnight walk in the helper that measures how many day files a window needs
+// was a third copy of that defect, wrong about the very thing being counted.
+func localDatesInWindow(t *testing.T, now time.Time) int {
+	t.Helper()
+	spec, err := ParseWindowSpec(Window7d, now)
+	if err != nil {
+		t.Fatalf("ParseWindowSpec(%q) at %v: %v", Window7d, now, err)
+	}
+	days := 0
+	day := time.Date(spec.From.Year(), spec.From.Month(), spec.From.Day(), dayAnchorHour, 0, 0, 0, spec.From.Location())
+	last := time.Date(spec.To.Year(), spec.To.Month(), spec.To.Day(), dayAnchorHour, 0, 0, 0, spec.To.Location())
+	for ; !day.After(last); day = day.AddDate(0, 0, 1) {
+		days++
+	}
+	return days
 }
 
 func TestParseWindowSpec_RejectsUnknownWithoutEchoingInput(t *testing.T) {

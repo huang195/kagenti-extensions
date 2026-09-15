@@ -135,10 +135,6 @@ type Writer struct {
 	// loggedDrops is the cumulative drop count already reported. Atomic only because
 	// submit's post-Close inline path can reach write from a caller's goroutine.
 	loggedDrops atomic.Int64
-	// skippedLines and truncatedDays report what the MOST RECENT Query could not read.
-	// See SkippedLines.
-	skippedLines  atomic.Int64
-	truncatedDays atomic.Int64
 
 	// betweenWindowReads is a TEST SEAM and nothing else: Window calls it, when
 	// non-nil, between reading the accumulator and reading the day files.
@@ -359,7 +355,11 @@ func (w *Writer) Record(_ string, e *pipeline.SessionEvent) {
 	// event is inference, OR somebody priced it", and spelling the second half out makes
 	// the guard read as that rule instead of as a nest of negations.
 	settledCost := hasCost && ev.Priced()
-	if e.Inference == nil && !settledCost {
+	// A figure that WAS on the wire and was declined. Admitted for the reason the guard
+	// below spells out: it is evidence of priceable traffic, which an unpriced record with
+	// no refusal is not.
+	refusedCost := hasCost && ev.RejectedReason != ""
+	if e.Inference == nil && !settledCost && !refusedCost {
 		// Non-inference traffic the proxy handled — MCP, health checks, tunnels.
 		// Recording it would put every proxied response in the cost denominator,
 		// the mistake that made a correct deployment read "1/10 priced" forever.
@@ -380,6 +380,17 @@ func (w *Writer) Record(_ string, e *pipeline.SessionEvent) {
 		// PRICED, not merely present: a record that exists but priced nothing adds no
 		// dollars, so letting it through would inflate the request count without moving
 		// the money — the denominator mistake above, arriving by a different door.
+		//
+		// OR REFUSED, which is the one exception and is not a weakening of that rule. A
+		// record carrying costevent.RejectedImplausible says a cost figure WAS on the wire
+		// and this proxy declined it (see costing.implausibleUnparsedCost), so it is
+		// evidence of priceable traffic in a way an absent figure never is. That refusal is
+		// published precisely "so the coverage gap stays nameable", and this guard dropped
+		// every one of them: the refusal is gated on a nil inference extension, which is
+		// also the half of this condition it cannot satisfy, so ALL refusals fell out — a
+		// response from an unparsed endpoint claiming $50,000 left nothing whatever in a
+		// file retained for thirty days, while the ring counted the response. Recorded here
+		// as priceable-and-unpriced; see the PriceableRequests assignment below.
 		return
 	}
 
@@ -507,6 +518,35 @@ func (w *Writer) Record(_ string, e *pipeline.SessionEvent) {
 				// PricedRequests and never a sibling of it.
 				r.IncompleteRequests = 1
 			}
+		} else if ev.RejectedReason != "" {
+			// A REFUSED FIGURE IS A COVERAGE GAP, and this is where it becomes visible.
+			//
+			// PriceableRequests without PricedRequests, which is the shape every consumer
+			// already renders: priceable-minus-priced is the gap that "stops a partial total
+			// being presented as a complete one". A cost figure reached this proxy and was
+			// declined, so the request COULD have been priced — usage.Counts.PriceableRequests
+			// is explicit that this is "the count of requests that could have carried a price"
+			// — and nothing priced it. Left at zero, a day whose only unpriced traffic was
+			// refused would report parity and print no caveat at all, which is the exact
+			// failure priced-versus-priceable exists to prevent.
+			//
+			// NO DOLLARS AND NO PricedRequests: the point of the refusal is that there is no
+			// figure. ev.Micros() returns zero for a refused record anyway, so this branch
+			// could not add money even by mistake.
+			//
+			// A DIVERGENCE FROM THE RING, stated here and in the package doc rather than
+			// discovered: usage.Aggregator.costOf goes through costevent.Decode, which reports
+			// no record at all for an unpriced one, so the ring counts a refusal in Requests
+			// and in nothing else. The ledger's denominator is therefore one larger for the
+			// same traffic. That is the right way round — the ring cannot see the refusal and
+			// this file is the surface an operator reads tomorrow — and the dollars, which are
+			// zero in both, still agree.
+			//
+			// A HOSTILE HOST CAN THEREFORE DEGRADE ITS OWN COVERAGE RATIO by claiming
+			// implausible figures. That is the intended reading: something on the wire is
+			// asserting costs this proxy refuses, and an operator should see it. It moves no
+			// money, and the per-minute accumulator caps how many rows it can create.
+			r.PriceableRequests = 1
 		}
 	}
 
@@ -800,8 +840,8 @@ func (w *Writer) logDrops() {
 // WHAT IT DOES NOT COUNT: rows whose fsync failed. They are in the file and every reader
 // will see them; only their survival across power loss is unproven, and that is reported
 // as an error from Flush and Close rather than as a lost row. Nor does it count anything
-// a reader could not decode later — that is SkippedLines and TruncatedDays, which are
-// gauges for the last read rather than a write-path total.
+// a reader could not decode later — that is Caveats, which Query and Window return to the
+// read that produced them rather than accumulating on the write path.
 //
 // Exported so a caller can surface it rather than leaving it in a log line nobody
 // greps: a cost total assembled from a ledger that dropped rows is short by an unknown
@@ -809,37 +849,15 @@ func (w *Writer) logDrops() {
 //
 // NO NON-TEST CALLER TODAY, and it stays exported anyway. It is the completeness signal
 // the package doc and Window's contract both cite, and the /v1/usage response has a
-// Degraded field that already carries the two READ-side gauges beside it (see
-// SkippedLines and TruncatedDays) — this is the write-side one that belongs there next,
-// which is a sessionapi change rather than a reason to withdraw the number.
+// Degraded field that already carries the two READ-side counts beside it (see Caveats) —
+// this is the write-side one that belongs there next, which is a sessionapi change rather
+// than a reason to withdraw the number.
+//
+// UNLIKE Caveats, THIS ONE IS PROCESS-WIDE ON PURPOSE. A dropped row is a fact about the
+// writer, not about anybody's read: it happened once, no later read can rediscover it, and
+// every reader of this ledger is equally short because of it. Caveats are the opposite —
+// what THIS read could not decode — which is why they are returned and this is not.
 func (w *Writer) Dropped() int64 { return w.dropped.Load() }
-
-// SkippedLines is how many lines the MOST RECENT Query or Window could not decode.
-//
-// A GAUGE, NOT A COUNTER, and deliberately: a day file with one corrupt line is
-// re-read on every /v1/usage request, so a cumulative count would climb forever over
-// one piece of damage and read as an escalating fault. The last read's figure answers
-// the question a caller actually has — "is the number you just gave me complete".
-//
-// Skips were previously counted into a local and logged at slog.Debug, below the
-// default level, so a day quietly losing lines was indistinguishable in production
-// from a clean one.
-func (w *Writer) SkippedLines() int64 { return w.skippedLines.Load() }
-
-// TruncatedDays is how many day files the MOST RECENT Query or Window ABANDONED
-// part-way through — an IO error, or a line past maxLineBytes that a scanner cannot
-// step over.
-//
-// Worse than a skipped line by an unknown amount: everything after that offset is
-// missing from the answer and the file gives no way to say how much. A non-zero value
-// means the total just returned is short, and a caller that reports a figure without
-// checking it is serving a truncated day as a complete one.
-//
-// Same gauge semantics as SkippedLines. NOT yet reflected in the /v1/usage response
-// shape — that is authlib/sessionapi's to add, and until it does, a client reading
-// only the JSON still cannot see this. Exported here so it is available rather than
-// discarded.
-func (w *Writer) TruncatedDays() int64 { return w.truncatedDays.Load() }
 
 // run is the ONLY goroutine that touches the filesystem after construction.
 //

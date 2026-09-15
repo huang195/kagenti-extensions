@@ -321,9 +321,17 @@ func TestSessionEventWire_EveryFieldSerializes(t *testing.T) {
 // and so the one most likely to send someone looking in the wrong place. A reason
 // nobody can look up is barely better than the em dash it replaced.
 func TestTunnelReasonsAreDocumented(t *testing.T) {
+	// A FAILURE, NOT A SKIP. This was t.Skipf("docs not readable from here"), which turned
+	// the only test that checks these strings are documented into a silent pass — and a
+	// test that cannot run is worse than no test, because it reports success. go test runs
+	// in the package directory, so this path resolves for every invocation from anywhere in
+	// the repo; if it ever does not, the doc has moved or been deleted and the reason this
+	// test exists has moved with it.
 	doc, err := os.ReadFile("../../docs/laptop-service.md")
 	if err != nil {
-		t.Skipf("docs not readable from here: %v", err)
+		t.Fatalf("read ../../docs/laptop-service.md: %v — this test's whole subject is that "+
+			"every tunnel reason is documented there; if the file moved, point this at its new "+
+			"home rather than letting the check disappear", err)
 	}
 	for _, reason := range []TunnelReason{
 		TunnelClientRejectedCA, TunnelClientHungUp, TunnelHandshakeFailed,

@@ -8,6 +8,7 @@ import (
 	"strings"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	"github.com/rossoctl/cortex/authbridge/authlib/costevent"
 	"github.com/rossoctl/cortex/authbridge/authlib/pipeline"
@@ -132,6 +133,145 @@ func TestCountsAddFoldsPricedRequests(t *testing.T) {
 	}
 	if unpriced := a.PriceableRequests - a.PricedRequests; unpriced != 8 {
 		t.Errorf("unpriced = %d, want 8", unpriced)
+	}
+}
+
+// TestCountsAdd_EveryInt64FieldSaturatesAndSaysSo walks Counts BY REFLECTION, which is the
+// only way this test cannot rot.
+//
+// A hand-written table of the fields would have to be extended by whoever adds a field —
+// the same person who would have to remember to use the checked accumulate in Add, and the
+// evidence in Add's own doc is that this is exactly what gets forgotten (an out-of-module
+// copy hand-summed these fields and silently missed PricedRequests). Reflection asks the
+// struct instead of asking a list, so a new int64 field added with a bare `+=` fails here on
+// the day it lands.
+//
+// Both halves are asserted, because either alone is a lie: the clamp (the number must not
+// wrap into a negative) and the disclosure (a clamped total must say it is a floor).
+func TestCountsAdd_EveryInt64FieldSaturatesAndSaysSo(t *testing.T) {
+	rt := reflect.TypeOf(Counts{})
+	checked := 0
+	for i := range rt.NumField() {
+		f := rt.Field(i)
+		if f.Type.Kind() != reflect.Int64 {
+			continue
+		}
+		checked++
+		t.Run(f.Name, func(t *testing.T) {
+			for _, dir := range []struct {
+				name       string
+				start, add int64
+				want       int64
+			}{
+				{"upward", math.MaxInt64, 1, math.MaxInt64},
+				{"downward", math.MinInt64, -1, math.MinInt64},
+			} {
+				t.Run(dir.name, func(t *testing.T) {
+					var a, b Counts
+					reflect.ValueOf(&a).Elem().Field(i).SetInt(dir.start)
+					reflect.ValueOf(&b).Elem().Field(i).SetInt(dir.add)
+					a.Add(b)
+					if got := reflect.ValueOf(a).Field(i).Int(); got != dir.want {
+						t.Errorf("%s = %d after overflowing %s, want %d — a bare += wraps here, and "+
+							"the wrapped figure then sits in the durable ledger for its full retention",
+							f.Name, got, dir.name, dir.want)
+					}
+					if !a.Saturated {
+						t.Errorf("%s hit the int64 %s bound and Saturated is false; a silently clamped "+
+							"total is the same class of lie as a wrapped one, and a client has no way "+
+							"to know the figure is a floor", f.Name, dir.name)
+					}
+				})
+			}
+		})
+	}
+	// The loop itself must have found the fields, or a rename made this test a no-op that
+	// reports success — which is the failure mode the reflection was chosen to avoid.
+	if checked < 12 {
+		t.Errorf("walked %d int64 fields of Counts, expected at least 12; the struct was "+
+			"renamed or retyped and this test now asserts nothing", checked)
+	}
+}
+
+// TestCountsAdd_TheWrapMeasuredInPricingIsClosed is the disclosure in
+// pricing.MaxCostMicros, executed.
+//
+// That comment states the arithmetic — math.MaxInt64 / MaxCostMicros is 1023, so 1,024
+// requests each priced at the bound wrap the aggregate to -9214364837600034816 — and names
+// Counts.Add as the place that has to close it, because no per-request bound can. This runs
+// exactly that scenario and asserts the total never goes negative.
+//
+// The count is deliberately past 1,024. A test that stopped at the wrap point would pass on
+// an implementation that wraps once and then keeps accumulating from a negative base.
+func TestCountsAdd_TheWrapMeasuredInPricingIsClosed(t *testing.T) {
+	const atBound = int64(pricing.MaxCostMicros) - 1 // the largest figure MicrosFromUSD admits
+	var total Counts
+	for n := 1; n <= 2_000; n++ {
+		total.Add(Counts{Requests: 1, CostMicros: atBound, PricedRequests: 1})
+		if total.CostMicros < 0 {
+			t.Fatalf("CostMicros = %d after %d requests at %d micros: the aggregate wrapped, which "+
+				"is the failure pricing.MaxCostMicros documents and cannot fix",
+				total.CostMicros, n, atBound)
+		}
+	}
+	if total.CostMicros != math.MaxInt64 {
+		t.Errorf("CostMicros = %d, want math.MaxInt64 (%d) — the sum is meant to CLAMP at the "+
+			"ceiling, not to stop accumulating or to reset", total.CostMicros, int64(math.MaxInt64))
+	}
+	if !total.Saturated {
+		t.Error("2,000 requests at the cost bound produced a clamped total that does not disclose " +
+			"it; the number is then a ceiling presented as a sum")
+	}
+	// Requests is 2,000 and exact. The disclosure must not be read as "nothing here is
+	// trustworthy": one field saturated, the others are still sums.
+	if total.Requests != 2_000 {
+		t.Errorf("Requests = %d, want 2000 — saturation on one field must not disturb another",
+			total.Requests)
+	}
+}
+
+// TestCountsAdd_SaturationIsInheritedByAnyTotalContainingIt is why the flag is OR-ed rather
+// than recomputed.
+//
+// Buckets are folded into totals and into coarser buckets, and a fold does not repeat the
+// addition that saturated. If the flag did not travel, the bucket would say its figure is a
+// floor and the window total containing it would say its own figure is exact — the same
+// number, two different claims, and the client reads the one that is wrong.
+func TestCountsAdd_SaturationIsInheritedByAnyTotalContainingIt(t *testing.T) {
+	saturated := Counts{Requests: 1, CostMicros: math.MaxInt64, Saturated: true}
+	total := Counts{Requests: 1, CostMicros: 5}
+	total.Add(saturated)
+	if !total.Saturated {
+		t.Error("a total that folded in a saturated bucket reports itself exact; the floor is " +
+			"inherited by every sum the bucket is part of")
+	}
+	// And the flag is not sticky the other way: folding a clean bucket into a clean total
+	// must not manufacture a caveat, or the disclosure means nothing.
+	clean := Counts{Requests: 1, CostMicros: 5}
+	clean.Add(Counts{Requests: 1, CostMicros: 5})
+	if clean.Saturated {
+		t.Error("an ordinary fold set Saturated; a caveat that appears on clean data trains an " +
+			"operator to ignore it")
+	}
+}
+
+// TestCountsSaturatedOmittedWhenFalse keeps the wire quiet for the overwhelming majority of
+// responses, on the same rule as PricedRequests below: absence is the clean answer.
+func TestCountsSaturatedOmittedWhenFalse(t *testing.T) {
+	b, err := json.Marshal(Counts{Requests: 3, CostMicros: 5})
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	if strings.Contains(string(b), "saturated") {
+		t.Errorf("a clean Counts serialised the saturation flag, got %s", b)
+	}
+	b, err = json.Marshal(Counts{Requests: 3, Saturated: true})
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	if !strings.Contains(string(b), `"saturated":true`) {
+		t.Errorf("a saturated Counts did not serialise the flag, got %s — the disclosure only "+
+			"works if it reaches the client", b)
 	}
 }
 
@@ -728,6 +868,144 @@ func TestRecord_LabelLengthIsCapped(t *testing.T) {
 	}
 }
 
+// TestTruncateLabel_CutsOnARuneBoundaryAndKeepsTheByteCap is the cap the byte cut was
+// breaking.
+//
+// s[:maxLabelLen] can split a multi-byte sequence, and encoding/json then expands each
+// invalid byte into a 3-byte U+FFFD — so the serialised label came out LONGER than the cap
+// (measured in costledger: 121 bytes cut at 96 serialised at 100). The invalid fragment is
+// the smaller problem; the byte cap silently not holding is the defect.
+//
+// EVERY CASE HAS A ONE-BYTE PREFIX, and that is load-bearing rather than incidental.
+// maxLabelLen is 96, which is divisible by 2, 3 and 4 — so a label of uniform multi-byte
+// runes has a rune boundary exactly AT the cap and the byte cut is accidentally correct. The
+// first version of this test in costledger passed against the unfixed code for precisely that
+// reason. One ASCII byte in front moves the cut to offset 95, which is a boundary for none of
+// the three widths.
+func TestTruncateLabel_CutsOnARuneBoundaryAndKeepsTheByteCap(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		rune string
+	}{
+		{"two-byte runes", "é"},
+		{"three-byte runes", "€"},
+		{"four-byte runes", "𝄞"},
+		{"the replacement character sanitising produces", "�"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			// The prefix is what stops 96 from landing on a boundary; see the doc above.
+			in := "a" + strings.Repeat(tc.rune, maxLabelLen)
+			got := truncateLabel(in)
+
+			if len(got) > maxLabelLen {
+				t.Errorf("truncateLabel returned %d bytes, cap is %d", len(got), maxLabelLen)
+			}
+			if !utf8.ValidString(got) {
+				t.Errorf("truncateLabel returned invalid UTF-8 (%q): the cut landed inside a rune",
+					got)
+			}
+			// The reason the boundary matters, asserted as the property rather than as UTF-8
+			// validity: a round trip through the encoder must not change the bytes, or the byte
+			// cap this function enforces does not hold on the wire.
+			enc, err := json.Marshal(got)
+			if err != nil {
+				t.Fatalf("marshal: %v", err)
+			}
+			var back string
+			if uerr := json.Unmarshal(enc, &back); uerr != nil {
+				t.Fatalf("unmarshal: %v", uerr)
+			}
+			if back != got {
+				t.Errorf("the label changed through encoding/json: %q became %q — an invalid "+
+					"trailing byte was expanded into U+FFFD", got, back)
+			}
+			if len(enc)-2 > maxLabelLen {
+				t.Errorf("the label serialises to %d bytes, past the %d-byte cap it was cut to; "+
+					"the cap does not hold where it is spent", len(enc)-2, maxLabelLen)
+			}
+			// And the cut must not be so eager that it drops a whole rune it could have kept: at
+			// most three bytes of slack, which is the walk-back limit.
+			if maxLabelLen-len(got) > 3 {
+				t.Errorf("truncateLabel returned %d bytes for a %d-byte cap: it walked back further "+
+					"than the longest UTF-8 sequence", len(got), maxLabelLen)
+			}
+		})
+	}
+}
+
+// TestRingLabel_SanitisesBeforeCapping pins the ORDER, which is the half that is easy to get
+// backwards and impossible to notice.
+//
+// Sanitising triples a control byte (one byte becomes a 3-byte U+FFFD), so capping first
+// would let 96 control bytes become 288 and break the bound that exists to make a label's
+// memory and line length predictable.
+func TestRingLabel_SanitisesBeforeCapping(t *testing.T) {
+	got := ringLabel(strings.Repeat("\x1b", maxLabelLen))
+	if len(got) > maxLabelLen {
+		t.Errorf("ringLabel returned %d bytes for %d control bytes, cap is %d: the cap was applied "+
+			"before the rewrite that expands each byte threefold", len(got), maxLabelLen, maxLabelLen)
+	}
+	if strings.ContainsRune(got, 0x1b) {
+		t.Errorf("ringLabel kept an ESC byte: %q", got)
+	}
+	if !utf8.ValidString(got) {
+		t.Errorf("ringLabel returned invalid UTF-8: %q — capping split a replacement character", got)
+	}
+}
+
+// TestSnapshot_TheRingDoesNotServeControlBytesInALabel is the gap that mattered more than the
+// cut.
+//
+// The ring did not sanitise AT ALL. The model comes off the parsed request body and the
+// endpoint is the host the workload asked for, so GET /v1/usage served an ANSI escape
+// straight out of memory — while the ledger's copy of the same label was clean, because
+// costledger sanitises on write. Two surfaces, one request, different bytes: group=model
+// showed the label as two series, and only the unfixed surface could reposition an operator's
+// cursor. CWE-150.
+//
+// U+009B IS IN THE TABLE because it is the case a byte scan cannot see: it is the
+// single-character CSI, encoded as 0xC2 0x9B, so nothing about it is below 0x20 and a
+// terminal decoding UTF-8 acts on it exactly as on ESC [.
+func TestSnapshot_TheRingDoesNotServeControlBytesInALabel(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		label string
+	}{
+		{"an ESC-bracket colour sequence", "claude\x1b[31m-opus"},
+		{"a bare carriage return", "claude\r-opus"},
+		{"DEL", "claude\x7f-opus"},
+		{"U+009B, the single-byte CSI a byte scan misses", "claude2J-opus"},
+		{"an invalid UTF-8 byte", "claude\xff-opus"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			now := time.Date(2026, 9, 4, 23, 30, 30, 0, time.UTC)
+			a := New(WithClock(fixedClock(now)))
+			e := respEvent(now, 200, time.Second, tc.label, 10)
+			// Both axes, because both are set off-host and neither passed through a sanitiser.
+			e.Host = tc.label
+			a.Record("s1", e)
+
+			for _, g := range []Group{GroupMethod, GroupEndpoint} {
+				for k := range mergeSeries(a.Snapshot(time.Minute, BucketWidth, "", g).Buckets) {
+					if hasControlRunes(k) {
+						t.Errorf("group=%s served the label %q, which still carries a control rune: "+
+							"/v1/usage hands it to whatever renders it, and the ledger's copy of the "+
+							"same label is clean", g, k)
+					}
+					if !utf8.ValidString(k) {
+						t.Errorf("group=%s served invalid UTF-8: %q", g, k)
+					}
+					if !strings.Contains(k, "�") {
+						t.Errorf("group=%s served %q with no replacement character: the hostile bytes "+
+							"were DROPPED rather than replaced, which collapses tampering into a "+
+							"plausible-looking label nobody would question", g, k)
+					}
+				}
+			}
+		})
+	}
+}
+
 // inferenceEvent builds a priceable response event with an explicit token split.
 //
 // Separate from respEvent because that helper predates the split fields and takes
@@ -790,12 +1068,168 @@ func TestFoldInto_CarriesEveryCountsField(t *testing.T) {
 	a.Record("s1", e)
 	totals := a.Snapshot(10*BucketWidth, BucketWidth, "s1", GroupNone).Totals
 
+	// Saturated is the ONE field one event cannot populate, and it is asserted the other way
+	// round rather than skipped. It is a fault disclosure, not a carried value: it can only
+	// be true if an addition hit the int64 ceiling, which a single event cannot do and which
+	// no real deployment should ever see. Exempting it with a bare `continue` would let it
+	// become permanently true — a caveat on every clean response — with nothing here to
+	// notice, so the exemption is spelled as its own expectation instead.
+	// TestCountsAdd_EveryInt64FieldSaturatesAndSaysSo covers the true case.
+	//
+	// RefusedTokenRequests is exempt on the same footing and for the same reason: this
+	// event's token report is plausible, so refusing it would be the bug. Its non-zero case
+	// is TestFoldInto_RefusesAnImplausibleTokenReportWhicheverFieldCarriesIt.
+	assertedAbsent := map[string]bool{"Saturated": true, "RefusedTokenRequests": true}
 	v := reflect.ValueOf(totals)
 	for i := 0; i < v.NumField(); i++ {
-		if v.Field(i).IsZero() {
-			t.Errorf("Counts.%s came back zero: the fold does not carry it, so this field is absent from every /v1/usage total. Carry it in foldInto (the token split rides along via Counts.Add) or, if one event genuinely cannot populate it, say so here.",
-				v.Type().Field(i).Name)
+		name := v.Type().Field(i).Name
+		if assertedAbsent[name] {
+			if !v.Field(i).IsZero() {
+				t.Errorf("Counts.%s is set after folding one ordinary event: it is a fault "+
+					"disclosure and ordinary traffic must leave it clean, or every response "+
+					"carries a caveat that means nothing", name)
+			}
+			continue
 		}
+		if v.Field(i).IsZero() {
+			t.Errorf("Counts.%s came back zero: the fold does not carry it, so this field is absent from every /v1/usage total. Carry it in foldInto (the token split rides along via Counts.Add) or, if one event genuinely cannot populate it, say so in assertedAbsent above.",
+				name)
+		}
+	}
+}
+
+// tokenSources maps each token field of Counts to the pipeline.InferenceExtension field
+// foldInto reads it from.
+//
+// A map rather than a list of cases, so the test below can assert it COVERS the struct: a
+// seventh token field added to Counts and read from a new wire field fails here by name
+// instead of arriving unguarded. That is the whole reason this is not six hand-written
+// subtests — Tokens was unbounded for as long as it was because nothing enumerated the
+// fields that come from the provider.
+var tokenSources = map[string]string{
+	"Tokens":           "TotalTokens",
+	"InputTokens":      "InputTokens",
+	"CacheReadTokens":  "CacheReadTokens",
+	"CacheWriteTokens": "CacheWriteTokens",
+	"OutputTokens":     "OutputTokens",
+	"ReasoningTokens":  "ReasoningTokens",
+}
+
+// countsTokenFields returns the reflect field indexes of Counts' token figures, and fails if
+// any of them has no entry in tokenSources.
+func countsTokenFields(t *testing.T) []int {
+	t.Helper()
+	rt := reflect.TypeOf(Counts{})
+	var out []int
+	for i := range rt.NumField() {
+		name := rt.Field(i).Name
+		if !strings.HasSuffix(name, "Tokens") {
+			continue
+		}
+		if _, ok := tokenSources[name]; !ok {
+			t.Errorf("Counts.%s is a token figure with no entry in tokenSources: it is read from "+
+				"a provider-controlled field and nothing here checks that an implausible value is "+
+				"refused", name)
+			continue
+		}
+		out = append(out, i)
+	}
+	if len(out) != len(tokenSources) {
+		t.Fatalf("matched %d token fields of Counts against %d mapped sources; the map and the "+
+			"struct have diverged and this test no longer covers what it claims",
+			len(out), len(tokenSources))
+	}
+	return out
+}
+
+// TestFoldInto_RefusesAnImplausibleTokenReportWhicheverFieldCarriesIt is the token half of
+// the bound cost already had.
+//
+// Cost is bounded per request twice over and tokens were not bounded at all: every figure
+// came from a provider-controlled `int` on the wire, straight into the aggregate. So the
+// same forged response that could not move the dollar total by more than $10,000 could move
+// the token total by 9.2e18, and a negative one could move it DOWN — making a real bill look
+// smaller, which is the direction that gets exploited.
+//
+// Three shapes per field, because they fail differently: past the ceiling (the plausible
+// case), the whole int64 range (the wrap case, which Counts.Add now clamps but should never
+// see), and negative (the subtraction). Driven by reflection over Counts so a token field
+// added later cannot skip this.
+func TestFoldInto_RefusesAnImplausibleTokenReportWhicheverFieldCarriesIt(t *testing.T) {
+	fields := countsTokenFields(t)
+	rt := reflect.TypeOf(Counts{})
+	for _, i := range fields {
+		name := rt.Field(i).Name
+		wire := tokenSources[name]
+		for _, bad := range []struct {
+			what string
+			v    int
+		}{
+			{"one past the plausible ceiling", maxPlausibleRequestTokens + 1},
+			{"the whole int64 range", math.MaxInt},
+			{"negative, which subtracts from the aggregate", -1},
+		} {
+			t.Run(name+"/"+bad.what, func(t *testing.T) {
+				now := time.Now().Truncate(BucketWidth)
+				a := New(WithClock(func() time.Time { return now }))
+				e := inferenceEvent("claude-opus-5", 10, 20, 30, 40, 5, 0b11111)
+				e.At = now
+				reflect.ValueOf(e.Inference).Elem().FieldByName(wire).SetInt(int64(bad.v))
+				a.Record("s1", e)
+				totals := a.Snapshot(10*BucketWidth, BucketWidth, "s1", GroupNone).Totals
+
+				if totals.RefusedTokenRequests != 1 {
+					t.Errorf("RefusedTokenRequests = %d after %s = %d (%s), want 1 — a dropped "+
+						"figure that is not counted is indistinguishable from traffic that used no "+
+						"tokens", totals.RefusedTokenRequests, wire, bad.v, bad.what)
+				}
+				// The WHOLE report goes, not just the offending field: a believed figure beside a
+				// refused one is a breakdown that cannot be reconciled against its own total.
+				for _, j := range fields {
+					if got := reflect.ValueOf(totals).Field(j).Int(); got != 0 {
+						t.Errorf("Counts.%s = %d, want 0: %s was %s (%d), so no figure in this "+
+							"report is trustworthy", rt.Field(j).Name, got, wire, bad.what, bad.v)
+					}
+				}
+				if totals.PresentKinds != 0 {
+					t.Errorf("PresentKinds = %#b after a refused report, want 0 — those bits assert "+
+						"the provider REPORTED these kinds, which is the claim being refused",
+						totals.PresentKinds)
+				}
+				// The request still happened, and this says nothing about whether it was billed.
+				if totals.Requests != 1 {
+					t.Errorf("Requests = %d, want 1: refusing the token report must not drop the "+
+						"request", totals.Requests)
+				}
+			})
+		}
+	}
+}
+
+// TestFoldInto_AcceptsATokenReportAtTheCeiling is the control that keeps the bound from
+// being a coverage gap dressed as a guard.
+//
+// A refusal is a figure withheld, so a bound set too low is the same defect in the other
+// direction — and one that would only be discovered when a legitimately large context
+// window arrived. The ceiling is INCLUSIVE, and the largest real call anyone can construct
+// today is 5x under it.
+func TestFoldInto_AcceptsATokenReportAtTheCeiling(t *testing.T) {
+	now := time.Now().Truncate(BucketWidth)
+	a := New(WithClock(func() time.Time { return now }))
+	e := inferenceEvent("claude-opus-5", maxPlausibleRequestTokens, 0, 0, 0, 0, 0b1)
+	e.At = now
+	e.Inference.TotalTokens = maxPlausibleRequestTokens
+	a.Record("s1", e)
+	totals := a.Snapshot(10*BucketWidth, BucketWidth, "s1", GroupNone).Totals
+
+	if totals.RefusedTokenRequests != 0 {
+		t.Errorf("RefusedTokenRequests = %d for a report exactly at the ceiling, want 0: the bound "+
+			"is inclusive, and refusing here withholds a figure that is real",
+			totals.RefusedTokenRequests)
+	}
+	if totals.Tokens != maxPlausibleRequestTokens || totals.InputTokens != maxPlausibleRequestTokens {
+		t.Errorf("Tokens = %d, InputTokens = %d, want %d for both", totals.Tokens,
+			totals.InputTokens, int64(maxPlausibleRequestTokens))
 	}
 }
 

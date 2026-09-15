@@ -69,11 +69,19 @@ type Config struct {
 // and per-plugin config in place, but the ledger is constructed once at startup and
 // handed to the session store as a recorder, so a running proxy holds whichever writer
 // it opened. Editing anything here — enabled, dir, retention_days — takes effect on
-// RESTART, and turning it off in a live config leaves the existing writer recording to
-// the old directory until the process ends.
+// RESTART.
 //
-// Worth stating rather than leaving to be discovered: an operator who edits this to stop
-// writing cost history has every reason to believe it stopped.
+// The edit is REFUSED rather than ignored: reloader.validateReloadable compares this
+// block the way it compares mode and listener.*, so a live edit fails the reload,
+// leaves LastError naming cost_ledger on /reload/status, and asks for a pod restart.
+//
+// It did not always. This doc used to warn that "an operator who edits this to stop
+// writing cost history has every reason to believe it stopped" — and they did, because
+// the edit was ACCEPTED: ReloadsOK incremented, ActiveConfigSHA256 moved, and /config
+// served the new values while the startup writer kept appending under the old
+// retention. Documenting that was the weaker of the two options available; the guard
+// is three lines and the precedent for it was already in the same function. Pinned by
+// reloader.TestReloader_RefusesCostLedgerChange.
 type CostLedgerConfig struct {
 	// Enabled is a POINTER so "unset" and "explicitly false" are different states.
 	// The local default is on, and an operator has to be able to turn it off; with a
@@ -108,12 +116,22 @@ type CostLedgerConfig struct {
 // number it was WRONG. It was the literal 7, on the reading that "7d" spans seven days;
 // but usage.ParseWindowSpec defines 7d as a ROLLING seven times twenty-four hours, and
 // unless that begins exactly at midnight it starts part-way through one date and ends
-// part-way through another, so the ledger opens EIGHT day files to answer it
-// (usage.Window7dLocalDays). A retention of 7 keeps today and the six before it, so the
-// eighth — the oldest, the one the window opens ON — had already been unlinked:
-// retention_days: 7 passed validation and then answered window:"7d" over a partial
-// week, which is exactly the case this floor exists to refuse. The paragraph above was
-// already saying "eight" while the constant said 7.
+// part-way through another, so the ledger opens EIGHT day files to answer it in an ordinary
+// week. A retention of 7 keeps today and the six before it, so the eighth — the oldest, the
+// one the window opens ON — had already been unlinked: retention_days: 7 passed validation
+// and then answered window:"7d" over a partial week, which is exactly the case this floor
+// exists to refuse. The paragraph above was already saying "eight" while the constant said 7.
+//
+// NINE, NOT EIGHT, and the second correction has the same shape as the first. Eight assumed
+// every day in the week is 24 hours long: a spring-forward week is 167 hours, so a 168-hour
+// rolling span reaches an hour further back than a calendar week and touches a NINTH local
+// date — measured at 00:00 on 2026-03-15 in America/New_York as much as in America/Havana,
+// because 7d's From is a duration subtraction and has nothing to do with where in the day a
+// transition falls. At eight, retention_days: 8 passed validation and then answered
+// window:"7d" over a partial week on the two mornings a year that happens. It is
+// usage.Window7dLocalDays, which is now documented as a CEILING rather than a count for
+// exactly this reason; see there for the alternative fix (making 7d calendar-aligned) and why
+// it is a product decision rather than a bound to correct.
 //
 // One surviving file per day retained is exact rather than approximate: store.prune
 // keeps the days in [ref-(retainDays-1), ref], so retainDays IS the number of dates
@@ -139,7 +157,7 @@ type CostLedgerConfig struct {
 // A test-only dependency is the right shape for a cross-package invariant that is not a
 // runtime relationship: config does not need to KNOW about windows, it needs to AGREE with
 // them, and agreement is a thing to check rather than to compute.
-const minCostLedgerRetentionDays = 8
+const minCostLedgerRetentionDays = 9
 
 // LedgerEnabled reports whether the ledger should run, given the default for this
 // deployment shape.
@@ -160,9 +178,11 @@ func (c *CostLedgerConfig) Validate() error {
 		return fmt.Errorf("cost_ledger.retention_days must not be negative, got %d", c.RetentionDays)
 	}
 	if c.RetentionDays > 0 && c.RetentionDays < minCostLedgerRetentionDays {
-		// Says EIGHT and says why it is not seven: an operator who typed 7 for a seven-day
+		// Says NINE and says why it is not seven: an operator who typed 7 for a seven-day
 		// window is not making a careless mistake, and a message that only quoted the floor
 		// would read as an off-by-one in the software rather than as the rolling span it is.
+		// It names both increments, because 8 is as reasonable a guess as 7 and was the floor
+		// until a spring-forward week was measured against it.
 		// The numbers are spelled out rather than interpolated from authlib/usage, for the
 		// reason minCostLedgerRetentionDays is a literal: this package must not import the
 		// aggregator. Every one of them is pinned against usage's own constants by
@@ -170,8 +190,9 @@ func (c *CostLedgerConfig) Validate() error {
 		// makes this message wrong in a test rather than wrong in front of an operator.
 		return fmt.Errorf("cost_ledger.retention_days must be at least %d, or 0 for the default: "+
 			"the usage API serves window=7d from these day files, and that window is a ROLLING "+
-			"7x24h, so it reads 8 local day files rather than 7 — a shorter retention reports "+
-			"a partial week as a full one, got %d",
+			"7x24h, so it reads 8 local day files rather than 7 — and 9 in a spring-forward "+
+			"week, which is only 167 hours long — a shorter retention reports a partial week "+
+			"as a full one, got %d",
 			minCostLedgerRetentionDays, c.RetentionDays)
 	}
 	return nil

@@ -11,7 +11,7 @@ import (
 
 func TestConfig_CostLedgerSectionParses(t *testing.T) {
 	var c Config
-	// 8, not 7: the floor is usage.Window7dLocalDays, and a fixture below the floor is
+	// 9, not 7 or 8: the floor is usage.Window7dLocalDays, and a fixture below the floor is
 	// not a config this loader would accept — see
 	// TestCostLedgerConfig_TheFloorCoversEveryDayTheWindowTouches.
 	src := `
@@ -19,7 +19,7 @@ mode: proxy-sidecar
 cost_ledger:
   enabled: true
   dir: /var/lib/cortex/cost
-  retention_days: 8
+  retention_days: 9
 `
 	if err := yaml.Unmarshal([]byte(src), &c); err != nil {
 		t.Fatalf("yaml: %v", err)
@@ -30,8 +30,8 @@ cost_ledger:
 	if c.CostLedger.Dir != "/var/lib/cortex/cost" {
 		t.Errorf("dir = %q", c.CostLedger.Dir)
 	}
-	if c.CostLedger.RetentionDays != 8 {
-		t.Errorf("retention_days = %d, want 8", c.CostLedger.RetentionDays)
+	if c.CostLedger.RetentionDays != 9 {
+		t.Errorf("retention_days = %d, want 9", c.CostLedger.RetentionDays)
 	}
 }
 
@@ -49,8 +49,8 @@ func TestCostLedgerConfig_UnsetAndExplicitFalseDiffer(t *testing.T) {
 	}{
 		{"no block, local default on", "mode: proxy-sidecar\n", true, true},
 		{"no block, cluster default off", "mode: proxy-sidecar\n", false, false},
-		{"block present but enabled unset, local", "mode: proxy-sidecar\ncost_ledger:\n  retention_days: 8\n", true, true},
-		{"block present but enabled unset, cluster", "mode: proxy-sidecar\ncost_ledger:\n  retention_days: 8\n", false, false},
+		{"block present but enabled unset, local", "mode: proxy-sidecar\ncost_ledger:\n  retention_days: 9\n", true, true},
+		{"block present but enabled unset, cluster", "mode: proxy-sidecar\ncost_ledger:\n  retention_days: 9\n", false, false},
 		{"explicit false beats the local default", "mode: proxy-sidecar\ncost_ledger:\n  enabled: false\n", true, false},
 		{"explicit true beats the cluster default", "mode: proxy-sidecar\ncost_ledger:\n  enabled: true\n", false, true},
 	} {
@@ -63,8 +63,8 @@ func TestCostLedgerConfig_UnsetAndExplicitFalseDiffer(t *testing.T) {
 			// value in a fixture would not fail anything — it would just quietly teach a
 			// retention the loader rejects. One of them said retention_days: 5, which stopped
 			// being legal when the floor landed beside it, and two said 7, which stopped being
-			// legal when the floor was corrected to the eight day files window=7d actually
-			// reads. This check is what caught both.
+			// legal when the floor was corrected to the nine day files window=7d can touch in a
+			// spring-forward week. This check is what caught both.
 			if c.CostLedger != nil {
 				if verr := c.CostLedger.Validate(); verr != nil {
 					t.Errorf("fixture is not a config this loader would accept: %v", verr)
@@ -90,12 +90,15 @@ func TestCostLedgerConfig_RejectsNegativeRetention(t *testing.T) {
 // window:"7d", priced:true over two days of spend — indistinguishable downstream from
 // a genuinely quiet week.
 //
-// 7 IS IN THIS TABLE, and it is the case that matters: it is the number an operator
-// reading "window=7d" types, it used to be accepted, and it is one day file short —
-// the eighth date, which is the oldest and the one the rolling window opens on, had
-// already been pruned. See TestCostLedgerConfig_TheFloorCoversEveryDayTheWindowTouches.
+// 7 AND 8 ARE BOTH IN THIS TABLE, and they are the cases that matter, because each was
+// once the floor. 7 is the number an operator reading "window=7d" types, and it is one day
+// file short: the eighth date, the oldest and the one the rolling window opens on, had
+// already been pruned. 8 covers an ordinary week and is short by one file in a
+// spring-forward week, which is only 167 hours long — the same defect arrived at by a
+// second route. See TestCostLedgerConfig_TheFloorCoversEveryDayTheWindowTouches and
+// usage.Window7dLocalDays.
 func TestCostLedgerConfig_RejectsARetentionShorterThanTheLongestWindow(t *testing.T) {
-	for _, days := range []int{1, 2, 6, 7} {
+	for _, days := range []int{1, 2, 6, 7, 8} {
 		c := &CostLedgerConfig{RetentionDays: days}
 		err := c.Validate()
 		if err == nil {
@@ -129,10 +132,19 @@ func TestCostLedgerConfig_ZeroRetentionIsStillTheDefault(t *testing.T) {
 // passed validation and still served window:"7d" over a partial week, which is exactly
 // the case the floor exists to prevent.
 //
+// AND THEN IT ADMITTED A SECOND ONE AT EIGHT. Eight is what an ordinary week touches, but a
+// spring-forward week is 167 hours, so a rolling 168-hour span reaches into a NINTH date and
+// retention_days: 8 answered window:"7d" over a partial week on the two mornings a year that
+// happens. usage.Window7dLocalDays is now a CEILING of nine rather than a count of eight.
+//
 // The day count is derived from ParseWindowSpec here rather than compared against
 // usage.Window7dLocalDays, so that this test fails if either the window's definition
-// or the floor moves. The second assertion is the one that keeps the constants from
-// drifting apart again.
+// or the floor moves. It measures an ORDINARY week — this package has no zone fixtures and
+// time.Local is whatever the runner has — so it asserts the floor is not SHORT of eight; that
+// the ceiling is reached by the 167-hour week is pinned next to the constant, in
+// usage.TestParseWindowSpec_ASpringForwardWeekReachesTheNinthLocalDate. The equality
+// assertion below is the link between the two, and is what keeps the constants from drifting
+// apart again.
 func TestCostLedgerConfig_TheFloorCoversEveryDayTheWindowTouches(t *testing.T) {
 	// Mid-afternoon, i.e. not the midnight special case: this is the shape every real
 	// request has.
@@ -161,11 +173,13 @@ func TestCostLedgerConfig_TheFloorCoversEveryDayTheWindowTouches(t *testing.T) {
 			"DERIVED from the window it protects, or the two drift again",
 			minCostLedgerRetentionDays, usage.Window7dLocalDays)
 	}
-	// And the boundary is refused, not merely met: one day short of the span is the
-	// value an operator actually types.
-	if verr := (&CostLedgerConfig{RetentionDays: days - 1}).Validate(); verr == nil {
-		t.Errorf("retention_days: %d accepted; it holds one day file fewer than window=%q reads",
-			days-1, usage.Window7d)
+	// And the boundary is refused, not merely met: one day short of the FLOOR is the value an
+	// operator actually types, and it is now 8 rather than 7 — the number this floor itself
+	// used to be, which covers an ordinary week and is one file short of a spring-forward one.
+	if verr := (&CostLedgerConfig{RetentionDays: usage.Window7dLocalDays - 1}).Validate(); verr == nil {
+		t.Errorf("retention_days: %d accepted; it holds one day file fewer than the most days "+
+			"window=%q can touch (%d), which is the partial week this floor refuses",
+			usage.Window7dLocalDays-1, usage.Window7d, usage.Window7dLocalDays)
 	}
 }
 
@@ -201,13 +215,82 @@ func TestMinCostLedgerRetentionDays_MatchesTheWindowItProtects(t *testing.T) {
 			"Update the constant AND the numbers spelled out in Validate's message.",
 			got, usage.Window7d, want, got, usage.Window7d)
 	}
-	// The message says "a ROLLING 7x24h, so it reads 8 local day files rather than 7".
-	// Pin both halves so the prose cannot drift from the constants either.
+	// The message says "a ROLLING 7x24h, so it reads 8 local day files rather than 7 — and 9
+	// in a spring-forward week". Pin all three numbers so the prose cannot drift from the
+	// constants either.
 	if days := int(usage.Window7dSpan / (24 * time.Hour)); days != 7 {
 		t.Errorf("Validate's message says the window is a rolling 7x24h, but it is %dx24h", days)
 	}
-	if usage.Window7dLocalDays != 8 {
-		t.Errorf("Validate's message says the window reads 8 local day files, but it reads %d",
-			usage.Window7dLocalDays)
+	if usage.Window7dLocalDays != 9 {
+		t.Errorf("Validate's message says a spring-forward week reads 9 local day files, but the "+
+			"ceiling is %d", usage.Window7dLocalDays)
 	}
+	// The ordinary-week figure the message also quotes. Stated as the ceiling minus the
+	// spring-forward day rather than as a bare 8, so the two cannot drift apart.
+	if ordinary := usage.Window7dLocalDays - 1; ordinary != 8 {
+		t.Errorf("Validate's message says an ordinary week reads 8 local day files, but the "+
+			"ceiling implies %d", ordinary)
+	}
+}
+
+// The ledger has no path to an event without the session store: it records by being
+// registered as a Recorder on it, and the block that constructs it in
+// authbridge-proxy's main is nested inside `if cfg.Session.SessionEnabled()`. This
+// pair used to load, validate, report success, and write nothing — with no error, no
+// warning, and no log line naming the ledger anywhere.
+//
+// Refused rather than warned because no deployment decision can make it work: the two
+// settings contradict each other. The message has to name BOTH, since the fix is a
+// choice between them.
+func TestValidate_RefusesTheLedgerWithoutSessions(t *testing.T) {
+	on, off := true, false
+	c := &Config{
+		Mode:       ModeProxySidecar,
+		Listener:   forwardOnlyListener(),
+		Session:    SessionConfig{Enabled: &off},
+		CostLedger: &CostLedgerConfig{Enabled: &on},
+	}
+	err := Validate(c)
+	if err == nil {
+		t.Fatal("cost_ledger.enabled: true with session.enabled: false accepted; " +
+			"the ledger is registered as a Recorder on the session store, so it can never see an event")
+	}
+	for _, want := range []string{"cost_ledger", "session"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("error %q does not name %q — the fix is a choice between the two settings", err, want)
+		}
+	}
+}
+
+// The refusal must be narrow. It fires on an EXPLICIT `enabled: true` only, because an
+// absent `enabled` means "the caller's default" — on for a local install, off in
+// Kubernetes — and failing startup over a default nobody wrote would break a
+// deployment that legitimately runs with sessions off. The default-on case is a Warn
+// at the call site instead (warnCostLedgerNeedsSessions in cmd/authbridge-proxy).
+func TestValidate_TheLedgerSessionRefusalIsNarrow(t *testing.T) {
+	on, off := true, false
+	for _, tc := range []struct {
+		name string
+		cfg  *Config
+	}{
+		{"sessions on, ledger on", &Config{Mode: ModeProxySidecar, Listener: forwardOnlyListener(), Session: SessionConfig{Enabled: &on}, CostLedger: &CostLedgerConfig{Enabled: &on}}},
+		{"sessions unset (defaults on), ledger on", &Config{Mode: ModeProxySidecar, Listener: forwardOnlyListener(), CostLedger: &CostLedgerConfig{Enabled: &on}}},
+		{"sessions off, ledger block present but enabled unset", &Config{Mode: ModeProxySidecar, Listener: forwardOnlyListener(), Session: SessionConfig{Enabled: &off}, CostLedger: &CostLedgerConfig{RetentionDays: 9}}},
+		{"sessions off, ledger explicitly off", &Config{Mode: ModeProxySidecar, Listener: forwardOnlyListener(), Session: SessionConfig{Enabled: &off}, CostLedger: &CostLedgerConfig{Enabled: &off}}},
+		{"sessions off, no ledger block", &Config{Mode: ModeProxySidecar, Listener: forwardOnlyListener(), Session: SessionConfig{Enabled: &off}}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if err := Validate(tc.cfg); err != nil {
+				t.Errorf("rejected a legitimate config: %v", err)
+			}
+		})
+	}
+}
+
+// forwardOnlyListener is the --local listener shape: proxy-sidecar with the forward
+// role only, which is the deployment the cost ledger actually runs in. Spelled here
+// so these fixtures exercise validateCostLedger rather than tripping the reverse
+// role's reverse_proxy_backend requirement first.
+func forwardOnlyListener() ListenerConfig {
+	return ListenerConfig{Roles: []string{RoleForward}}
 }

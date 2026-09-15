@@ -135,3 +135,72 @@ func TestWriteDemoConfig_PreservesAnExistingFile(t *testing.T) {
 		t.Errorf("edits were overwritten:\n%s", got)
 	}
 }
+
+// A relative cost_ledger.dir must be refused, not resolved.
+//
+// costLedgerDir's own comment says it returns an error rather than falling back to
+// the working directory, "for the reason defaultCortexDir does" — and then returned
+// `dir` verbatim, so `dir: cost` produced exactly that failure. The proxy's working
+// directory is not a property of the config: a launchd job, a container and a shell
+// in a checkout each resolve it somewhere else, so one setting scatters day files
+// across three directories and a query opens one of them and reports the rest as
+// absent.
+func TestCostLedgerDir_RefusesARelativeDir(t *testing.T) {
+	for _, dir := range []string{"cost", "./cost", "../cost", "cortex/cost"} {
+		cfg := &config.Config{CostLedger: &config.CostLedgerConfig{Dir: dir}}
+		got, err := costLedgerDir(cfg)
+		if err == nil {
+			t.Errorf("cost_ledger.dir %q accepted, resolved to %q; it would resolve against the "+
+				"proxy's working directory, which is what this function's comment says it refuses", dir, got)
+			continue
+		}
+		// The operator has to be able to tell which setting to fix.
+		if !strings.Contains(err.Error(), "cost_ledger.dir") {
+			t.Errorf("error for %q does not name the setting: %v", dir, err)
+		}
+		if got != "" {
+			t.Errorf("returned %q alongside an error; the caller would write there", got)
+		}
+	}
+}
+
+// An absolute dir is honoured and cleaned. Cleaning is not cosmetic: the writer's
+// per-day file handling is keyed on the path, so a trailing slash or a doubled
+// separator naming the same directory twice is a way to get two handles on one day
+// file.
+func TestCostLedgerDir_HonoursAndCleansAnAbsoluteDir(t *testing.T) {
+	base := t.TempDir()
+	for _, in := range []string{base + "/cost", base + "/cost/", base + "//cost", base + "/./cost"} {
+		cfg := &config.Config{CostLedger: &config.CostLedgerConfig{Dir: in}}
+		got, err := costLedgerDir(cfg)
+		if err != nil {
+			t.Fatalf("cost_ledger.dir %q rejected: %v", in, err)
+		}
+		if want := filepath.Join(base, "cost"); got != want {
+			t.Errorf("cost_ledger.dir %q resolved to %q, want the cleaned %q", in, got, want)
+		}
+	}
+}
+
+// With no dir set the default still applies, and it is still absolute — the floor the
+// refusal above rests on. Derived from $HOME rather than stored in the config, so a
+// config copied between machines does not point at someone else's home.
+func TestCostLedgerDir_DefaultsUnderCortexDirAndIsAbsolute(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	for _, cfg := range []*config.Config{
+		nil,
+		{},
+		{CostLedger: &config.CostLedgerConfig{RetentionDays: 8}},
+	} {
+		got, err := costLedgerDir(cfg)
+		if err != nil {
+			t.Fatalf("costLedgerDir(%+v): %v", cfg, err)
+		}
+		if !filepath.IsAbs(got) {
+			t.Errorf("default ledger dir %q is not absolute", got)
+		}
+		if filepath.Base(got) != costLedgerDirName {
+			t.Errorf("default ledger dir %q does not end in %q", got, costLedgerDirName)
+		}
+	}
+}

@@ -60,6 +60,16 @@
 //     coverage denominator and not in the ledger's. It is priced in both, so the
 //     dollars match and only the ratio differs.
 //
+//   - A REFUSED FIGURE is counted as priceable here and nowhere in the ring. A record
+//     carrying costevent.RejectedImplausible says a cost was on the wire and this proxy
+//     declined it, and the writer records that as priceable-and-unpriced so the coverage
+//     gap survives to tomorrow. usage.Aggregator.costOf reaches the record through
+//     costevent.Decode, which reports nothing at all for an unpriced one, so the ring
+//     counts the response in Requests and in no other counter. The dollars are zero in
+//     both and only the ratio differs — the same shape as the bullet above, in the
+//     opposite direction. It is deliberate: the refusal exists to keep a coverage gap
+//     nameable, and this is the surface that is still there tomorrow to name it on.
+//
 //   - The token fields read here are the modern ones only. pricing.UsageFromInference
 //     still falls back to InferenceExtension.PromptTokens and CompletionTokens when the
 //     split counters are absent, so a producer emitting only the legacy pair yields a
@@ -83,6 +93,7 @@ package costledger
 import (
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/rossoctl/cortex/authbridge/authlib/usage"
 )
@@ -176,18 +187,39 @@ func (r Row) key() key {
 // TestRecord_LabelsAreCappedSoALineCanNeverExceedTheReadLimit pins the arithmetic.
 const maxLabelLen = 96
 
-// truncateLabel caps one label. A byte cut, matching usage.truncateLabel and
-// pipeline's maxClientLen exactly — including its documented willingness to split a
-// multi-byte rune, because two truncation rules for one string that appears in both
-// places would be a worse trade than the occasional replacement character.
+// truncateLabel caps one label at maxLabelLen BYTES, cut on a RUNE boundary.
+//
+// THE CAP STAYS IN BYTES because bytes are what it bounds: the length of a line in an
+// append-only file, and through that the reachability of readDay's unskippable-line
+// path. Cutting on a rune boundary moves where that cap lands by at most three bytes
+// and does not weaken it.
+//
+// IT USED TO BE A PLAIN BYTE CUT, which halved whatever rune straddled byte 96 and left
+// an invalid UTF-8 sequence in a DURABLE file that other tools parse — and it did so
+// most readily on exactly the labels this package rewrites, since sanitizeLabel emits
+// 3-byte U+FFFD runes and rowLabel cuts afterwards. The old comment defended the byte
+// cut on the grounds that a model name is "effectively always ASCII" and that one
+// truncation rule beats two; the first is a caller's choice rather than a fact, and the
+// second is now satisfied the other way round — pipeline.capUA cuts on a rune boundary
+// too.
+//
+// usage.truncateLabel is the remaining byte cut, on the ring's in-memory copies of the
+// same labels. Named rather than silently diverged from: it is a different package's
+// file, its strings die with the process, and the fix belongs with its owner.
 func truncateLabel(s string) string {
 	if len(s) <= maxLabelLen {
 		return s
 	}
-	return s[:maxLabelLen]
+	cut := maxLabelLen
+	// Walk back off a continuation byte; at most three steps, since no UTF-8 sequence
+	// is longer than four bytes.
+	for cut > 0 && !utf8.RuneStart(s[cut]) {
+		cut--
+	}
+	return s[:cut]
 }
 
-// sanitizeLabel replaces control characters and DEL with U+FFFD.
+// sanitizeLabel replaces C0 controls, DEL and C1 controls with U+FFFD.
 //
 // These strings are request- or upstream-controlled — Endpoint is the host the
 // workload asked for and Model comes straight off the parsed request body — and they
@@ -200,11 +232,32 @@ func truncateLabel(s string) string {
 // plausible-looking label: "m\x1b[31mx" reads as "m�[31mx" rather than as "m[31mx",
 // which nobody would question.
 //
-// This is the same rule abctl's tui.sanitizeLabel applies when RENDERING these labels,
-// and it is deliberately NOT that function: cmd/ is a main-module package this library
-// must not import. Two copies of a five-line rule beats a dependency edge the wrong way
-// round; the rule is stated in both doc comments so a future change to either is a
-// visible divergence rather than a silent one.
+// C1 IS INCLUDED — U+0080–U+009F — and leaving it out was the gap this comment used to
+// describe as complete. U+009B is the single-character CSI: a terminal decoding UTF-8
+// acts on it exactly as it acts on ESC [, so "2J" clears the pane with no ESC byte in
+// the label at all. C1 encodes as 0xC2 0x80–0xC2 0x9F, so nothing in it is below 0x20
+// and the byte scan this function used to gate on stepped straight past it. An invalid
+// byte is replaced too, so the label held in memory, the label served, and the label
+// encoding/json would have written are one string rather than three.
+//
+// SHARED RULE, THREE COPIES, AND THE FIRST TWO MUST STAY IDENTICAL:
+//
+//   - pipeline.sanitizeUA is the PRIMARY guard for the Agent label. It sits in
+//     ParseUserAgent, where a User-Agent header becomes a value, so it covers the live
+//     usage aggregator as well as this file — one choke point for both consumers of
+//     EventClient.Label rather than one fix per consumer.
+//   - THIS one is the primary guard for Endpoint, Model and Provenance, which never pass
+//     through that parser, and defence in depth for Agent. It stays for that reason
+//     rather than out of habit: it is the copy in front of a file that is retained for
+//     retentionDays and cannot be edited afterwards, so it is the one that has to hold
+//     even if a future edit weakens the other.
+//   - abctl's tui.sanitizeLabel is a third copy, at RENDER time, in a main module this
+//     library must not import. It still filters C0 and DEL only — named here because a
+//     divergence stated is a divergence someone can fix.
+//
+// Two copies of a five-line rule beats a dependency edge the wrong way round; two copies
+// with different rules is the thing to avoid, so a change to either of the first two
+// belongs in both.
 //
 // NOT a JSON-integrity guard — encoding/json escapes control bytes, so an unsanitised
 // label could never split a line or break readDay. Every consumer downstream of the
@@ -216,35 +269,55 @@ func truncateLabel(s string) string {
 // the ring's copy dies with the process, and the ledger's is the one that survives —
 // so the divergence is the right way round. The matching fix belongs in usage.
 func sanitizeLabel(s string) string {
-	if !hasControlBytes(s) {
+	if !hasControlRunes(s) {
 		// The overwhelmingly common case, and no allocation for it: this runs on the
 		// session-append path, under the store's write lock.
 		return s
 	}
 	var b strings.Builder
 	b.Grow(len(s))
-	for _, r := range s {
-		if r == 0x7f || r < 0x20 {
+	for i := 0; i < len(s); {
+		r, size := utf8.DecodeRuneInString(s[i:])
+		if isControlRune(r) || (r == utf8.RuneError && size == 1) {
 			b.WriteRune('\uFFFD')
+			i += size
 			continue
 		}
-		b.WriteRune(r)
+		b.WriteString(s[i : i+size])
+		i += size
 	}
 	return b.String()
 }
 
-// hasControlBytes reports whether s carries a C0 control byte or DEL.
+// hasControlRunes reports whether s carries anything sanitizeLabel would replace.
 //
-// A BYTE scan, which is exact rather than approximate: no continuation byte of a
-// multi-byte UTF-8 sequence is below 0x80, so a byte below 0x20 can only be that
-// character itself.
-func hasControlBytes(s string) bool {
-	for i := 0; i < len(s); i++ {
-		if s[i] == 0x7f || s[i] < 0x20 {
+// A RUNE scan, and it has to be one. A byte scan is exact for C0 and DEL \u2014 no
+// continuation byte of a multi-byte UTF-8 sequence is below 0x80, so a byte below 0x20
+// can only be that character itself \u2014 and blind to C1, which lives entirely above 0x80.
+// That blindness is what let U+009B through. The tests read this as the "did anything
+// hostile reach disk" predicate, so it has to name the same set the rewrite replaces.
+//
+// An INVALID byte reports true (RuneError at size 1 is the decoder saying "this is not
+// UTF-8"); a legitimately encoded U+FFFD does not, because it decodes at size 3 \u2014 so an
+// already-sanitised label does not read as still hostile.
+func hasControlRunes(s string) bool {
+	for i := 0; i < len(s); {
+		r, size := utf8.DecodeRuneInString(s[i:])
+		if isControlRune(r) || (r == utf8.RuneError && size == 1) {
 			return true
 		}
+		i += size
 	}
 	return false
+}
+
+// isControlRune reports whether r is a C0 control, DEL, or a C1 control.
+//
+// The one predicate the scan and the rewrite both read, so they cannot disagree about
+// what a control character is. pipeline.isControlRune has the same three clauses in the
+// same order; see sanitizeLabel for why there are two of them.
+func isControlRune(r rune) bool {
+	return r < 0x20 || r == 0x7f || (r >= 0x80 && r <= 0x9f)
 }
 
 // rowLabel prepares one string for a durable row: sanitised, then capped.
@@ -252,7 +325,9 @@ func hasControlBytes(s string) bool {
 // THE ORDER MATTERS. Sanitising can triple a string's length — every replaced byte
 // becomes three — so capping first would let a label of 96 control bytes reach 288 on
 // disk and break the line-length arithmetic maxLabelLen exists to guarantee. Capping
-// last can split a U+FFFD, which truncateLabel already documents as an accepted cost.
+// last used to be able to split a U+FFFD in half and put an invalid UTF-8 fragment in a
+// durable row; truncateLabel now cuts on a rune boundary, so this order costs nothing
+// and the byte bound still holds exactly.
 func rowLabel(s string) string {
 	return truncateLabel(sanitizeLabel(s))
 }

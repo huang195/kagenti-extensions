@@ -20,16 +20,21 @@ import "math"
 // WHAT IT DOES NOT BOUND: THE ACCUMULATED SUM. This comment used to claim it closed the
 // aggregate wrap — "two such requests wrapped usage.Counts.Add to a NEGATIVE total" — and
 // that overclaimed. It moved the threshold; it did not remove it. math.MaxInt64 /
-// MaxCostMicros is 1023, so 1024 requests each priced at the bound still wrap Counts.Add
-// to a large negative total (measured: -9214364837600034816), which then sits in the
+// MaxCostMicros is 1023, so 1024 requests each priced at the bound would wrap Counts.Add
+// to a large negative total (measured: -9214364837600034816), which then sat in the
 // durable ledger for its full retention with no repair path.
 //
 // NO per-request bound can close that, and the arithmetic says so in one line: for any
 // bound C > 0 the sum wraps after ceil(math.MaxInt64/C) requests, and nothing here bounds
 // the request count. A smaller C buys distance, not closure. Closing it takes a CHECKED
-// ACCUMULATE where the sum is kept — usage.Counts.Add and the ledger's own totals — which
-// is a different package's invariant and is not this constant's to hold.
-// TestNoPerRequestBoundClosesTheAccumulationWrap pins that reasoning.
+// ACCUMULATE where the sum is kept, which is a different package's invariant and not this
+// constant's to hold. TestNoPerRequestBoundClosesTheAccumulationWrap pins that reasoning.
+//
+// AND IT IS NOW CLOSED THERE, so read the paragraph above as arithmetic rather than as an
+// open defect: usage.Counts.Add routes every field through a checked accumulate that
+// saturates instead of wrapping and sets Counts.Saturated to disclose that the figure has
+// become a floor. What remains true is the part this constant is responsible for — a
+// per-request bound cannot do it, and pushing MaxCostMicros lower would not have.
 //
 // EXCLUSIVE: a figure of exactly MaxCostMicros is out of range (MicrosFromUSD rejects
 // `micros >= MaxCostMicros`). 2^53 is the first integer whose successor float64 cannot
@@ -55,14 +60,37 @@ const (
 	// whole window — so 2,000,000 already covers the worst real call. Ten million is
 	// 5x that, so a future window growth cannot turn a legitimate bill into a
 	// coverage gap.
+	//
+	// EXPORTED AS MaxPlausibleTokens below, because authlib/usage needs the same bound to
+	// refuse an implausible token report and had restated it as a second literal. Two
+	// literals that must agree is the shape that let the retention floor drift from the
+	// window it protects; one definition and one importer is the fix.
 	maxPlausibleTokens = 10_000_000
 
 	// maxPlausibleMicrosPerToken is the highest per-token rate one tier could carry, in
 	// micros: 1,000 micros = $0.001/token = $1,000 per million tokens. The most
 	// expensive tier in the bundled VENDOR LIST table is $7.5e-05/token (Claude 3 Opus
-	// / Opus 4 output, $75/Mtok), so this is ~13x the dearest rate that ships today and
-	// a model priced an order of magnitude above anything current still settles
-	// normally.
+	// / Opus 4 output, $75/Mtok), so this is 13.3x the dearest RAW rate that ships today.
+	//
+	// THE EFFECTIVE MARGIN IS 1.33x, NOT 13x, and the difference is a multiplier. A
+	// resolved rate is the table rate times MultiplierRule.Factor, which validate caps at
+	// maxMultiplier = 10 — so what this ceiling has to clear is not the dearest rate in
+	// the table but the dearest rate a legitimate config can PRODUCE from it: 7.5e-05 x 10
+	// = 7.5e-04/token, against a ceiling of 1e-03. That is 1.33x of headroom.
+	//
+	// The comment used to claim the 13x and stop there, which overstated its own
+	// protection: a $100/Mtok model at a 10x markup reaches the cap, and
+	// TestMaxPlausibleRequestCostMicros_Derivation only ever scanned the raw Bundled()
+	// rates, so it would have gone green while it happened. It now applies maxMultiplier
+	// to the scan, and fails when the REAL headroom is exhausted rather than when the raw
+	// rate is.
+	//
+	// 1.33x is thin but it is not the number to raise on its own: this ceiling times
+	// maxPlausibleTokens is what gives the cap three orders of magnitude over the worst
+	// call anyone can actually construct (see MaxPlausibleRequestCostMicros), and a 10x
+	// markup over vendor list is arguably not a legitimate config in the first place. If a
+	// bundled rate ever moves past $100/Mtok, the derivation test is what will say so, and
+	// both halves get revisited then.
 	maxPlausibleMicrosPerToken = 1_000
 )
 
@@ -91,6 +119,22 @@ const (
 // ambiguity at the edge to exclude, and the derivation reads "the most a request could
 // plausibly cost" — that figure is by construction still plausible.
 const MaxPlausibleRequestCostMicros int64 = maxPlausibleTokens * maxPlausibleMicrosPerToken
+
+// MaxPlausibleTokens is the largest token count one request could plausibly report, per
+// field. See maxPlausibleTokens for the derivation — this is that constant, exported.
+//
+// It exists because authlib/usage refuses an implausible token report and needs the same
+// bound: the token fields arrive as a provider-controlled `int` on the wire, so without one
+// a forged response that cannot move the dollar total past $10,000 could still move the
+// token total by 9.2e18, and a client renders the two side by side.
+//
+// ONE DEFINITION, ONE IMPORTER, deliberately. usage restated this as a second literal with a
+// comment recording the duplication as debt — and it was right to: two literals that must
+// agree is precisely the shape that let config's retention floor drift from the window span
+// it protects, shipping a floor of 7 against a window that opens 8 files. Exporting the bound
+// here and deriving there means a future change to the plausible ceiling cannot move one
+// without the other.
+const MaxPlausibleTokens = maxPlausibleTokens
 
 // PlausibleRequestCostUSD reports whether usd could be what ONE inference request cost.
 //

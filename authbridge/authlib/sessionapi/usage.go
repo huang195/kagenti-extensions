@@ -334,33 +334,62 @@ var errSessionWithSymbolicWindow = usageError{
 // which is a claim the rows do not support — the gap is still visible, in
 // Totals.PricedRequests against Totals.PriceableRequests.
 func (s *Server) ledgerSnapshot(ctx context.Context, spec usage.Spec, group usage.Group) (usage.Snapshot, error) {
-	rows, err := s.ledger.Window(ctx, spec.From, spec.To)
+	rows, caveats, err := s.ledger.Window(ctx, spec.From, spec.To)
 	if err != nil {
 		return usage.Snapshot{}, err
 	}
-	totals, series, ungrouped := costledger.Fold(rows, group)
-	// Read AFTER Window, never before: both counters are gauges for the most recent read,
-	// so sampling them earlier would report the previous caller's answer as this one's.
+	// THE GROUPING THIS SOURCE CAN APPLY, which is not always the one that was asked for,
+	// and the response says which it was.
+	//
+	// A ledger row is (endpoint, model, agent, provenance) per minute, so group=session,
+	// group=status and group=plugin have no column to key on here — while the ring, which
+	// serves the same axes over a duration window, answers all three. Echoing the
+	// requested group over an empty series made those two states indistinguishable from
+	// the response: a client asking for status got group:"status" with series:null and no
+	// way to tell "this source cannot break down by status" from "there was no traffic".
+	// Worse, Fold used to publish a residual for them, so the response also claimed 100%
+	// of its own total was unaccounted for. See costledger.Groupable.
+	//
+	// Reported as the grouping IN EFFECT rather than refused with a 400, because a
+	// rejection would have to be conditional on a ledger being wired up at all — the same
+	// request is served from the ring in Kubernetes, where it is answerable — and an API
+	// whose validity depends on the deployment is one a client cannot code against. That
+	// is the argument the session= guard above makes in the other direction, and it is
+	// load-bearing in both.
+	applied := group
+	if !costledger.Groupable(group) {
+		applied = usage.GroupNone
+	}
+	totals, series, ungrouped := costledger.Fold(rows, applied)
+	// FROM THE READ THAT PRODUCED THEM, which is why they come back from Window rather
+	// than off the ledger. They used to be two atomics on the Writer, sampled here right
+	// after Window returned — so any other /v1/usage request landing between those two
+	// calls handed this response its caveats. Measured: a reader of a day file holding one
+	// undecodable line reported SkippedLines 0, while a reader of a CLEAN day reported 1.
+	// A chart polling this endpoint is exactly the traffic that produces it.
 	//
 	// Surfaced here because the ledger having the numbers is not the same as a client
 	// being able to see them. Until this, a day that lost lines produced a response
 	// byte-identical to a clean one — a short total under priced:true — so the skip that
 	// saved the rest of the day was invisible to everyone downstream of it.
 	var degraded *usage.Degraded
-	if skipped, truncated := s.ledger.SkippedLines(), s.ledger.TruncatedDays(); skipped > 0 || truncated > 0 {
-		degraded = &usage.Degraded{SkippedLines: skipped, TruncatedDays: truncated}
+	if !caveats.Clean() {
+		degraded = &usage.Degraded{SkippedLines: caveats.SkippedLines, TruncatedDays: caveats.TruncatedDays}
 		// At Warn, and unconditionally: a client may not render the field, and an operator
 		// with a corrupt day file wants to hear about it once per read rather than never.
 		slog.Warn("sessionapi: cost ledger read was incomplete — the total is short",
-			"window", spec.Label, "skippedLines", skipped, "truncatedDays", truncated)
+			"window", spec.Label, "skippedLines", caveats.SkippedLines,
+			"truncatedDays", caveats.TruncatedDays)
 	}
 	snap := usage.Snapshot{
 		Window:        spec.Label,
 		BucketSeconds: int(spec.To.Sub(spec.From).Seconds()),
-		Group:         group,
-		Buckets:       []usage.Bucket{{At: spec.From, Counts: totals, Series: series}},
-		Totals:        totals,
-		Degraded:      degraded,
+		// The grouping SERVED, on the same rule as Window above: a response says what it
+		// actually did, and a client that asked for something else learns so by comparing.
+		Group:    applied,
+		Buckets:  []usage.Bucket{{At: spec.From, Counts: totals, Series: series}},
+		Totals:   totals,
+		Degraded: degraded,
 		// Same rule as Aggregator.Snapshot: an inexact figure is still a figure, so a
 		// window whose every request was a truncated stream reports priced:true over a
 		// real total and discloses the caveat in Totals.IncompleteRequests. Withholding

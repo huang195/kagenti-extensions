@@ -92,7 +92,7 @@ import (
 // 250,000 micros instead of 1,250,000. Recorded here because it is the same mistake
 // twice — a reader deciding what to discard from an invariant it cannot check — and the
 // second fix is what removes the class rather than the instance.
-func (w *Writer) Window(ctx context.Context, from, to time.Time) ([]Row, error) {
+func (w *Writer) Window(ctx context.Context, from, to time.Time) ([]Row, Caveats, error) {
 	fromMin, toMin := span(from, to)
 	pending, _, gen := w.pending()
 	if w.betweenWindowReads != nil {
@@ -100,14 +100,14 @@ func (w *Writer) Window(ctx context.Context, from, to time.Time) ([]Row, error) 
 		w.betweenWindowReads()
 	}
 
-	rows, err := w.Query(ctx, from, to)
+	rows, caveats, err := w.Query(ctx, from, to)
 	if err != nil {
-		return nil, err
+		return nil, Caveats{}, err
 	}
 	if w.flushGeneration() != gen {
 		// Step 3: the accumulator moved while this read ran, so the snapshot may be on
 		// disk too. Return the disk half alone rather than risk counting a minute twice.
-		return rows, nil
+		return rows, caveats, nil
 	}
 	for _, r := range pending {
 		if m := r.At.Truncate(time.Minute); m.Before(fromMin) || m.After(toMin) {
@@ -119,8 +119,53 @@ func (w *Writer) Window(ctx context.Context, from, to time.Time) ([]Row, error) 
 		}
 		rows = append(rows, r)
 	}
-	return rows, nil
+	return rows, caveats, nil
 }
+
+// Caveats is what ONE READ could not deliver — and it belongs to that read.
+//
+// RETURNED, NOT STORED, and that is the fix rather than a style choice. These two counts
+// used to be atomics on the Writer, set by whichever Query ran last and sampled by the
+// caller afterwards, so two concurrent /v1/usage readers swapped each other's answers.
+// Measured, with one clean day file and one holding an undecodable line:
+//
+//	reader A read the CORRUPT day and then reported SkippedLines() = 0
+//	reader B read the CLEAN   day and then reported SkippedLines() = 1
+//
+// Both directions of the same defect in one interleaving: a damaged day served as
+// complete, and a clean day carrying a caveat that described someone else's file. No
+// ordering is needed to produce it — the read and the sample are two separate calls, and
+// anything at all between them is another reader's write. sessionapi does exactly that,
+// once per request, on an endpoint a chart polls.
+//
+// STILL A GAUGE RATHER THAN A COUNTER, in the sense the old doc meant: it describes the
+// read that returned it and never accumulates. A day file with one corrupt line is
+// re-read on every /v1/usage request, and a cumulative count would climb forever over one
+// piece of damage and read as an escalating fault. Attaching it to the read is what makes
+// that true per caller instead of per process.
+type Caveats struct {
+	// SkippedLines is how many lines this read could not decode and stepped over. Each is
+	// spend that happened and is not in the rows returned beside it.
+	//
+	// A FLOOR ON ROWS LOST, not an exact count of them. One undecodable line is usually one
+	// row, but a line that is a crash fragment with the next append concatenated onto it is
+	// one line holding two lost rows — measured. So a non-zero value here means "at least
+	// this many rows are missing", which is the reading a client has to present. See
+	// store.appendBytes for why the bytes cannot support an exact figure.
+	SkippedLines int64
+	// TruncatedDays is how many day files this read ABANDONED part-way — an IO error, or a
+	// line past maxLineBytes that a scanner cannot step over.
+	//
+	// Worse than a skipped line by an unknown amount: everything after that offset is
+	// missing and the file gives no way to say how much. Tracked separately from a skip
+	// rather than added to it for exactly that reason.
+	TruncatedDays int64
+}
+
+// Clean reports that the read lost nothing, so a caller can disclose the caveats only
+// when there are some. The absent-not-zero convention usage.Degraded documents: zeros in
+// an always-present object read as "checked, fine" from a producer that never checked.
+func (c Caveats) Clean() bool { return c == Caveats{} }
 
 // Query returns every row whose minute falls in [from, to], inclusive at minute
 // granularity.
@@ -128,10 +173,12 @@ func (w *Writer) Window(ctx context.Context, from, to time.Time) ([]Row, error) 
 // Reads only what the Writer has flushed — closed minutes. Prefer Window, which
 // adds the open minute; this is the disk half on its own, kept separate so
 // "only closed minutes reach disk" stays directly testable.
-// PUBLISHES WHAT IT COULD NOT READ, on SkippedLines and TruncatedDays. A day file
-// that lost lines, or one whose read was abandoned part-way, otherwise produced
-// exactly the same answer as a clean one — a short total labelled priced:true with no
-// caveat anywhere in it.
+//
+// RETURNS WHAT IT COULD NOT READ, as Caveats, beside the rows it did. A day file that
+// lost lines, or one whose read was abandoned part-way, otherwise produced exactly the
+// same answer as a clean one — a short total labelled priced:true with no caveat anywhere
+// in it. They travel with the rows rather than on the Writer because they describe THIS
+// read; see Caveats for the two readers that swapped them.
 //
 // EXPORTED WITH NO NON-TEST CALLER, and it stays that way: it is the named disk half of
 // this package's contract, cited by name from sessionapi's ledgerSnapshot, from
@@ -148,11 +195,11 @@ func (w *Writer) Window(ctx context.Context, from, to time.Time) ([]Row, error) 
 // is what bounds the work an abandoned read can still do. A cancelled read returns the
 // context's error and NO rows: a partial day would be a short total with nothing saying
 // it was short, which is the failure SkippedLines exists to stop being invisible.
-func (w *Writer) Query(ctx context.Context, from, to time.Time) ([]Row, error) {
+func (w *Writer) Query(ctx context.Context, from, to time.Time) ([]Row, Caveats, error) {
 	fromMin, toMin := span(from, to)
 
 	var out []Row
-	var skipped, truncated int64
+	var caveats Caveats
 	// Walk dates rather than globbing the directory: the read stays bounded by the
 	// span the caller asked for instead of by how long the ledger has been running.
 	//
@@ -164,17 +211,17 @@ func (w *Writer) Query(ctx context.Context, from, to time.Time) ([]Row, error) {
 	for d := w.store.dayOf(fromMin); !d.After(w.store.dayOf(toMin)); d = d.AddDate(0, 0, 1) {
 		if err := ctx.Err(); err != nil {
 			// Before the first read too, so a request cancelled while it queued does no IO
-			// at all. The gauges are left alone: they describe the most recent read that
-			// produced an answer, and this one did not.
-			return nil, err
+			// at all. No caveats are returned with it: they describe an answer, and a
+			// cancelled read is not one.
+			return nil, Caveats{}, err
 		}
 		rows, issues, err := w.store.readDay(d)
 		if err != nil {
-			return nil, err
+			return nil, Caveats{}, err
 		}
-		skipped += int64(issues.skippedLines)
+		caveats.SkippedLines += int64(issues.skippedLines)
 		if issues.truncated {
-			truncated++
+			caveats.TruncatedDays++
 		}
 		for _, r := range rows {
 			if m := r.At.Truncate(time.Minute); m.Before(fromMin) || m.After(toMin) {
@@ -183,11 +230,7 @@ func (w *Writer) Query(ctx context.Context, from, to time.Time) ([]Row, error) {
 			out = append(out, r)
 		}
 	}
-	// Stored, not added: these are gauges for the read that just happened. See
-	// SkippedLines for why a cumulative counter would be the wrong shape.
-	w.skippedLines.Store(skipped)
-	w.truncatedDays.Store(truncated)
-	return out, nil
+	return out, caveats, nil
 }
 
 // span normalises a caller's range to inclusive minute bounds.
@@ -203,15 +246,60 @@ func span(from, to time.Time) (time.Time, time.Time) {
 	return from.Truncate(time.Minute), to.Truncate(time.Minute)
 }
 
-// dayOf truncates to LOCAL midnight. Local, not UTC: "today" means the operator's
-// day, and a laptop that crosses a timezone must not have its day reset
-// mid-afternoon.
+// dayOf is the LEDGER DAY of an instant: the local calendar date it falls on, carried
+// as an instant at dayHour so the date can be formatted and walked. Local, not UTC:
+// "today" means the operator's day, and a laptop that crosses a timezone must not have
+// its day reset mid-afternoon.
 //
-// AddDate on the result is how the day walk advances, and it is DST-correct where a
-// 24h addition is not: on a spring-forward day local midnight plus 24h is 01:00 the
-// next day, which would skip the first hour of that day's file.
+// A DAY IDENTIFIER, NOT A DAY BOUNDARY. Nothing here may treat the result as the first
+// instant of the day: row filtering is done on the caller's own minute bounds (see
+// span), and this function decides only WHICH DAY FILE an instant belongs to.
+//
+// IT USED TO BE LOCAL MIDNIGHT, and that is a date that does not exist in every zone.
+// Where a DST transition falls AT 00:00 — America/Havana, America/Santiago, Asia/Beirut
+// and others — the spring-forward day has no midnight at all, and time.Date resolves a
+// time inside the gap onto the far side of it. Measured:
+//
+//	dayOf(2026-03-08 09:30 America/Havana)   = 2026-03-07 23:00  → the WRONG DATE
+//	dayOf(2026-09-06 09:30 America/Santiago) = 2026-09-05 23:00  → the WRONG DATE
+//
+// Every consequence followed from that one mapping, and all of them were money:
+// store.path named the row's file after the previous day, so the file a reader for that
+// date opens never existed; the day walk below stepped from a normalised midnight and
+// opened 2026-03-07 TWICE, counting a Havana laptop's spend for that day twice over;
+// and in Asia/Beirut, where the normalisation goes the other way, AddDate stepped PAST
+// the transition day so its spend was absent from the answer entirely. A zone whose
+// transition is at 02:00 — America/New_York — was unaffected, which is why every test
+// in this package passed: the only zone in them was a fixed offset, which has no
+// transitions and cannot express any of this. See dst_test.go.
+//
+// AddDate on the result is how the day walk advances, and it is DST-correct where a 24h
+// addition is not: a day is not always 24 hours long, so adding one would drift by the
+// transition's offset and eventually skip or repeat a date.
 func dayOf(t time.Time) time.Time {
-	return time.Date(t.Year(), t.Month(), t.Day(), 0, 0, 0, 0, t.Location())
+	y, m, d := t.Date()
+	return dayNoon(y, m, d, t.Location())
+}
+
+// dayHour is the hour of day every ledger day is represented at.
+//
+// NOON, because it is the hour furthest from both midnights. A zone's DST transition
+// moves the clock by an hour (Australia/Lord_Howe by thirty minutes), so no transition
+// can move noon into a different DATE — it would take a twelve-hour shift, which no zone
+// has. Midnight is the opposite: it sits one hour from the previous day, which is exactly
+// how a midnight inside a DST gap normalised backwards into it.
+//
+// Nothing depends on the value being 12 rather than any other mid-afternoon hour; it
+// depends on it being an hour that EXISTS on every local date, in every zone, forever.
+const dayHour = 12
+
+// dayNoon builds the ledger day for a calendar date in loc.
+//
+// The single place the dayHour convention is applied, so dayOf and store.dayFromName —
+// the two directions of the same mapping, which prune compares against each other —
+// cannot drift.
+func dayNoon(y int, m time.Month, d int, loc *time.Location) time.Time {
+	return time.Date(y, m, d, dayHour, 0, 0, 0, loc)
 }
 
 // Fold sums rows into one total, an optional per-label series, and the cost that
@@ -226,9 +314,19 @@ func dayOf(t time.Time) time.Time {
 // usage.Snapshot.UngroupedCostMicros. A row with no value for the requested axis counts
 // toward the total and cannot be a series key — a gateway-priced /v1/embeddings
 // response is stored with Model "" — so summing the series gives a smaller number than
-// the total beside it, and this is the size of that difference. Zero for a group where
-// usage.Group.Reconcilable is false, which is what keeps a group that offers no
-// reconciliation from reporting its whole total as a residual.
+// the total beside it, and this is the size of that difference.
+//
+// ZERO FOR AN AXIS THIS SOURCE CANNOT GROUP BY AT ALL, which is a stronger condition
+// than usage.Group.Reconcilable and the fix for a defect that reported real spend as
+// entirely unaccounted for. Reconcilable answers for the ring, and is false only for
+// GroupNone and GroupPlugin; a ledger row also carries no session id and no status, so
+// group=session and group=status produced NO series and a residual equal to the whole
+// total — "none of this money can be attributed", over a window where every dollar was
+// attributable to an endpoint, a model and an agent. Both conditions are now required:
+// Groupable, because a residual against an absent breakdown is meaningless, and
+// Reconcilable, because GroupPlugin's series is not a partition. See Groupable, and see
+// sessionapi's ledgerSnapshot for how a client tells "cannot group by that" from "the
+// breakdown is complete".
 //
 // Counted HERE rather than left to the caller as totals-minus-series, because this is
 // the loop that decides what to skip. A caller deriving it would be re-deriving a
@@ -238,7 +336,9 @@ func Fold(rows []Row, group usage.Group) (usage.Counts, map[string]usage.Counts,
 	var totals usage.Counts
 	var series map[string]usage.Counts
 	var ungrouped int64
-	reconcilable := group.Reconcilable()
+	// BOTH predicates, and the source's one first: a residual is only meaningful where
+	// this source can produce a breakdown to be the residual OF.
+	reconcilable := Groupable(group) && group.Reconcilable()
 	for _, r := range rows {
 		totals.Add(r.Counts)
 		label, ok := labelFor(r, group)
@@ -256,6 +356,43 @@ func Fold(rows []Row, group usage.Group) (usage.Counts, map[string]usage.Counts,
 		series[label] = cur
 	}
 	return totals, series, ungrouped
+}
+
+// Groupable reports whether a LEDGER ROW can carry a value for this axis — that is,
+// whether a breakdown by it is answerable from this source at all.
+//
+// RECONCILABILITY IS A PROPERTY OF THE SOURCE, NOT OF THE GROUP, and this predicate
+// exists because that distinction was missing. usage.Group.Reconcilable answers for the
+// RING, whose buckets keep a status series and a plugin series and can be filtered by
+// session; it is false only for GroupNone and GroupPlugin. The ledger's rows are
+// (endpoint, model, agent, provenance) per minute and carry none of the other three: a
+// session is a laptop-lifetime concept, and status and plugin composition are
+// per-request facts a per-minute row cannot represent without one entry per combination.
+// So a group the ring can reconcile may be unanswerable here, and Fold used the ring's
+// predicate to decide whether to publish a residual — which turned
+// GET /v1/usage?window=today&group=status into a response whose residual equalled its
+// entire total. See Fold.
+//
+// EXPORTED because sessionapi has to ask the same question one layer up, to report the
+// grouping the ledger could actually APPLY rather than the one that was requested. A
+// client comparing the two learns "this source cannot break down by that axis", which is
+// a different fact from "the breakdown is complete" and from "the breakdown fell short by
+// this much" — and all three have to be distinguishable from the response alone.
+//
+// KEPT HONEST BY A TEST rather than by matching comments: labelFor is the loop that
+// actually produces the keys, and TestGroupable_MatchesWhatLabelForCanActuallyProduce
+// asserts this switch and that one agree for every axis usage defines. A new axis fails
+// that test until somebody decides which side it belongs on.
+func Groupable(group usage.Group) bool {
+	switch group {
+	// Every axis a Row has a field for. GroupMethod is the model series under an older
+	// name — see labelFor.
+	case usage.GroupModel, usage.GroupMethod, usage.GroupEndpoint, usage.GroupAgent:
+		return true
+	}
+	// GroupNone included: it asks for no breakdown, so there is nothing to answer and
+	// nothing to reconcile, which is the same conclusion Reconcilable reaches for it.
+	return false
 }
 
 // unknownAgentLabel is the reserved DISPLAY bucket for traffic that carried no

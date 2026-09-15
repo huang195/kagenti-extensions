@@ -7,8 +7,10 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	"github.com/rossoctl/cortex/authbridge/authlib/pipeline"
 	"github.com/rossoctl/cortex/authbridge/authlib/usage"
@@ -47,7 +49,7 @@ func TestQuery_SpanInsideOneDay(t *testing.T) {
 	)
 	w := newTestWriter(t, dir, func() time.Time { return base })
 
-	got, err := w.Query(context.Background(), base, base.Add(time.Minute))
+	got, _, err := w.Query(context.Background(), base, base.Add(time.Minute))
 	if err != nil {
 		t.Fatalf("Query: %v", err)
 	}
@@ -85,7 +87,7 @@ func TestQuery_SpanCrossingLocalMidnight(t *testing.T) {
 		}
 	}
 
-	got, err := w.Query(context.Background(), before, after)
+	got, _, err := w.Query(context.Background(), before, after)
 	if err != nil {
 		t.Fatalf("Query: %v", err)
 	}
@@ -101,7 +103,7 @@ func TestQuery_MissingDayFileIsNotAnError(t *testing.T) {
 	base := time.Date(2026, 9, 13, 9, 0, 0, 0, time.Local)
 	w := newTestWriter(t, dir, func() time.Time { return base })
 
-	got, err := w.Query(context.Background(), base.AddDate(0, 0, -3), base)
+	got, _, err := w.Query(context.Background(), base.AddDate(0, 0, -3), base)
 	if err != nil {
 		t.Fatalf("Query over an empty range: %v", err)
 	}
@@ -123,7 +125,7 @@ func TestQuery_TruncatedFinalLineIsSkippedAndTheRestSurvives(t *testing.T) {
 	)
 	w := newTestWriter(t, dir, func() time.Time { return base })
 
-	got, err := w.Query(context.Background(), base, base.Add(time.Hour))
+	got, _, err := w.Query(context.Background(), base, base.Add(time.Hour))
 	if err != nil {
 		t.Fatalf("Query: %v", err)
 	}
@@ -148,7 +150,7 @@ func TestQuery_CorruptLineMidFileSkipsOnlyThatLine(t *testing.T) {
 	)
 	w := newTestWriter(t, dir, func() time.Time { return base })
 
-	got, err := w.Query(context.Background(), base, base.Add(time.Hour))
+	got, caveats, err := w.Query(context.Background(), base, base.Add(time.Hour))
 	if err != nil {
 		t.Fatalf("Query: %v", err)
 	}
@@ -165,13 +167,15 @@ func TestQuery_CorruptLineMidFileSkipsOnlyThatLine(t *testing.T) {
 	}
 	// J4: the skip has to be VISIBLE. It was counted into a local and logged at
 	// slog.Debug, below the default level, so in production this figure was
-	// indistinguishable from a complete one.
-	if got := w.SkippedLines(); got != 1 {
-		t.Errorf("SkippedLines() = %d, want 1; a caller has no other way to tell this "+
-			"800 from a day that really only cost 800", got)
+	// indistinguishable from a complete one. Read off THIS read's Caveats, not off the
+	// writer: see Caveats for the two readers that swapped them.
+	if caveats.SkippedLines != 1 {
+		t.Errorf("SkippedLines = %d, want 1; a caller has no other way to tell this "+
+			"800 from a day that really only cost 800", caveats.SkippedLines)
 	}
-	if got := w.TruncatedDays(); got != 0 {
-		t.Errorf("TruncatedDays() = %d, want 0 — the read stepped over the damage and finished", got)
+	if caveats.TruncatedDays != 0 {
+		t.Errorf("TruncatedDays = %d, want 0 — the read stepped over the damage and finished",
+			caveats.TruncatedDays)
 	}
 }
 
@@ -189,22 +193,34 @@ func TestQuery_AnAbandonedDayIsReportedSeparatelyFromSkippedLines(t *testing.T) 
 	)
 	w := newTestWriter(t, dir, func() time.Time { return base })
 
-	if _, err := w.Query(context.Background(), base, base.Add(time.Hour)); err != nil {
+	_, caveats, err := w.Query(context.Background(), base, base.Add(time.Hour))
+	if err != nil {
 		t.Fatalf("Query: %v", err)
 	}
-	if got := w.SkippedLines(); got != 1 {
-		t.Errorf("SkippedLines() = %d, want 1", got)
+	// AT LEAST ONE, not exactly one, because SkippedLines is documented as a FLOOR on rows
+	// lost rather than a count of them: one undecodable line can hold two rows where a
+	// crash fragment was concatenated with the next append (measured — see
+	// TestQuery_FragmentConcatenatedWithTheNextAppendCostsOneLine), and this file loses a
+	// second row to the wall below regardless. Pinning the exact 1 asserted a stronger
+	// claim than the field makes, and would fail a reader that counted the truth more
+	// completely.
+	if caveats.SkippedLines < 1 {
+		t.Errorf("SkippedLines = %d, want at least 1: the read stepped over a line that held "+
+			"spend, and a caller has no other way to know the figure beside it is short",
+			caveats.SkippedLines)
 	}
-	if got := w.TruncatedDays(); got != 1 {
-		t.Errorf("TruncatedDays() = %d, want 1; a day the reader gave up on must not be "+
-			"served as a complete one", got)
+	if caveats.TruncatedDays != 1 {
+		t.Errorf("TruncatedDays = %d, want 1; a day the reader gave up on must not be "+
+			"served as a complete one", caveats.TruncatedDays)
 	}
 }
 
-// GAUGES, not counters. A day file with one corrupt line is re-read on every
-// /v1/usage request, so a cumulative count would climb forever over one piece of
-// damage and read as a fault that is getting worse.
-func TestQuery_ReadIssuesReportTheLastReadNotAllOfThem(t *testing.T) {
+// PER READ, not cumulative. A day file with one corrupt line is re-read on every
+// /v1/usage request, so a running count would climb forever over one piece of damage and
+// read as a fault that is getting worse. Returning the counts to the read that produced
+// them is what makes that true for every caller at once rather than for whichever one
+// sampled the writer last; see Caveats.
+func TestQuery_ReadIssuesDescribeTheReadThatReturnedThem(t *testing.T) {
 	dir := t.TempDir()
 	base := time.Date(2026, 9, 13, 9, 0, 0, 0, time.Local)
 	writeDay(t, dir, base,
@@ -214,23 +230,27 @@ func TestQuery_ReadIssuesReportTheLastReadNotAllOfThem(t *testing.T) {
 	w := newTestWriter(t, dir, func() time.Time { return base })
 
 	for i := 0; i < 3; i++ {
-		if _, err := w.Query(context.Background(), base, base.Add(time.Hour)); err != nil {
+		_, caveats, err := w.Query(context.Background(), base, base.Add(time.Hour))
+		if err != nil {
 			t.Fatalf("Query %d: %v", i, err)
 		}
-		if got := w.SkippedLines(); got != 1 {
-			t.Fatalf("after read %d SkippedLines() = %d, want 1 — one line of damage must not "+
-				"read as %d lines of damage because it was queried %d times", i+1, got, got, i+1)
+		if caveats.SkippedLines != 1 {
+			t.Fatalf("read %d returned SkippedLines = %d, want 1 — one line of damage must not "+
+				"read as %d lines of damage because it was queried %d times",
+				i+1, caveats.SkippedLines, caveats.SkippedLines, i+1)
 		}
 	}
 
-	// And a clean read clears it, or the gauge would outlive the file it described.
+	// And a read of a clean day carries nothing, or a caveat would outlive the file it
+	// described.
 	clean := base.AddDate(0, 0, -1)
 	writeDay(t, dir, clean, line(clean, "gw", "m", 1, 10, 5, 100))
-	if _, err := w.Query(context.Background(), clean, clean.Add(time.Hour)); err != nil {
+	_, caveats, err := w.Query(context.Background(), clean, clean.Add(time.Hour))
+	if err != nil {
 		t.Fatalf("Query: %v", err)
 	}
-	if got := w.SkippedLines(); got != 0 {
-		t.Errorf("SkippedLines() = %d after reading a clean day, want 0", got)
+	if !caveats.Clean() {
+		t.Errorf("a read of a clean day returned %+v, want no caveats", caveats)
 	}
 }
 
@@ -250,7 +270,7 @@ func TestQuery_FragmentConcatenatedWithTheNextAppendCostsOneLine(t *testing.T) {
 	}
 	w := newTestWriter(t, dir, func() time.Time { return base })
 
-	got, err := w.Query(context.Background(), base, base.Add(time.Hour))
+	got, _, err := w.Query(context.Background(), base, base.Add(time.Hour))
 	if err != nil {
 		t.Fatalf("Query: %v", err)
 	}
@@ -286,7 +306,7 @@ func TestQuery_LineBeyondTheBufferLimitEndsThatDay(t *testing.T) {
 	)
 	w := newTestWriter(t, dir, func() time.Time { return base })
 
-	got, err := w.Query(context.Background(), base, base.Add(time.Hour))
+	got, caveats, err := w.Query(context.Background(), base, base.Add(time.Hour))
 	if err != nil {
 		t.Fatalf("Query must not fail the whole request over one day file: %v", err)
 	}
@@ -295,9 +315,9 @@ func TestQuery_LineBeyondTheBufferLimitEndsThatDay(t *testing.T) {
 	}
 	// And it must SAY SO. A truncated day served as a complete one is how the short
 	// figure reaches a client as window:"today", priced:true with no caveat.
-	if w.TruncatedDays() != 1 {
-		t.Errorf("TruncatedDays() = %d, want 1 — a day abandoned part-way must be visible "+
-			"to the caller, not only in a log line", w.TruncatedDays())
+	if caveats.TruncatedDays != 1 {
+		t.Errorf("TruncatedDays = %d, want 1 — a day abandoned part-way must be visible "+
+			"to the caller, not only in a log line", caveats.TruncatedDays)
 	}
 }
 
@@ -348,15 +368,23 @@ func TestRecord_LabelsAreCappedSoALineCanNeverExceedTheReadLimit(t *testing.T) {
 // that is retained for retentionDays, that an operator cats, and that cannot be edited
 // afterwards. An escape sequence there rewrites the terminal of whoever reads it, on every
 // read, for as long as the file exists. CWE-150.
+//
+// C1 IS IN HERE DELIBERATELY. The sanitiser filtered C0 and DEL only, and this test could
+// not see that: U+009B is the single-character CSI, so "2J" clears the pane of
+// whoever cats the file with no ESC byte for a C0 filter to catch, and the assertion that
+// was meant to prove no control character survived was reading a predicate with the same
+// blind spot.
 func TestRecord_ControlCharactersNeverReachADayFile(t *testing.T) {
 	dir := t.TempDir()
 	now := at
 	w := newTestWriter(t, dir, func() time.Time { return now })
 
-	// An SGR sequence that recolours the pane, a newline that breaks a table apart, and a
-	// carriage return that erases the line reporting it.
+	// An SGR sequence that recolours the pane, a newline that breaks a table apart, a
+	// carriage return that erases the line reporting it — and a C1 CSI, which is the same
+	// attack as the first one with the ESC byte removed.
 	e := costedEvent(t, "gw\x1b[31m", "opus\nnext-line", 0.25, 100, 50)
 	e.Client = &pipeline.EventClient{Raw: "curl/8.4\r\x07"}
+	setProvenance(t, e, "gateway\u009b2J")
 	w.Record("s1", e)
 
 	now = at.Add(time.Minute)
@@ -370,9 +398,17 @@ func TestRecord_ControlCharactersNeverReachADayFile(t *testing.T) {
 	}
 	for name, got := range map[string]string{
 		"Endpoint": rows[0].Endpoint, "Model": rows[0].Model, "Agent": rows[0].Agent,
+		"Provenance": rows[0].Provenance,
 	} {
-		if hasControlBytes(got) {
-			t.Errorf("%s = %q on disk: a control byte reached a durable row", name, got)
+		if hasControlRunes(got) {
+			t.Errorf("%s = %q on disk: a control character reached a durable row", name, got)
+		}
+		// The C1 half asserted on its own, because the byte-scanning predicate this test
+		// used to read reported the row clean while the CSI was still in it — two bytes,
+		// 0xC2 0x9B, which a terminal decoding UTF-8 acts on exactly as it acts on ESC [.
+		if strings.ContainsRune(got, '\u009b') {
+			t.Errorf("%s = %q on disk: U+009B (CSI) survived; a C0-only filter does not "+
+				"protect the operator who cats this file", name, got)
 		}
 		// REPLACED, not dropped: "gw[31m" would read as a plausible hostname and hide the
 		// tampering, which is the whole reason sanitizeLabel substitutes rather than deletes.
@@ -424,6 +460,80 @@ func TestRecord_ASanitisedLabelIsStillCappedInBYTES(t *testing.T) {
 	}
 }
 
+// A label is cut on a RUNE boundary, and the cap is still counted in BYTES.
+//
+// The cut used to be a plain byte slice, so a multi-byte rune straddling byte 96 was
+// halved and an invalid UTF-8 sequence went into an append-only file that other tools
+// parse and that cannot be corrected afterwards. Two ways to reach it, both here: a model
+// name a workload chose (ordinary non-ASCII), and a label this package rewrote itself,
+// where every replacement is a 3-byte U+FFFD and a byte cut has a two-in-three chance of
+// splitting one.
+//
+// THE BYTE CAP STAYS. It is what bounds the line length maxLabelLen exists to guarantee,
+// so the assertion is <= maxLabelLen bytes AND valid UTF-8 — not a rune count.
+//
+// AND THE BYTE CUT BREAKS THE BYTE CAP, which is the argument for this fix that the
+// UTF-8 one obscures. Measured against the mutation: a 121-byte label cut at 96 leaves a
+// 2-byte fragment, and encoding/json expands each invalid byte into a 3-byte U+FFFD, so
+// the label lands on disk at 100 bytes — past the cap the line-length arithmetic rests on.
+// Cutting cleanly is what makes maxLabelLen mean what it says.
+//
+// EVERY CASE CARRIES A ONE-BYTE PREFIX, and without it this test proves nothing:
+// maxLabelLen is 96, which is a multiple of both 2 and 3, so a label made only of 2- or
+// 3-byte runes has a rune boundary exactly at byte 96 and even a plain byte cut lands
+// cleanly. The first version of this test had no prefix and passed against the byte cut it
+// was written to catch. The prefix is what puts a rune across the cap.
+func TestRecord_ALabelIsCutOnARuneBoundary(t *testing.T) {
+	for _, tc := range []struct{ name, label string }{
+		// 3-byte runes behind one ASCII byte, so byte 96 falls in the middle of one.
+		{"multi-byte model name", "m" + strings.Repeat("模", maxLabelLen/3+8)},
+		// Sanitised control bytes, which become 3-byte U+FFFD runes on the way through —
+		// this package's own output, cut by this package's own cap.
+		{"a label this package rewrote", "m" + strings.Repeat("\x1b", maxLabelLen+32)},
+		// A 2-byte rune, which straddles a different byte offset.
+		{"two-byte runes", "m" + strings.Repeat("é", maxLabelLen)},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			now := at
+			w := newTestWriter(t, dir, func() time.Time { return now })
+
+			e := costedEvent(t, tc.label, tc.label, 0.25, 100, 50)
+			e.Client = &pipeline.EventClient{Raw: tc.label}
+			setProvenance(t, e, tc.label)
+			w.Record("s1", e)
+
+			now = at.Add(time.Minute)
+			if err := w.Flush(); err != nil {
+				t.Fatalf("Flush: %v", err)
+			}
+
+			rows := readAllRows(t, dir)
+			if len(rows) != 1 {
+				t.Fatalf("got %d rows, want 1: %+v", len(rows), rows)
+			}
+			for name, got := range map[string]string{
+				"Endpoint": rows[0].Endpoint, "Model": rows[0].Model,
+				"Agent": rows[0].Agent, "Provenance": rows[0].Provenance,
+			} {
+				if len(got) > maxLabelLen {
+					t.Errorf("%s is %d BYTES on disk, want at most %d", name, len(got), maxLabelLen)
+				}
+				if !utf8.ValidString(got) {
+					t.Errorf("%s = %q on disk is not valid UTF-8: the cut split a rune, and this "+
+						"file is append-only", name, got)
+				}
+			}
+			// The bytes on disk, not only the decoded row: json.Marshal substitutes U+FFFD for
+			// invalid input, so a decoded row can read as valid while the file it came from
+			// carried the fragment. Asserting the file is what makes this about the file.
+			if !utf8.Valid(readAllBytes(t, dir)) {
+				t.Error("the day file is not valid UTF-8")
+			}
+		})
+	}
+}
+
 // The whole C1 measurement, end to end: one hostile label followed by real spend, and
 // the day's total must survive. This is the assertion the old blessing test made
 // impossible to write.
@@ -446,7 +556,7 @@ func TestQuery_AHostileLabelCannotDestroyTheRestOfTheDay(t *testing.T) {
 		t.Fatalf("Flush: %v", err)
 	}
 
-	rows, err := w.Query(context.Background(), at.Add(-time.Hour), now)
+	rows, _, err := w.Query(context.Background(), at.Add(-time.Hour), now)
 	if err != nil {
 		t.Fatalf("Query: %v", err)
 	}
@@ -467,7 +577,7 @@ func TestQuery_DoesNotSeeTheOpenMinute(t *testing.T) {
 	w := newTestWriter(t, dir, func() time.Time { return now })
 	w.Record("s1", costedEvent(t, "gw", "m", 0.25, 100, 50))
 
-	got, err := w.Query(context.Background(), at.Add(-time.Hour), at)
+	got, _, err := w.Query(context.Background(), at.Add(-time.Hour), at)
 	if err != nil {
 		t.Fatalf("Query: %v", err)
 	}
@@ -485,11 +595,11 @@ func TestWindow_IncludesTheOpenMinuteWithNothingOnDisk(t *testing.T) {
 	w := newTestWriter(t, dir, func() time.Time { return now })
 	w.Record("s1", costedEvent(t, "gw", "m", 0.25, 100, 50))
 
-	if disk, err := w.Query(context.Background(), at.Add(-time.Hour), at); err != nil || len(disk) != 0 {
+	if disk, _, err := w.Query(context.Background(), at.Add(-time.Hour), at); err != nil || len(disk) != 0 {
 		t.Fatalf("disk half = %d rows (err %v), want 0 — the premise of this test", len(disk), err)
 	}
 
-	rows, err := w.Window(context.Background(), at.Add(-time.Hour), at)
+	rows, _, err := w.Window(context.Background(), at.Add(-time.Hour), at)
 	if err != nil {
 		t.Fatalf("Window: %v", err)
 	}
@@ -514,7 +624,7 @@ func TestWindow_CountsAMinuteExactlyOnceAcrossTheFlush(t *testing.T) {
 	w.Record("s1", costedEvent(t, "gw", "m", 0.25, 100, 50))
 
 	from, to := at.Add(-time.Hour), at.Add(time.Hour)
-	before, err := w.Window(context.Background(), from, to)
+	before, _, err := w.Window(context.Background(), from, to)
 	if err != nil {
 		t.Fatalf("Window while open: %v", err)
 	}
@@ -531,7 +641,7 @@ func TestWindow_CountsAMinuteExactlyOnceAcrossTheFlush(t *testing.T) {
 		t.Fatalf("sync: %v", err)
 	}
 
-	after, err := w.Window(context.Background(), from, to)
+	after, _, err := w.Window(context.Background(), from, to)
 	if err != nil {
 		t.Fatalf("Window after the roll: %v", err)
 	}
@@ -586,15 +696,15 @@ func TestWindow_ARestartInTheSameMinuteHidesNothingAlreadyCommitted(t *testing.T
 	p2 := newTestWriter(t, dir, clock)
 	p2.Record("s1", costedEvent(t, "gw", "m", 0.25, 100, 50))
 
-	rows, err := p2.Window(context.Background(), at.Add(-time.Hour), at)
+	rows, caveats, err := p2.Window(context.Background(), at.Add(-time.Hour), at)
 	if err != nil {
 		t.Fatalf("Window: %v", err)
 	}
 	totals, _, _ := Fold(rows, usage.GroupNone)
 	if totals.CostMicros < committed {
 		t.Errorf("Window() = %d micros, BELOW the %d already on disk — a committed row is "+
-			"hidden, and nothing reports it: Dropped() = %d, SkippedLines() = %d",
-			totals.CostMicros, committed, p2.Dropped(), p2.SkippedLines())
+			"hidden, and nothing reports it: Dropped() = %d, read caveats = %+v",
+			totals.CostMicros, committed, p2.Dropped(), caveats)
 	}
 	if want := int64(1_250_000); totals.CostMicros != want {
 		t.Errorf("CostMicros = %d, want %d ($1.00 on disk + $0.25 held); 250000 is the "+
@@ -632,7 +742,7 @@ func TestWindow_AFlushRacingTheReadIsCountedExactlyOnce(t *testing.T) {
 		}
 	}
 
-	rows, err := w.Window(context.Background(), at.Add(-time.Hour), at)
+	rows, _, err := w.Window(context.Background(), at.Add(-time.Hour), at)
 	if err != nil {
 		t.Fatalf("Window: %v", err)
 	}
@@ -663,7 +773,7 @@ func TestQuery_ACancelledContextStopsTheReadBeforeAnyIO(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 
-	rows, err := w.Query(ctx, base, base.Add(time.Minute))
+	rows, _, err := w.Query(ctx, base, base.Add(time.Minute))
 	if !errors.Is(err, context.Canceled) {
 		t.Errorf("Query on a cancelled context: err = %v, want context.Canceled", err)
 	}
@@ -676,7 +786,7 @@ func TestQuery_ACancelledContextStopsTheReadBeforeAnyIO(t *testing.T) {
 
 	// And Window, which is what a reader actually calls, propagates it rather than
 	// answering from memory alone.
-	if _, werr := w.Window(ctx, base, base.Add(time.Minute)); !errors.Is(werr, context.Canceled) {
+	if _, _, werr := w.Window(ctx, base, base.Add(time.Minute)); !errors.Is(werr, context.Canceled) {
 		t.Errorf("Window on a cancelled context: err = %v, want context.Canceled", werr)
 	}
 }
@@ -701,7 +811,7 @@ func TestWindow_KeepsADiskRowAboveTheHeldMinute(t *testing.T) {
 	next := at.Truncate(time.Minute).Add(time.Minute)
 	writeDay(t, dir, next, line(next, "gw", "m", 1, 100, 50, 1_000_000))
 
-	rows, err := w.Window(context.Background(), at.Add(-time.Hour), next.Add(time.Hour))
+	rows, _, err := w.Window(context.Background(), at.Add(-time.Hour), next.Add(time.Hour))
 	if err != nil {
 		t.Fatalf("Window: %v", err)
 	}
@@ -727,7 +837,7 @@ func TestWindow_ExcludesAHeldMinuteOutsideTheRange(t *testing.T) {
 
 	// "today" as ParseWindowSpec builds it: local midnight to now.
 	now = midnight.Add(5 * time.Minute)
-	rows, err := w.Window(context.Background(), midnight, now)
+	rows, _, err := w.Window(context.Background(), midnight, now)
 	if err != nil {
 		t.Fatalf("Window: %v", err)
 	}
@@ -745,7 +855,7 @@ func TestQuery_ReversedRangeIsNormalised(t *testing.T) {
 	writeDay(t, dir, base, line(base, "gw", "m", 1, 10, 5, 100))
 	w := newTestWriter(t, dir, func() time.Time { return base })
 
-	got, err := w.Query(context.Background(), base.Add(time.Hour), base)
+	got, _, err := w.Query(context.Background(), base.Add(time.Hour), base)
 	if err != nil {
 		t.Fatalf("Query: %v", err)
 	}
@@ -763,22 +873,45 @@ func TestFold_ByModelSumsToTotals(t *testing.T) {
 			Requests: 1, InputTokens: 20, CostMicros: 50, PricedRequests: 1, PriceableRequests: 1}},
 	}
 
-	totals, series, _ := Fold(rows, usage.GroupModel)
+	// A row with no model, which is spend the breakdown CANNOT attribute. Without one in
+	// the input this test compares a value to itself: Fold adds every row's Counts to
+	// totals and the groupable ones to series, so with all rows groupable "sum == totals"
+	// is the same accumulation twice and cannot fail whatever labelFor does. The
+	// unattributable row is what makes the reconciliation an assertion.
+	rows = append(rows, Row{At: base, Endpoint: "gw", Counts: usage.Counts{
+		Requests: 1, InputTokens: 10, CostMicros: 25, PricedRequests: 1, PriceableRequests: 1}})
 
-	if totals.CostMicros != 350 {
-		t.Errorf("totals.CostMicros = %d, want 350", totals.CostMicros)
+	totals, series, ungrouped := Fold(rows, usage.GroupModel)
+
+	if totals.CostMicros != 375 {
+		t.Errorf("totals.CostMicros = %d, want 375 (300 + 50 + the 25 with no model)", totals.CostMicros)
 	}
 	if series["opus"].CostMicros != 300 || series["haiku"].CostMicros != 50 {
 		t.Errorf("series = %+v, want opus 300 and haiku 50", series)
 	}
-	// The property that makes a breakdown table trustworthy: its rows account for
-	// the total it sits under.
+	// The gap is DISCLOSED rather than hidden or double-counted. This is the half that can
+	// actually break: Fold publishes a residual only when the group is one the ledger can
+	// answer AND the ring calls reconcilable, and getting that wrong once made
+	// group=status answer with a residual equal to its entire total.
+	if ungrouped != 25 {
+		t.Errorf("ungrouped = %d, want 25 — spend with no model must be disclosed as the "+
+			"residual, not folded into a series key or dropped", ungrouped)
+	}
+	// The property that makes a breakdown table trustworthy, stated as the identity that
+	// holds when the residual is right: the rows plus the residual account for the total
+	// they sit under.
 	var sum int64
 	for _, c := range series {
 		sum += c.CostMicros
 	}
-	if sum != totals.CostMicros {
-		t.Errorf("series sums to %d but totals is %d", sum, totals.CostMicros)
+	if sum+ungrouped != totals.CostMicros {
+		t.Errorf("series sums to %d, residual is %d, totals is %d; a client cannot reconcile "+
+			"the table it was given with the figure above it", sum, ungrouped, totals.CostMicros)
+	}
+	// And the residual is not vacuously zero, which would make the identity above the
+	// tautology this test used to be.
+	if ungrouped == 0 {
+		t.Fatal("the residual is zero, so the reconciliation above proves nothing")
 	}
 }
 
@@ -891,17 +1024,24 @@ func TestFold_GroupingsTheLedgerCannotAnswerReturnNoSeries(t *testing.T) {
 		if totals.CostMicros != 10 {
 			t.Errorf("group=%s totals.CostMicros = %d, want 10", g, totals.CostMicros)
 		}
-		// An axis a persisted row cannot represent leaves the WHOLE total outside the
-		// breakdown, and for the two that can be reconciled that is what the residual says:
-		// the series is short by everything. group=plugin is excluded by
-		// usage.Group.Reconcilable, because on a ring-backed window that same series
-		// deliberately double-counts dollars and the number would not mean the same thing.
-		want := int64(10)
-		if !g.Reconcilable() {
-			want = 0
-		}
-		if ungrouped != want {
-			t.Errorf("group=%s ungrouped cost = %d, want %d", g, ungrouped, want)
+		// NO RESIDUAL, and this assertion used to demand the opposite: that an axis a
+		// persisted row cannot represent leaves the WHOLE total outside the breakdown, so
+		// the residual says "the series is short by everything". That is what shipped, and
+		// it made GET /v1/usage?window=today&group=status answer with series: null and
+		// ungroupedCostMicros equal to Totals.CostMicros — a response asserting that none of
+		// the money in it could be accounted for, over traffic where every dollar had an
+		// endpoint, a model and an agent. usage.Group.Reconcilable refuses GroupNone for
+		// exactly that reason ("a residual equal to the entire total ... would read as a
+		// fault"), and these two axes reach the same state by a different door.
+		//
+		// A residual is a statement about a breakdown that ALMOST accounts for the total.
+		// Where the source can produce no breakdown at all there is nothing for it to be a
+		// residual of, and the honest response says which grouping was actually applied
+		// instead — see Groupable and sessionapi's ledgerSnapshot.
+		if ungrouped != 0 {
+			t.Errorf("group=%s ungrouped cost = %d over a total of %d, want 0: the ledger cannot "+
+				"group by this axis at all, which is not the same claim as a breakdown that fell "+
+				"short by 100%%", g, ungrouped, totals.CostMicros)
 		}
 	}
 }
@@ -1067,5 +1207,99 @@ func TestLedgerAndRingAgreeOnASpoofedUnknownAgent(t *testing.T) {
 	if ledgerKey != ringKey {
 		t.Errorf("ledger key %q != ring key %q; the two sources would render two rows for one thing",
 			ledgerKey, ringKey)
+	}
+}
+
+// TestQuery_TwoReadersDoNotSwapEachOthersCaveats is the fourth defect, and the reason
+// Caveats is a return value rather than two counters on the Writer.
+//
+// They used to be atomics set by whichever Query ran last, sampled by the caller in a
+// separate call — which is exactly what sessionapi does, once per /v1/usage request, on an
+// endpoint a chart polls. Measured on this fixture, with the reads INTERLEAVED and no
+// concurrency at all:
+//
+//	reader A read the day holding an undecodable line, then reported SkippedLines() = 0
+//	reader B read the CLEAN day, then reported SkippedLines() = 1
+//
+// Both halves of the report in one sequence: a damaged day served as complete, and a
+// clean day carrying a caveat about someone else's file. Nothing needs to race — any
+// other read between the call and the sample is enough, and there is no ordering that
+// makes the pair safe, which is why the fix is to attach the counts to the read.
+func TestQuery_TwoReadersDoNotSwapEachOthersCaveats(t *testing.T) {
+	dir := t.TempDir()
+	base := time.Date(2026, 9, 13, 9, 0, 0, 0, testZone)
+	clean := base.AddDate(0, 0, -1)
+	writeDay(t, dir, base,
+		line(base, "gw", "m", 1, 10, 5, 100),
+		`{"at":"2026-09-13T09:01:00Z","endpoint":"gw"`, // the damage
+	)
+	writeDay(t, dir, clean, line(clean, "gw", "m", 1, 10, 5, 100))
+	w := newTestWriter(t, dir, func() time.Time { return base })
+
+	// A starts on the corrupt day, B answers from the clean one in between, A finishes.
+	// The interleaving that used to hand each the other's answer.
+	_, aCaveats, aErr := w.Query(context.Background(), base, base.Add(time.Hour))
+	if aErr != nil {
+		t.Fatalf("A Query: %v", aErr)
+	}
+	_, bCaveats, bErr := w.Query(context.Background(), clean, clean.Add(time.Hour))
+	if bErr != nil {
+		t.Fatalf("B Query: %v", bErr)
+	}
+	if aCaveats.SkippedLines != 1 {
+		t.Errorf("the read of the CORRUPT day returned SkippedLines = %d, want 1: a day that "+
+			"lost a line must not report clean because another reader finished after it",
+			aCaveats.SkippedLines)
+	}
+	if !bCaveats.Clean() {
+		t.Errorf("the read of the CLEAN day returned %+v, want no caveats: a client would "+
+			"render another reader's damage as its own, and an operator would go looking for "+
+			"corruption in the wrong file", bCaveats)
+	}
+}
+
+// TestQuery_ConcurrentReadersEachGetTheirOwnCaveats is the same property under real
+// concurrency, which is how it reaches production: two /v1/usage requests, one asking
+// about a day that lost a line and one about a day that did not.
+//
+// Worth having alongside the interleaved test above because -race says nothing about this
+// on its own — the old counters were atomics, so the swap was a perfectly race-free wrong
+// answer.
+func TestQuery_ConcurrentReadersEachGetTheirOwnCaveats(t *testing.T) {
+	dir := t.TempDir()
+	base := time.Date(2026, 9, 13, 9, 0, 0, 0, testZone)
+	clean := base.AddDate(0, 0, -1)
+	writeDay(t, dir, base,
+		line(base, "gw", "m", 1, 10, 5, 100),
+		`{"at":"2026-09-13T09:01:00Z","endpoint":"gw"`,
+	)
+	writeDay(t, dir, clean, line(clean, "gw", "m", 1, 10, 5, 100))
+	w := newTestWriter(t, dir, func() time.Time { return base })
+
+	const rounds = 200
+	var wg sync.WaitGroup
+	errs := make(chan string, 2*rounds)
+	read := func(from time.Time, want int64) {
+		defer wg.Done()
+		for i := 0; i < rounds; i++ {
+			_, caveats, err := w.Query(context.Background(), from, from.Add(time.Hour))
+			if err != nil {
+				errs <- fmt.Sprintf("Query: %v", err)
+				return
+			}
+			if caveats.SkippedLines != want {
+				errs <- fmt.Sprintf("read of %s returned SkippedLines = %d, want %d",
+					from.Format(dayLayout), caveats.SkippedLines, want)
+				return
+			}
+		}
+	}
+	wg.Add(2)
+	go read(base, 1)
+	go read(clean, 0)
+	wg.Wait()
+	close(errs)
+	for msg := range errs {
+		t.Error(msg + " — each read has to carry the caveats for the file IT opened")
 	}
 }

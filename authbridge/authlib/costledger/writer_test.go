@@ -7,6 +7,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -767,26 +768,72 @@ func TestClose_CountsWhatIsLeftInTheQueueAndTheAccumulator(t *testing.T) {
 }
 
 // N3: closed must be set AFTER the writer goroutine has stopped. While it was set
-// first, submit's inline-write branch and the draining goroutine could both be in
-// writeLines on one day file, each with a rollback size from its own Stat.
+// before close(quit), submit's inline-write branch was armed while the goroutine was
+// still draining, so two writeLines could run on one day file — each taking its
+// rollback size from its own Stat, so a partial write in either truncates away the
+// other's rows.
+//
+// THE ORDERING ITSELF IS ASSERTED, not a consequence of it, because the consequence
+// needs a concurrent partial write to become damage and a unit test cannot arrange
+// ENOSPC. The clock is the seam: the settle tick calls w.now() on the writer
+// goroutine, so a clock that parks there and watches w.closed reports directly whether
+// the flag flipped while the goroutine was alive. With the flag set before wg.Wait it
+// flips immediately and the parked goroutine sees it; with it set after, the flag
+// cannot move until this clock has returned and the goroutine has exited.
 func TestClose_MarksClosedOnlyAfterTheGoroutineHasStopped(t *testing.T) {
 	dir := t.TempDir()
-	now := at
-	w := newTestWriter(t, dir, func() time.Time { return now })
+	var wp atomic.Pointer[Writer]
+	var parked, sawClosedWhileRunning atomic.Bool
 
-	if w.closed.Load() {
-		t.Fatal("closed before Close was called")
+	clock := func() time.Time {
+		w := wp.Load()
+		if w == nil {
+			// New's own call, before the writer is published.
+			return at
+		}
+		parked.Store(true)
+		defer parked.Store(false)
+		// Long enough for Close to reach its ordering — it takes microseconds to get
+		// there — and short enough that the correct implementation, which waits this out
+		// once, does not slow the suite down.
+		deadline := time.Now().Add(250 * time.Millisecond)
+		for time.Now().Before(deadline) {
+			if w.closed.Load() {
+				sawClosedWhileRunning.Store(true)
+				return at
+			}
+			time.Sleep(time.Millisecond)
+		}
+		return at
 	}
-	if err := w.Close(); err != nil {
-		t.Fatalf("Close: %v", err)
+
+	// A fast settle so the goroutine reaches the clock promptly.
+	w, err := New(dir, WithClock(clock), WithSettleInterval(time.Millisecond))
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	wp.Store(w)
+
+	// Wait until the goroutine is parked in the clock, so Close runs its ordering while
+	// the goroutine is demonstrably still alive.
+	for deadline := time.Now().Add(2 * time.Second); !parked.Load(); {
+		if time.Now().After(deadline) {
+			t.Fatal("the writer goroutine never reached the clock; the settle tick is not running")
+		}
+		time.Sleep(time.Millisecond)
+	}
+
+	if cerr := w.Close(); cerr != nil {
+		t.Fatalf("Close: %v", cerr)
+	}
+	if sawClosedWhileRunning.Load() {
+		t.Error("closed was set while the writer goroutine was still running: submit's " +
+			"inline write and the draining goroutine can then be in writeLines on one day " +
+			"file at once, and each rolls back to a size the other has already moved")
 	}
 	if !w.closed.Load() {
 		t.Error("not closed after Close returned; submit would queue work to a goroutine that has gone")
 	}
-	// The ordering itself: with closed set before close(quit), a Flush racing the drain
-	// would write inline alongside the goroutine. Asserted through the observable
-	// consequence — Close waits, so by the time it returns the goroutine is done and an
-	// inline write is the ONLY writer.
 	select {
 	case <-w.quit:
 	default:

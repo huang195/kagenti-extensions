@@ -2491,3 +2491,360 @@ func TestCostInexactClauses_OrderAndUnknownKeys(t *testing.T) {
 		t.Errorf("a raw ESC from a wire key reached the rendered caveat: %v", got)
 	}
 }
+
+// ungroupedSnapshot is a window whose SERIES IS SHORT OF ITS TOTAL, with
+// usage.Snapshot.UngroupedCostMicros carrying the difference.
+//
+// The shape a gateway-priced /v1/embeddings response produces: the gateway settled a cost,
+// the inference parser cannot read that path so the event carries no model, and the dollars
+// therefore count toward Totals while belonging to no group=model key. It is priced traffic
+// — the ungrouped part is added to PricedRequests too — and what it lacks is a label on
+// this axis, not a figure.
+//
+// THE IDENTITY IS ASSERTED HERE, once, so no case below can pass against a fixture that
+// never held it. sum(series CostMicros) + UngroupedCostMicros == Totals.CostMicros is what
+// the field promises for a reconcilable group; a test that only matched rendered strings
+// would look identical whether or not the numbers reconciled, which is the failure mode of
+// asserting output instead of arithmetic.
+//
+// Through usage.SetUngroupedCost rather than by taking the address of a local, so the
+// absent-not-zero rule under test is the producer's own: a residual of zero must leave the
+// field nil.
+func ungroupedSnapshot(t *testing.T, seriesCost map[string]int64, ungrouped int64) *usage.Snapshot {
+	t.Helper()
+	var totals usage.Counts
+	series := map[string]usage.Counts{}
+	for label, micros := range seriesCost {
+		c := usage.Counts{Requests: 1, PriceableRequests: 1, PricedRequests: 1, CostMicros: micros}
+		series[label] = c
+		totals.Add(c)
+	}
+	totals.Add(usage.Counts{Requests: 1, PriceableRequests: 1, PricedRequests: 1, CostMicros: ungrouped})
+	snap := &usage.Snapshot{
+		Window: usage.WindowToday, Group: usage.GroupModel, Priced: true,
+		Totals:  totals,
+		Buckets: []usage.Bucket{{Counts: totals, Series: series}},
+	}
+	snap.SetUngroupedCost(ungrouped)
+	var sum int64
+	for _, c := range series {
+		sum += c.CostMicros
+	}
+	if sum+ungrouped != snap.Totals.CostMicros {
+		t.Fatalf("fixture does not reconcile: series %d + ungrouped %d = %d, totals %d",
+			sum, ungrouped, sum+ungrouped, snap.Totals.CostMicros)
+	}
+	return snap
+}
+
+// costLineIndex reports which rendered line first contains want, or -1.
+//
+// Used for the ORDER assertions: two disclosures that must not be mistaken for each other
+// have to appear in a fixed order, and "both strings are somewhere in the output" cannot
+// see an ordering defect.
+func costLineIndex(rendered, want string) int {
+	for i, l := range strings.Split(rendered, "\n") {
+		if strings.Contains(l, want) {
+			return i
+		}
+	}
+	return -1
+}
+
+// TestRenderCostPane_DisclosesTheSpendNoRowCarries.
+//
+// The defect: usage.Snapshot.UngroupedCostMicros was populated by both producers and read
+// by nothing, so the pane drew a breakdown that summed to LESS than the total two sections
+// above it with nothing on screen to explain the difference. A reader adding the column up
+// found $4.0000 under a $4.2500 headline.
+func TestRenderCostPane_DisclosesTheSpendNoRowCarries(t *testing.T) {
+	snap := ungroupedSnapshot(t, map[string]int64{"m-a": 3_000_000, "m-b": 1_000_000}, 250_000)
+
+	got := renderCostPane(snap, usage.GroupModel, 120, 40)
+	by := sectionOf(t, got, "BY MODEL")
+	if !strings.Contains(by, costUngroupedLabel) {
+		t.Errorf("the breakdown does not disclose the spend no row carries:\n%s", by)
+	}
+	if !strings.Contains(by, "$0.2500") {
+		t.Errorf("the residual band carries no figure (want $0.2500):\n%s", by)
+	}
+	// Its share is of the same published total the rows are measured against, so the band
+	// is comparable with them: 250000/4250000.
+	if !strings.Contains(by, "5.9%") {
+		t.Errorf("the residual band carries no share of the published total:\n%s", by)
+	}
+	// And the headline is still the SERVER'S total, never the sum of the rows. The residual
+	// exists so the breakdown can be reconciled, not so the total can be re-derived.
+	if tot := sectionOf(t, got, "TOTAL"); !strings.Contains(tot, "$4.2500") {
+		t.Errorf("TOTAL is not the published figure:\n%s", tot)
+	}
+	if strings.Contains(got, "$4.0000") {
+		t.Errorf("the series sum is presented as a total somewhere in the pane:\n%s", got)
+	}
+}
+
+// TestRenderCostPane_AReconciledBreakdownRendersNoBand is the mirror, and the half that
+// keeps the band worth reading.
+//
+// Absence of the field means the breakdown accounts for every dollar — a nil pointer, not a
+// zero — so a band must not appear. A permanent "(unattributed) $0.0000" row on every
+// correctly attributed window is the same failure as a coverage warning that never clears:
+// it trains a reader to skip the one row that matters.
+func TestRenderCostPane_AReconciledBreakdownRendersNoBand(t *testing.T) {
+	snap := ungroupedSnapshot(t, map[string]int64{"m-a": 3_000_000, "m-b": 1_000_000}, 0)
+	if snap.UngroupedCostMicros != nil {
+		t.Fatalf("fixture premise is wrong: a zero residual was published as %d",
+			*snap.UngroupedCostMicros)
+	}
+
+	got := renderCostPane(snap, usage.GroupModel, 120, 40)
+	if strings.Contains(got, costUngroupedLabel) {
+		t.Errorf("a complete breakdown still drew a residual band:\n%s", got)
+	}
+	if strings.Contains(got, "$0.0000") {
+		t.Errorf("a zero band was rendered for a breakdown with no residual:\n%s", got)
+	}
+}
+
+// TestCostUngroupedRow_OnlyAPublishedPositiveResidualBecomesABand is the unit-level half.
+//
+// Three refusals, and each would put a claim on screen that the data does not support: an
+// absent field means the breakdown reconciles, a zero is that same case wearing a value,
+// and a negative residual is not spend. usage.SetUngroupedCost already refuses the last
+// two, which is exactly why this restates them — a guarantee inherited silently is a
+// guarantee that stops holding without anything noticing.
+func TestCostUngroupedRow_OnlyAPublishedPositiveResidualBecomesABand(t *testing.T) {
+	base := func(micros *int64) *usage.Snapshot {
+		return &usage.Snapshot{
+			Priced:              true,
+			Totals:              usage.Counts{CostMicros: 4_250_000, PricedRequests: 3, PriceableRequests: 3},
+			UngroupedCostMicros: micros,
+		}
+	}
+	for _, tc := range []struct {
+		name  string
+		value *int64
+		want  bool
+	}{
+		{"absent", nil, false},
+		{"zero", ptrInt64(0), false},
+		{"negative", ptrInt64(-5_000_000), false},
+		{"positive", ptrInt64(250_000), true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			row, ok := costUngroupedRow(base(tc.value))
+			if ok != tc.want {
+				t.Fatalf("ok = %v, want %v (row %+v)", ok, tc.want, row)
+			}
+			if !ok {
+				return
+			}
+			if row.label != costUngroupedLabel {
+				t.Errorf("label = %q, want %q", row.label, costUngroupedLabel)
+			}
+			if !strings.Contains(row.right, "$0.2500") || !row.hasBar {
+				t.Errorf("row = %+v, want the figure and a share bar", row)
+			}
+		})
+	}
+}
+
+func ptrInt64(v int64) *int64 { return &v }
+
+// TestRenderCostPane_TheResidualBandIsNotTheTruncationNote.
+//
+// TWO DIFFERENT CLAIMS, and merging them would be worse than either alone. "+N more, each
+// smaller than the last row" is rows omitted FOR SPACE — a taller terminal shows them. The
+// band is spend with no row on this axis AT ALL — no terminal will ever produce one. A
+// reader who read them as one disclosure would go looking for a row that cannot exist.
+//
+// The ORDER is asserted, not just the presence of both: the note's own wording names "the
+// last row", so a band sitting above it would make that phrase point at the residual and
+// turn the count into a claim about entries cheaper than it.
+func TestRenderCostPane_TheResidualBandIsNotTheTruncationNote(t *testing.T) {
+	series := map[string]int64{}
+	for i := 0; i < costMaxSeriesRows+2; i++ {
+		series[fmt.Sprintf("model-%02d", i)] = int64(1_000_000 - i*1_000)
+	}
+	snap := ungroupedSnapshot(t, series, 250_000)
+
+	by := sectionOf(t, renderCostPane(snap, usage.GroupModel, 120, 60), "BY MODEL")
+	note := costLineIndex(by, "+2 more")
+	band := costLineIndex(by, costUngroupedLabel)
+	if note < 0 {
+		t.Fatalf("the truncation note is missing; test premise is wrong:\n%s", by)
+	}
+	if band < 0 {
+		t.Fatalf("the residual band is missing:\n%s", by)
+	}
+	if band < note {
+		t.Errorf("the band is drawn above the +N note, so \"the last row\" names the residual:\n%s", by)
+	}
+	// The note counts ELIDED SERIES ROWS ONLY. The band is not one of them, and the cap
+	// applies to label rows, so it must not be counted against either.
+	if strings.Contains(by, "+3 more") {
+		t.Errorf("the residual band was counted as an elided series row:\n%s", by)
+	}
+	// The two claims never share a line, which is what keeps them two claims.
+	if note == band {
+		t.Errorf("the band and the truncation note are on one line:\n%s", by)
+	}
+}
+
+// TestRenderCostPane_TheResidualBandIsAStateNotAName.
+//
+// The band is not a key and must not be readable as one. Its spelling follows
+// costUnattributedLabel's convention — parenthesised, lowercase — rather than inventing a
+// second way of saying "this is a state".
+//
+// On group=agent BOTH labels can appear at once, and the case is not contrived: the agent
+// axis reserves a bucket for traffic that named no client. They are different facts —
+// "(no user-agent)" is a row of real spend whose requests carried no User-Agent,
+// "(unattributed)" is spend with no row at all — so the pane must keep them distinguishable
+// rather than collapsing them into one "unknown".
+func TestRenderCostPane_TheResidualBandIsAStateNotAName(t *testing.T) {
+	if !strings.HasPrefix(costUngroupedLabel, "(") || !strings.HasSuffix(costUngroupedLabel, ")") {
+		t.Errorf("costUngroupedLabel = %q, which does not follow costUnattributedLabel's convention",
+			costUngroupedLabel)
+	}
+	if costUngroupedLabel == costUnattributedLabel {
+		t.Fatal("the residual band and the reserved agent bucket share one spelling for two facts")
+	}
+	snap := ungroupedSnapshot(t, map[string]int64{
+		"claude-code/2.1.14":        3_000_000,
+		pipeline.UnknownClientLabel: 1_000_000,
+	}, 250_000)
+
+	by := sectionOf(t, renderCostPane(snap, usage.GroupAgent, 120, 40), "BY AGENT")
+	for _, want := range []string{costUnattributedLabel, costUngroupedLabel} {
+		if !strings.Contains(by, want) {
+			t.Errorf("BY AGENT is missing %q:\n%s", want, by)
+		}
+	}
+	if strings.Contains(by, pipeline.UnknownClientLabel) {
+		t.Errorf("the reserved bucket reached the screen as a name:\n%s", by)
+	}
+}
+
+// TestRenderCostPane_TheResidualBandTravelsWithItsRows.
+//
+// Where the band ranks against the height budget. It qualifies the ROWS, not the figure —
+// Totals.CostMicros already includes every ungrouped dollar — so it belongs to the
+// breakdown section and is dropped WITH it. Two things follow, and both are asserted:
+// a band never appears without the rows it is residual of, and the total is never left
+// short by the section's loss.
+//
+// This is why the band is not a TOTAL caveat unit. A caveat's loss would leave a qualified
+// figure looking exact, which is what costTotalFigure's markers exist to prevent; losing
+// the band leaves a complete total and no column to add up, which misstates nothing.
+func TestRenderCostPane_TheResidualBandTravelsWithItsRows(t *testing.T) {
+	snap := ungroupedSnapshot(t, map[string]int64{"m-a": 3_000_000, "m-b": 1_000_000}, 250_000)
+	for h := 1; h <= 24; h++ {
+		got := renderCostPane(snap, usage.GroupModel, 80, h)
+		// The answer survives every budget, as it must on every path in this pane.
+		if !strings.Contains(got, "$4.2500") {
+			t.Errorf("h=%d dropped the total:\n%s", h, got)
+		}
+		if strings.Contains(got, costUngroupedLabel) && !strings.Contains(got, "m-a") {
+			t.Errorf("h=%d shows a residual with none of the rows it is residual of:\n%s", h, got)
+		}
+		if n := len(strings.Split(got, "\n")); n > h {
+			t.Errorf("h=%d rendered %d lines:\n%s", h, n, got)
+		}
+	}
+}
+
+// TestRenderCostPane_FitsEveryWidthWithTheResidualBand.
+//
+// The band adds a label ("(unattributed)", 15 cells) and a figure to the shared column
+// grid, so it moves the width arithmetic for every row in the section. The pane's contract
+// is unchanged: never exceed the budget, and drop whole figures rather than clip them.
+func TestRenderCostPane_FitsEveryWidthWithTheResidualBand(t *testing.T) {
+	snap := ungroupedSnapshot(t, map[string]int64{
+		"a-really-long-ascii-model-name": 3_820_000,
+		"日本語モデル":                         350_000,
+	}, 250_000)
+	for _, w := range append(costWidthFloors, costHostileWidths()...) {
+		for _, h := range []int{60, 40, 24, 20, 16} {
+			got := renderCostPane(snap, usage.GroupModel, w, h)
+			for i, line := range strings.Split(got, "\n") {
+				if lw := lipgloss.Width(line); lw > w {
+					t.Errorf("w=%d h=%d line %d is %d columns: %q", w, h, i, lw, line)
+				}
+			}
+			// A clipped figure is a different, smaller number. The band's own figure is held to
+			// the same rule as every other one in this pane.
+			if strings.Contains(got, "$0.25") && !strings.Contains(got, "$0.2500") {
+				t.Errorf("w=%d h=%d clipped the residual figure mid-digits:\n%s", w, h, got)
+			}
+		}
+	}
+}
+
+// TestRenderCostPane_AnEmptyBreakdownDrawsNoResidualBand.
+//
+// The path where the field is LARGEST and a band would say least. group=session on a
+// ledger-backed window carries no series at all — a per-minute row holds no session id — so
+// costledger.Fold finds no label for any row and publishes the WHOLE total as ungrouped. A
+// "(unattributed) 100.0%" band under "no session breakdown for this window" restates that
+// sentence in a form that reads as a mystery spender, and a residual is the part a
+// breakdown leaves out: with no breakdown there is nothing for it to be residual of.
+func TestRenderCostPane_AnEmptyBreakdownDrawsNoResidualBand(t *testing.T) {
+	whole := int64(12_500_000)
+	snap := &usage.Snapshot{
+		Window: usage.WindowToday, Group: usage.GroupSession, Priced: true,
+		Totals:  usage.Counts{Requests: 400, CostMicros: whole, PricedRequests: 400, PriceableRequests: 400},
+		Buckets: []usage.Bucket{{Counts: usage.Counts{Requests: 400, CostMicros: whole}}},
+	}
+	snap.SetUngroupedCost(whole)
+	if snap.UngroupedCostMicros == nil {
+		t.Fatal("fixture premise is wrong: the whole total was not published as ungrouped")
+	}
+
+	by := sectionOf(t, renderCostPane(snap, usage.GroupSession, 120, 40), "BY SESSION")
+	if strings.Contains(by, costUngroupedLabel) {
+		t.Errorf("a 100%% residual band was drawn where there is no breakdown to reconcile:\n%s", by)
+	}
+	if !strings.Contains(by, "no session breakdown") {
+		t.Errorf("the empty breakdown stopped saying it is empty:\n%s", by)
+	}
+	// And nothing is understated: the total still carries every dollar.
+	if tot := sectionOf(t, renderCostPane(snap, usage.GroupSession, 120, 40), "TOTAL"); !strings.Contains(tot, "$12.5000") {
+		t.Errorf("TOTAL does not carry the whole figure:\n%s", tot)
+	}
+}
+
+// TestRenderCostPane_TheResidualBandSharesTheRowsColumnGrid.
+//
+// Rendered through the same renderCostRows call as the label rows, so its figure sits in
+// the same column as theirs. A band a reader cannot align with the rows is a band they
+// cannot compare against them, which is the whole point of giving it a share and a bar.
+func TestRenderCostPane_TheResidualBandSharesTheRowsColumnGrid(t *testing.T) {
+	snap := ungroupedSnapshot(t, map[string]int64{
+		"a-really-long-ascii-model-name": 3_000_000,
+		"short":                          1_000_000,
+	}, 250_000)
+
+	by := sectionOf(t, renderCostPane(snap, usage.GroupModel, 120, 60), "BY MODEL")
+	width := -1
+	var bandSeen bool
+	for _, l := range strings.Split(by, "\n") {
+		if !strings.HasPrefix(l, costIndent) || !strings.Contains(l, "$") {
+			continue
+		}
+		if strings.Contains(l, costUngroupedLabel) {
+			bandSeen = true
+		}
+		if width < 0 {
+			width = lipgloss.Width(l)
+			continue
+		}
+		if got := lipgloss.Width(l); got != width {
+			t.Errorf("row is %d columns, the first row was %d — the band does not share the grid:\n%s",
+				got, width, by)
+		}
+	}
+	if !bandSeen {
+		t.Fatalf("no band matched; test premise is wrong:\n%s", by)
+	}
+}

@@ -868,3 +868,103 @@ func TestCostIncompleteReasonLines_OrdersTheFloorFirstAndSaysNothingForNone(t *t
 		}
 	}
 }
+
+// TestRunCost_AsksForAnAxisThatCannotCarryAResidual pins the PREMISE behind this command
+// showing no residual band, so the absence stays a decision rather than becoming an
+// oversight.
+//
+// usage.Snapshot.UngroupedCostMicros is the part of the total no SERIES entry carries, and
+// both producers compute it only where usage.Group.Reconcilable is true. This command asks
+// for group=none, which is not reconcilable, so the field can never arrive — and would have
+// nothing to disclose if it did, since the headline is Totals.CostMicros and no series is
+// summed here.
+//
+// The value of this test is what it says WHEN IT FAILS. Anyone giving this command a real
+// axis — a by-model table, say — starts receiving a residual, and a table summing to less
+// than the headline above it with nothing to explain the gap is the defect the field exists
+// to end.
+func TestRunCost_AsksForAnAxisThatCannotCarryAResidual(t *testing.T) {
+	var gotGroup string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotGroup = r.URL.Query().Get("group")
+		w.Header().Set("Content-Type", "application/json")
+		if _, err := w.Write([]byte(`{"window":"today","totals":{"requests":1},"priced":false}`)); err != nil {
+			t.Errorf("write: %v", err)
+		}
+	}))
+	defer srv.Close()
+
+	var out, errOut strings.Builder
+	runCost([]string{"--endpoint", srv.URL}, &out, &errOut)
+
+	// Absent on the wire is how apiclient spells GroupNone, and usage.ParseGroup reads "" as
+	// exactly that — so the parse is the check rather than a string comparison that would
+	// pass for a group nobody validated.
+	group, err := usage.ParseGroup(gotGroup)
+	if err != nil {
+		t.Fatalf("server saw group=%q, which the API does not accept: %v", gotGroup, err)
+	}
+	if group.Reconcilable() {
+		t.Errorf("this command now asks for group=%q, whose series CAN be reconciled against the "+
+			"total — so the answer may carry usage.Snapshot.UngroupedCostMicros, the spend no "+
+			"series row accounts for. Nothing in this command reads it. Either go back to a "+
+			"group that offers no reconciliation, or disclose the residual wherever the "+
+			"breakdown is printed (tui.costUngroupedRow is the pane's form of it) and carry it "+
+			"in costJSON for the scripted reader", group)
+	}
+}
+
+// TestRunCost_TheHeadlineIsThePublishedTotalNotASeriesSum.
+//
+// The rule usage.Snapshot.UngroupedCostMicros' own doc states for every client: never
+// present the sum of a series as the window's total. This surface prints one figure, and it
+// must be the one the server published — a total that already includes the spend no series
+// entry carries.
+//
+// The fixture is a reconcilable answer whose series is SHORT of its total by a quarter of a
+// dollar: 4.00 in the one series entry, 0.25 ungrouped, 4.25 in Totals. That is the shape a
+// gateway-priced /v1/embeddings response produces, and it is served here on a duration
+// window because a ring-backed answer is where a client can ask for a group at all. A
+// command that re-derived its headline by adding the breakdown up would print $4.00 and be
+// short by real money.
+func TestRunCost_TheHeadlineIsThePublishedTotalNotASeriesSum(t *testing.T) {
+	const body = `{"window":"1h","group":"model","priced":true,` +
+		`"totals":{"requests":5,"costMicros":4250000,"pricedRequests":5,"priceableRequests":5},` +
+		`"buckets":[{"at":"2026-01-01T00:00:00Z","requests":5,"costMicros":4250000,` +
+		`"series":{"claude-opus-5":{"requests":4,"costMicros":4000000,"pricedRequests":4,"priceableRequests":4}}}],` +
+		`"ungroupedCostMicros":250000}`
+	// The identity the field restores, asserted on the fixture rather than assumed: a test
+	// that only matched the headline would look the same against numbers that never
+	// reconciled.
+	var snap usage.Snapshot
+	if err := json.Unmarshal([]byte(body), &snap); err != nil {
+		t.Fatalf("fixture does not decode: %v", err)
+	}
+	var series int64
+	for _, b := range snap.Buckets {
+		for _, c := range b.Series {
+			series += c.CostMicros
+		}
+	}
+	if snap.UngroupedCostMicros == nil {
+		t.Fatal("fixture premise is wrong: no residual was published")
+	}
+	if series+*snap.UngroupedCostMicros != snap.Totals.CostMicros {
+		t.Fatalf("fixture does not reconcile: series %d + ungrouped %d != totals %d",
+			series, *snap.UngroupedCostMicros, snap.Totals.CostMicros)
+	}
+
+	srv := fakeUsageServer(t, body)
+	defer srv.Close()
+	var out, errOut strings.Builder
+	if code := runCost([]string{"--endpoint", srv.URL, "--window", "1h"}, &out, &errOut); code != 0 {
+		t.Fatalf("exit = %d, want 0; stderr = %s", code, errOut.String())
+	}
+	got := out.String()
+	if !strings.Contains(got, "$4.25") {
+		t.Errorf("headline is not the published total (want $4.25):\n%s", got)
+	}
+	if strings.Contains(got, "$4.00") {
+		t.Errorf("the series sum is presented as the window total:\n%s", got)
+	}
+}

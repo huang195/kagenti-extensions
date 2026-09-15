@@ -20,16 +20,21 @@ import "math"
 // WHAT IT DOES NOT BOUND: THE ACCUMULATED SUM. This comment used to claim it closed the
 // aggregate wrap — "two such requests wrapped usage.Counts.Add to a NEGATIVE total" — and
 // that overclaimed. It moved the threshold; it did not remove it. math.MaxInt64 /
-// MaxCostMicros is 1023, so 1024 requests each priced at the bound still wrap Counts.Add
-// to a large negative total (measured: -9214364837600034816), which then sits in the
+// MaxCostMicros is 1023, so 1024 requests each priced at the bound would wrap Counts.Add
+// to a large negative total (measured: -9214364837600034816), which then sat in the
 // durable ledger for its full retention with no repair path.
 //
 // NO per-request bound can close that, and the arithmetic says so in one line: for any
 // bound C > 0 the sum wraps after ceil(math.MaxInt64/C) requests, and nothing here bounds
 // the request count. A smaller C buys distance, not closure. Closing it takes a CHECKED
-// ACCUMULATE where the sum is kept — usage.Counts.Add and the ledger's own totals — which
-// is a different package's invariant and is not this constant's to hold.
-// TestNoPerRequestBoundClosesTheAccumulationWrap pins that reasoning.
+// ACCUMULATE where the sum is kept, which is a different package's invariant and not this
+// constant's to hold. TestNoPerRequestBoundClosesTheAccumulationWrap pins that reasoning.
+//
+// AND IT IS NOW CLOSED THERE, so read the paragraph above as arithmetic rather than as an
+// open defect: usage.Counts.Add routes every field through a checked accumulate that
+// saturates instead of wrapping and sets Counts.Saturated to disclose that the figure has
+// become a floor. What remains true is the part this constant is responsible for — a
+// per-request bound cannot do it, and pushing MaxCostMicros lower would not have.
 //
 // EXCLUSIVE: a figure of exactly MaxCostMicros is out of range (MicrosFromUSD rejects
 // `micros >= MaxCostMicros`). 2^53 is the first integer whose successor float64 cannot

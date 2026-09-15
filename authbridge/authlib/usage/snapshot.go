@@ -690,7 +690,7 @@ func (a *Aggregator) Snapshot(window, resolution time.Duration, sessionID string
 			// being read, so the entries sum to the cost of the events that had a label for
 			// this axis, and the rest is the shortfall. Group.Reconcilable is what keeps
 			// group=plugin, whose entries deliberately double-count, out of this arithmetic.
-			ungrouped += b.Counts.CostMicros - seriesCost(b.Series)
+			ungrouped += b.CostMicros - seriesCost(b.Series)
 		}
 		if ring != nil {
 			if src := &ring[slot(t)]; src.start.Equal(t) {

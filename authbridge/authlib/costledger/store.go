@@ -173,9 +173,25 @@ func appendBytes(f appendTarget, size int64, b []byte) error {
 // arbitrarily by whatever else ends up in that directory.
 //
 // A line longer than this ENDS that day's read, with a warning, because a scanner
-// cannot skip a token it refused to buffer. Bounded memory is worth more than
-// resyncing past damage of a kind no ledger write can produce — every row this
-// package emits is one Encode of one struct.
+// cannot skip a token it refused to buffer. Every row appended after that offset is
+// then unreadable, on this read and on every future one, and the file is append-only
+// so the loss is permanent.
+//
+// AN EARLIER VERSION OF THIS COMMENT CLAIMED THAT WAS FINE, on the grounds that this
+// is "damage of a kind no ledger write can produce — every row this package emits is
+// one Encode of one struct". That was FALSE, and it was the premise the whole design
+// rested on. One Encode of one struct is exactly how the damage was produced: Row
+// carries Model, Model is the model name off the parsed request body, and it was
+// written with no length cap — so a workload naming its model with a megabyte of
+// bytes wrote a single valid line past this limit and destroyed the remainder of that
+// day. Measured: 5 priced requests totalling $3.25 read back as $0.25.
+//
+// The write side now caps every label at maxLabelLen, which puts the longest line
+// this package can emit under a kilobyte. So this guard is once again what the
+// comment above wrongly assumed it already was — a last resort for a file corrupted
+// by something other than this package — and NOT a live failure mode a request can
+// reach. Keep it that way: any new Row field carrying caller-controlled bytes needs a
+// cap on the write path, not a larger buffer here.
 const maxLineBytes = 1 << 20
 
 // readDay decodes one day file. A missing file is not an error: an idle day writes

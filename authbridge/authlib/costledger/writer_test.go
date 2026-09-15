@@ -3,6 +3,7 @@ package costledger
 import (
 	"bytes"
 	"encoding/json"
+	"fmt"
 	"io"
 	"os"
 	"path/filepath"
@@ -412,6 +413,94 @@ func TestWriter_IOFailureDoesNotPropagate(t *testing.T) {
 	// surfaces one.
 	_ = w.Flush()
 	w.Record("s1", costedEvent(t, "gw", "m", 0.25, 100, 50))
+}
+
+// The J6 bound. The model name is request-chosen, so without a cap the accumulator
+// grows to whatever a caller sends — 50,000 keys held for one minute was measured,
+// and every one of them is also copied by takeLocked under mu inside
+// session.Store.Append's write lock.
+func TestRecord_DistinctLabelsPerMinuteAreCapped(t *testing.T) {
+	dir := t.TempDir()
+	now := at
+	w := newTestWriter(t, dir, func() time.Time { return now })
+
+	const sent = 5_000
+	for i := 0; i < sent; i++ {
+		w.Record("s1", costedEvent(t, "gw", fmt.Sprintf("model-%d", i), 0.25, 100, 50))
+	}
+
+	held, _ := w.pending()
+	if len(held) > maxLabelsPerMinute {
+		t.Errorf("the open minute holds %d rows after %d distinct models, want at most %d; "+
+			"unbounded here is unbounded memory AND an unbounded walk on the request path",
+			len(held), sent, maxLabelsPerMinute)
+	}
+	// FOLDED, NOT DROPPED. Coarse attribution is a worse answer than exact attribution
+	// and a far better one than a total that is short by 4,936 requests.
+	var total int64
+	var requests int64
+	var sawOverflow bool
+	for _, r := range held {
+		total += r.CostMicros
+		requests += r.Requests
+		if r.Model == overflowLabel {
+			sawOverflow = true
+		}
+	}
+	if want := int64(sent) * 250_000; total != want {
+		t.Errorf("CostMicros across the capped minute = %d, want %d — the cap must cost "+
+			"attribution detail, never dollars", total, want)
+	}
+	if requests != int64(sent) {
+		t.Errorf("Requests = %d, want %d", requests, sent)
+	}
+	if !sawOverflow {
+		t.Error("no (other) row: the excess was dropped or silently keyed under a real " +
+			"model, either of which misattributes it")
+	}
+}
+
+// The reserved slot has to be reserved BEFORE the map is full, or the overflow row
+// itself becomes the (cap+1)th entry and the map settles one over its stated bound.
+// usage.addLabel reserves it the same way and for the same reason.
+func TestRecord_TheOverflowRowFitsInsideTheCap(t *testing.T) {
+	dir := t.TempDir()
+	now := at
+	w := newTestWriter(t, dir, func() time.Time { return now })
+
+	for i := 0; i < maxLabelsPerMinute+10; i++ {
+		w.Record("s1", costedEvent(t, "gw", fmt.Sprintf("model-%d", i), 0.25, 100, 50))
+	}
+
+	held, _ := w.pending()
+	if len(held) != maxLabelsPerMinute {
+		t.Errorf("held %d rows, want exactly %d — %d means the (other) row was added on "+
+			"top of a full map instead of into the slot kept for it",
+			len(held), maxLabelsPerMinute, maxLabelsPerMinute+1)
+	}
+}
+
+// The cap is PER MINUTE, not for the life of the writer: a new minute starts from an
+// empty accumulator, so a deployment with 40 real labels never reaches the bound and
+// never sees an (other) band at all.
+func TestRecord_TheCapResetsWithTheMinute(t *testing.T) {
+	dir := t.TempDir()
+	now := at
+	w := newTestWriter(t, dir, func() time.Time { return now })
+
+	for i := 0; i < maxLabelsPerMinute*2; i++ {
+		w.Record("s1", costedEvent(t, "gw", fmt.Sprintf("model-%d", i), 0.25, 100, 50))
+	}
+	now = at.Add(time.Minute)
+	fresh := costedEvent(t, "gw", "opus", 0.25, 100, 50)
+	fresh.At = now
+	w.Record("s1", fresh)
+
+	held, _ := w.pending()
+	if len(held) != 1 || held[0].Model != "opus" {
+		t.Errorf("the new minute holds %+v, want one row for opus — the cap must not carry "+
+			"over and coarsen a minute that has no cardinality problem", held)
+	}
 }
 
 // A day file records spend, so it must not be readable by other accounts on a

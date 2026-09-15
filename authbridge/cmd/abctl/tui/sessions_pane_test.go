@@ -213,6 +213,114 @@ func TestSessionsTable_CostFitsItsColumn(t *testing.T) {
 	}
 }
 
+// fittedCostWidth returns the width fitTableColumns leaves the COST column at terminal
+// width w, failing the test if the column is not in the fitted set at all.
+//
+// The absence check is the invariant the sessions godoc used to have backwards: the fitter
+// SHRINKS the widest column and never drops one, which is what keeps the positional-index
+// trap closed (event_retention_test.go asserts row[5]). A fitter that started dropping
+// columns would spring it, and a shifted index still compiles and still asserts.
+func fittedCostWidth(t *testing.T, w int) int {
+	t.Helper()
+	fitted := fitTableColumns(sessionsColumns(), w)
+	if len(fitted) != len(sessionsColumns()) {
+		t.Fatalf("width %d: fitTableColumns returned %d of %d columns; a dropped column shifts every positional row reader",
+			w, len(fitted), len(sessionsColumns()))
+	}
+	for _, c := range fitted {
+		if c.Title == "COST" {
+			return c.Width
+		}
+	}
+	t.Fatalf("width %d: no COST column in the fitted set: %v", w, fitted)
+	return 0
+}
+
+// The FITTER'S OUTPUT, which is what nothing checked.
+//
+// TestSessionsTable_CostFitsItsColumn above pins formatUSDCell against the 10 columns
+// sessionsColumns DECLARES — a width the table only has from a 70-column terminal up.
+// fitTableColumns shrinks COST to 5 at 40, 7 at 50 and 8 at 60, and bubbles renders a cell
+// as runewidth.Truncate(value, col.Width, "…"), which cuts from the right and keeps the
+// leading digits: $1234.5678 in a 5-wide column comes out "$123…", ten times smaller and
+// still readable as an amount. That is exactly the "never render a partial number" rule the
+// COST column's own comment says #953 forbids, and a constructor-only assertion could not
+// see it.
+//
+// Every cell must therefore be one of exactly two things: the whole figure, or the elision
+// marker. Nothing in between, and NOT blank — blank means "unpriced" in this table.
+func TestSessionsTable_CostCellIsNeverATruncatedNumber(t *testing.T) {
+	// Micros rather than dollars so the expected string is derived from the same value the
+	// row builder formats; a float literal round-tripped through 1e6 could disagree in the
+	// fourth decimal and make the test about arithmetic instead of about width.
+	amounts := []int64{
+		30,            // "<$0.0001", the sub-floor form: 8 columns
+		120_000,       // "$0.1200": 7 columns, fits from a 50-column terminal up
+		12_500_000,    // "$12.5000": 8 columns
+		1_234_567_800, // "$1234.5678": 10 columns, needs the full declared width
+		9_999_999_900, // "$9999.9999": 10 columns, the documented ceiling
+	}
+	for _, w := range []int{40, 50, 60, 70, 80, 96} {
+		costW := fittedCostWidth(t, w)
+		for _, micros := range amounts {
+			usd := float64(micros) / 1e6
+			whole := formatUSDCell(usd)
+
+			m := &model{width: w, height: 40}
+			m.sessionsTbl = newSessionsTable()
+			m.sessions = []session.SessionSummary{{ID: "sess-a", EventCount: 1}}
+			m.spend.snap = &usage.Snapshot{
+				Window: "1h", Priced: true,
+				Buckets: []usage.Bucket{{Series: map[string]usage.Counts{
+					"sess-a": {Requests: 1, CostMicros: micros, PricedRequests: 1, PriceableRequests: 1},
+				}}},
+			}
+			// layout() is the production path — it is the only caller of
+			// SetColumns(fitTableColumns(...)) — so this exercises the real fitted widths
+			// rather than a width the test computed for itself.
+			m.layout()
+			m.rebuildSessionsTable()
+
+			got := sessionsRowCell(t, m, "COST")
+			switch got {
+			case whole:
+				// Stated in full, so it must actually fit or bubbles will clip it anyway.
+				if gw := lipgloss.Width(got); gw > costW {
+					t.Errorf("term %d, %s: COST cell is %d columns in a %d-wide column; bubbles truncates it to a smaller-looking figure",
+						w, whole, gw, costW)
+				}
+			case costElision:
+				// Elided, so the whole figure must genuinely not have fitted — otherwise
+				// the fix is hiding a figure it could have shown.
+				if lipgloss.Width(whole) <= costW {
+					t.Errorf("term %d, %s: COST elided although %d columns fit a %d-wide column",
+						w, whole, lipgloss.Width(whole), costW)
+				}
+			case "":
+				t.Errorf("term %d, %s: COST cell is blank, which in this table means UNPRICED; a known cost that will not fit must say %q",
+					w, whole, costElision)
+			default:
+				t.Errorf("term %d, %s: COST cell = %q, want the whole figure or %q — never a partial number",
+					w, whole, got, costElision)
+			}
+		}
+	}
+}
+
+// The widths the sessions godoc and fitCostCell's comment both quote. Asserted so the
+// prose cannot go stale silently the way the "106 columns / drops trailing columns" note
+// it replaced did.
+func TestFitTableColumns_SessionsCostWidthsAreWhatTheCommentsClaim(t *testing.T) {
+	if got := tableWidth(sessionsColumns()); got != 102 {
+		t.Errorf("declared sessions table width = %d, want 102 (90 declared + 6 columns × cellPadding)", got)
+	}
+	for _, tc := range []struct{ term, cost int }{{40, 5}, {50, 7}, {60, 8}, {70, 10}, {80, 10}, {96, 10}} {
+		if got := fittedCostWidth(t, tc.term); got != tc.cost {
+			t.Errorf("terminal %d: fitted COST width = %d, want %d", tc.term, got, tc.cost)
+		}
+	}
+}
+
 func TestSessionCost_SumsEveryBucketForTheSession(t *testing.T) {
 	// The strip asks for one bucket, but nothing guarantees the server folds to one
 	// — resolution is negotiated, not dictated. Reading Buckets[0] alone would

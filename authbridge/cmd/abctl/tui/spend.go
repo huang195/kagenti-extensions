@@ -170,6 +170,20 @@ type spendSummary struct {
 	// the denominator that makes it readable.
 	Unpriced  int64
 	Priceable int64
+	// Incomplete is how many of the window's PRICED requests carry a figure that is not
+	// EXACT: a stream that died before its output count, so the amount is a LOWER BOUND,
+	// or a gateway that reported only a total.
+	//
+	// A SUBSET of the priced requests, never a deduction from them — the dollars are in
+	// WindowUSD and belong there. It answers a different question from Unpriced:
+	// coverage asks how much of the traffic the figure covers, exactness asks whether
+	// the figure it does cover is the real number. Both can be true at once.
+	//
+	// This branch carries a commit titled "Stop publishing a truncated stream's floor as
+	// an exact total", and cmd_cost.go was its only consumer in cmd/abctl: the strip, the
+	// sessions table's COST cell and the Usage pane's cost cell all republished exactly
+	// that floor as an exact figure. Carried here so the strip can mark it.
+	Incomplete int64
 	// HasSnapshot reports that a poll actually answered.
 	//
 	// It is what separates "we looked, and there was no inference traffic" from
@@ -205,6 +219,11 @@ type spendSummary struct {
 	// likely to be partial and, until now, the only one with no indicator.
 	TodayUnpriced  int64
 	TodayPriceable int64
+	// TodayIncomplete is the day's own exactness counter, separate from Incomplete for
+	// the same reason its coverage counters are separate from the window's: it is a
+	// different question about a different span, and one figure must never wear another's
+	// qualification.
+	TodayIncomplete int64
 
 	SavedUSD float64 // set once tool-prune savings are aggregated
 	HasSaved bool
@@ -246,6 +265,10 @@ func (m *model) spendSummary() spendSummary {
 		WindowLabel: sanitizeLabel(snap.Window),
 		Priced:      snap.Priced,
 		Priceable:   snap.Totals.PriceableRequests,
+		// Carried whether or not the window is priced: a snapshot cannot report an inexact
+		// figure without reporting a priced one, but reading it unconditionally means the
+		// renderer decides what to do with it in one place rather than two.
+		Incomplete:  snap.Totals.IncompleteRequests,
 		HasSnapshot: true,
 	}
 	// Priceable minus priced, NOT requests minus priced. Requests counts every
@@ -301,12 +324,19 @@ func (m *model) spendSummary() spendSummary {
 // Snapshot.Priced is WINDOW-wide: a snapshot that priced another session's traffic
 // says Priced == true, so trusting that flag alone would render $0.0000 against a
 // session whose cost is simply unknown.
-func (m *model) sessionCost(id string) (usd float64, priced bool) {
+//
+// inexact is the third answer, and it is about the figure rather than about whether
+// there is one: true means at least one of this session's priced requests carries a
+// figure that is not exact (usage.Counts.IncompleteRequests), so usd is a LOWER BOUND.
+// Returned rather than folded into priced because the dollars are real and belong on
+// screen — only the claim of exactness is withdrawn. The cell marks it; see
+// fitCostCell.
+func (m *model) sessionCost(id string) (usd float64, priced, inexact bool) {
 	if m.spend.snap == nil || !m.spend.snap.Priced || id == "" {
-		return 0, false
+		return 0, false, false
 	}
 	var micros int64
-	var pricedReqs int64
+	var pricedReqs, incompleteReqs int64
 	// Every bucket, not Buckets[0]. The strip asks for a single-bucket resolution
 	// but the server negotiates it (see Snapshot.BucketSeconds), so reading the
 	// first bucket would report the first slice of the window as the whole of it.
@@ -317,11 +347,12 @@ func (m *model) sessionCost(id string) (usd float64, priced bool) {
 		}
 		micros += c.CostMicros
 		pricedReqs += c.PricedRequests
+		incompleteReqs += c.IncompleteRequests
 	}
 	if pricedReqs == 0 {
-		return 0, false
+		return 0, false, false
 	}
-	return float64(micros) / 1e6, true
+	return float64(micros) / 1e6, true, incompleteReqs > 0
 }
 
 // parseWindowSpan interprets a snapshot's Window string as a duration.
@@ -479,6 +510,9 @@ func (m *model) applyTodayFigure(out *spendSummary) {
 	if gap := snap.Totals.PriceableRequests - snap.Totals.PricedRequests; gap > 0 {
 		out.TodayUnpriced = gap
 	}
+	// And the day's exactness, which is a different claim from its coverage: a day can be
+	// fully covered and still be a floor, because one truncated stream is enough.
+	out.TodayIncomplete = snap.Totals.IncompleteRequests
 }
 
 // spendTodayTickIsCurrent reports whether a today tick belongs to the live chain.

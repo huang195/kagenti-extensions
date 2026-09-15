@@ -679,6 +679,79 @@ func TestRenderSpendStrip_ASuppressedWindowsGapWearsTheWindowsLabel(t *testing.T
 	}
 }
 
+// A truncated stream's floor must never be published as an exact total.
+//
+// That is the title of a commit on this branch, and the strip ignored it: the figure
+// went out as "$4.1700 today" and "$1.1200 /1h" to four decimal places, with no
+// annotation, for a total the aggregator itself reports as a lower bound. Asserted at
+// every width for the reason the partial marker is: one column is exactly what it takes
+// to make the qualification undroppable.
+func TestRenderSpendStrip_AnInexactTotalIsMarkedAtEveryWidth(t *testing.T) {
+	s := spendSummary{
+		TodayUSD: 4.17, HasToday: true, TodayPriceable: 318, TodayIncomplete: 4,
+		WindowUSD: 1.12, WindowLabel: "1h", BurnPerMin: 0.0187, Priced: true,
+		HasSnapshot: true, Priceable: 10, Incomplete: 3,
+	}
+	for w := 1; w <= 200; w++ {
+		got := renderSpendStrip(s, w)
+		for amount, label := range map[string]string{"$4.1700": "today", "$1.1200": "the hour"} {
+			if !strings.Contains(got, amount) {
+				continue
+			}
+			if !strings.Contains(got, inexactMarker+amount) {
+				t.Fatalf("width %d: %q states %s's inexact total as an exact figure", w, got, label)
+			}
+		}
+	}
+	wide := renderSpendStrip(s, 200)
+	if !strings.Contains(wide, "4 inexact") {
+		t.Errorf("wide strip %q does not say how many of the day's figures are inexact", wide)
+	}
+	if !strings.Contains(wide, "3 inexact") {
+		t.Errorf("wide strip %q does not say how many of the hour's figures are inexact", wide)
+	}
+}
+
+// The other half: an exact total carries no marker. Without this the fix could be
+// "made to pass" by marking everything, which is the same as marking nothing.
+func TestRenderSpendStrip_AnExactTotalCarriesNoInexactMarker(t *testing.T) {
+	s := spendSummary{
+		TodayUSD: 4.17, HasToday: true, TodayPriceable: 318,
+		WindowUSD: 1.12, WindowLabel: "1h", Priced: true, HasSnapshot: true, Priceable: 10,
+	}
+	got := renderSpendStrip(s, 200)
+
+	if strings.Contains(got, inexactMarker+"$4.1700") || strings.Contains(got, inexactMarker+"$1.1200") {
+		t.Errorf("strip %q marks an exact total as inexact", got)
+	}
+	if strings.Contains(got, "inexact") {
+		t.Errorf("strip %q carries an exactness caveat with nothing to act on", got)
+	}
+}
+
+// Exactness and coverage are different claims about the same number and both can be
+// true at once, so a figure that is both must say both — and in the order cmd_cost.go
+// fixed: the figure itself first, then what it covers.
+func TestRenderSpendStrip_AFigureCanBeBothInexactAndPartial(t *testing.T) {
+	s := spendSummary{
+		TodayUSD: 0.0031, HasToday: true, TodayUnpriced: 399, TodayPriceable: 400, TodayIncomplete: 2,
+		HasSnapshot: true,
+	}
+	got := renderSpendStrip(s, 200)
+
+	if !strings.Contains(got, inexactMarker+"$0.0031"+partialMarker+" today") {
+		t.Errorf("strip %q does not carry both markers on the figure they qualify", got)
+	}
+	if !strings.Contains(got, "(2 inexact, 399 of 400 unpriced)") {
+		t.Errorf("strip %q does not state both caveats, exactness first", got)
+	}
+	// And both markers survive the compact form, which is what a narrow terminal gets.
+	narrow := renderSpendStrip(s, 24)
+	if !strings.Contains(narrow, inexactMarker+"$0.0031"+partialMarker) {
+		t.Errorf("narrow strip %q dropped a marker; the figure now reads as settled", narrow)
+	}
+}
+
 // The width matrix, with both caveats live. The strip's contract is one line, never
 // wider than its budget, and no clipped number — and a caveat is the newest thing that
 // can break it. The CJK label is two display columns per rune and one rune, so any
@@ -692,6 +765,12 @@ func TestRenderSpendStrip_CaveatsObeyTheWidthContract(t *testing.T) {
 			TodayUSD: 0.0031, HasToday: true, TodayUnpriced: 399, TodayPriceable: 400,
 			WindowUSD: 1.12, WindowLabel: "1h", BurnPerMin: 0.0187, Priced: true,
 			HasSnapshot: true, Unpriced: 12, Priceable: 318,
+			SavedUSD: 0.24, HasSaved: true,
+		}},
+		{"every figure both inexact and partial", spendSummary{
+			TodayUSD: 0.0031, HasToday: true, TodayUnpriced: 399, TodayPriceable: 400, TodayIncomplete: 7,
+			WindowUSD: 1.12, WindowLabel: "1h", BurnPerMin: 0.0187, Priced: true,
+			HasSnapshot: true, Unpriced: 12, Priceable: 318, Incomplete: 3,
 			SavedUSD: 0.24, HasSaved: true,
 		}},
 		{"cjk window label under a partial day", spendSummary{

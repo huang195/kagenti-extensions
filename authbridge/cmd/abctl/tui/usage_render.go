@@ -343,13 +343,31 @@ func renderUsageSummary(snap *usage.Snapshot) string {
 // endpoint, so a window mixing priced and unpriced requests is the normal case
 // rather than an edge one. Presenting its subtotal as if it were the whole spend
 // is the failure this coverage count exists to prevent.
+//
+// Coverage is not the only way a total can mislead, and this cell used to make the other
+// way invisible: usage.Counts.IncompleteRequests counts priced requests whose figure is a
+// LOWER BOUND (a stream that died before its output count) or an approximation (a gateway
+// reporting only a total). While it is non-zero the dollar total is inexact, so the figure
+// wears inexactMarker and says how many — the exactness caveat before the coverage one,
+// because it qualifies the figure itself where coverage qualifies what the figure is
+// about.
 func renderCostSummary(snap *usage.Snapshot) string {
 	if !snap.Priced {
 		// Not "$0.0000". A zero cost and an unknown cost are different answers, and
 		// only one of them means the traffic was free.
 		return "COST unavailable"
 	}
-	cell := fmt.Sprintf("COST $%.4f", float64(snap.Totals.CostMicros)/1e6)
+	// formatUSDCell, not a bare %.4f. The formatter exists to stop exactly what this line
+	// did: it renders anything positive under $0.00005 as "<$0.0001" instead of "$0.0000",
+	// which reads as "this traffic was free". One cache-read-only request is $0.000038 —
+	// 100 cache-read tokens at a typical rate — so a real charge printed as free was one
+	// quiet request away, on the pane whose whole job is to report usage. Both other money
+	// surfaces already route through it; this was the hole.
+	amount := formatUSDCell(float64(snap.Totals.CostMicros) / 1e6)
+	if snap.Totals.IncompleteRequests > 0 {
+		amount = inexactMarker + amount
+	}
+	cell := "COST " + amount
 	// Compared against PRICEABLE requests, not all of them. Requests counts every
 	// proxied response — MCP tool calls, health checks, anything else the sidecar
 	// handled — while only inference can ever be priced, so the old ratio left a
@@ -361,6 +379,14 @@ func renderCostSummary(snap *usage.Snapshot) string {
 	// column showed them identically. Only shown when it tells the reader something —
 	// a single uniform provenance that is authoritative needs no annotation.
 	cell += provenanceNote(snap.PricedBy)
+
+	// Spelled out as well as marked, because this cell has room for a sentence where the
+	// strip and the table have room for a glyph. Only when it is non-zero: a permanent
+	// caveat with nothing to act on is what teaches an operator to ignore the one that
+	// matters.
+	if inc := snap.Totals.IncompleteRequests; inc > 0 {
+		cell += fmt.Sprintf(" (%d of %d inexact)", inc, snap.Totals.PricedRequests)
+	}
 
 	priceable := snap.Totals.PriceableRequests
 	if priceable == 0 || snap.Totals.PricedRequests >= priceable {

@@ -544,6 +544,70 @@ func TestSpendSummary_TodayCoverageIsNotTheWindowsCoverage(t *testing.T) {
 	}
 }
 
+// An inexact total must reach the renderer AS inexact, from either snapshot.
+//
+// The fixture is the other shape every "today" fixture on this branch lacked:
+// IncompleteRequests > 0. This branch carries a commit titled "Stop publishing a
+// truncated stream's floor as an exact total", and spendSummary had no field for the
+// counter that says so — so the strip republished the floor as "$4.1700 today" and
+// "$1.1200 /1h", exact to four decimal places.
+func TestSpendSummary_CarriesTheInexactCountFromBothSnapshots(t *testing.T) {
+	m := &model{}
+	m.spend.snap = &usage.Snapshot{
+		Window: "1h",
+		Totals: usage.Counts{
+			Requests: 10, CostMicros: 1_120_000,
+			PricedRequests: 10, PriceableRequests: 10, IncompleteRequests: 3,
+		},
+		Priced: true,
+	}
+	m.spend.todaySnap = &usage.Snapshot{
+		Window: usage.WindowToday,
+		Totals: usage.Counts{
+			Requests: 318, CostMicros: 4_170_000,
+			PricedRequests: 318, PriceableRequests: 318, IncompleteRequests: 4,
+		},
+		Priced: true,
+	}
+
+	got := m.spendSummary()
+
+	if got.Incomplete != 3 {
+		t.Errorf("Incomplete = %d, want the window's 3", got.Incomplete)
+	}
+	if got.TodayIncomplete != 4 {
+		t.Errorf("TodayIncomplete = %d, want the day's 4", got.TodayIncomplete)
+	}
+	// Disclosed, not deducted: the dollars are real and belong in the total.
+	if got.WindowUSD != 1.12 || got.TodayUSD != 4.17 {
+		t.Errorf("an inexact figure was withheld instead of qualified: window=%v today=%v",
+			got.WindowUSD, got.TodayUSD)
+	}
+}
+
+// And an exact answer must carry no count, so the marker cannot become permanent
+// furniture.
+func TestSpendSummary_AnExactTotalReportsNothingInexact(t *testing.T) {
+	m := &model{}
+	m.spend.snap = &usage.Snapshot{
+		Window: "1h",
+		Totals: usage.Counts{Requests: 10, CostMicros: 1_120_000, PricedRequests: 10, PriceableRequests: 10},
+		Priced: true,
+	}
+	m.spend.todaySnap = &usage.Snapshot{
+		Window: usage.WindowToday,
+		Totals: usage.Counts{Requests: 318, CostMicros: 4_170_000, PricedRequests: 318, PriceableRequests: 318},
+		Priced: true,
+	}
+
+	got := m.spendSummary()
+
+	if got.Incomplete != 0 || got.TodayIncomplete != 0 {
+		t.Errorf("an exact pair of snapshots reported inexact counts: window=%d today=%d",
+			got.Incomplete, got.TodayIncomplete)
+	}
+}
+
 // THE case where the honest answer is to show less. A proxy with no durable cost
 // ledger — Kubernetes by design — answers window=today from the ring's maximum span
 // and reports THAT span. Trusting the request rather than the answer would label a

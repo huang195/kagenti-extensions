@@ -321,6 +321,130 @@ func TestFitTableColumns_SessionsCostWidthsAreWhatTheCommentsClaim(t *testing.T)
 	}
 }
 
+// The COST cell republished a truncated stream's floor as "$0.2546" — a figure exact to
+// four decimal places for an amount the aggregator itself reports as a lower bound. The
+// cell has no room for a sentence, so it carries the one-column marker every other money
+// surface in abctl uses.
+func TestSessionsTable_InexactCostCellSaysSo(t *testing.T) {
+	m := costSessionsModel()
+	m.sessions = []session.SessionSummary{{ID: "sess-a", EventCount: 3, TotalTokens: 100}}
+	m.spend.snap = &usage.Snapshot{
+		Window: "1h", Priced: true,
+		Buckets: []usage.Bucket{{
+			Series: map[string]usage.Counts{
+				"sess-a": {
+					Requests: 3, CostMicros: 254_600,
+					PricedRequests: 3, PriceableRequests: 3, IncompleteRequests: 1,
+				},
+			},
+		}},
+	}
+
+	m.rebuildSessionsTable()
+
+	got := sessionsRowCell(t, m, "COST")
+	if want := inexactMarker + "$0.2546"; got != want {
+		t.Errorf("COST cell = %q, want %q — a lower bound stated as an exact figure is the "+
+			"claim IncompleteRequests exists to withdraw", got, want)
+	}
+}
+
+// And an exact figure carries no marker, so the annotation stays worth reading.
+func TestSessionsTable_ExactCostCellCarriesNoMarker(t *testing.T) {
+	m := costSessionsModel()
+	m.sessions = []session.SessionSummary{{ID: "sess-a", EventCount: 3}}
+	m.spend.snap = &usage.Snapshot{
+		Window: "1h", Priced: true,
+		Buckets: []usage.Bucket{{
+			Series: map[string]usage.Counts{
+				"sess-a": {Requests: 3, CostMicros: 254_600, PricedRequests: 3, PriceableRequests: 3},
+			},
+		}},
+	}
+
+	m.rebuildSessionsTable()
+
+	if got := sessionsRowCell(t, m, "COST"); got != "$0.2546" {
+		t.Errorf("COST cell = %q, want the bare %q", got, "$0.2546")
+	}
+}
+
+// The marker costs a column, so it must obey the same rule the figure does: whole, or
+// elided, never a partial number. It cannot be dropped to make a figure fit — that would
+// turn a lower bound back into an exact-looking total, which is the defect.
+func TestSessionsTable_InexactCostCellIsNeverATruncatedNumber(t *testing.T) {
+	amounts := []int64{120_000, 12_500_000, 1_234_567_800}
+	for _, w := range []int{40, 50, 60, 70, 80, 96} {
+		costW := fittedCostWidth(t, w)
+		for _, micros := range amounts {
+			usd := float64(micros) / 1e6
+			whole := inexactMarker + formatUSDCell(usd)
+
+			m := &model{width: w, height: 40}
+			m.sessionsTbl = newSessionsTable()
+			m.sessions = []session.SessionSummary{{ID: "sess-a", EventCount: 1}}
+			m.spend.snap = &usage.Snapshot{
+				Window: "1h", Priced: true,
+				Buckets: []usage.Bucket{{Series: map[string]usage.Counts{
+					"sess-a": {
+						Requests: 1, CostMicros: micros,
+						PricedRequests: 1, PriceableRequests: 1, IncompleteRequests: 1,
+					},
+				}}},
+			}
+			m.layout()
+			m.rebuildSessionsTable()
+
+			switch got := sessionsRowCell(t, m, "COST"); got {
+			case whole:
+				if gw := lipgloss.Width(got); gw > costW {
+					t.Errorf("term %d, %s: cell is %d columns in a %d-wide column; bubbles clips it",
+						w, whole, gw, costW)
+				}
+			case costElision:
+				if lipgloss.Width(whole) <= costW {
+					t.Errorf("term %d, %s: elided although %d columns fit a %d-wide column",
+						w, whole, lipgloss.Width(whole), costW)
+				}
+			case formatUSDCell(usd):
+				t.Errorf("term %d: cell = %q — the marker was dropped to make the figure fit, "+
+					"which restates a lower bound as an exact total", w, got)
+			default:
+				t.Errorf("term %d, %s: cell = %q, want the whole marked figure or %q",
+					w, whole, got, costElision)
+			}
+		}
+	}
+}
+
+func TestSessionCost_ReportsWhetherTheFigureIsExact(t *testing.T) {
+	// IncompleteRequests is summed over the same buckets as the dollars, and one
+	// inexact request is enough to make the session's total a lower bound.
+	m := costSessionsModel()
+	m.spend.snap = &usage.Snapshot{
+		Window: "1h", Priced: true,
+		Buckets: []usage.Bucket{
+			{Series: map[string]usage.Counts{"sess-a": {CostMicros: 100_000, PricedRequests: 1, PriceableRequests: 1}}},
+			{Series: map[string]usage.Counts{"sess-a": {
+				CostMicros: 150_000, PricedRequests: 1, PriceableRequests: 1, IncompleteRequests: 1,
+			}}},
+			{Series: map[string]usage.Counts{"sess-b": {CostMicros: 9_000, PricedRequests: 1, PriceableRequests: 1}}},
+		},
+	}
+
+	usd, priced, inexact := m.sessionCost("sess-a")
+	if !priced || usd != 0.25 {
+		t.Fatalf("sessionCost = (%v, %v), want (0.25, true)", usd, priced)
+	}
+	if !inexact {
+		t.Error("inexact = false although one of the session's buckets reports an incomplete figure")
+	}
+	// A session with no incomplete request of its own must not inherit another's.
+	if _, _, inexactB := m.sessionCost("sess-b"); inexactB {
+		t.Error("inexact = true for a session whose own figures are all exact")
+	}
+}
+
 func TestSessionCost_SumsEveryBucketForTheSession(t *testing.T) {
 	// The strip asks for one bucket, but nothing guarantees the server folds to one
 	// — resolution is negotiated, not dictated. Reading Buckets[0] alone would
@@ -335,12 +459,15 @@ func TestSessionCost_SumsEveryBucketForTheSession(t *testing.T) {
 		},
 	}
 
-	usd, priced := m.sessionCost("sess-a")
+	usd, priced, inexact := m.sessionCost("sess-a")
 	if !priced {
 		t.Fatal("priced = false for a session with two priced buckets")
 	}
 	if usd != 0.25 {
 		t.Errorf("sessionCost = %v, want 0.25 (both buckets summed)", usd)
+	}
+	if inexact {
+		t.Error("inexact = true although neither bucket reports an incomplete figure")
 	}
 }
 
@@ -365,12 +492,17 @@ func TestSessionCost_UnknownCases(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			m := costSessionsModel()
 			m.spend.snap = tc.snap
-			usd, ok := m.sessionCost(tc.id)
+			usd, ok, inexact := m.sessionCost(tc.id)
 			if ok {
 				t.Errorf("priced = true; an unknown cost must be reported as unknown, not as %v", usd)
 			}
 			if usd != 0 {
 				t.Errorf("usd = %v alongside priced=false; a caller trusting the figure would render it", usd)
+			}
+			// An unknown cost cannot be inexact: there is no figure for the claim to be
+			// about, and a marker on a blank cell would be furniture.
+			if inexact {
+				t.Error("inexact = true for a cost that does not exist")
 			}
 		})
 	}

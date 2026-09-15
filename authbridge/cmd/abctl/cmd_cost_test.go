@@ -968,3 +968,252 @@ func TestRunCost_TheHeadlineIsThePublishedTotalNotASeriesSum(t *testing.T) {
 		t.Errorf("the series sum is presented as the window total:\n%s", got)
 	}
 }
+
+// TestRunCost_DisclosesARefusedTokenReportAndClearsTheDollars.
+//
+// The defect this closes: usage.Counts.RefusedTokenRequests was aggregated by the server and
+// read by nothing, so a window that threw away token reports printed a token count and a split
+// byte-identical to a complete one. The counter exists because capping cost while leaving tokens
+// unbounded is not a position that survives being stated — and a bound whose refusals are
+// invisible is the same thing again one step later.
+//
+// The ASYMMETRY is the part that has to be in the words. A refused token report removes nothing
+// from CostMicros: cost is settled by a different producer and bounded twice over. So a line that
+// let a reader doubt the dollar figure would send them after the one number in the answer that is
+// right, and this asserts the line says so.
+func TestRunCost_DisclosesARefusedTokenReportAndClearsTheDollars(t *testing.T) {
+	srv := fakeUsageServer(t, `{"window":"today","totals":{"requests":318,`+
+		`"costMicros":4170000,"pricedRequests":318,"priceableRequests":318,`+
+		`"tokens":120000,"inputTokens":20000,"presentKinds":1,`+
+		`"refusedTokenRequests":3},"priced":true}`)
+	defer srv.Close()
+
+	var out, errOut strings.Builder
+	if code := runCost([]string{"--endpoint", srv.URL}, &out, &errOut); code != 0 {
+		t.Fatalf("exit = %d, want 0; stderr = %s", code, errOut.String())
+	}
+	got := out.String()
+	for _, want := range []string{
+		"3 token reports refused",
+		"SHORT",
+		"dollar total is unaffected",
+	} {
+		if !strings.Contains(got, want) {
+			t.Errorf("output missing %q — the refusal is not disclosed as a token shortfall:\n%s",
+				want, got)
+		}
+	}
+	// The token figures still print: they are short, not unknown, and withholding them would
+	// report measured traffic as unmeasured.
+	if !strings.Contains(got, "120k tokens") || !strings.Contains(got, "input 20k") {
+		t.Errorf("the token figures were withheld over a refusal:\n%s", got)
+	}
+	// It sits with the figures it qualifies, above the dollar caveats. A caveat printed beside a
+	// figure it is not about is a misattribution, not a warning.
+	if split, refusal := strings.Index(got, "input 20k"), strings.Index(got, "refused"); split > refusal {
+		t.Errorf("the refusal line is printed above the split it qualifies:\n%s", got)
+	}
+}
+
+// TestRunCost_NoRefusedReportsCarryNoLine is the mirror, and the half that keeps the disclosure
+// worth reading. A permanent "0 token reports refused" is the "checked, fine" claim from a
+// producer that never checked.
+func TestRunCost_NoRefusedReportsCarryNoLine(t *testing.T) {
+	srv := fakeUsageServer(t, `{"window":"today","totals":{"requests":318,`+
+		`"costMicros":4170000,"pricedRequests":318,"priceableRequests":318,`+
+		`"tokens":120000,"inputTokens":20000,"presentKinds":1},"priced":true}`)
+	defer srv.Close()
+
+	var out, errOut strings.Builder
+	runCost([]string{"--endpoint", srv.URL}, &out, &errOut)
+	if got := out.String(); strings.Contains(got, "refused") {
+		t.Errorf("a window with no refusals carries a refusal line:\n%s", got)
+	}
+}
+
+// TestRunCost_DisclosesAClampedAggregateAheadOfADamagedRead.
+//
+// usage.Counts.Saturated says an addition into these totals reached the int64 ceiling and was
+// CLAMPED rather than allowed to wrap, so the requests, the tokens and the cost on the headline
+// are all floors. Its own doc argues the clamp is only acceptable BECAUSE the flag travels with
+// it, and that it is deliberately NOT logged — "the disclosure travels on the same response as
+// the number it qualifies" — so a client that drops it is what turns the clamp back into a lie.
+//
+// ORDER as well as presence. The clamp leads even the damaged read: a damaged read is short in
+// the dollars, a clamp is short in every column of the aggregate. And the two keep separate
+// words, because one sends an operator to a day file and the other to whatever produced 9.2e18
+// micros of traffic.
+func TestRunCost_DisclosesAClampedAggregateAheadOfADamagedRead(t *testing.T) {
+	srv := fakeUsageServer(t, `{"window":"today","totals":{"requests":318,`+
+		`"costMicros":4170000,"pricedRequests":318,"priceableRequests":318,`+
+		`"saturated":true},"priced":true,"degraded":{"skippedLines":3}}`)
+	defer srv.Close()
+
+	var out, errOut strings.Builder
+	if code := runCost([]string{"--endpoint", srv.URL}, &out, &errOut); code != 0 {
+		t.Fatalf("exit = %d, want 0; stderr = %s", code, errOut.String())
+	}
+	got := out.String()
+	for _, want := range []string{
+		"every figure above is a FLOOR",
+		"rather than allowed to wrap",
+		"requests, tokens and cost are all larger",
+	} {
+		if !strings.Contains(got, want) {
+			t.Errorf("output missing %q — the clamp is not disclosed:\n%s", want, got)
+		}
+	}
+	// The figure still prints: it is a floor, not an unknown.
+	if !strings.Contains(got, "$4.17") {
+		t.Errorf("a clamped figure was withheld rather than qualified:\n%s", got)
+	}
+	if clamp, damaged := strings.Index(got, "is a FLOOR"), strings.Index(got, "total is SHORT"); damaged < 0 {
+		t.Errorf("premise is wrong: no damage line in:\n%s", got)
+	} else if clamp > damaged {
+		t.Errorf("the damaged-read line outranks the clamp:\n%s", got)
+	}
+}
+
+// TestRunCost_ACleanAggregateCarriesNoClampLine is the mirror: false must mean "the arithmetic
+// held", so a correct deployment prints nothing for it.
+func TestRunCost_ACleanAggregateCarriesNoClampLine(t *testing.T) {
+	srv := fakeUsageServer(t, `{"window":"today","totals":{"requests":318,`+
+		`"costMicros":4170000,"pricedRequests":318,"priceableRequests":318},"priced":true}`)
+	defer srv.Close()
+
+	var out, errOut strings.Builder
+	runCost([]string{"--endpoint", srv.URL}, &out, &errOut)
+	if got := out.String(); strings.Contains(got, "FLOOR") {
+		t.Errorf("a clean aggregate carries a clamp line:\n%s", got)
+	}
+}
+
+// TestRunCost_JSONCarriesTheClampAndTheRefusalUnderCountsOwnNames.
+//
+// The machine path, and the reason Totals is usage.Counts embedded rather than re-keyed: a
+// disclosure added to Counts reaches a script the day the server sends it, with no line in
+// costJSON at all. This asserts that property rather than assuming it — the whole point of the
+// verbatim rule is that it holds without anyone remembering to extend a struct.
+//
+// A script is the reader that needs both most. It cannot see a rendered caveat, and neither
+// field has a server log line it could read instead.
+func TestRunCost_JSONCarriesTheClampAndTheRefusalUnderCountsOwnNames(t *testing.T) {
+	srv := fakeUsageServer(t, `{"window":"today","totals":{"requests":318,`+
+		`"costMicros":4170000,"pricedRequests":318,"priceableRequests":318,`+
+		`"tokens":120000,"refusedTokenRequests":3,"saturated":true},"priced":true}`)
+	defer srv.Close()
+
+	var out, errOut strings.Builder
+	if code := runCost([]string{"--endpoint", srv.URL, "--json"}, &out, &errOut); code != 0 {
+		t.Fatalf("exit = %d, want 0; stderr = %s", code, errOut.String())
+	}
+	var decoded struct {
+		Totals struct {
+			RefusedTokenRequests int64 `json:"refusedTokenRequests"`
+			Saturated            bool  `json:"saturated"`
+		} `json:"totals"`
+	}
+	if err := json.Unmarshal([]byte(out.String()), &decoded); err != nil {
+		t.Fatalf("--json output is not valid JSON: %v\n%s", err, out.String())
+	}
+	if decoded.Totals.RefusedTokenRequests != 3 {
+		t.Errorf("totals.refusedTokenRequests = %d, want 3:\n%s",
+			decoded.Totals.RefusedTokenRequests, out.String())
+	}
+	if !decoded.Totals.Saturated {
+		t.Errorf("totals.saturated is false; a clamped aggregate reaches no script:\n%s", out.String())
+	}
+}
+
+// TestRunCost_JSONOmitsTheClampAndTheRefusalWhenThereAreNone.
+//
+// omitempty on both, so a healthy answer is byte-identical to what this printed before the
+// fields existed. A zero would have to carry two meanings — "checked, none" and "not checked" —
+// which is the reading the whole absent-not-zero convention exists to refuse.
+func TestRunCost_JSONOmitsTheClampAndTheRefusalWhenThereAreNone(t *testing.T) {
+	srv := fakeUsageServer(t, `{"window":"today","totals":{"requests":2,`+
+		`"costMicros":250000,"pricedRequests":2,"priceableRequests":2},"priced":true}`)
+	defer srv.Close()
+
+	var out, errOut strings.Builder
+	if code := runCost([]string{"--endpoint", srv.URL, "--json"}, &out, &errOut); code != 0 {
+		t.Fatalf("exit = %d, want 0", code)
+	}
+	for _, unwanted := range []string{"refusedTokenRequests", "saturated"} {
+		if strings.Contains(out.String(), unwanted) {
+			t.Errorf("--json emitted %q for an answer with nothing to disclose:\n%s",
+				unwanted, out.String())
+		}
+	}
+}
+
+// TestRunCost_JSONCarriesTheBreakdownOvershoot.
+//
+// usage.Snapshot.SeriesOvershootMicros says the answer CONTRADICTS ITSELF: its breakdown summed
+// to more than its own total, which a reconcilable group's series cannot do — so a value means
+// the producer is wrong about its own arithmetic.
+//
+// ON THIS STRUCT THOUGH UngroupedCostMicros IS NOT, and the difference is what the ABSENCE means
+// rather than how likely the presence is. A missing residual is ambiguous between "the breakdown
+// accounts for every dollar" and "no breakdown was asked for", and this command asks for
+// group=none — so the field would be a promise nothing keeps. A missing overshoot has one reading
+// on every axis including none: nothing overshot. So absence is TRUE here rather than merely
+// unpopulated, and a script that treats it as "this answer is not self-contradictory" is right
+// today and stays right after an axis change.
+//
+// Served here by a producer that sends it anyway, which is the case worth covering: this side of
+// the wire does not get to assume the other side obeys its own contract, and a broken or hostile
+// aggregator is exactly when a defect report earns its place. The human summary prints nothing
+// for it and writeCostSummary says why — it prints no breakdown, so the caveat would qualify
+// nothing on screen.
+func TestRunCost_JSONCarriesTheBreakdownOvershoot(t *testing.T) {
+	srv := fakeUsageServer(t, `{"window":"1h","group":"model","totals":{"requests":2,`+
+		`"costMicros":4000000,"pricedRequests":2,"priceableRequests":2},"priced":true,`+
+		`"seriesOvershootMicros":250000}`)
+	defer srv.Close()
+
+	var out, errOut strings.Builder
+	if code := runCost([]string{"--endpoint", srv.URL, "--json"}, &out, &errOut); code != 0 {
+		t.Fatalf("exit = %d, want 0; stderr = %s", code, errOut.String())
+	}
+	var decoded struct {
+		SeriesOvershootMicros *int64 `json:"seriesOvershootMicros"`
+	}
+	if err := json.Unmarshal([]byte(out.String()), &decoded); err != nil {
+		t.Fatalf("--json output is not valid JSON: %v\n%s", err, out.String())
+	}
+	if decoded.SeriesOvershootMicros == nil {
+		t.Fatalf("--json dropped the overshoot entirely, so a script cannot tell a "+
+			"self-contradictory answer from a sound one:\n%s", out.String())
+	}
+	if *decoded.SeriesOvershootMicros != 250_000 {
+		t.Errorf("seriesOvershootMicros = %d, want 250000:\n%s",
+			*decoded.SeriesOvershootMicros, out.String())
+	}
+	// VERBATIM, and not renamed on the way through: the schema rule is one vocabulary from
+	// aggregate to CLI, so the key here has to be the key on the wire.
+	if !strings.Contains(out.String(), `"seriesOvershootMicros"`) {
+		t.Errorf("--json spells the overshoot under some other key:\n%s", out.String())
+	}
+}
+
+// TestRunCost_JSONOmitsTheOvershootWhenNothingOvershot.
+//
+// A POINTER with omitempty, so a healthy answer serialises nothing and absence keeps meaning
+// "nothing overshot" rather than becoming a zero that means both that and "not checked". This is
+// also what keeps the field free: every correct answer is byte-identical to what this printed
+// before it existed.
+func TestRunCost_JSONOmitsTheOvershootWhenNothingOvershot(t *testing.T) {
+	srv := fakeUsageServer(t, `{"window":"today","totals":{"requests":2,`+
+		`"costMicros":250000,"pricedRequests":2,"priceableRequests":2},"priced":true}`)
+	defer srv.Close()
+
+	var out, errOut strings.Builder
+	if code := runCost([]string{"--endpoint", srv.URL, "--json"}, &out, &errOut); code != 0 {
+		t.Fatalf("exit = %d, want 0", code)
+	}
+	if strings.Contains(out.String(), "seriesOvershoot") {
+		t.Errorf("--json emitted the overshoot for an answer that did not overshoot:\n%s",
+			out.String())
+	}
+}

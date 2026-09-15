@@ -183,6 +183,8 @@ Flags:
 // field that nothing can ever populate is a promise to a script that nothing keeps: a
 // consumer would read its absence as "the breakdown reconciles" when the truth is that no
 // breakdown was asked for. Whoever gives this command an axis owes it a place in this struct.
+// SeriesOvershootMicros below is the same shape of field admitted on the opposite finding about
+// its absence, and the two comments are meant to be read together.
 type costJSON struct {
 	// Window is what the SERVER served, so a script reading this learns it got six
 	// hours rather than a day without having to ask a second question.
@@ -248,6 +250,33 @@ type costJSON struct {
 	// this printed before — absence keeps meaning "the read was clean" rather than becoming
 	// zeros a consumer has to interpret.
 	Degraded *usage.Degraded `json:"degraded,omitempty"`
+	// SeriesOvershootMicros says the answer CONTRADICTS ITSELF: the breakdown summed to more
+	// than the total, by this much. It is a defect report rather than a figure — see
+	// usage.Snapshot.SeriesOvershootMicros, which states that a reconcilable group's series can
+	// sum to the total or to less and never to more, so a value here means the producer is wrong
+	// about its own arithmetic. Nothing should chart it and nothing should add it to anything.
+	//
+	// HERE THOUGH UngroupedCostMicros IS NOT, and the difference is what the ABSENCE means
+	// rather than how likely the presence is. Both can only be populated where
+	// usage.Group.Reconcilable is true, so neither can arrive on this command's group=none. But
+	// a missing residual is AMBIGUOUS — "the breakdown accounts for every dollar" and "no
+	// breakdown was asked for" are different answers wearing the same absence — and that is the
+	// promise a script would misread. A missing overshoot has one reading on every axis
+	// including none: nothing overshot. An axis with no series cannot sum to more than a total
+	// the server refuses to publish negative, so absence is TRUE here rather than merely
+	// unpopulated, and a consumer that treats it as "this answer is not self-contradictory" is
+	// correct today and stays correct after an axis change.
+	//
+	// A SCRIPT IS THE READER THAT NEEDS IT MOST. The human summary prints no series, so it
+	// renders nothing for this (see writeCostSummary, which has no line for it and says why);
+	// the server logs nothing for it either. An unattended consumer summing these documents
+	// across days is the only reader that both can act on "this response is broken" and has no
+	// other channel to learn it — the same argument Degraded is on this struct for.
+	//
+	// VERBATIM as *int64 with usage.Snapshot's own key spelling, omitempty on the POINTER: a
+	// healthy answer serialises nothing, so absence keeps meaning "nothing overshot" rather than
+	// becoming a zero that means both that and "not checked".
+	SeriesOvershootMicros *int64 `json:"seriesOvershootMicros,omitempty"`
 }
 
 func writeCostJSON(snap *usage.Snapshot, stdout, stderr io.Writer) int {
@@ -261,6 +290,11 @@ func writeCostJSON(snap *usage.Snapshot, stdout, stderr io.Writer) int {
 		UnpricedBy:   snap.UnpricedBy,
 		IncompleteBy: snap.IncompleteBy,
 		Degraded:     snap.Degraded,
+		// usage.Counts.Saturated and usage.Counts.RefusedTokenRequests need no line here: Totals
+		// is usage.Counts embedded verbatim, so both travel with their own field names and their
+		// own omitempty. That is the whole point of not re-keying the struct — a disclosure added
+		// to Counts reaches a script the day the server sends it.
+		SeriesOvershootMicros: snap.SeriesOvershootMicros,
 	}
 	if err := enc.Encode(out); err != nil {
 		fmt.Fprintf(stderr, "abctl cost: writing JSON: %v\n", err)
@@ -291,6 +325,17 @@ const (
 //     an unknown cost are different answers, and only one means the traffic was free.
 //   - No caveat line when its number is zero. A permanent warning with nothing to
 //     act on is what teaches an operator to ignore the one signal that matters.
+//
+// NO LINE FOR usage.Snapshot.SeriesOvershootMicros, and the omission is a decision. That field
+// says the answer's SERIES summed to more than its total — a defect report about a breakdown,
+// and this command prints no breakdown at all: it asks for group=none and prints one figure. A
+// sentence telling a reader not to trust rows that are not on screen qualifies nothing, which is
+// the misattribution every caveat on this branch is placed to avoid. It cannot arrive here
+// either — both producers compute it only where usage.Group.Reconcilable is true — so the pane
+// that draws the breakdown is its consumer (tui.costOvershootNote), costJSON carries it for the
+// reader that can act on a fact with nothing on screen to attach it to, and
+// TestRunCost_AsksForAnAxisThatCannotCarryAResidual is what fails if this command ever takes an
+// axis and owes a rendering.
 func writeCostSummary(snap *usage.Snapshot, stdout io.Writer) {
 	t := snap.Totals
 	fmt.Fprintf(stdout, "COST — %s\n", costWindowLabel(snap.Window))
@@ -321,10 +366,46 @@ func writeCostSummary(snap *usage.Snapshot, stdout io.Writer) {
 	if split := tokenSplit(t); split != "" {
 		fmt.Fprintf(stdout, "  %s\n", split)
 	}
+	// THE TOKEN CAVEAT SITS WITH THE TOKEN FIGURES, above the dollar caveats even though the
+	// clamp disclosure below is the more serious claim. That is moneyFigure's rule applied to
+	// this surface: a caveat printed beside a figure it is not about is not a warning but a
+	// misattribution, and this one is about neither the dollars nor the request count.
+	//
+	// usage.Counts.RefusedTokenRequests counts requests whose token report was rejected as
+	// implausible and contributed nothing to Tokens or to the split. Non-zero means both
+	// figures above are SHORT by an amount that cannot be stated — the report that would have
+	// said how much is the report that was refused.
+	//
+	// AND IT SAYS THE DOLLARS ARE FINE. Cost is settled by a different producer and bounded
+	// separately (pricing.MaxPlausibleRequestCostMicros for a gateway's own figure,
+	// pricing.MaxCostMicros for the unit), so a refused token report removes nothing from
+	// CostMicros. A window with trustworthy dollars and short tokens is the normal shape of
+	// this disclosure, and a line that let a reader doubt the money would send them after the
+	// one number that is right.
+	if r := t.RefusedTokenRequests; r > 0 {
+		fmt.Fprintf(stdout, "  ! %s token report%s refused as implausible — the token count and "+
+			"the split above are SHORT by an amount nothing can state; the dollar total is "+
+			"unaffected\n", plainCount(r), plainPlural(r))
+	}
 
-	// The damage disclosure leads, ahead of both, because it is the only one of the three
-	// that says the SUM ITSELF is incomplete. The two below qualify a figure this answer
-	// carries; this one says spend is missing from it. usage.Snapshot.Degraded's own doc
+	// A CLAMPED AGGREGATE LEADS THE DOLLAR CAVEATS, ahead even of the damaged read, because it
+	// is the only one that qualifies every number in this answer rather than the sum of the
+	// dollars: usage.Counts.Saturated says an addition into these totals reached the int64
+	// ceiling and was capped rather than allowed to wrap, so the requests, the tokens and the
+	// cost on the headline are all floors.
+	//
+	// A BOOL, so there is no number to print and none is invented — see the field's own doc for
+	// why a count of clamped additions would depend on the resolution the caller asked for,
+	// which is the one property this API insists a total must not have.
+	if t.Saturated {
+		fmt.Fprintln(stdout, "  ! every figure above is a FLOOR — a total reached the largest whole "+
+			"number the aggregate can hold and was clamped rather than allowed to wrap, so the "+
+			"real requests, tokens and cost are all larger by an amount nothing here can state")
+	}
+	// The damage disclosure leads the two below it, because they qualify a figure this answer
+	// carries where this one says spend is missing from the sum entirely. Only the clamp above
+	// outranks it, and only because a clamp is short in every column rather than in the dollars
+	// alone. usage.Snapshot.Degraded's own doc
 	// forbids merging the two claims or showing them under one marker, so they are three
 	// separate lines with three sets of words and no shared prefix beyond the "!".
 	//

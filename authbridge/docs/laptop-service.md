@@ -116,10 +116,20 @@ does survive a restart; see below.
 
 ## Cost history is written to `~/.cortex/cost`
 
-**Every local install keeps a cost ledger on disk, on by default.** Sessions themselves —
+**A local install keeps a cost ledger on disk, on by default.** Sessions themselves —
 prompts, completions, tool arguments — stay in memory and die with the process. Per-minute
 cost totals do not: they are appended to `~/.cortex/cost/YYYY-MM-DD.jsonl`, one file per
 local day, **kept for 30 days** (roughly 10 MB).
+
+**Where that default comes from, because it is not the binary's.** The generated
+`~/.cortex/config.yaml` contains an explicit `cost_ledger: {enabled: true}`, written by
+`authbridge-proxy --local --write-config`. The *binary's* default is on only under `--local`
+— and the installed service runs `authbridge-proxy --config ~/.cortex/config.yaml`, never
+`--local`, so the file is what decides. That matters for one case: **a config generated
+before this was added has no `cost_ledger` block, and such an install has the ledger OFF.**
+Check with `grep -A1 cost_ledger ~/.cortex/config.yaml`; add the two lines and
+`abctl service restart` if it is missing. This paragraph exists because the sentence above
+it was, for a while, true only for a hand-run `authbridge-proxy --local`.
 
 It exists because the in-memory counters are a 6-hour ring, and the proxy restarts several
 times a day. Without the ledger, "what did today cost" answers over whatever is left in

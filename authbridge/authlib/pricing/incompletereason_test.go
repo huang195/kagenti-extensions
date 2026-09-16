@@ -351,3 +351,49 @@ func TestIncompleteReason_FloorChargesEachTierAtItsOwnRate(t *testing.T) {
 		byCost[micros] = tier
 	}
 }
+
+// TOKENS REFUSED, MONEY BELIEVED — the divergence this bound closes, measured on both sides.
+//
+// headerCost refuses a gateway's own figure past MaxPlausibleRequestCostMicros ($10,000), and
+// usage.plausibleTokenReport refuses an implausible token REPORT, counting it in
+// Counts.RefusedTokenRequests. The modelled path had neither: pricing.Cost bounded the counts
+// only below zero, so the dollars derived from a report the aggregator had just called
+// impossible were priced and kept, bounded only by MaxCostMicros — $9 billion, five orders of
+// magnitude past the cap the header path enforces on the same request.
+//
+// The figures below are what makes it worth a test rather than a comment: at the dearest rate
+// that ships, one forged field prices at tens of millions of dollars, and every one of those
+// dollars reaches the budget ledger, the 30-day file and the daily total.
+func TestCost_RefusesAnImplausibleTokenCountOnTheModelledPath(t *testing.T) {
+	// The dearest tier in the bundled table: $75/Mtok.
+	var r Rates
+	r.Base[TierOutput], r.Set[TierOutput] = 7.5e-5, true
+	r.Base[TierInput], r.Set[TierInput] = 7.5e-5, true
+
+	for _, tc := range []struct {
+		name string
+		u    Usage
+		want bool // priced?
+	}{
+		{"a real large call is still priced", Usage{Input: 1_000_000, Output: 64_000}, true},
+		{"the plausible ceiling itself is priced", Usage{Output: maxPlausibleTokens}, true},
+		{"one token past the ceiling is unpriced", Usage{Output: maxPlausibleTokens + 1}, false},
+		// What the old code did with this: 1e12 tokens x 7.5e-5 = $75,000,000, comfortably
+		// under MaxCostMicros, so it was priced and settled.
+		{"a forged trillion-token report", Usage{Output: 1_000_000_000_000}, false},
+		// And the mixed case, because the loop must not stop at the first plausible field.
+		{"one bad field among good ones", Usage{Input: 1000, Output: maxPlausibleTokens + 1}, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			micros, ok := Cost(r, tc.u)
+			if ok != tc.want {
+				t.Errorf("Cost() priced = %v (%d micros), want priced = %v", ok, micros, tc.want)
+			}
+			if ok && micros > MaxPlausibleRequestCostMicros {
+				t.Errorf("Cost() = %d micros, past MaxPlausibleRequestCostMicros (%d): bounding the "+
+					"COUNTS is supposed to make the figure bound follow arithmetically",
+					micros, MaxPlausibleRequestCostMicros)
+			}
+		})
+	}
+}

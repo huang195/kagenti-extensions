@@ -74,13 +74,12 @@ type store struct {
 	// to "which day does this instant belong to" for every part of this file.
 	//
 	// It is the Writer's clock zone, which is time.Local in production because every
-	// producer and every reader derives its timestamps from time.Now(). It exists
-	// because path() used to name the file from the ROW's own zone while readDay is
-	// called with a day derived from the CALLER's, and the two agreed only by the
-	// coincidence that nothing in the pipeline calls .UTC(). One that did would file a
-	// row near midnight under a date no query for that local day ever visits: written,
-	// retained for 30 days, and invisible to every read. Deciding it in one place makes
-	// the agreement structural instead of a convention nobody wrote down.
+	// producer and every reader derives its timestamps from time.Now(). Deciding it in one
+	// place is what makes the agreement structural rather than a convention nobody wrote
+	// down: path names the file while readDay is called with a day derived from the CALLER's
+	// zone, and if those two ever disagree — anything in the pipeline calling .UTC() would
+	// do it — a row near midnight is filed under a date no query for that local day ever
+	// visits: written, retained for 30 days, and invisible to every read.
 	loc *time.Location
 }
 
@@ -144,20 +143,13 @@ func (s *store) path(t time.Time) string {
 // time.ParseInLocation(dayLayout, base, s.loc) and is the whole point of the function
 // existing. ParseInLocation resolves a bare date to that day's LOCAL MIDNIGHT, and in a
 // zone whose DST transition is at 00:00 that instant does not exist — so
-// "2026-03-08.jsonl" in America/Havana came back as 2026-03-07 23:00, thirteen hours
-// before the day prune compares it against.
-//
-// WHAT THAT COSTS, stated exactly, because prune's arithmetic hides part of it. Every
-// comparison prune makes is `Before` a day derived from dayOf, so one side skewed by
-// thirteen hours decides a deletion. MEASURED, with both this and dayOf wrong: retainDays
-// 2 on 2026-03-09 in Havana unlinked the 2026-03-08 file — yesterday, inside the window.
-// With dayOf fixed and only this left wrong, the observable damage is smaller and not
-// zero: `newest` reads a day early, so the retention floor engages on a healthy host and
-// measures retention from midnight rather than from the ledger day, and at retainDays 1
-// that trips the "clock is further ahead than retention could explain" warning on every
-// prune. The reason to fix it anyway is that the two directions of this mapping are
-// compared against each other; leaving them in different representations means the next
-// change to either end is a deletion nobody predicted.
+// "2026-03-08.jsonl" in America/Havana comes back as 2026-03-07 23:00, thirteen hours
+// before the day prune compares it against. Every comparison prune makes is `Before` a day
+// derived from dayOf, so a side skewed by thirteen hours decides a deletion: measured, with
+// dayOf skewed the same way, retainDays 2 on 2026-03-09 in Havana unlinked the 2026-03-08
+// file — yesterday, inside the window. The two directions of this mapping are compared
+// against each other, so leaving them in different representations makes the next change to
+// either end a deletion nobody predicted.
 //
 // The date TEXT has no zone in it, so parsing it in UTC cannot be ambiguous or absent;
 // the zone belongs to the day it names, which is what dayNoon applies.
@@ -182,12 +174,10 @@ func (s *store) dayFromName(name string) (time.Time, bool) {
 // reason — a handle cached across a day boundary would keep writing yesterday's
 // file forever, which is the bug that makes a day silently gain 24 hours of rows.
 //
-// The count is SUMMED PER DAY FILE, so a batch whose second file is unwritable reports
-// only that file's rows rather than all of them. That half is DEFENSIVE rather than a live
-// case: a batch is one minute today, so byDay has one entry, and the over-count
-// Writer.Dropped actually suffered was inside a single file — see writeLinesTo, which
-// carries that argument. Counting per file is what keeps this correct if a batch ever does
-// carry two days, which the grouping above already assumes it can.
+// The count is SUMMED PER DAY FILE, so a batch whose second file is unwritable reports only
+// that file's rows rather than all of them. Defensive rather than a live case — a batch is
+// usually one minute, so byDay has one entry — but it is what keeps the count correct when a
+// batch does carry two days, which the grouping above already assumes it can.
 func (s *store) append(rows []Row) (int, error) {
 	if len(rows) == 0 {
 		return 0, nil
@@ -301,31 +291,28 @@ func syncDir(dir string) error {
 // writeLinesTo is writeLines with the opening of the day file injected, so a test can
 // put a file that fails part-way through a write where the real one goes.
 //
-// Marshalled in full FIRST and written ONCE, which is what keeps a day file
-// syntactically intact under a SHORT WRITE. Encoding straight to the file, a row at a
-// time, meant a short write — ENOSPC, EIO — left a fragment with no trailing
-// newline, and the next successful append concatenated onto it: a guaranteed syntax
-// error at that offset. readDay resyncs past one now, but not producing the damage
-// beats tolerating it, and a laptop filling its disk is exactly when someone asks
-// what things cost.
+// Marshalled in full FIRST and written ONCE, which is what keeps a day file syntactically
+// intact under a SHORT WRITE. Encoding straight to the file, a row at a time, means a short
+// write — ENOSPC, EIO — leaves a fragment with no trailing newline and the next successful
+// append concatenates onto it: a guaranteed syntax error at that offset. readDay resyncs
+// past one, but not producing the damage beats tolerating it, and a laptop filling its disk
+// is exactly when someone asks what things cost.
 //
-// IT DOES NOT HOLD ACROSS A CRASH, and an earlier version of this paragraph said
-// "under a failure" without qualification. A short write is a failure this function is
-// still running after, so it can append the fence newline appendBytes documents. Power
-// loss, SIGKILL and a panic are failures it is not: the write may have landed partly with
-// nothing left to fence it, and the file is then exactly the shape described above — a
-// fragment that swallows whatever is appended next. See appendBytes for what that costs
-// and why it is still the right trade.
+// IT DOES NOT HOLD ACROSS A CRASH. A short write is a failure this function is still running
+// after, so it can append the fence newline appendBytes documents. Power loss, SIGKILL and a
+// panic are failures it is not: the write may have landed partly with nothing left to fence
+// it, and the file is then exactly the shape described above — a fragment that swallows
+// whatever is appended next. See appendBytes for what that costs and why it is still the
+// right trade.
 //
-// RETURNS HOW MANY ROWS DID NOT LAND, which is not the same as len(rows) whenever the
-// write tore. The single Write reports the byte count it stored, the rows are laid out in
-// that same buffer in order, and O_APPEND means the bytes it stored are in the file — so
-// every row that ends at or before that offset is on disk and readable, and only the row
-// straddling the tear and the ones after it are gone. Counting the whole batch was true
-// only while this function truncated on failure, and that rollback is gone (see
-// appendBytes): the caller would over-report loss, and Writer.Dropped is the one signal
-// an operator has for "is my ledger complete" — over-reporting teaches them to disbelieve
-// it just as thoroughly as under-reporting hides it.
+// RETURNS HOW MANY ROWS DID NOT LAND, which is not the same as len(rows) whenever the write
+// tore. The single Write reports the byte count it stored, the rows are laid out in that
+// same buffer in order, and O_APPEND means the bytes it stored are in the file — so every
+// row that ends at or before that offset is on disk and readable, and only the row
+// straddling the tear and the ones after it are gone. Counting the whole batch would
+// over-report loss, and Writer.Dropped is the one signal an operator has for "is my ledger
+// complete": over-reporting teaches them to disbelieve it just as thoroughly as
+// under-reporting hides it.
 //
 // WHAT THE COUNT DOES NOT INCLUDE: a Sync that failed. Those rows ARE in the file and any
 // reader will see them; what is unproven is that they survive the host losing power. That
@@ -361,24 +348,21 @@ func writeLinesTo(rows []Row, open func() (dayFile, error)) (int, error) {
 	n, werr := appendBytes(f, buf.Bytes())
 	if n > 0 {
 		// FSYNCED, so a nil error means the bytes are on the device rather than in the
-		// page cache. Without this, Writer.Close's whole reason for existing — "an orderly
-		// stop loses nothing" — was false for a host that lost power seconds after the
-		// stop, and the doc said otherwise. Softening the doc was the alternative; syncing
-		// is better, because the promise is the thing callers use Flush and Close FOR.
+		// page cache. Without it, Writer.Close's whole reason for existing — "an orderly stop
+		// loses nothing" — is false for a host that loses power seconds after the stop.
+		// Softening that promise was the alternative; syncing is better, because the promise
+		// is what callers use Flush and Close FOR. The cost is one fsync per closed minute,
+		// on the writer goroutine, never on a request path. Reported rather than swallowed: a
+		// sync that fails is a durability claim that cannot be made.
 		//
-		// The cost is one fsync per closed minute, on the writer goroutine, never on a
-		// request path. Reported rather than swallowed: a sync that fails is a durability
-		// claim that cannot be made, and Flush and Close are the two callers that exist to
-		// hear it.
-		//
-		// ON A TORN WRITE TOO, which it used to skip. Two reasons it has to run there. The
-		// rows before the tear are exactly the ones this function now reports as NOT lost,
-		// and that claim is about disk, not about the page cache. And the newline fence
-		// appendBytes just appended exists precisely for the crash case — an unterminated
-		// fragment swallowing the next row appended — so leaving the one byte whose whole
-		// purpose is crash-durability unsynced would be self-defeating. The tear stays the
-		// reported error, because it is the one a caller can act on; a Sync failure behind it
-		// only adds that the same device is failing in a second way.
+		// ON A TORN WRITE TOO, for two reasons. The rows before the tear are exactly the ones
+		// this function reports as NOT lost, and that claim is about disk, not about the page
+		// cache. And the newline fence appendBytes just appended exists precisely for the
+		// crash case — an unterminated fragment swallowing the next row appended — so leaving
+		// the one byte whose whole purpose is crash-durability unsynced would be
+		// self-defeating. The tear stays the reported error, because it is the one a caller
+		// can act on; a Sync failure behind it only adds that the same device is failing in a
+		// second way.
 		if serr := f.Sync(); serr != nil && werr == nil {
 			werr = serr
 		}
@@ -449,43 +433,34 @@ func appendBytes(f io.Writer, b []byte) (int, error) {
 // then unreadable, on this read and on every future one, and the file is append-only
 // so the loss is permanent.
 //
-// AN EARLIER VERSION OF THIS COMMENT CLAIMED THAT WAS FINE, on the grounds that this
-// is "damage of a kind no ledger write can produce — every row this package emits is
-// one Encode of one struct". That was FALSE, and it was the premise the whole design
-// rested on. One Encode of one struct is exactly how the damage was produced: Row
-// carries Model, Model is the model name off the parsed request body, and it was
-// written with no length cap — so a workload naming its model with a megabyte of
-// bytes wrote a single valid line past this limit and destroyed the remainder of that
-// day. Measured: 5 priced requests totalling $3.25 read back as $0.25.
+// "No ledger write can produce a line that long" is NOT a safe assumption, and it is the
+// one this design rested on. One Encode of one struct is exactly how the damage was
+// produced: Row carries Model, Model is the model name off the parsed request body, and
+// with no length cap a workload naming its model with a megabyte of bytes wrote a single
+// valid line past this limit and destroyed the remainder of that day. Measured: 5 priced
+// requests totalling $3.25 read back as $0.25.
 //
-// The write side now caps every label at maxLabelLen, which puts the longest line
-// this package can emit under a kilobyte. So this guard is once again what the
-// comment above wrongly assumed it already was — a last resort for a file corrupted
-// by something other than this package — and NOT a live failure mode a request can
-// reach. Keep it that way: any new Row field carrying caller-controlled bytes needs a
-// cap on the write path, not a larger buffer here.
+// The write side caps every label at maxLabelLen, which puts the longest line this package
+// can emit under a kilobyte, so this guard is a last resort for a file corrupted by
+// something other than this package rather than a live failure mode a request can reach.
+// Keep it that way: any new Row field carrying caller-controlled bytes needs a cap on the
+// write path, not a larger buffer here.
 const maxLineBytes = 1 << 20
 
 // readDay decodes one day file. A missing file is not an error: an idle day writes
 // none, which is the normal case on a laptop.
 //
-// SKIPS an undecodable line and keeps going, rather than stopping at it. This used
-// to drive one json.Decoder over the whole file and return what it had on the first
-// error — which tolerates a truncated FINAL line, and only that, because a Decoder
-// cannot resync. A bad line in the MIDDLE silently truncated the rest of the day,
-// permanently, and the shortened figure was still labelled "today".
+// SKIPS an undecodable line and keeps going, rather than stopping at it. A scanner rather
+// than one json.Decoder over the whole file, because a Decoder cannot resync: it tolerates a
+// truncated FINAL line and only that, so a bad line in the MIDDLE silently truncates the
+// rest of the day, permanently, with the shortened figure still labelled "today". A single
+// Write on the append side keeps a mid-file syntax error from being produced in the first
+// place; this is the half that keeps an already-damaged file readable.
 //
-// That was reachable, not theoretical: before the write path became a single
-// rolled-back Write, a short append left a fragment with no newline and the next
-// append concatenated onto it, guaranteeing a syntax error mid-file. Both halves are
-// fixed; this half is the one that keeps an already-damaged file readable.
-//
-// Skips are COUNTED, RETURNED and logged at Warn. An earlier version counted them
-// into a local and logged that at slog.Debug — below the default level, so in
-// production a day quietly losing lines was indistinguishable from a clean one, and
-// the count reached no caller, no exported counter and no API response. The count is
-// what lets an operator tell "my ledger is fine" from "my ledger is losing lines", so
-// it has to leave this function. See dayIssues and Writer.SkippedLines.
+// Skips are COUNTED, RETURNED and logged at Warn — not at Debug, which is below the default
+// level, and not into a local, which reaches no caller, no exported counter and no API
+// response. The count is what lets an operator tell "my ledger is fine" from "my ledger is
+// losing lines", so it has to leave this function. See dayIssues and Writer.SkippedLines.
 func (s *store) readDay(day time.Time) ([]Row, dayIssues, error) {
 	f, err := os.Open(s.path(day))
 	if os.IsNotExist(err) {
@@ -607,10 +582,6 @@ func (s *store) prune(now time.Time) error {
 			continue
 		}
 		name := e.Name()
-		// dayFromName, so a name is dated in exactly the representation dayOf produces —
-		// s.loc's ledger day, at dayHour. Both sides of every `Before` below are then the
-		// same kind of instant. It used to be an inline time.ParseInLocation to local
-		// midnight, which is a date that does not exist in every zone; see dayFromName.
 		// A file this prune, or an earlier one, has already condemned. Kept in its own list:
 		// it is invisible to reads (dayFromName rejects the extension), must not count toward
 		// "newest", and is the only thing this pass is allowed to actually unlink. See
@@ -621,6 +592,10 @@ func (s *store) prune(now time.Time) error {
 			}
 			continue
 		}
+		// dayFromName, so a name is dated in exactly the representation dayOf produces —
+		// s.loc's ledger day, at dayHour — which makes both sides of every `Before` below the
+		// same kind of instant. Not an inline ParseInLocation to local midnight, which is a
+		// date that does not exist in every zone; see dayFromName.
 		day, ok := s.dayFromName(name)
 		if !ok {
 			continue

@@ -974,7 +974,7 @@ func TestSnapshot_TheRingDoesNotServeControlBytesInALabel(t *testing.T) {
 		{"an ESC-bracket colour sequence", "claude\x1b[31m-opus"},
 		{"a bare carriage return", "claude\r-opus"},
 		{"DEL", "claude\x7f-opus"},
-		{"U+009B, the single-byte CSI a byte scan misses", "claude2J-opus"},
+		{"U+009B, the single-byte CSI a byte scan misses", "claude\u009b2J-opus"},
 		{"an invalid UTF-8 byte", "claude\xff-opus"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {

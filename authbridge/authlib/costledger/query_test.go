@@ -371,7 +371,7 @@ func TestRecord_LabelsAreCappedSoALineCanNeverExceedTheReadLimit(t *testing.T) {
 // read, for as long as the file exists. CWE-150.
 //
 // C1 IS IN HERE DELIBERATELY. The sanitiser filtered C0 and DEL only, and this test could
-// not see that: U+009B is the single-character CSI, so "2J" clears the pane of
+// not see that: U+009B is the single-character CSI, so "\u009b2J" clears the pane of
 // whoever cats the file with no ESC byte for a C0 filter to catch, and the assertion that
 // was meant to prove no control character survived was reading a predicate with the same
 // blind spot.

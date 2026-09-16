@@ -104,12 +104,11 @@ type Snapshot struct {
 	// Window is the span this snapshot ACTUALLY covers, e.g. "10m", "6h0m0s" or
 	// "today". Not necessarily the span requested.
 	//
-	// It used to be only the requested one, and the difference now matters: the
-	// symbolic windows ("today", "7d") are served from the durable cost ledger, and a
-	// proxy with no ledger — Kubernetes by design — answers them from the ring's
-	// maximum window instead and reports THAT here. A client must read this field
-	// rather than echo its own request, or it will label six hours of spend as a
-	// day's.
+	// The difference matters: the symbolic windows ("today", "7d") are served from the
+	// durable cost ledger, and a proxy with no ledger — Kubernetes by design — answers
+	// them from the ring's maximum window instead and reports THAT here. A client must
+	// read this field rather than echo its own request, or it will label six hours of
+	// spend as a day's.
 	Window string `json:"window"`
 	// BucketSeconds is the resolution of the buckets actually returned, which for a
 	// ring-backed window is the requested resolution rounded to a whole multiple of
@@ -221,16 +220,13 @@ type Snapshot struct {
 	// response's series carries — the amount by which summing the breakdown falls short
 	// of the total printed beside it.
 	//
-	// It exists because that shortfall was undisclosed. The dominant instance is a
-	// GATEWAY-PRICED RESPONSE THE INFERENCE PARSER COULD NOT READ: /v1/embeddings and
-	// /v1/rerank are not among the paths it parses, so the event carries no model while the
-	// gateway's own header settles a cost, and that spend counts toward Totals and drops
-	// out of group=model. Per-axis that is the honest answer — there is no model to
-	// attribute it to, and moving it into a made-up bucket or out of the totals would each
-	// be worse. In aggregate it made the response contradict itself with nothing to
-	// explain the difference, which is the same shape as the group=plugin dollar
-	// duplication and the endpoint-versus-model denominator, both of which this API says
-	// out loud.
+	// The dominant instance is a GATEWAY-PRICED RESPONSE THE INFERENCE PARSER COULD NOT
+	// READ: /v1/embeddings and /v1/rerank are not among the paths it parses, so the event
+	// carries no model while the gateway's own header settles a cost, and that spend counts
+	// toward Totals and drops out of group=model. Per-axis that is the honest answer — there
+	// is no model to attribute it to, and moving it into a made-up bucket or out of the
+	// totals would each be worse. Undisclosed, though, it makes the response contradict
+	// itself with nothing to explain the difference.
 	//
 	// WHAT A CLIENT DOES WITH IT: render it as its own residual band — "unattributed", or
 	// the (other) band a table already collapses into — and never present the sum of a
@@ -241,19 +237,18 @@ type Snapshot struct {
 	// ledger-backed window reports GroupNone for an axis its rows have no column for. See
 	// Group.Reconcilable for why one predicate was not enough.
 	//
-	// BOTH WINDOW KINDS POPULATE IT, verified rather than assumed — which is why this is
-	// not ledger-only the way Degraded is:
+	// BOTH WINDOW KINDS POPULATE IT, verified rather than assumed — which is why this is not
+	// ledger-only the way Degraded is, and it has to hold on both or a client would come to
+	// trust the reconciliation and then have it break at whichever window boundary switches
+	// storage:
 	//   - a LEDGER window, because such a response is stored as a row with Model "" and
 	//     costledger.labelFor then returns ok=false for group=model. Pinned by
 	//     TestFold_GatewayPricedRowWithNoModelIsDisclosedAsUngrouped.
-	//   - a RING window, because Aggregator.costOf prices any SETTLED cost record whether
-	//     or not the event carries an Inference extension, while foldInto guards byMethod
-	//     on a non-empty model — so the same spend lands in the bucket total and in no
-	//     series entry. Pinned by
+	//   - a RING window, because Aggregator.costOf prices any SETTLED cost record whether or
+	//     not the event carries an Inference extension, while foldInto guards byMethod on a
+	//     non-empty model — so the same spend lands in the bucket total and in no series
+	//     entry. Pinned by
 	//     TestSnapshot_GatewayPricedTrafficWithNoModelIsDisclosedAsUngrouped.
-	// A field that appeared on one kind and not the other would be worse than none: a
-	// client would come to trust the reconciliation and then have it break at whichever
-	// window boundary switches storage.
 	//
 	// A POINTER, absent rather than zero on a window whose series accounts for
 	// everything — the Degraded convention, for the reason its doc gives. A zero would
@@ -282,13 +277,12 @@ type Snapshot struct {
 	// exactly two ways: a Group was marked Reconcilable when its series double-counts (which
 	// is why GroupPlugin is excluded), or a series accumulator counts one event twice.
 	//
-	// IT USED TO BE DISCARDED. SetUngroupedCost took `micros <= 0` as "nothing to disclose"
-	// and returned, which collapsed "the breakdown accounts for everything" together with
-	// "the breakdown accounts for more than everything" — and the second is a defect report
-	// this package threw away on the floor. That matters more now, not less: reconcilability
-	// has become a property of the SOURCE as well as the group (see Group.Reconcilable), so a
-	// disagreement between the two predicates is a live possibility, and this residual going
-	// negative is exactly how it would show.
+	// IT MUST NOT COLLAPSE INTO "no residual". A `micros <= 0` guard treats "the breakdown
+	// accounts for everything" and "the breakdown accounts for MORE than everything" as the
+	// same clean answer, and the second is a defect report. Reconcilability is now a property
+	// of the SOURCE as well as the group (see Group.Reconcilable), so a disagreement between
+	// the two predicates is a live possibility, and this residual going negative is how it
+	// would show.
 	//
 	// A SEPARATE FIELD rather than a negative UngroupedCostMicros, because the two are
 	// different claims and a client acts on them differently. UngroupedCostMicros is a
@@ -340,12 +334,11 @@ type Degraded struct {
 	// SkippedLines is how many LINES could not be decoded and were passed over. Each is
 	// spend that happened and is not in the total.
 	//
-	// A FLOOR ON ROWS LOST, NOT AN EXACT COUNT OF THEM, and this doc used to read as
-	// though it were exact. It counts lines because that is what the reader can see. One
-	// undecodable line is usually one row — but the ledger's newline fence only runs while
-	// the writing process is alive, so a crash mid-append leaves an unterminated fragment
-	// and the next append is concatenated onto it: ONE line holding TWO lost rows.
-	// MEASURED that way — two rows missing from the answer while the count said one.
+	// A FLOOR ON ROWS LOST, NOT AN EXACT COUNT OF THEM. It counts lines because that is
+	// what the reader can see. One undecodable line is usually one row — but the ledger's
+	// newline fence only runs while the writing process is alive, so a crash mid-append
+	// leaves an unterminated fragment and the next append is concatenated onto it: ONE
+	// line holding TWO lost rows, measured that way.
 	//
 	// So a non-zero value means "AT LEAST this many rows are missing", which is the reading
 	// a client has to present. Same number and same qualification as
@@ -376,15 +369,14 @@ type Degraded struct {
 // Exported because both producers — Aggregator.Snapshot and the ledger's fold — have to
 // make the same call, and a predicate written twice is a predicate that drifts.
 //
-// NOT SUFFICIENT ON ITS OWN, and a caller that treated it as such published a residual
-// equal to an entire total. This says whether a group's series WOULD reconcile against
-// Totals; it cannot say whether the source being read can produce that series at all.
-// The two are different questions, and the second one belongs to the source: the ring
-// keeps a status series, a plugin series and per-session rings, while a cost-ledger row
-// is (endpoint, model, agent, provenance) per minute and has no column for status or
-// session. costledger.Groupable answers it there, and costledger.Fold requires BOTH —
-// because "the breakdown falls short by this much" and "there is no breakdown to fall
-// short" are different answers, and only the first is a residual.
+// NOT SUFFICIENT ON ITS OWN — treated as such, it publishes a residual equal to an entire
+// total. This says whether a group's series WOULD reconcile against Totals; it cannot say
+// whether the source being read can produce that series at all. The second question belongs
+// to the source: the ring keeps a status series, a plugin series and per-session rings, while
+// a cost-ledger row is (endpoint, model, agent, provenance) per minute and has no column for
+// status or session. costledger.Groupable answers it there, and costledger.Fold requires
+// BOTH — "the breakdown falls short by this much" and "there is no breakdown to fall short"
+// are different answers, and only the first is a residual.
 //
 // So: reconcilability is a property of the SOURCE AND the group. This half is the
 // group's, and a true here is a necessary condition rather than a licence.
@@ -404,27 +396,22 @@ func (g Group) Reconcilable() bool {
 // "checked, complete" from a path that computed nothing. See
 // Snapshot.UngroupedCostMicros.
 //
-// A NEGATIVE RESIDUAL IS A DEFECT REPORT AND USED TO BE SWALLOWED HERE. The guard was
-// `micros <= 0`, which treated "the series accounts for every dollar" and "the series
-// accounts for MORE dollars than exist" as the same clean answer. Only the first can happen
-// to correct code: a reconcilable group's series sums to the total or to less. The second
-// means a Group is marked reconcilable while its series double-counts, or an accumulator
-// counted an event twice — and it now travels as Snapshot.SeriesOvershootMicros instead of
-// being discarded at the one place that could see it.
+// A NEGATIVE RESIDUAL IS A DEFECT REPORT, not "nothing to disclose": only a shortfall can
+// happen to correct code, since a reconcilable group's series sums to the total or to less. A
+// negative means a Group is marked reconcilable while its series double-counts, or an
+// accumulator counted an event twice, so it travels as Snapshot.SeriesOvershootMicros rather
+// than being discarded at the one place that could see it.
 //
-// Both callers get it for free, which is why the disclosure lives here rather than in an
-// error return: an error would need every caller to hold a logger (this package has none)
-// and would let a caller drop the signal again, which is the defect being fixed.
+// Both callers get that for free, which is why the disclosure lives here rather than in an
+// error return: an error would need every caller to hold a logger (this package has none) and
+// would let a caller drop the signal again.
 //
-// IT TAKES A CostSum RATHER THAN AN int64 so that a clamped residual cannot arrive here
-// looking like an exact one. Both callers accumulated the residual with a bare `+=` — a
-// wrap there produced a NEGATIVE figure, which the second case below then published as
-// SeriesOvershootMicros: a field whose own doc tells the reader this process is wrong about
-// its own arithmetic. Correct-but-saturated data therefore fabricated a defect report,
-// while the real residual it should have carried was lost. Making the parameter a type that
-// carries its own saturation flag is what stops the two conditions ever being confused
-// again; the alternative — an int64 plus a bool a caller could forget — is the shape that
-// produced this.
+// IT TAKES A CostSum RATHER THAN AN int64 so a clamped residual cannot arrive looking like an
+// exact one. Accumulated with a bare `+=`, a wrap produces a NEGATIVE figure, which the
+// second case below then publishes as SeriesOvershootMicros — so correct-but-saturated data
+// fabricates a defect report while the real residual is lost. A parameter that carries its
+// own saturation flag is what stops the two conditions being confused; an int64 plus a bool a
+// caller could forget is the shape that produced it.
 func (s *Snapshot) SetUngroupedCost(sum CostSum) {
 	// SATURATION FIRST, and unconditionally: it is a statement about the money in this
 	// snapshot, not about which of the two residual fields gets set, and it holds even when
@@ -542,12 +529,11 @@ var dayStartSweepSteps = []time.Duration{time.Hour, time.Minute, time.Second}
 // time.FixedZone passed. A fixed offset has no transitions and structurally cannot express
 // this. See TestStartOfLocalDay_IsTheFirstInstantOnTheDateInEveryZone.
 //
-// IT MATTERS MORE THAN IT DID, because the layer underneath was just corrected. The cost
-// ledger names its day files from a date carried at noon (costledger.dayOf, dayFromName
-// and dayHour), so a file is now named for the date a row is genuinely on, in every zone.
-// This function is what SELECTS those files. Left as a midnight, the bound and the naming
-// disagreed about where a Havana day starts, and the disagreement was silent: no error, no
-// caveat, just a total including an hour that belongs to another date.
+// IT HAS TO AGREE WITH THE LAYER UNDERNEATH. The cost ledger names its day files from a date
+// carried at noon (costledger.dayOf, dayFromName and dayHour) and this function is what
+// SELECTS those files, so a midnight bound and that naming would disagree about where a
+// Havana day starts — silently: no error, no caveat, just a total including an hour that
+// belongs to another date.
 //
 // THE RULE, stated plainly: sweep the instant axis forward from a point certainly before
 // the date began and take the FIRST instant whose local date is the one wanted. That is
@@ -631,9 +617,8 @@ const Window7dSpan = 7 * 24 * time.Hour
 
 // Window7dLocalDays is the MOST distinct LOCAL DATES a 7d window can touch: NINE.
 //
-// A CEILING, NOT A COUNT, and that is the correction. It used to be 8 and to be described as
-// how many dates the window touches, which is right for an ordinary week and wrong once a
-// year in every zone that observes DST.
+// A CEILING, NOT A COUNT. Eight is what the window touches in an ordinary week, and it is
+// wrong once a year in every zone that observes DST.
 //
 // Two increments, for two different reasons:
 //
@@ -652,11 +637,10 @@ const Window7dSpan = 7 * 24 * time.Hour
 //     week means the span reaches less far and the ceiling is slack by a day.
 //
 // It is therefore the number of DAY FILES a durable ledger must still hold to answer this
-// window, which is why config's retention floor agrees with this rather than being written
-// as its own independent number. They were two constants that had to agree and did not: the
-// floor was 7, so retention_days: 7 passed validation and then answered window:"7d" over a
-// partial week — the exact case the floor exists to refuse. Nine has now been through the
-// same correction twice, which is the argument for the ceiling rather than the count.
+// window, which is why config's retention floor is derived from this rather than written as
+// its own independent number. As two constants that had to agree, they did not: a floor of 7
+// let retention_days: 7 pass validation and then answer window:"7d" over a partial week — the
+// exact case the floor exists to refuse.
 //
 // COSTS ONE DAY FILE OF RETENTION ALL YEAR to cover two mornings of it, and that is the
 // trade taken deliberately. The alternative considered was making 7d CALENDAR-ALIGNED, which
@@ -937,13 +921,13 @@ func (a *Aggregator) Snapshot(window, resolution time.Duration, sessionID string
 		out.Totals.Add(b.Counts)
 		if reconcilable {
 			// Derived here rather than counted in foldInto, because THIS is where a group is
-			// chosen: one event is in the byMethod map and out of the byEndpoint one depending
-			// on which labels it carried, so "what this breakdown leaves out" is not a property
-			// of the event and cannot be accumulated at record time. The subtraction is exact
-			// for a reconcilable group — every event lands in at most one entry of the map
-			// being read, so the entries sum to the cost of the events that had a label for
-			// this axis, and the rest is the shortfall. Group.Reconcilable is what keeps
-			// group=plugin, whose entries deliberately double-count, out of this arithmetic.
+			// chosen: one event is in the byMethod map and out of the byEndpoint one depending on
+			// which labels it carried, so "what this breakdown leaves out" is not a property of
+			// the event and cannot be accumulated at record time. The subtraction is exact for a
+			// reconcilable group — every event lands in at most one entry of the map being read,
+			// so the entries sum to the cost of the events that had a label for this axis and the
+			// rest is the shortfall. Group.Reconcilable keeps group=plugin, whose entries
+			// deliberately double-count, out of this arithmetic.
 			//
 			// Three saturating steps rather than one expression, because all three can clamp
 			// and dropping any one of the flags reinstates a silent wrap: the series sum, the

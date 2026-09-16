@@ -201,9 +201,9 @@ func MicrosFromUSD(usd float64) (int64, bool) {
 //
 //   - A tier that carried tokens has no rate. The invariant: a request is priced
 //     only if every tier it used had a rate, so a partial table produces a named
-//     gap rather than a total that is quietly too low. This is toolprune's
-//     rateFor rule (plugin.go:155-174) promoted — see the plan for the failure it
-//     was written against.
+//     gap rather than a total that is quietly too low. toolprune holds the same
+//     rule on the counting side (metrics.unpriced): name the gap rather than
+//     charge one model's tokens at another model's rate.
 //   - No tokens were reported at all. That is unknown usage, not a free request;
 //     counting it as priced-zero would dilute the coverage denominator.
 //   - A negative count, which is a parser bug or a hostile body. A negative cost

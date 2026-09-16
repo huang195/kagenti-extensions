@@ -17,9 +17,8 @@ import (
 // cost breakdown, where a caller lying about itself mis-attributes that caller's
 // own spend and nothing else.
 //
-// That is the same caveat Context.Session carries about client-asserted session
-// ids, deliberately in the same words, because it is the same property of a
-// different field.
+// That is the same caveat Context.Session carries about client-asserted session ids,
+// deliberately in the same words: the same property of a different field.
 //
 // NOT TO BE CONFUSED WITH Identity / EventIdentity, which sit beside it on the
 // same context and the same event. Those are the AUTHENTICATED auth principal,
@@ -97,7 +96,7 @@ const maxClientLen = 128
 //
 // C0, DEL AND C1 — all three, because a C0-only filter is the version of this that
 // looks right and is not. U+009B is the single-character CSI: a terminal decoding
-// UTF-8 treats it exactly as it treats ESC [, so "2J" clears the screen with no
+// UTF-8 treats it exactly as it treats ESC [, so "\u009b2J" clears the screen with no
 // ESC byte anywhere in the string. The C1 block is U+0080–U+009F and encodes as
 // 0xC2 0x80–0xC2 0x9F, so nothing below 0x20 appears in it and a byte scan for control
 // bytes steps straight past it.
@@ -163,15 +162,13 @@ func hasControlRunes(s string) bool {
 // The one predicate both the scan and the rewrite read, so they cannot disagree about
 // what a control character is. costledger has the same clauses in the same order.
 //
-// THE FOURTH CLAUSE IS THE SAME ARGUMENT AS THE THIRD, applied to the characters the C1
-// reasoning missed. C1 is here because U+009B opens an escape sequence in a terminal, so a
-// User-Agent could paint over a chart. A bidi override does the same job in any renderer at
-// all, without an escape sequence and without a terminal: U+202E makes a label display
-// right-to-left, so "claude-code/2.1.14" can be made to read as another agent's name in the
-// column beside real spend, and a zero-width joiner or space hides the difference between two
-// keys that a reader is comparing. These are display-spoofing runes reaching a 30-day file and
-// a chart through a self-reported header, which is exactly the class the C1 clause was added
-// for — so leaving them out was an oversight about scope, not a judgement about risk.
+// THE FOURTH CLAUSE IS THE SAME ARGUMENT AS THE THIRD, applied to runes that need no escape
+// sequence at all. C1 is here because U+009B opens one in a terminal, so a User-Agent could
+// paint over a chart; a bidi override does the same job in any renderer, with no terminal
+// involved — U+202E makes a label display right-to-left, so "claude-code/2.1.14" can be made
+// to read as another agent's name in the column beside real spend, and a zero-width joiner or
+// space hides the difference between two keys a reader is comparing. Display-spoofing runes
+// reaching a 30-day file and a chart through a self-reported header are the same class.
 //
 // NOT A GENERAL UNICODE POLICY, and deliberately narrow: the members named are the ones with
 // no legitimate use in a product token. A User-Agent is ASCII by RFC 9110's grammar, so
@@ -290,10 +287,9 @@ func ParseUserAgent(ua string) *EventClient {
 // Label() directly, while the cost ledger stores absence losslessly as "" and maps it
 // back at the query boundary (see costledger.labelFor). Those are two different code
 // paths reaching the same bucket, so two spellings would surface as two rows in any
-// client that merged a ring answer with a ledger answer — and each row would hold half
-// the unattributed spend, which is worse than either alone. It was a bare literal in
-// both packages, agreeing only by the comment that said it must; this makes the
-// agreement something the compiler keeps.
+// client that merged a ring answer with a ledger answer — and each row would hold half the
+// unattributed spend, which is worse than either alone. A matching literal in both packages
+// would agree only by the comment saying it must; this makes it the compiler's to keep.
 //
 // NOT an agent name. See Label for what it means and why a consumer must not present
 // it as one.
@@ -318,12 +314,12 @@ const UnknownClientLabel = "unknown"
 // reason: it can name nothing, and inventing a name for it would put a value in a
 // cost table that no request ever sent.
 //
-// CARRIES NO CONTROL CHARACTERS when the EventClient came from ParseUserAgent, which
-// is the only path a request takes. It is a property of the parser, not of this method
-// — a hand-built EventClient (a test, a future producer) can hold anything its author
-// put there, and this method will join it to a name and hand it on. That is the second
-// reason costledger sanitises again before writing a row rather than trusting this
-// string: the guarantee here is about one code path, and the file is forever.
+// CARRIES NO CONTROL CHARACTERS when the EventClient came from ParseUserAgent, which is the
+// only path a request takes — a property of the parser, not of this method. A hand-built
+// EventClient (a test, a future producer) can hold anything its author put there and this
+// method will join it to a name and hand it on, which is the second reason costledger
+// sanitises again before writing a row: the guarantee here covers one code path, and the file
+// is forever.
 //
 // A caller that sends literally "User-Agent: unknown" does land in that reserved
 // bucket, and that collision is not defended against. Reserving the word would buy

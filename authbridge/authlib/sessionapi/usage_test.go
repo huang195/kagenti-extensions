@@ -479,7 +479,7 @@ func recordCostedMinute(t *testing.T, led *costledger.Writer, at time.Time, host
 func TestHandleUsage_TodayIsServedFromTheLedger(t *testing.T) {
 	// A closed minute on disk, plus an empty ring, so a non-zero total can only
 	// have come from the ledger.
-	led := ledgerWithOneCostedMinute(t, time.Now().Add(-2*time.Minute), "gw", "opus", 0.25)
+	led := ledgerWithOneCostedMinute(t, insideToday(t, 2*time.Minute), "gw", "opus", 0.25)
 	ts, _ := newTestServer(t, WithUsage(usage.New()), WithCostLedger(led))
 
 	status, body := fetchUsage(t, ts.URL, "?window=today")
@@ -634,7 +634,7 @@ func TestHandleUsage_LedgerBackedWindowGroupsByModel(t *testing.T) {
 	// The Cost pane's by-model table must work over "today", not only over the
 	// ring's windows — otherwise the breakdown silently covers a different span
 	// from the total above it.
-	led := ledgerWithOneCostedMinute(t, time.Now().Add(-2*time.Minute), "gw", "opus", 0.25)
+	led := ledgerWithOneCostedMinute(t, insideToday(t, 2*time.Minute), "gw", "opus", 0.25)
 	ts, _ := newTestServer(t, WithUsage(usage.New()), WithCostLedger(led))
 
 	status, body := fetchUsage(t, ts.URL, "?window=today&group=model")
@@ -666,7 +666,7 @@ func TestHandleUsage_LedgerBackedWindowGroupsByModel(t *testing.T) {
 // cannot be a group=model key. costledger.Fold computes that residual; this pins that
 // ledgerSnapshot carries it out to the JSON.
 func TestHandleUsage_LedgerBackedModelSeriesDisclosesWhatItLeavesOut(t *testing.T) {
-	at := time.Now().Add(-2 * time.Minute)
+	at := insideToday(t, 2*time.Minute)
 	led := ledgerWithOneCostedMinute(t, at, "gw", "opus", 0.10)
 	// A second row in the same minute: priced by the gateway, with no Inference extension
 	// at all. A different composite key, so it is its own row.
@@ -718,7 +718,7 @@ func TestHandleUsage_LedgerBackedModelSeriesDisclosesWhatItLeavesOut(t *testing.
 // The other half of the convention: absent, not zero, when the breakdown accounts for
 // every dollar. Same reasoning as TestHandleUsage_ACleanLedgerReadCarriesNoDegradedBlock.
 func TestHandleUsage_ALedgerWindowWithNothingUngroupedOmitsTheField(t *testing.T) {
-	led := ledgerWithOneCostedMinute(t, time.Now().Add(-2*time.Minute), "gw", "opus", 0.25)
+	led := ledgerWithOneCostedMinute(t, insideToday(t, 2*time.Minute), "gw", "opus", 0.25)
 	ts, _ := newTestServer(t, WithUsage(usage.New()), WithCostLedger(led))
 
 	status, body := fetchUsage(t, ts.URL, "?window=today&group=model")
@@ -734,7 +734,7 @@ func TestHandleUsage_ALedgerWindowWithNothingUngroupedOmitsTheField(t *testing.T
 // all-sessions data under a session label. See the guard in handleUsage for why the
 // refusal is unconditional.
 func TestHandleUsage_SessionWithSymbolicWindowIsRejected(t *testing.T) {
-	led := ledgerWithOneCostedMinute(t, time.Now().Add(-2*time.Minute), "gw", "opus", 0.25)
+	led := ledgerWithOneCostedMinute(t, insideToday(t, 2*time.Minute), "gw", "opus", 0.25)
 	for _, srvName := range []string{"with ledger", "without ledger"} {
 		opts := []Option{WithUsage(usage.New())}
 		if srvName == "with ledger" {
@@ -840,7 +840,7 @@ func TestHandleUsage_ACorruptLedgerLineIsDisclosedInTheResponse(t *testing.T) {
 // about which context reaches costledger.Window and a real client disconnect cannot be
 // timed against the read.
 func TestHandleUsage_TheRequestContextReachesTheLedgerRead(t *testing.T) {
-	led := ledgerWithOneCostedMinute(t, time.Now().Add(-2*time.Minute), "gw", "opus", 0.25)
+	led := ledgerWithOneCostedMinute(t, insideToday(t, 2*time.Minute), "gw", "opus", 0.25)
 	srv := New(":0", session.New(5*time.Minute, 100, 0), WithUsage(usage.New()), WithCostLedger(led))
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -866,7 +866,7 @@ func TestHandleUsage_TheRequestContextReachesTheLedgerRead(t *testing.T) {
 // the half that makes the field worth having: zeros on every clean read would train a
 // reader to ignore it.
 func TestHandleUsage_ACleanLedgerReadCarriesNoDegradedBlock(t *testing.T) {
-	led := ledgerWithOneCostedMinute(t, time.Now().Add(-2*time.Minute), "gw", "opus", 0.25)
+	led := ledgerWithOneCostedMinute(t, insideToday(t, 2*time.Minute), "gw", "opus", 0.25)
 	ts, _ := newTestServer(t, WithUsage(usage.New()), WithCostLedger(led))
 
 	status, body := fetchUsage(t, ts.URL, "?window=today")
@@ -876,5 +876,40 @@ func TestHandleUsage_ACleanLedgerReadCarriesNoDegradedBlock(t *testing.T) {
 	if strings.Contains(body, "degraded") {
 		t.Errorf("a clean read serialised a degraded block; absence is how a client tells "+
 			"clean from damaged: %s", body)
+	}
+}
+
+// TestInsideToday_NeverLeavesTheWindowItIsAnchoredTo pins the contract that made this helper
+// necessary, and it holds at every time of day rather than only at the convenient ones.
+//
+// The fixtures here used `time.Now().Add(-2 * time.Minute)`, which lands YESTERDAY during the
+// first two minutes after local midnight — so the row went into yesterday's day file while
+// `window=today` asked about this one, and seven tests reported `CostMicros = 0` for a reason
+// unrelated to what any of them was checking. CI caught it at 00:00:30 UTC, roughly 30 seconds
+// into a day, where the window is 30 seconds wide.
+//
+// Worth recording how it survived: the same defect was found and fixed in ONE test in this file
+// earlier, and the six siblings using the identical expression were left. Fixing the instance
+// rather than the pattern is what put it in CI.
+//
+// The assertion is deliberately a property, not a value: an anchor must be at or after the
+// start of today and at or before now, whatever the clock says when the suite runs. At 00:00:30
+// that forces the clamp; at 15:00 it does not, and a test that only ever runs at 15:00 proves
+// nothing about the case that broke.
+func TestInsideToday_NeverLeavesTheWindowItIsAnchoredTo(t *testing.T) {
+	start := startOfToday(t)
+	for _, into := range []time.Duration{
+		0, time.Second, 2 * time.Minute, time.Hour, 12 * time.Hour, 23 * time.Hour, 48 * time.Hour,
+	} {
+		at := insideToday(t, into)
+		now := time.Now()
+		if at.Before(start) {
+			t.Errorf("insideToday(%s) = %s, before the start of today (%s): a row anchored there "+
+				"lands in yesterday's day file and window=today cannot see it", into, at, start)
+		}
+		if at.After(now) {
+			t.Errorf("insideToday(%s) = %s, after now (%s): a row anchored in the future is "+
+				"outside [From, now] and window=today cannot see it either", into, at, now)
+		}
 	}
 }

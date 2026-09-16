@@ -114,9 +114,26 @@ func bodylessSites() []bodylessSite {
 	}, {
 		// plugin.go OnResponseFrame, streaming arm: a stream that finalized with no
 		// completion, no finish reason, no usage and no tool calls.
+		//
+		// THIS SITE WAS NAMED AND NOT DRIVEN, and the driver below is the correction. It
+		// used to be `OnResponseFrame(nil, true)` — byte-identical to the one-shot site
+		// above it — and with no earlier frame there is no stream state, so the terminal
+		// call took the `state == nil` branch and this table exercised two of the three
+		// sites it claims. Mutation-verified in both directions: deleting the settle in the
+		// streaming arm passed all 59 packages of authlib, while deleting the one in the
+		// arm below it failed two tests, so the method was sound and this row was the hole.
+		//
+		// A NON-TERMINAL FRAME FIRST is what creates the state (see the `!last` branch:
+		// existence of the scratch is what tells the terminal frame a stream ran). The frame
+		// is a real Anthropic `ping` event, which the folder ignores by design — so the
+		// stream demonstrably RAN and demonstrably carried nothing, which is the production
+		// shape this arm exists for: an SSE keepalive followed by a turn that was cancelled
+		// or died before message_start. An empty non-terminal frame would create the state
+		// too, but a zero-length SSE event is not something a listener dispatches.
 		name:   "OnResponseFrame/empty-stream",
 		stream: true,
 		drive: func(p *InferenceParser, pctx *pipeline.Context) {
+			p.OnResponseFrame(context.Background(), pctx, []byte(`{"type":"ping"}`), false)
 			p.OnResponseFrame(context.Background(), pctx, nil, true)
 		},
 	}}

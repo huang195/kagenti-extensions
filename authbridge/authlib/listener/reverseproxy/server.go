@@ -322,6 +322,17 @@ func (s *Server) handleRequest(w http.ResponseWriter, r *http.Request) {
 		Shared:    s.Shared,
 		StartedAt: time.Now(),
 	}
+	// Resolved here, before the pipeline runs, so the calling program is fixed for every
+	// event this request produces: Headers above is a clone that plugins write to, so a
+	// later resolution would attribute the request to whatever the pipeline left behind,
+	// and the answer would depend on which recording site asked first. See
+	// pipeline.Context.ResolveClient — the forward proxy and ext_proc pin at their own
+	// construction sites for the same reason.
+	//
+	// Inbound, this is the caller's own User-Agent. Without it every event here recorded no
+	// client at all, and Label() answered "unknown" — which is documented as "the request
+	// carried no User-Agent" and would have meant "this listener was never wired".
+	pctx.ResolveClient()
 
 	// Surface connection-level identity to plugins that opt in. r.TLS is
 	// non-nil only when the connection went through TLS — for plain HTTP
@@ -429,6 +440,7 @@ func (s *Server) handleRequest(w http.ResponseWriter, r *http.Request) {
 			Invocations: pipeline.SnapshotInvocations(pctx.Extensions.Invocations, pipeline.InvocationPhaseRequest),
 			Plugins:     plugins,
 			Identity:    pipeline.SnapshotIdentity(pctx),
+			Client:      pctx.ClientInfo(),
 			Host:        pctx.Host,
 			HTTPMethod:  pctx.Method,
 			HTTPPath:    pctx.Path,
@@ -551,6 +563,7 @@ func (s *Server) modifyResponse(resp *http.Response) error {
 			Invocations: pipeline.SnapshotInvocations(pctx.Extensions.Invocations, pipeline.InvocationPhaseResponse),
 			Plugins:     plugins,
 			Identity:    pipeline.SnapshotIdentity(pctx),
+			Client:      pctx.ClientInfo(),
 			Host:        pctx.Host,
 			HTTPMethod:  pctx.Method,
 			HTTPPath:    pctx.Path,
@@ -604,6 +617,7 @@ func (s *Server) recordInboundReject(pctx *pipeline.Context, action pipeline.Act
 		Direction:   pipeline.Inbound,
 		Phase:       pipeline.SessionDenied,
 		RequestID:   pctx.RequestID(),
+		Client:      pctx.ClientInfo(),
 		Invocations: pipeline.SnapshotInvocations(pctx.Extensions.Invocations, pipeline.InvocationPhaseRequest),
 		Host:        pctx.Host,
 		HTTPMethod:  pctx.Method,
@@ -714,6 +728,7 @@ func (s *Server) recordInboundResponseEvent(pctx *pipeline.Context, statusCode i
 		Invocations: pipeline.SnapshotInvocations(pctx.Extensions.Invocations, pipeline.InvocationPhaseResponse),
 		Plugins:     plugins,
 		Identity:    pipeline.SnapshotIdentity(pctx),
+		Client:      pctx.ClientInfo(),
 		Host:        pctx.Host,
 		HTTPMethod:  pctx.Method,
 		HTTPPath:    pctx.Path,

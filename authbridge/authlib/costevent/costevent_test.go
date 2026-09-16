@@ -3,6 +3,7 @@ package costevent
 import (
 	"encoding/json"
 	"math"
+	"reflect"
 	"testing"
 
 	"github.com/rossoctl/cortex/authbridge/authlib/pipeline"
@@ -108,6 +109,63 @@ func TestEventJSONTagsArePinned(t *testing.T) {
 	const want = `{"cost_usd":0.25,"source":"gateway-header","daily_total_usd":3.5,"daily_max_usd":10}`
 	if string(b) != want {
 		t.Errorf("wire format changed:\n got %s\nwant %s", b, want)
+	}
+}
+
+// EVERY FIELD, INCLUDING THE omitempty ONES, because the marshal above cannot see them.
+//
+// abctl decodes this struct out of process, so a tag that changes — or a new field whose tag
+// nobody pinned — is a field that silently stops arriving. The four fields set above are the
+// ones with no omitempty; every other tag is absent from that expectation precisely because
+// its field was zero, which is how the three this change adds — and three that predate it —
+// went unpinned.
+func TestEventJSONTagsArePinned_EveryField(t *testing.T) {
+	b, err := json.Marshal(Event{
+		CostUSD:          0.25,
+		Source:           SourceGatewayHeader,
+		DailyTotalUSD:    3.5,
+		DailyMaxUSD:      10,
+		Provenance:       "authoritative",
+		Settled:          true,
+		Incomplete:       true,
+		IncompleteReason: "output-uncounted",
+		PromptUSD:        0.2,
+		OutputUSD:        0.05,
+		RejectedReason:   "implausible",
+		Avoided: []Saving{{
+			Component:     "tool-prune",
+			TokensAvoided: 1200,
+			USD:           0.01,
+			Provenance:    "configured",
+		}},
+	})
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	const want = `{"cost_usd":0.25,"source":"gateway-header","daily_total_usd":3.5,` +
+		`"daily_max_usd":10,"provenance":"authoritative","settled":true,"incomplete":true,` +
+		`"incomplete_reason":"output-uncounted","prompt_usd":0.2,"output_usd":0.05,` +
+		`"rejected_reason":"implausible","avoided":[{"component":"tool-prune",` +
+		`"tokensAvoided":1200,"usd":0.01,"provenance":"configured"}]}`
+	if string(b) != want {
+		t.Errorf("wire format changed:\n got %s\nwant %s", b, want)
+	}
+}
+
+// A FIELD ADDED WITHOUT A PINNED TAG FAILS HERE.
+//
+// The two tests above assert the tags of the fields they happen to set; this one asserts that
+// the set is complete, so adding a field to Event without extending the expectation above is
+// a failure rather than a silent gap. Same instrument as
+// pipeline.TestSessionEventWireCoversEveryField, for the same reason: the consumer is another
+// process.
+func TestEventWireCoversEveryField(t *testing.T) {
+	// Keep in step with the marshal in TestEventJSONTagsArePinned_EveryField.
+	const pinned = 12
+	if got := reflect.TypeOf(Event{}).NumField(); got != pinned {
+		t.Fatalf("Event has %d fields, %d are pinned on the wire.\n"+
+			"Add the new field to TestEventJSONTagsArePinned_EveryField's marshal AND its "+
+			"expected string, or abctl will never see it.", got, pinned)
 	}
 }
 

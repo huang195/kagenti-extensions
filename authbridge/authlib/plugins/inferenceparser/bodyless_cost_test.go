@@ -338,9 +338,8 @@ func TestBodylessResponse_StreamPlaceholderZeroPublishesNothing(t *testing.T) {
 // arrives is finalized by the flush in Process. What this test pins is the capability shape
 // those two paths rest on.
 //
-// The fix belongs in that listener, not here: gate the early return on the response headers'
-// end_of_stream, mirroring the request side's requestHasBody guard at server.go:113. This
-// test fails if ReadsBody is dropped, which would silently move which branch runs.
+// This test fails if ReadsBody is dropped, which would silently move which branch of that
+// listener runs.
 func TestCapabilities_ReadsBodyDecidesTheExtprocBranch(t *testing.T) {
 	p := NewInferenceParser()
 	if !p.Capabilities().ReadsBody {

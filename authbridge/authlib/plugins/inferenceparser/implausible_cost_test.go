@@ -182,12 +182,22 @@ func TestUnparsedEndpoint_RefusalIsPublishedExactlyOnce(t *testing.T) {
 		t.Fatal("no record on the first terminal frame")
 	}
 
+	// A PLAUSIBLE FIGURE ON THE SECOND PASS, so the latch is tested rather than restated.
+	// With the header unchanged, both dispatches produce the same refusal and comparing them
+	// compares one record to itself — green with the latch deleted. A figure that WOULD settle
+	// is the discriminating input: the refusal has to survive it.
+	pctx.ResponseHeaders.Set(costing.ResponseCostHeader, "0.5")
+
 	p.OnResponseFrame(context.Background(), pctx, nil, true)
 	p.OnResponse(context.Background(), pctx)
 
 	second, _ := publishedCost(t, pctx)
 	if second.CostUSD != first.CostUSD || second.RejectedReason != first.RejectedReason || second.Settled != first.Settled {
 		t.Errorf("the record changed across repeated terminal dispatches:\nfirst  %+v\nsecond %+v", first, second)
+	}
+	if second.CostUSD != 0 {
+		t.Errorf("CostUSD = %v after a repeat dispatch carrying a plausible 0.5; the latch has to "+
+			"hold the refusal, not let a later figure replace it", second.CostUSD)
 	}
 	if second.RejectedReason != costevent.RejectedImplausible {
 		t.Errorf("RejectedReason = %q after the repeat dispatches, want %q — a latch that dropped the disclosure would be as wrong as one that doubled it", second.RejectedReason, costevent.RejectedImplausible)

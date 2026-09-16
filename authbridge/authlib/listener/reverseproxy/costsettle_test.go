@@ -534,15 +534,31 @@ func TestReverseProxy_ClientDisconnectMidStreamStillSettles(t *testing.T) {
 
 	// Wait until the first event is downstream, so the fold has definitely happened, then
 	// hang up exactly as a real client does.
-	br := bufio.NewReader(resp.Body)
-	for {
-		line, err := br.ReadString('\n')
+	// BOUNDED. A read error fails cleanly, but a backend that holds the connection open
+	// without writing would otherwise park here until the package timeout — a test that hangs
+	// instead of failing, and takes every other test's output with it.
+	firstEvent := make(chan error, 1)
+	go func() {
+		br := bufio.NewReader(resp.Body)
+		for {
+			line, err := br.ReadString('\n')
+			if err != nil {
+				firstEvent <- err
+				return
+			}
+			if strings.HasPrefix(line, "data:") {
+				firstEvent <- nil
+				return
+			}
+		}
+	}()
+	select {
+	case err := <-firstEvent:
 		if err != nil {
 			t.Fatalf("reading first event: %v", err)
 		}
-		if strings.HasPrefix(line, "data:") {
-			break
-		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("no SSE event downstream within 5s; the fold this test depends on never happened")
 	}
 	cancel()
 	resp.Body.Close()

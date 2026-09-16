@@ -168,8 +168,9 @@ func TestReverseProxy_APluginCannotInventAClient(t *testing.T) {
 			t.Errorf("phase %s: Client = %+v, want nil: the caller sent no User-Agent and a "+
 				"plugin's write became the recorded agent", ev.Phase, ev.Client)
 		}
-		if got := ev.Client.Label(); got != "unknown" {
-			t.Errorf("phase %s: Label() = %q, want unknown for an unattributed request", ev.Phase, got)
-		}
+		// No Label() assertion here, deliberately: Label() is nil-safe by construction, so
+		// asserting it answers "unknown" on a value the check above requires to be nil cannot
+		// fail. pipeline.TestSessionEvent_OldWireFormatDecodesWithNoClient is where the
+		// nil-receiver contract belongs, and it guards the deref with Fatalf.
 	}
 }

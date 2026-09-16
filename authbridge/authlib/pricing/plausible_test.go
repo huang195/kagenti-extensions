@@ -87,9 +87,9 @@ func TestMicrosFromUSD_TheEdgeIsAmbiguousInFloat64(t *testing.T) {
 // pulls in a model dearer than $0.001/token fails here and forces the derivation to be
 // revisited instead of silently invalidating it.
 func TestMaxPlausibleRequestCostMicros_Derivation(t *testing.T) {
-	if got, want := MaxPlausibleRequestCostMicros, int64(maxPlausibleTokens)*maxPlausibleMicrosPerToken; got != want {
-		t.Fatalf("MaxPlausibleRequestCostMicros = %d, want %d — the cap must stay the product of its two named halves", got, want)
-	}
+	// No `== maxPlausibleTokens * maxPlausibleMicrosPerToken` assertion: that is the constant's
+	// own definition, so it holds by construction and could never fail. The figures below are
+	// the ones that can — a literal, and a scan of the real table.
 	if MaxPlausibleRequestCostMicros != 10_000_000_000 {
 		t.Errorf("MaxPlausibleRequestCostMicros = %d micros, want 1e10 ($10,000); the derivation in cost.go quotes that figure and a reader checks the comment against it", MaxPlausibleRequestCostMicros)
 	}

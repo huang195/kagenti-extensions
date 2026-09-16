@@ -274,6 +274,13 @@ func TestUnparsedEndpoint_SettlesExactlyOnce(t *testing.T) {
 		t.Fatal("no cost record published on the first terminal frame")
 	}
 
+	// A SECOND, DIFFERENT GATEWAY FIGURE, which is what makes this assertion capable of
+	// failing. Dispatching twice against an unchanged header compares the one published
+	// record to itself: settleCost's own map key is the only thing that could differ, so
+	// deleting the latch leaves it green. Rewriting the header first proves the latch
+	// short-circuits BEFORE Settle reads it — the shape settle_state_test.go's sibling uses.
+	pctx.ResponseHeaders.Set(costing.ResponseCostHeader, "99.0")
+
 	// The second terminal dispatch. Also the buffered hook, since a
 	// pipeline that ran both must not charge twice either.
 	p.OnResponseFrame(context.Background(), pctx, nil, true)
@@ -282,6 +289,10 @@ func TestUnparsedEndpoint_SettlesExactlyOnce(t *testing.T) {
 	second, _ := publishedCost(t, pctx)
 	if second.CostUSD != first.CostUSD {
 		t.Errorf("CostUSD moved from %v to %v across repeated terminal dispatches; a double charge is not recoverable from a later correction", first.CostUSD, second.CostUSD)
+	}
+	if second.CostUSD != 0.0042 {
+		t.Errorf("CostUSD = %v, want the FIRST figure 0.0042 — the second header said 99.0, so a "+
+			"latch that re-read it would show that instead", second.CostUSD)
 	}
 }
 

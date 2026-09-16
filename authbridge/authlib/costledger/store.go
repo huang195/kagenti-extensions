@@ -23,6 +23,12 @@ const dayLayout = "2006-01-02"
 // think about it, long enough to answer "what did last month cost".
 const defaultRetentionDays = 30
 
+// maxRetentionDays mirrors config.maxCostLedgerRetentionDays, which owns the derivation.
+// Restated rather than imported for the reason the floor is: this package must not depend on
+// the config loader. TestMaxRetentionDays_MatchesTheConfigCeiling pins the two together, so a
+// change to one fails a test instead of quietly leaving the durable side unguarded.
+const maxRetentionDays = 3650
+
 // fileMode is 0o600 because these files record spend. 0o644 would make one
 // account's bill readable by every other account on a shared machine, and there is
 // no reader that needs it.
@@ -64,6 +70,23 @@ func newStore(dir string, retainDays int, loc *time.Location) (*store, error) {
 	}
 	if retainDays <= 0 {
 		retainDays = defaultRetentionDays
+	}
+	// CLAMPED HERE TOO, not only in config.Validate, because what is on the other side of this
+	// bound is an irreversible delete. A retention large enough to wrap prune's AddDate
+	// produces a cutoff in the FUTURE and takes the whole ledger with it (see
+	// config.maxCostLedgerRetentionDays for the measurement), and Validate only runs on a
+	// value that arrived through a config file — every other caller of newStore, including a
+	// test and any future in-process construction, would reach prune unguarded.
+	//
+	// CLAMPED RATHER THAN REFUSED, unlike in the config, and the asymmetry is the point: a
+	// bad config should fail to load loudly, while a running proxy asked for an absurd
+	// retention should keep the maximum sane amount of history rather than refuse to record
+	// cost at all. Warn, because a silent clamp is how the two definitions drift.
+	if retainDays > maxRetentionDays {
+		slog.Warn("costledger: retention_days is past the maximum; clamping",
+			"requested", retainDays, "using", maxRetentionDays,
+			"reason", "retention is counted back with AddDate, which normalises, so a large enough value wraps the cutoff into the future and prune deletes every day file including today")
+		retainDays = maxRetentionDays
 	}
 	if loc == nil {
 		loc = time.Local

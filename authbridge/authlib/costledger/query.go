@@ -314,7 +314,10 @@ func dayNoon(y int, m time.Month, d int, loc *time.Location) time.Time {
 // usage.Snapshot.UngroupedCostMicros. A row with no value for the requested axis counts
 // toward the total and cannot be a series key — a gateway-priced /v1/embeddings
 // response is stored with Model "" — so summing the series gives a smaller number than
-// the total beside it, and this is the size of that difference.
+// the total beside it, and this is the size of that difference. It is a usage.CostSum
+// rather than a bare int64 so that a residual which reached the int64 ceiling arrives at
+// SetUngroupedCost saying so, instead of arriving negative and being published as this
+// process having lost track of its own arithmetic.
 //
 // ZERO FOR AN AXIS THIS SOURCE CANNOT GROUP BY AT ALL, which is a stronger condition
 // than usage.Group.Reconcilable and the fix for a defect that reported real spend as
@@ -332,10 +335,16 @@ func dayNoon(y int, m time.Month, d int, loc *time.Location) time.Time {
 // the loop that decides what to skip. A caller deriving it would be re-deriving a
 // number this function already knows exactly, and would get it wrong for any axis whose
 // series is not a partition.
-func Fold(rows []Row, group usage.Group) (usage.Counts, map[string]usage.Counts, int64) {
+func Fold(rows []Row, group usage.Group) (usage.Counts, map[string]usage.Counts, usage.CostSum) {
 	var totals usage.Counts
 	var series map[string]usage.Counts
-	var ungrouped int64
+	// A usage.CostSum, not an int64, and returned as one. This was the last money
+	// accumulate in the package that wrapped instead of clamping: rows come off DISK, so
+	// nothing between a hand-edited day file and this loop bounds r.CostMicros, and two
+	// rows near the ceiling turned the residual negative — which sessionapi hands to
+	// Snapshot.SetUngroupedCost, which reads a negative residual as this process being
+	// wrong about its own arithmetic. See usage.CostSum.
+	var ungrouped usage.CostSum
 	// BOTH predicates, and the source's one first: a residual is only meaningful where
 	// this source can produce a breakdown to be the residual OF.
 	reconcilable := Groupable(group) && group.Reconcilable()
@@ -344,7 +353,7 @@ func Fold(rows []Row, group usage.Group) (usage.Counts, map[string]usage.Counts,
 		label, ok := labelFor(r, group)
 		if !ok {
 			if reconcilable {
-				ungrouped += r.CostMicros
+				ungrouped.Add(r.CostMicros)
 			}
 			continue
 		}

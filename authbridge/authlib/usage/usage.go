@@ -381,6 +381,75 @@ func addSat(a, b int64) (int64, bool) {
 	return a + b, false
 }
 
+// CostSum is a running total of money in micros that clamps instead of wrapping, and
+// remembers that it clamped.
+//
+// IT EXISTS BECAUSE Counts.Add WAS NOT THE ONLY PLACE MONEY IS SUMMED, which is the half
+// the accumulation fix got wrong. Counts.addInto routes every field of an aggregate through
+// addSat, and the reasoning for that is written out at length on Counts.Saturated and
+// pricing.MaxCostMicros — but three money accumulates sat outside it, all of them totals
+// DERIVED from Counts rather than fields of one:
+//
+//	seriesCost              sums CostMicros across a label breakdown
+//	Snapshot's ungrouped    the residual, per raw bucket
+//	costledger.Fold's       the same residual, per ledger row
+//
+// Each was a bare `+=` on an int64 that a saturating add had already been chosen for one
+// call frame away. Two saturated buckets or two saturated rows — reachable at the ~1,024
+// requests pricing.MaxCostMicros documents, and immediately from a hand-edited day file —
+// wrapped them.
+//
+// AND THE RESIDUAL IS THE WORST PLACE FOR IT TO HAPPEN, which is why this is a type rather
+// than an exported function. A wrapped residual goes NEGATIVE, and
+// Snapshot.SetUngroupedCost reads a negative residual as the series having overshot its own
+// total — a condition whose field doc tells the reader that this process is wrong about its
+// own arithmetic and to file a bug. So the wrap did not merely produce a wrong number: it
+// fabricated a defect report about correct data, and suppressed the real residual while
+// doing it. Clamping alone would still be a lie; the flag is what makes it honest, exactly
+// as Counts.Saturated is for the fields.
+//
+// A TYPE, NOT `func AddCostMicros(a, b int64) (int64, bool)`, for the reason given on
+// Counts.addInto: the point is that one call writes both the figure and the disclosure, so
+// there is no shape in which a caller takes the clamped sum and drops the fact that it
+// clamped. An exported saturating add would have been one `_` away from restoring this bug.
+type CostSum struct {
+	// Micros is the total so far, clamped to the int64 range.
+	Micros int64
+	// Saturated says Micros is a bound rather than a sum. Callers surface it by setting
+	// Counts.Saturated on the totals the residual belongs to: that field already means
+	// "read every money figure here as a bound", and a second flag for the same fact
+	// would let a client trust one while the other contradicted it.
+	Saturated bool
+}
+
+// Add accumulates micros into s.
+func (s *CostSum) Add(micros int64) {
+	sum, saturated := addSat(s.Micros, micros)
+	s.Micros = sum
+	if saturated {
+		s.Saturated = true
+	}
+}
+
+// Sub subtracts micros from s, which is how a residual is computed: a bucket's total
+// minus what its breakdown accounted for.
+//
+// Separate from Add(-micros) for one input only, and it is the input that made
+// SetUngroupedCost need its own guard: math.MinInt64 has no positive counterpart, so
+// negating it yields math.MinInt64 again and SUBTRACTING it would add. Reachable only
+// from an already-clamped figure, and clamped to the ceiling with the flag set rather
+// than being special-cased into exactness — the true answer is out of range in that
+// direction whatever s holds, and pretending otherwise for the sub-case where it
+// happens to fit would put a branch nothing can test in the middle of the one
+// arithmetic in this file that must be obviously right.
+func (s *CostSum) Sub(micros int64) {
+	if micros == math.MinInt64 {
+		s.Micros, s.Saturated = math.MaxInt64, true
+		return
+	}
+	s.Add(-micros)
+}
+
 // Bucket is one BucketWidth slice of time, as served to clients.
 //
 // A bucket with no traffic is still emitted, with zeroed counts. That is

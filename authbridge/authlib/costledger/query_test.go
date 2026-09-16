@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"math"
 	"os"
 	"path/filepath"
 	"strings"
@@ -893,9 +894,9 @@ func TestFold_ByModelSumsToTotals(t *testing.T) {
 	// actually break: Fold publishes a residual only when the group is one the ledger can
 	// answer AND the ring calls reconcilable, and getting that wrong once made
 	// group=status answer with a residual equal to its entire total.
-	if ungrouped != 25 {
+	if ungrouped.Micros != 25 {
 		t.Errorf("ungrouped = %d, want 25 — spend with no model must be disclosed as the "+
-			"residual, not folded into a series key or dropped", ungrouped)
+			"residual, not folded into a series key or dropped", ungrouped.Micros)
 	}
 	// The property that makes a breakdown table trustworthy, stated as the identity that
 	// holds when the residual is right: the rows plus the residual account for the total
@@ -904,13 +905,13 @@ func TestFold_ByModelSumsToTotals(t *testing.T) {
 	for _, c := range series {
 		sum += c.CostMicros
 	}
-	if sum+ungrouped != totals.CostMicros {
+	if sum+ungrouped.Micros != totals.CostMicros {
 		t.Errorf("series sums to %d, residual is %d, totals is %d; a client cannot reconcile "+
-			"the table it was given with the figure above it", sum, ungrouped, totals.CostMicros)
+			"the table it was given with the figure above it", sum, ungrouped.Micros, totals.CostMicros)
 	}
 	// And the residual is not vacuously zero, which would make the identity above the
 	// tautology this test used to be.
-	if ungrouped == 0 {
+	if ungrouped.Micros == 0 {
 		t.Fatal("the residual is zero, so the reconciliation above proves nothing")
 	}
 }
@@ -1038,10 +1039,10 @@ func TestFold_GroupingsTheLedgerCannotAnswerReturnNoSeries(t *testing.T) {
 		// Where the source can produce no breakdown at all there is nothing for it to be a
 		// residual of, and the honest response says which grouping was actually applied
 		// instead — see Groupable and sessionapi's ledgerSnapshot.
-		if ungrouped != 0 {
+		if ungrouped.Micros != 0 {
 			t.Errorf("group=%s ungrouped cost = %d over a total of %d, want 0: the ledger cannot "+
 				"group by this axis at all, which is not the same claim as a breakdown that fell "+
-				"short by 100%%", g, ungrouped, totals.CostMicros)
+				"short by 100%%", g, ungrouped.Micros, totals.CostMicros)
 		}
 	}
 }
@@ -1080,20 +1081,85 @@ func TestFold_GatewayPricedRowWithNoModelIsDisclosedAsUngrouped(t *testing.T) {
 	if sum != 100_000 {
 		t.Errorf("series sums to %d, want 100000 (only the row that named a model)", sum)
 	}
-	if ungrouped != 250_000 {
+	if ungrouped.Micros != 250_000 {
 		t.Errorf("ungrouped cost = %d, want 250000: without it a client summing group=model is "+
 			"short of Totals.CostMicros by that much and the response says nothing about why",
-			ungrouped)
+			ungrouped.Micros)
 	}
-	if sum+ungrouped != totals.CostMicros {
+	if sum+ungrouped.Micros != totals.CostMicros {
 		t.Errorf("series (%d) + ungrouped (%d) = %d, want totals %d — the reconciliation the "+
-			"field exists to restore", sum, ungrouped, sum+ungrouped, totals.CostMicros)
+			"field exists to restore", sum, ungrouped.Micros, sum+ungrouped.Micros, totals.CostMicros)
 	}
 	// The same row is fully attributable on the axis it DOES carry, so that grouping has
 	// nothing to disclose. A residual that showed up on every axis regardless would train a
 	// client to ignore it.
-	if _, _, byEndpoint := Fold(rows, usage.GroupEndpoint); byEndpoint != 0 {
-		t.Errorf("group=endpoint ungrouped cost = %d, want 0 — both rows carry an endpoint", byEndpoint)
+	if _, _, byEndpoint := Fold(rows, usage.GroupEndpoint); byEndpoint.Micros != 0 {
+		t.Errorf("group=endpoint ungrouped cost = %d, want 0 — both rows carry an endpoint", byEndpoint.Micros)
+	}
+}
+
+// A RESIDUAL THAT REACHES THE int64 CEILING IS A BOUND, NOT A FABRICATED DEFECT REPORT.
+//
+// Fold accumulated it with a bare `+=` while every field of the Counts beside it went
+// through Counts.Add's saturating accumulate. Two rows near the ceiling therefore wrapped
+// the residual NEGATIVE — and a negative residual is not merely a wrong number here.
+// usage.Snapshot.SetUngroupedCost reads one as the series having overshot its own total and
+// publishes SeriesOvershootMicros, a field whose doc tells the reader that this process is
+// wrong about its own arithmetic and to file a bug. So the wrap turned correct-but-clamped
+// data into a bug report about correct data, and lost the real residual while doing it.
+//
+// REACHABLE FROM FILE CONTENT, which is why this is pinned at Fold rather than left to the
+// type's own unit test. Rows arrive from readDay, which json.Unmarshals each line with no
+// bound on costMicros (store.go), so any int64 a day file holds reaches this loop. The
+// WRITER cannot produce such a row — every event it sums is capped at
+// pricing.MaxPlausibleRequestCostMicros, $10,000 — so the row this test builds is one a
+// corrupted or hand-edited file yields, which is exactly the input the read path already
+// has skippedLines and TruncatedDays to talk about.
+//
+// The assertions are ordered worst-first: the sign, then the magnitude, then the
+// disclosure. Reverting the accumulate to `+=` fails on the sign, which is the one that
+// says the arithmetic wrapped rather than clamped.
+func TestFold_ASaturatedResidualIsABoundNotAFabricatedOvershoot(t *testing.T) {
+	base := time.Date(2026, 9, 13, 9, 0, 0, 0, time.Local)
+	// Two of these sum to math.MaxInt64+1: the first value past the range, so the clamp is
+	// exercised at its edge rather than deep inside it.
+	half := int64(math.MaxInt64/2) + 1
+	// No model, so both rows are residual rather than series entries.
+	rows := []Row{
+		{At: base, Endpoint: "gw", Model: "", Counts: usage.Counts{
+			Requests: 1, CostMicros: half, PricedRequests: 1, PriceableRequests: 1}},
+		{At: base, Endpoint: "gw", Model: "", Counts: usage.Counts{
+			Requests: 1, CostMicros: half, PricedRequests: 1, PriceableRequests: 1}},
+	}
+
+	totals, _, ungrouped := Fold(rows, usage.GroupModel)
+
+	if ungrouped.Micros < 0 {
+		t.Fatalf("residual = %d — negative, so the accumulate wrapped. A negative residual is "+
+			"published as SeriesOvershootMicros, which tells an operator this process lost track "+
+			"of its own arithmetic; the input here is merely large", ungrouped.Micros)
+	}
+	if ungrouped.Micros != math.MaxInt64 {
+		t.Errorf("residual = %d, want math.MaxInt64: the clamp is the largest figure that can be "+
+			"stated, and anything less understates spend the rows really carry", ungrouped.Micros)
+	}
+	if !ungrouped.Saturated {
+		t.Error("residual clamped without saying so — the clamp is only honest while the flag " +
+			"travels with it, which is the whole argument for usage.CostSum being a type")
+	}
+
+	// End to end through the setter, because "does not wrap" is not the claim that matters to
+	// a client — "does not report a defect that did not happen" is.
+	snap := usage.Snapshot{Totals: totals}
+	snap.SetUngroupedCost(ungrouped)
+	if snap.SeriesOvershootMicros != nil {
+		t.Errorf("SeriesOvershootMicros = %d over rows whose breakdown is simply absent: the "+
+			"field means this process double-counted, and publishing it here sends an operator "+
+			"after a bug in the aggregator instead of at the day file", *snap.SeriesOvershootMicros)
+	}
+	if !snap.Totals.Saturated {
+		t.Error("Totals.Saturated is false while the residual clamped — that field is the one " +
+			"place a client is told to read every money figure here as a bound")
 	}
 }
 
@@ -1108,8 +1174,8 @@ func TestFold_AnUnpricedRowWithNoModelAddsNothingToTheResidual(t *testing.T) {
 
 	_, _, ungrouped := Fold(rows, usage.GroupModel)
 
-	if ungrouped != 0 {
-		t.Errorf("ungrouped cost = %d over a row that cost nothing, want 0", ungrouped)
+	if ungrouped.Micros != 0 {
+		t.Errorf("ungrouped cost = %d over a row that cost nothing, want 0", ungrouped.Micros)
 	}
 }
 
@@ -1150,7 +1216,7 @@ func TestFold_GroupAgentBreaksDownByAgent(t *testing.T) {
 // with no model is not inference, so it is not ABOUT that axis. An absent agent is
 // different — the spend certainly happened and certainly belongs somewhere in a
 // per-agent breakdown, which is also why the aggregator's byAgent has no guard where
-// byEndpoint and byMethod do.
+// byEndpoint.Micros and byMethod do.
 func TestFold_GroupAgentMapsAbsenceToUnknown(t *testing.T) {
 	rows := []Row{
 		{Endpoint: "gw", Model: "m", Agent: "claude-code/2.1.14",

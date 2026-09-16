@@ -361,6 +361,16 @@ func (s *Server) ledgerSnapshot(ctx context.Context, spec usage.Spec, group usag
 		applied = usage.GroupNone
 	}
 	totals, series, ungrouped := costledger.Fold(rows, applied)
+	// Carried onto the totals BEFORE the snapshot is built, not left to
+	// SetUngroupedCost's own assignment below. This response's single bucket is a copy of
+	// totals, so setting the flag afterwards would mark Totals as a bound while the bucket
+	// holding the same figure claimed to be exact — and a client charting the bucket would
+	// never see it. The ring's Snapshot has the opposite shape (many buckets, one
+	// cross-bucket residual), which is why the setter flags Totals there and this flags
+	// both here.
+	if ungrouped.Saturated {
+		totals.Saturated = true
+	}
 	// FROM THE READ THAT PRODUCED THEM, which is why they come back from Window rather
 	// than off the ledger. They used to be two atomics on the Writer, sampled here right
 	// after Window returned — so any other /v1/usage request landing between those two

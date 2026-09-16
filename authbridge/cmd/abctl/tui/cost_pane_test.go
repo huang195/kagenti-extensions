@@ -2531,7 +2531,10 @@ func ungroupedSnapshot(t *testing.T, seriesCost map[string]int64, ungrouped int6
 		Totals:  totals,
 		Buckets: []usage.Bucket{{Counts: totals, Series: series}},
 	}
-	snap.SetUngroupedCost(ungrouped)
+	// A usage.CostSum, not an int64: the setter takes the saturation flag alongside the
+	// figure so a clamped residual cannot arrive looking exact. These fixtures state a
+	// residual directly, so Saturated stays false.
+	snap.SetUngroupedCost(usage.CostSum{Micros: ungrouped})
 	var sum int64
 	for _, c := range series {
 		sum += c.CostMicros
@@ -2802,7 +2805,7 @@ func TestRenderCostPane_AnEmptyBreakdownDrawsNoResidualBand(t *testing.T) {
 		Totals:  usage.Counts{Requests: 400, CostMicros: whole, PricedRequests: 400, PriceableRequests: 400},
 		Buckets: []usage.Bucket{{Counts: usage.Counts{Requests: 400, CostMicros: whole}}},
 	}
-	snap.SetUngroupedCost(whole)
+	snap.SetUngroupedCost(usage.CostSum{Micros: whole})
 	if snap.UngroupedCostMicros == nil {
 		t.Fatal("fixture premise is wrong: the whole total was not published as ungrouped")
 	}
@@ -2883,7 +2886,7 @@ func overshotSnapshot(t *testing.T, seriesCost map[string]int64, overshoot int64
 			PricedRequests: int64(len(series)), CostMicros: total},
 		Buckets: []usage.Bucket{{Series: series}},
 	}
-	snap.SetUngroupedCost(total - seriesTotal)
+	snap.SetUngroupedCost(usage.CostSum{Micros: total - seriesTotal})
 	if snap.SeriesOvershootMicros == nil {
 		t.Fatalf("fixture premise is wrong: series %d over a total of %d published no overshoot",
 			seriesTotal, total)

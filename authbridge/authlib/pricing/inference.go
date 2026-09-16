@@ -200,13 +200,14 @@ func totalsOnly(inf *pipeline.InferenceExtension) bool {
 		inf.TotalTokens > 0
 }
 
-// outputUncounted reports the floor case: a prompt was counted, nothing generated was,
-// and the provider never said why it stopped.
+// outputUncounted reports the floor case: a prompt was counted, the output tally cannot be
+// shown to be final, and the provider never said why it stopped.
+//
+// "CANNOT BE SHOWN TO BE FINAL" RATHER THAN "IS ZERO", which is the correction below. The
+// function used to return "complete" on any non-zero output tally, before consulting the
+// stop reason at all — so it answered "was anything counted" when the question is "is what
+// was counted all there is".
 func outputUncounted(inf *pipeline.InferenceExtension) bool {
-	// Something was generated AND counted, so the modelled figure is whole.
-	if inf.OutputTokens > 0 || inf.CompletionTokens > 0 {
-		return false
-	}
 	// THE DISCRIMINATOR, and it is deliberately not the Output presence bit.
 	//
 	// Do not "simplify" this to `PresentKinds & KindOutput == 0`. The mask reads like the
@@ -244,6 +245,40 @@ func outputUncounted(inf *pipeline.InferenceExtension) bool {
 	// zero — so its total stays exact.
 	if inf.FinishReason != "" {
 		return false
+	}
+	// A COUNTED OUTPUT IS NOT A FINAL ONE ON A STREAM, and treating the two as identical
+	// re-entered the defect this whole function exists to catch — from the opposite side.
+	//
+	// The early return here used to be unconditional: `OutputTokens > 0 -> return false`,
+	// placed ABOVE the stop reason, so a non-zero tally ended the question. That is right
+	// for a body that arrived whole and wrong for one still arriving. foldOpenAIFrame
+	// REPLACES the accumulated usage with each usage-bearing chunk's totals, under a comment
+	// stating why — "OpenAI streams cumulative usage: each usage-bearing chunk restates the
+	// full totals" — so on that shape a mid-generation tally is a RUNNING total. A stream of
+	// that dialect that dies before the end therefore had output > 0 and no stop reason, and
+	// was published as exact: a floor labelled whole, which is the failure this function's
+	// zero-output branch was written to prevent.
+	//
+	// GATED ON Stream RATHER THAN REQUIRING A STOP REASON OUTRIGHT. Demanding
+	// `FinishReason != ""` of every counted output would be simpler and is the wrong trade:
+	// a NON-streamed response arrived in one piece, so its tally is final whether or not the
+	// dialect bothers to name a stop reason, and flagging those would print the "+ partial"
+	// marker and the "the real total is higher" language over money that is exact. A caveat
+	// that appears on correct figures is one a reader learns to ignore, which costs more than
+	// the case it was added for.
+	//
+	// Stream comes from the REQUEST body, so it is false whenever this process did not read
+	// the request — an unparsed endpoint, extproc without a request body, a body past the
+	// size cap. The change can only ever add a caveat to traffic we know asked for a stream,
+	// and never to traffic we did not read: the safe direction for a predicate whose job is
+	// to under-claim precision rather than over-claim it (see IncompleteReason's ordering).
+	//
+	// ANTHROPIC WAS ALREADY SAFE and stays unaffected: Output is assigned only in the
+	// message_delta arm, which carries delta.stop_reason on the same frame, so a truncated
+	// Anthropic stream has no tally to be misread. This closes the OpenAI-shaped half, which
+	// is the half nothing was watching.
+	if inf.OutputTokens > 0 || inf.CompletionTokens > 0 {
+		return inf.Stream
 	}
 	// A prompt-side count is what makes this a FLOOR rather than simply unpriced:
 	// without one there is nothing for the figure to be a lower bound OF, and costing

@@ -9,7 +9,25 @@
 
      THREE SHAs ARE DELIBERATELY UNREACHABLE: cbe34bbc, c5b1f596 and 4765644f appear in text
      explaining that an earlier banner pointed at them wrongly. They are commits from an
-     abandoned branch, and rewriting them would delete the correction they exist to record. -->
+     abandoned branch, and rewriting them would delete the correction they exist to record.
+
+     "VERIFIED TO RESOLVE" IS NOW A CHECKABLE CLAIM, AND IT USED TO BE FALSE. Four
+     "SUPERSEDED by" citations in the ledger plan still pointed at the abandoned branch,
+     so they resolved for nobody but the author while this banner asserted the opposite —
+     the exact failure the paragraph above was written about, one screen below it. They now
+     point at their equivalents on the aggregate/ledger PR, each confirmed three ways:
+     reachable from that branch, a unique subject match, and an IDENTICAL patch-id, since
+     the split cherry-picked them rather than rewriting them.
+
+     Re-check the whole set after any rebase, rather than trusting this paragraph:
+
+       grep -rhoE '\b[0-9a-f]{8}\b' authbridge/docs/superpowers/{plans,specs}/2026-09-13-*.md |
+         sort -u | while read s; do git merge-base --is-ancestor $s <core-branch> 2>/dev/null ||
+         git merge-base --is-ancestor $s <abctl-branch> 2>/dev/null || echo "UNREACHABLE $s"; done
+
+     Expect exactly the three named above. Anything else is a citation a reviewer cannot
+     follow. Note the pattern also matches hex-looking prose (0b11001, 218100000); those are
+     figures, not SHAs. -->
 
 > **STATUS: implemented.** Landed as `6870ad3b`: `pipeline.EventClient`,
 > `usage.GroupAgent` with its `byAgent` accumulator, and the cost ledger's `agent`

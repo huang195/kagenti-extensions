@@ -9,7 +9,25 @@
 
      THREE SHAs ARE DELIBERATELY UNREACHABLE: cbe34bbc, c5b1f596 and 4765644f appear in text
      explaining that an earlier banner pointed at them wrongly. They are commits from an
-     abandoned branch, and rewriting them would delete the correction they exist to record. -->
+     abandoned branch, and rewriting them would delete the correction they exist to record.
+
+     "VERIFIED TO RESOLVE" IS NOW A CHECKABLE CLAIM, AND IT USED TO BE FALSE. Four
+     "SUPERSEDED by" citations in the ledger plan still pointed at the abandoned branch,
+     so they resolved for nobody but the author while this banner asserted the opposite —
+     the exact failure the paragraph above was written about, one screen below it. They now
+     point at their equivalents on the aggregate/ledger PR, each confirmed three ways:
+     reachable from that branch, a unique subject match, and an IDENTICAL patch-id, since
+     the split cherry-picked them rather than rewriting them.
+
+     Re-check the whole set after any rebase, rather than trusting this paragraph:
+
+       grep -rhoE '\b[0-9a-f]{8}\b' authbridge/docs/superpowers/{plans,specs}/2026-09-13-*.md |
+         sort -u | while read s; do git merge-base --is-ancestor $s <core-branch> 2>/dev/null ||
+         git merge-base --is-ancestor $s <abctl-branch> 2>/dev/null || echo "UNREACHABLE $s"; done
+
+     Expect exactly the three named above. Anything else is a citation a reviewer cannot
+     follow. Note the pattern also matches hex-looking prose (0b11001, 218100000); those are
+     figures, not SHAs. -->
 
 > **STATUS: implemented.** Landed as `6c7c7fe0` (core) / `9f0e35b0` (abctl).
 >
@@ -544,7 +562,7 @@ func New(dir string, opts ...Option) (*Writer, error) {
 // roll: this runs on the synchronous session-append path, and the ledger is
 // observability. A failure here must not become a failed request.
 //
-// SUPERSEDED by 23e4b7ac: "beyond one append per minute roll" was still one
+// SUPERSEDED by 97104114: "beyond one append per minute roll" was still one
 // filesystem write on the request path, and that path holds session.Store's WRITE
 // LOCK, so every other request in the proxy queues behind it. Record now does NO IO
 // at all — one mutex, one map operation, and at most one non-blocking channel send.
@@ -569,7 +587,7 @@ func (w *Writer) Record(_ string, e *pipeline.SessionEvent) {
 		return
 	}
 
-	// SUPERSEDED by 87185852 and 7f44e714, and this guard is the part of the plan an
+	// SUPERSEDED by f49803b2 and 3481e040, and this guard is the part of the plan an
 	// implementer must NOT copy. Both halves of it are wrong.
 	//
 	// "Inference == nil" was standing in for "not priceable", and it is not the same
@@ -1083,7 +1101,7 @@ Add to `store.go`:
 // mid-append, and discarding a whole day because its last line is half-written
 // would turn a 60-second gap into a 24-hour one.
 //
-// SUPERSEDED by 79857c7d, which is the same argument carried one step further. Stopping
+// SUPERSEDED by 85aa46d9, which is the same argument carried one step further. Stopping
 // at the bad line only works if the bad line is the LAST one — which it is for a crash
 // mid-append and is not for any other kind of corruption. A bad line in the morning
 // discarded the rest of the day, reintroducing exactly the 24-hour gap this comment

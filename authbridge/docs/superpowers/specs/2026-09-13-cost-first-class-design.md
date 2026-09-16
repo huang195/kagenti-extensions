@@ -1,176 +1,15 @@
-# Cost as a first-class citizen
+# Cost as a first-class citizen — design
 
-<!-- Commit references in this document point into TWO pull requests, not one. The work was
-     reviewed as a single branch and then split: authlib and the proxy binary into the
-     aggregate/ledger PR, the abctl surfaces into the PR stacked on it, and these documents
-     into a third. Every SHA below was repointed after that split and verified to resolve.
-     Four commits were split in half and are cited as `<one-half>` / `<other-half>`, labelled
-     (core) and (abctl), so either PR can be reached from here.
+**Status: implemented.** Delivered across the cost-observability PR series; `git log --grep=cost`
+is the index. This document is the design and the decisions, not a work plan — the five
+step-by-step plan documents that sat beside it were instructions for work now finished, and
+were deleted rather than left to rot.
 
-     THREE SHAs ARE DELIBERATELY UNREACHABLE: cbe34bbc, c5b1f596 and 4765644f appear in text
-     explaining that an earlier banner pointed at them wrongly. They are commits from an
-     abandoned branch, and rewriting them would delete the correction they exist to record.
-
-     "VERIFIED TO RESOLVE" IS NOW A CHECKABLE CLAIM, AND IT USED TO BE FALSE. Four
-     "SUPERSEDED by" citations in the ledger plan still pointed at the abandoned branch,
-     so they resolved for nobody but the author while this banner asserted the opposite —
-     the exact failure the paragraph above was written about, one screen below it. They now
-     point at their equivalents on the aggregate/ledger PR, each confirmed three ways:
-     reachable from that branch, a unique subject match, and an IDENTICAL patch-id, since
-     the split cherry-picked them rather than rewriting them.
-
-     Re-check the whole set after any rebase, rather than trusting this paragraph:
-
-       grep -rhoE '\b[0-9a-f]{8}\b' authbridge/docs/superpowers/{plans,specs}/2026-09-13-*.md |
-         sort -u | while read s; do git merge-base --is-ancestor $s <core-branch> 2>/dev/null ||
-         git merge-base --is-ancestor $s <abctl-branch> 2>/dev/null || echo "UNREACHABLE $s"; done
-
-     Expect exactly the three named above. Anything else is a citation a reviewer cannot
-     follow. Note the pattern also matches hex-looking prose (0b11001, 218100000); those are
-     figures, not SHAs. -->
-
-**Date:** 2026-09-13
-**Issues:** closes [#950](https://github.com/rossoctl/cortex/issues/950),
-[#952](https://github.com/rossoctl/cortex/issues/952),
-[#972](https://github.com/rossoctl/cortex/issues/972); satisfies
-[#953](https://github.com/rossoctl/cortex/issues/953) except latency percentiles
-([#951](https://github.com/rossoctl/cortex/issues/951)); feeds
-[#963](https://github.com/rossoctl/cortex/issues/963)
-**Release:** Cortex v0.9.0 ([#962](https://github.com/rossoctl/cortex/issues/962)), exit-bar item 3
-**Delivery:** one PR, seven signed commits
-
-> **STATUS — read before relying on this.** This design was written against
-> `767cbb63`. Upstream has since implemented several of its commits
-> independently and with a better factoring, and this work was rebased onto
-> current `main` rather than merged from that base. Superseded upstream:
-> `costevent.Key` and the presence-versus-pricedness split; the single-costing-owner
-> refactor, which upstream extracted into an `authlib/costing` package rather than
-> leaving in the parser; the `Avoided` container and `EstimateTokensFromBytes`; and
-> the abctl user-settings file.
->
-> What survived, and is what this branch delivers: the aggregate token split with
-> `presentKinds`, the model/endpoint/session/agent groupings, the spend strip and
-> per-session cost, the durable cost ledger, and the Cost pane. Upstream also has
-> pricing multipliers this design did not know about, without which every figure
-> here would have been vendor list price.
->
-> The last two of those arrived late, and a reader of an earlier revision of this
-> banner was told they were missing: the Cost pane landed in `c86507ca` and the
-> `agent` grouping — `usage.GroupAgent`, `pipeline.EventClient`, the ledger's
-> `agent` column — in `6870ad3b`. Both are in the tree. A banner that understates
-> what shipped defeats this convention exactly as thoroughly as one that overstates
-> it, so this is recorded rather than quietly corrected.
->
-> **The one rule this design is built around is NOT achieved on this branch.**
-> "Exactly one component turns tokens into dollars" (see *Architecture*) remains an
-> aspiration, and the code says so in its own godoc rather than leaving a reader to
-> find out by comparing two totals. `usage.Aggregator.costOf` still resolves a rate
-> itself for any request that carries a model and tokens but arrives with no settled
-> record. Three places say it in as many words: `authlib/usage/usage.go`'s
-> `eventCost` doc ("This package is NOT rate-free, which this comment previously
-> claimed"), `authlib/sessionapi/usage.go`'s handler doc ("cost is NOT
-> single-sourced … do not write here that cost is computed in exactly one place,
-> because it is not") and `authlib/costledger/row.go`'s divergence paragraph, which
-> enumerates the three differences that follow. So there are two sources — a
-> published figure preferred, a modelled one as fallback — and they can answer
-> differently about the same request. Of the four sites #972 names, `costOf` is
-> still one of them.
->
-> Two of its findings turned out to be bugs upstream still had, and are fixed on
-> this branch: a positive gateway cost header on a body-less response was charged
-> nowhere, and a truncated stream's floor was published as an exact total.
->
-> Kept rather than rewritten, because the reasoning is why the code looks the way
-> it does — including the parts that were wrong. Where it disagrees with the code,
-> the code is right.
->
-> **Line numbers drift.** Every `file.go:NN` citation below was accurate against the
-> tree it was written against, and many have since moved — `fold` alone has travelled
-> from `snapshot.go:159` to `:345` to `:438`. Read them as "roughly here"; find the
-> symbol by name.
->
-> ---
->
-> **SECOND SWEEP, 2026-09-15.** Two further review rounds landed fourteen-plus fixes
-> after the banner above was written. Eleven of its claims stopped being true; they are
-> collected here rather than rewritten in place, because in most cases the reasoning is
-> still why the code looks the way it does.
->
-> 1. **Costing has its own package, `authlib/costing`.** The *Layers* table names
->    `inference-parser` as the costing site, and *Architecture* gives three reasons the
->    parser should own the rule. The parser now **calls** `costing.Settle` at the point
->    the token counters are final; it does not own the rule. `costing`'s package doc
->    gives the reason this design missed: a gateway's cost-header semantics are
->    vendor-specific knowledge with no place in a provider-shaped body parser. The
->    "only the parser knows when usage is final" argument survives intact — it is
->    exactly why the parser is the *caller* — so the three reasons are left standing.
-> 2. **The history is "two places", not four.** `costing`'s own account is that cost was
->    decided inside `litellm-budget-track` and again inside the usage aggregator. The
->    four sites *Architecture* lists are #972's enumeration, which counted two client-side
->    renderers of a published figure alongside two producers of one. And budget-track now
->    **amends** the settled record to enforce a budget rather than consuming it.
-> 3. **Delivery row 7 did land — upstream, not here.** `ToolPrune` has no rate table
->    (its struct says so where the field used to be) and `pruneEvent` "carries FACTS
->    ONLY"; `pricing.EstimateTokensFromBytes` lives in `authlib/pricing/estimate.go`;
->    and `costing.Avoided`, called from `inference-parser`, publishes priced savings into
->    `costevent.Event.Avoided`. What did **not** land is the aggregation of that container
->    into `usage.Counts` — so the four missing `avoided*`/`prunable*` schema rows and the
->    pane's missing `AVOIDED` section are still right, but "did not land at all" is not.
->    A consequence for *Savings, honestly*: its `tui/prune_saving.go:97` and `:104-112`
->    citations now point at a file whose own header says it does none of that arithmetic.
-> 4. **The counterfactual-invariant test is written**, in `usage/pricing_test.go` as
->    `TestAggregator_TotalsAreInvariantToAvoidedCost`. It drives a real `Avoided` payload
->    through `Record` twice and pins every money field across the pair. Not vacuous
->    either, since `costevent` carries the container.
-> 5. **One client is recognised, not three.** `pipeline.knownClients` maps `claude-cli`
->    → `claude-code` and nothing else; `opencode` and `codex` are deliberately absent,
->    because a wrong guess files one agent under another's name where an unrecognised
->    one still reports under its raw User-Agent and can be identified from the breakdown.
->    The `EventClient` sketch's comment lists all three as if they were implemented.
-> 6. **The ledger stores an absent client as `""`, not `"unknown"`.** `"unknown"` is
->    `pipeline.UnknownClientLabel`, applied at the query boundary by
->    `costledger.labelFor` — a durable file must not bake a display value into a column
->    where it becomes permanently indistinguishable from an agent that really called
->    itself that. Corrected inline under *Storage*.
-> 7. **Three `/v1/usage` additions the *API* section does not list**, all additive:
->    `Counts.IncompleteRequests` (how many of a total's figures are a floor rather than
->    an exact number), `Snapshot.Degraded` (a pointer, so absent ≠ zero: how many ledger
->    lines and day files a read lost) and `Snapshot.IncompleteBy` (which *way* a figure
->    is inexact). **All three now reach abctl** — `IncompleteBy` was producer-side only when
->    the line above was written, and `20022a75` closed it in `--json`, the human summary and
->    the Cost pane. Closing it exposed a worse defect than the missing field: the pane had
->    been asserting "N of M priced figures are lower bounds — so the real total is higher"
->    over EVERY inexact figure, which is false for an approximation and false on the pane's
->    own default window, where a ledger row carries no reason at all. It now names a
->    direction only where the response named one, and says so plainly when it cannot.
->
->    A fourth disclosure joined them: `Snapshot.UngroupedCostMicros`, the cost no series
->    entry carries, so a breakdown that does not add up says so instead of just being short.
-> 8. **The Cost pane mock-up is a picture of the design, not of the pane.** Shipped
->    headings are `TOTAL`, `BY <group>`, `WHERE IT WENT (tokens, not dollars)` — the
->    parenthetical is *in the heading* — and `COVERAGE`. There is no `AVOIDED` section
->    and no per-tier dollar column. The group cycle is model → endpoint → session →
->    agent.
-> 9. **The strip's width table is illustrative, not a threshold list.** No width
->    constant exists: `fitStripFigures` searches figure count × verbosity and drops the
->    `SPEND` label before it drops a number. Every money figure now wears up to three
->    one-column claims, composed as `!~$4.1700+` — `!` the ledger read lost rows, `~` at
->    least one figure in this total is inexact, `+` the figure covers only part of the
->    traffic. Markers are never what gets dropped. A fifth figure was added: how long
->    ago the strip last polled, when that answer is stale.
-> 10. **Retention is configurable but floored, and the config is restart-only.** A
->     non-zero `cost_ledger.retention_days` below **8** is refused at load, because
->     `window=7d` is served from these files and a rolling 7×24h touches EIGHT local day
->     files unless it happens to begin at midnight. The floor is derived
->     (`usage.Window7dLocalDays`) rather than written as its own number — as a literal it
->     said 7 and admitted the partial week it existed to refuse; `0` still means 30. And
->     `CostLedgerConfig`
->     is **not** hot-reloadable — the reloader has no reference to it and the writer is
->     opened once at startup, so every key takes effect on restart.
-> 11. **Persisted UI state is a `cost:` section in `~/.cortex/abctl-config.yaml`**, the
->     YAML file main already writes — not the `~/.cortex/abctl-ui.json` this design
->     proposed. The banner records that file as superseded upstream; this names what
->     replaced it.
+Two things a reader should know before relying on it. It was written before several of its
+pieces were implemented upstream with a better factoring — costing was extracted into
+`authlib/costing` rather than left in the parser, and pricing multipliers exist that this design
+did not know about, without which every figure here would be vendor list price. And the sections
+below describe intent; where the implementation went a different way, the last section says so.
 
 ## Why
 
@@ -695,32 +534,6 @@ Two debts are stated rather than papered over:
 - **Behaviour preservation for phase 2** — the record carries both the old and the new figure
   during the transition, so drift is a comparison rather than a regression.
 
-## Delivery
-
-One PR, seven signed commits, reviewable in order. Visible wins land early rather than all at the
-end.
-
-**What actually landed:** one PR, but more commits than seven, because several of these were
-followed by their own fixes — the writer coming off the request path, the open minute being
-supplied at all, a corrupt ledger line no longer discarding the rest of its day. Rows 1, 2 and 7
-did not land in this form: 1 and 2 were superseded upstream (see the banner), and 7 — tool-prune's
-resolver, `Avoided` end to end — did not land at all, which is why the `avoided*` fields are absent
-and why the Cost pane has no `AVOIDED` section. Rows 3, 4, 5 and 6 map to `d3fb2ca7`, `b97dbc29` (abctl) / `003a30f8` (core),
-`6c7c7fe0` (core) / `9f0e35b0` (abctl) and `6870ad3b`; the Cost pane is `c86507ca`, an eighth commit this table does not list.
-
-| commit | content | effect |
-|---|---|---|
-| 1 | `costevent.Key = "cost"`, legacy fallback, presence ≠ pricedness | #972 phase 1; no behaviour change |
-| 2 | costing moves into `inference-parser`, reads the gateway cost header; budget-track becomes budget-only | #972 phase 2; **rows show money on a default install** |
-| 3 | `Counts` split, `presentKinds` fold, `GroupModel` / `GroupEndpoint`; `/v1/usage` additive | #950's core |
-| 4 | header spend strip, sessions-pane `COST` and wall time | **cost always on screen** |
-| 5 | cost ledger; headline becomes "today" and survives restart; `abctl cost --json` | exit-bar item 3 |
-| 6 | `Client` from User-Agent, `GroupAgent` | unblocks #941 / #942 / #943 |
-| 7 | tool-prune loses its resolver, `EstimateTokensFromBytes`, `Avoided` end to end, Cost pane on `$`, `~/.cortex/abctl-ui.json` | #972 phase 3 = **#952**; #953 |
-
-If the review proves unwieldy, the natural fracture is after commit 2 — the plumbing that fixes
-blank rows is independently valuable and independently testable.
-
 ## Risks
 
 - **Phase 2 touches the streaming response path**, where #926 (early flush of a leading thinking
@@ -740,3 +553,35 @@ blank rows is independently valuable and independently testable.
   totals.
 - The strip is not configurable away in this work. Cost being unconditionally visible is the
   feature.
+
+## Decisions taken during implementation
+
+Five places where the work departed from this document, or hit something the document did not
+know about. Recorded because in each case the code is right and the design was not.
+
+**The ledger is a second Recorder, not a reader of the aggregate.** This document implies the
+ledger reads the aggregator's closed buckets. It cannot: `session.Recorder` is one-way, and more
+importantly the aggregator keeps independent *marginals* — by model, by endpoint, by provenance —
+while a ledger row needs the exact cross-product of them. Summing marginals double-counts. So the
+ledger registers as its own Recorder beside the aggregator, which also means `usage` needed no
+changes and the ledger cannot regress charting. The cost is that it decodes each event's cost
+record itself.
+
+**`SessionEvent`'s JSON form is hand-maintained in four places** — the struct, `sessionEventWire`,
+`MarshalJSON` and `UnmarshalJSON`. A field added to one and not the others is silently absent from
+the wire. Anything that adds to that event has to touch all four.
+
+**The Cost pane keeps its own poll chain, making three in the TUI, deliberately.** Extracting a
+shared poller is the obvious response and was not done: it would refactor a working pane inside a
+commit that adds a feature. The existing guard shape is copied instead — `reqSeq` against stale
+replies, `tickGen` against stale chains.
+
+**The spend strip shipped fewer figures than this document draws.** Its four-figure form needs a
+durable ledger for "today" and an `Avoided` container for "saved". Until those existed the strip
+rendered neither rather than approximating them, and that generalised into the rule the whole
+feature now enforces: never render a number you do not have. `cost unavailable`, never `$0.00`.
+
+**Two prescriptions here are wrong and the code disagrees on purpose.** The Cost pane's settings
+validate against the pane's own grouping cycle rather than `usage.ParseGroup`, which accepts axes
+the pane cannot render; and they persist when the pane closes rather than on every keypress. A
+test written from this document would fail against the shipped code.

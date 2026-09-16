@@ -294,3 +294,34 @@ func TestValidate_TheLedgerSessionRefusalIsNarrow(t *testing.T) {
 func forwardOnlyListener() ListenerConfig {
 	return ListenerConfig{Roles: []string{RoleForward}}
 }
+
+// THE CEILING, and it is not a disk-space preference: past it the failure inverts.
+//
+// prune counts back with AddDate, which normalises rather than saturating, so a large enough
+// retention wraps the cutoff into the FUTURE and the first prune deletes every day file
+// including today. A validator that bounded only the floor admitted the one value whose
+// meaning is the opposite of its effect. Both edges are asserted, because a ceiling that
+// rejects its own maximum is the off-by-one this table exists to catch.
+func TestCostLedgerValidate_RejectsARetentionLargeEnoughToInvertPrune(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		days    int
+		wantErr bool
+	}{
+		{"the maximum itself is allowed", maxCostLedgerRetentionDays, false},
+		{"one past the maximum is refused", maxCostLedgerRetentionDays + 1, true},
+		{"the value that wraps the cutoff into the future", 1<<62 - 1, true},
+		{"an ordinary retention still loads", 30, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			err := (&CostLedgerConfig{RetentionDays: tc.days}).Validate()
+			if tc.wantErr && err == nil {
+				t.Errorf("retention_days = %d validated: prune's cutoff wraps into the future at "+
+					"that scale, so this config deletes the ledger it claims to keep", tc.days)
+			}
+			if !tc.wantErr && err != nil {
+				t.Errorf("retention_days = %d refused: %v", tc.days, err)
+			}
+		})
+	}
+}

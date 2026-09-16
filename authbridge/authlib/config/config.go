@@ -159,6 +159,24 @@ type CostLedgerConfig struct {
 // them, and agreement is a thing to check rather than to compute.
 const minCostLedgerRetentionDays = 9
 
+// maxCostLedgerRetentionDays is the ceiling a retention_days has to stay under, and the
+// reason there is one at all is that the failure INVERTS.
+//
+// prune counts back with ref.AddDate(0, 0, -(retainDays-1)). AddDate normalises, so a large
+// enough retention does not merely reach further back — it wraps. Measured at
+// retainDays = 1<<62-1 against a reference of 2026-09-15: the cutoff came out as
+// 2026-09-17, TWO DAYS IN THE FUTURE, which makes every day file including today older than
+// the cutoff. So the largest number an operator can type, meaning "keep everything", deletes
+// the entire ledger on the first prune. A validator that bounded only the floor let that
+// through while carefully explaining why 7 was too small.
+//
+// TEN YEARS, which is far past any use for a per-minute cost file on a laptop (3,650 days is
+// roughly 1.2 GB at the measured ~10 MB per 30 days) and far below the region where the
+// arithmetic misbehaves. It is deliberately not derived from math.MaxInt: a bound chosen to
+// be "just safe" would need a reader to verify the overflow arithmetic to know it is safe,
+// where a bound this far away is obviously so.
+const maxCostLedgerRetentionDays = 3650
+
 // LedgerEnabled reports whether the ledger should run, given the default for this
 // deployment shape.
 //
@@ -176,6 +194,16 @@ func (c *CostLedgerConfig) LedgerEnabled(defaultOn bool) bool {
 func (c *CostLedgerConfig) Validate() error {
 	if c.RetentionDays < 0 {
 		return fmt.Errorf("cost_ledger.retention_days must not be negative, got %d", c.RetentionDays)
+	}
+	if c.RetentionDays > maxCostLedgerRetentionDays {
+		// Named as the inversion it is rather than as a preference about disk. An operator who
+		// typed a huge number meant "keep everything", and the honest message is that this one
+		// would keep nothing.
+		return fmt.Errorf("cost_ledger.retention_days must be at most %d (ten years), got %d: "+
+			"retention is counted back with AddDate, which NORMALISES rather than saturating, so a "+
+			"large enough value wraps the cutoff into the FUTURE and the first prune deletes every "+
+			"day file including today — the opposite of what the number says",
+			maxCostLedgerRetentionDays, c.RetentionDays)
 	}
 	if c.RetentionDays > 0 && c.RetentionDays < minCostLedgerRetentionDays {
 		// Says NINE and says why it is not seven: an operator who typed 7 for a seven-day

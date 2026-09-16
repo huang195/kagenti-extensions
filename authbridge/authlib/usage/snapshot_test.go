@@ -3,7 +3,9 @@ package usage
 import (
 	"encoding/json"
 	"fmt"
+	"maps"
 	"math"
+	"sort"
 	"strings"
 	"testing"
 	"time"
@@ -760,4 +762,108 @@ func TestParseWindow_StillRejectsSymbolicWindows(t *testing.T) {
 			t.Errorf("ParseWindow(%q) succeeded; want an error", in)
 		}
 	}
+}
+
+// THE MEASURED 4.7 MB, bounded — and the bound has to hold for the shape that produced it:
+// window=6h&resolution=1m&group=session, which is 360 buckets times whatever cardinality the
+// caller chose. maxLabelsPerBucket bounds MEMORY at 64 per axis; nothing bounded the response,
+// and the two multiply.
+//
+// The assertions are about what a client receives, not about the helper: per-bucket series
+// count, the identity that the breakdown still sums to the total, and — the one that matters
+// for a chart — that a label is either a series in every bucket or (other) in every bucket.
+func TestSnapshot_SeriesPerBucketIsBoundedAndStableAcrossTheWindow(t *testing.T) {
+	now := time.Now().Truncate(BucketWidth)
+	a := New(WithClock(func() time.Time { return now }))
+
+	// More distinct models than the cap, over two buckets — and THE PER-BUCKET RANKINGS ARE
+	// DELIBERATELY DIFFERENT, which the first version of this fixture got wrong. With the same
+	// cost distribution in both buckets, ranking per bucket and ranking across the window pick
+	// the same labels, so the stability assertion below passed against a mutation that ranked
+	// per bucket — a test asserting a property it could not observe.
+	//
+	// So: the earlier bucket is where the money is, for models 0..15. The later bucket spends
+	// its money on models 16..23 instead, at a tenth the size. Window-wide, models 0..15 are
+	// the costliest and must be the series in BOTH buckets. Ranked per bucket, the later one
+	// would keep 16..23 and the membership would differ — which is exactly the flicker the
+	// window-wide ranking exists to prevent.
+	const models = MaxSeriesInResponse + 8
+	earlier := now.Add(-BucketWidth)
+	for i := 0; i < models; i++ {
+		model := fmt.Sprintf("model-%02d", i)
+		big, small := 1.00-float64(i)*0.01, 0.001
+		if i < MaxSeriesInResponse {
+			a.Record("s1", withCost(t, respEvent(earlier, 200, time.Second, model, 100), big))
+			a.Record("s1", withCost(t, respEvent(now, 200, time.Second, model, 100), small))
+			continue
+		}
+		a.Record("s1", withCost(t, respEvent(earlier, 200, time.Second, model, 100), small))
+		a.Record("s1", withCost(t, respEvent(now, 200, time.Second, model, 100), 0.10))
+	}
+
+	snap := a.Snapshot(10*BucketWidth, BucketWidth, "s1", GroupModel)
+
+	var populated int
+	for _, b := range snap.Buckets {
+		if len(b.Series) == 0 {
+			continue
+		}
+		populated++
+		if len(b.Series) > MaxSeriesInResponse+1 {
+			t.Errorf("bucket at %s carries %d series, want at most %d + the (other) band",
+				b.At.Format(time.RFC3339), len(b.Series), MaxSeriesInResponse)
+		}
+	}
+	if populated != 2 {
+		t.Fatalf("%d populated buckets, want 2 — the fixture is not exercising the window-wide "+
+			"ranking", populated)
+	}
+
+	// STABLE MEMBERSHIP. Capping each bucket on its own would let one label be a series in one
+	// minute and (other) in the next, so a chart would show a line appearing and vanishing over
+	// steady traffic. Compared as sets across the two populated buckets.
+	var first map[string]bool
+	for _, b := range snap.Buckets {
+		if len(b.Series) == 0 {
+			continue
+		}
+		got := make(map[string]bool, len(b.Series))
+		for k := range b.Series {
+			got[k] = true
+		}
+		if first == nil {
+			first = got
+			continue
+		}
+		if !maps.Equal(first, got) {
+			t.Errorf("series membership differs between buckets: %v vs %v — the ranking must be "+
+				"taken over the whole window", keysOf(first), keysOf(got))
+		}
+	}
+
+	// And the money still reconciles: nothing may be dropped by a cap whose job is to rename.
+	series := mergeSeries(snap.Buckets)
+	var sum int64
+	for _, c := range series {
+		sum += c.CostMicros
+	}
+	if sum != snap.Totals.CostMicros {
+		t.Errorf("series sums to %d against a total of %d — a cap must fold the rest into "+
+			"(other), never discard it", sum, snap.Totals.CostMicros)
+	}
+	if _, ok := series[overflowLabel]; !ok {
+		t.Errorf("no %q band over %d models with a cap of %d; the traffic past the cap reached "+
+			"no row at all", overflowLabel, models, MaxSeriesInResponse)
+	}
+}
+
+// keysOf is a sorted key list, so a failure above names the difference instead of printing two
+// maps in random order.
+func keysOf(m map[string]bool) []string {
+	out := make([]string, 0, len(m))
+	for k := range m {
+		out = append(out, k)
+	}
+	sort.Strings(out)
+	return out
 }

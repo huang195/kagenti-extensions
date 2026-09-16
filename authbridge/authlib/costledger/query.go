@@ -364,6 +364,16 @@ func Fold(rows []Row, group usage.Group) (usage.Counts, map[string]usage.Counts,
 		cur.Add(r.Counts)
 		series[label] = cur
 	}
+	// BOUNDED BEFORE IT IS SERVED. These rows come off disk, so the number of distinct
+	// (endpoint, model, agent) keys in one response is however many a month of traffic
+	// produced — nothing in this package bounded it, and query.go's own comment deferred the
+	// (other) band to the client. A client is the wrong place for it: the bytes are already on
+	// the wire by then, and every other consumer of /v1/usage gets an unbounded response.
+	//
+	// AFTER the totals and the residual, so the cap changes what the breakdown NAMES and
+	// nothing about what it sums to. usage.CapSeries folds the rest into the same (other) band
+	// the ring produces, so a client renders one band and not two.
+	series = usage.CapSeries(series, usage.MaxSeriesInResponse)
 	return totals, series, ungrouped
 }
 

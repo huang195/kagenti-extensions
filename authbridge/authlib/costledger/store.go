@@ -9,6 +9,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 )
 
@@ -22,6 +23,32 @@ const dayLayout = "2006-01-02"
 // 350 KB, so 30 days is on the order of 10 MB — small enough that nobody has to
 // think about it, long enough to answer "what did last month cost".
 const defaultRetentionDays = 30
+
+// expiredSuffix marks a day file that prune has CONDEMNED but not yet deleted.
+//
+// PRUNE RENAMES BEFORE IT UNLINKS, and the reason is that prune's cutoff is computed from a
+// clock it cannot verify. The floor that protects it — counting retention back from the older
+// of the clock's day and the newest day file — defeats itself once a forward-skewed process
+// has WRITTEN a file: that file then agrees with the wrong clock, both readings move together,
+// and no rule using only those two inputs can tell the state apart from time having genuinely
+// passed. Detection is not available here, so recoverability is what is left.
+//
+// A file ending in this suffix is invisible to every read: dayFromName requires a ".jsonl"
+// extension, so an expired file is matched by no window, contributes to no total, and is not a
+// candidate for "newest". It is deleted only when a LATER prune agrees it is still outside the
+// window — two independent passes, which a single wrong cutoff cannot supply.
+//
+// AND IT IS RESTORED IF THE CUTOFF RECEDES. That is the property this whole mechanism is for:
+// a prune driven by a skewed clock condemns real history, and when the clock is corrected the
+// next prune renames those files back rather than leaving the operator to do it. A wrong prune
+// becomes a delay in retention instead of a loss of cost history.
+const expiredSuffix = ".expired"
+
+// maxRetentionDays mirrors config.maxCostLedgerRetentionDays, which owns the derivation.
+// Restated rather than imported for the reason the floor is: this package must not depend on
+// the config loader. TestMaxRetentionDays_MatchesTheConfigCeiling pins the two together, so a
+// change to one fails a test instead of quietly leaving the durable side unguarded.
+const maxRetentionDays = 3650
 
 // fileMode is 0o600 because these files record spend. 0o644 would make one
 // account's bill readable by every other account on a shared machine, and there is
@@ -64,6 +91,23 @@ func newStore(dir string, retainDays int, loc *time.Location) (*store, error) {
 	}
 	if retainDays <= 0 {
 		retainDays = defaultRetentionDays
+	}
+	// CLAMPED HERE TOO, not only in config.Validate, because what is on the other side of this
+	// bound is an irreversible delete. A retention large enough to wrap prune's AddDate
+	// produces a cutoff in the FUTURE and takes the whole ledger with it (see
+	// config.maxCostLedgerRetentionDays for the measurement), and Validate only runs on a
+	// value that arrived through a config file — every other caller of newStore, including a
+	// test and any future in-process construction, would reach prune unguarded.
+	//
+	// CLAMPED RATHER THAN REFUSED, unlike in the config, and the asymmetry is the point: a
+	// bad config should fail to load loudly, while a running proxy asked for an absurd
+	// retention should keep the maximum sane amount of history rather than refuse to record
+	// cost at all. Warn, because a silent clamp is how the two definitions drift.
+	if retainDays > maxRetentionDays {
+		slog.Warn("costledger: retention_days is past the maximum; clamping",
+			"requested", retainDays, "using", maxRetentionDays,
+			"reason", "retention is counted back with AddDate, which normalises, so a large enough value wraps the cutoff into the future and prune deletes every day file including today")
+		retainDays = maxRetentionDays
 	}
 	if loc == nil {
 		loc = time.Local
@@ -653,6 +697,9 @@ func (s *store) prune(now time.Time) error {
 		day  time.Time
 	}
 	var days []dayEntry
+	// Condemned by an earlier pass. Collected separately so this pass can either agree (and
+	// unlink) or disagree (and restore), which is the two-pass rule expiredSuffix exists for.
+	var expired []dayEntry
 	var newest time.Time
 	for _, e := range entries {
 		if e.IsDir() {
@@ -663,6 +710,16 @@ func (s *store) prune(now time.Time) error {
 		// s.loc's ledger day, at dayHour. Both sides of every `Before` below are then the
 		// same kind of instant. It used to be an inline time.ParseInLocation to local
 		// midnight, which is a date that does not exist in every zone; see dayFromName.
+		// A file this prune, or an earlier one, has already condemned. Kept in its own list:
+		// it is invisible to reads (dayFromName rejects the extension), must not count toward
+		// "newest", and is the only thing this pass is allowed to actually unlink. See
+		// expiredSuffix.
+		if strings.HasSuffix(name, expiredSuffix) {
+			if day, ok := s.dayFromName(strings.TrimSuffix(name, expiredSuffix)); ok {
+				expired = append(expired, dayEntry{name: name, day: day})
+			}
+			continue
+		}
 		day, ok := s.dayFromName(name)
 		if !ok {
 			continue
@@ -721,7 +778,34 @@ func (s *store) prune(now time.Time) error {
 				"cause", "the host clock was stepped forward when those rows were recorded, or has since stepped back",
 				"effect", "those rows are unreadable by any window this clock can express and are now gone")
 		}
-		if rerr := os.Remove(filepath.Join(s.dir, d.name)); rerr != nil && firstErr == nil {
+		// CONDEMNED, NOT DELETED. The rename is the whole mitigation: see expiredSuffix.
+		from := filepath.Join(s.dir, d.name)
+		if rerr := os.Rename(from, from+expiredSuffix); rerr != nil && firstErr == nil {
+			firstErr = rerr
+		}
+	}
+
+	// Second pass: what an EARLIER prune condemned. A file still outside the window has now
+	// been judged twice and is unlinked; one that is back inside it is restored, which is what
+	// makes a prune driven by a skewed clock a delay rather than a loss.
+	for _, d := range expired {
+		live := filepath.Join(s.dir, strings.TrimSuffix(d.name, expiredSuffix))
+		if d.day.Before(cutoff) || d.day.After(horizon) {
+			if rerr := os.Remove(filepath.Join(s.dir, d.name)); rerr != nil && firstErr == nil {
+				firstErr = rerr
+			}
+			continue
+		}
+		// Back inside the window: the cutoff that condemned this file was wrong, or the clock
+		// that produced it has been corrected. Warn, because a restore means an earlier prune
+		// was working from a bad reading and an operator should know the host clock moved.
+		slog.Warn("costledger: restoring a day file an earlier prune condemned; it is inside the "+
+			"retention window again",
+			"file", d.name, "day", d.day.Format(dayLayout),
+			"cutoff", cutoff.Format(dayLayout), "retainDays", s.retainDays,
+			"cause", "the host clock was ahead when the earlier prune ran and has since been corrected",
+			"effect", "the rows in this file are readable again rather than lost")
+		if rerr := os.Rename(filepath.Join(s.dir, d.name), live); rerr != nil && firstErr == nil {
 			firstErr = rerr
 		}
 	}

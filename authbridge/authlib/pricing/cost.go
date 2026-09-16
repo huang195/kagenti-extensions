@@ -208,6 +208,18 @@ func MicrosFromUSD(usd float64) (int64, bool) {
 //     counting it as priced-zero would dilute the coverage denominator.
 //   - A negative count, which is a parser bug or a hostile body. A negative cost
 //     would corrode a running total that nothing re-derives.
+//   - A count above maxPlausibleTokens, on the same reasoning and from the same
+//     wire. THE MODELLED FIGURE WAS THE UNBOUNDED ONE: headerCost refuses a
+//     gateway's figure past MaxPlausibleRequestCostMicros ($10,000), and
+//     usage.plausibleTokenReport refuses an implausible token REPORT and counts it
+//     in Counts.RefusedTokenRequests — while the money derived from those same
+//     counts arrived here and was believed, bounded only by MaxCostMicros, which is
+//     $9 billion. So one response could have its tokens called impossible and its
+//     dollars kept, in the same aggregate, side by side in the same client.
+//     Bounding the COUNTS rather than the resulting figure is deliberate: it names
+//     the cause, and it makes the cost bound follow arithmetically, since
+//     MaxPlausibleRequestCostMicros IS maxPlausibleTokens times the dearest
+//     plausible per-token rate.
 //   - No rates at all, which is the ProvNone case reaching here directly.
 //   - A rate that is negative or non-finite, wherever it came from. Trusting the
 //     rate while checking the count would let a hostile or buggy producer emit
@@ -222,7 +234,9 @@ func Cost(r Rates, u Usage) (int64, bool) {
 	eff := r.At(u.PromptTotal())
 	var usd float64
 	for i, n := range u.tokens() {
-		if n < 0 {
+		// Both directions of the same bound, and both are about the same input: these
+		// counts are a provider-controlled integer on the wire. See the list above.
+		if n < 0 || n > maxPlausibleTokens {
 			return 0, false
 		}
 		if n == 0 {

@@ -363,8 +363,20 @@ func startOfToday(t *testing.T) time.Time {
 // and no assertion depends on it.
 func insideToday(t *testing.T, into time.Duration) time.Time {
 	t.Helper()
-	at := startOfToday(t).Add(into)
-	if now := time.Now(); at.After(now) {
+	return insideTodayAt(startOfToday(t), time.Now(), into)
+}
+
+// insideTodayAt is insideToday with both ends of the window passed in, so the clamp can be
+// exercised at a chosen instant instead of whenever the suite happens to run.
+//
+// SPLIT OUT BECAUSE THE COVERAGE WAS CLOCK-DEPENDENT. The wall-clock test below does kill a
+// removal of the clamp — its 48h row anchors two days out, so it fires at any hour — but the
+// case that actually broke CI was 00:00:30, where "today" is thirty seconds wide, and nothing
+// reproduced THAT on purpose. A test whose strength varies with the time of day is a test
+// that will be strong again only by luck.
+func insideTodayAt(start, now time.Time, into time.Duration) time.Time {
+	at := start.Add(into)
+	if at.After(now) {
 		return now
 	}
 	return at
@@ -911,5 +923,44 @@ func TestInsideToday_NeverLeavesTheWindowItIsAnchoredTo(t *testing.T) {
 			t.Errorf("insideToday(%s) = %s, after now (%s): a row anchored in the future is "+
 				"outside [From, now] and window=today cannot see it either", into, at, now)
 		}
+	}
+}
+
+// The same property at the instant that broke CI, with the clock passed in rather than read.
+//
+// TWO THINGS THE TEST ABOVE CANNOT DO, and this is why it exists rather than replacing it.
+// First, it pins the 30-second window deterministically: at 00:00:30 every offset in the
+// table except zero is in the future, so the clamp is the only thing keeping an anchor inside
+// [From, now] — the wall-clock version only reaches that state if the suite runs in the first
+// minutes of a local day. Second, the lower bound is REACHABLE here: `at.Before(start)` cannot
+// fire above, because a non-negative offset added to start and a clamp to a now that is itself
+// at or after start make it unreachable by construction, so that assertion documents the
+// invariant without testing it. Driving `now` lets a negative offset be stated as the illegal
+// input it is and checked.
+func TestInsideTodayAt_ClampsAtThirtySecondsPastMidnight(t *testing.T) {
+	start := time.Date(2026, 9, 16, 0, 0, 0, 0, time.Local)
+	now := start.Add(30 * time.Second)
+
+	for _, into := range []time.Duration{
+		0, time.Second, 29 * time.Second, 30 * time.Second, 31 * time.Second,
+		2 * time.Minute, time.Hour, 48 * time.Hour,
+	} {
+		at := insideTodayAt(start, now, into)
+		if at.Before(start) {
+			t.Errorf("insideTodayAt(%s) = %s, before the start of the window (%s): the row lands "+
+				"in yesterday's day file and window=today cannot see it", into, at, start)
+		}
+		if at.After(now) {
+			t.Errorf("insideTodayAt(%s) = %s, after now (%s) — this is the CI failure: at 00:00:30 "+
+				"the window is 30 seconds wide, and every offset past it must clamp", into, at, now)
+		}
+	}
+
+	// The clamp is not vacuous the other way either: an offset that FITS must be returned
+	// unchanged, or "inside today" could be satisfied by always answering `now` and every
+	// fixture would silently share one instant.
+	if got := insideTodayAt(start, now, 10*time.Second); !got.Equal(start.Add(10 * time.Second)) {
+		t.Errorf("insideTodayAt(10s) = %s, want %s: an offset inside the window is not clamped",
+			got, start.Add(10*time.Second))
 	}
 }

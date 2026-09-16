@@ -3,6 +3,9 @@ package costledger
 import (
 	"context"
 	"fmt"
+	"math"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -95,5 +98,60 @@ func TestReadDay_SanitisesAndCapsLabelsFromAForeignFile(t *testing.T) {
 	// And the row is otherwise intact: sanitising a label must not cost the money on it.
 	if rows[0].CostMicros != 100 {
 		t.Errorf("CostMicros = %d, want 100", rows[0].CostMicros)
+	}
+}
+
+// A RETENTION SO LARGE IT DELETES EVERYTHING is the failure this bound exists for, and it is
+// the reason a ceiling is not a disk-space preference.
+//
+// prune counts back with ref.AddDate(0, 0, -(retainDays-1)), and AddDate NORMALISES instead of
+// saturating. At retainDays = 1<<62-1 against 2026-09-15 the cutoff comes out as 2026-09-17 —
+// two days in the FUTURE — so every day file including today is older than the cutoff and the
+// first prune takes the whole ledger. The largest number an operator can type, meaning "keep
+// everything", kept nothing.
+//
+// Driven through newStore rather than by calling prune with a hand-built store, because the
+// clamp is what is under test and newStore is where it lives.
+func TestPrune_AnAbsurdRetentionKeepsHistoryRatherThanDeletingIt(t *testing.T) {
+	dir := t.TempDir()
+	day := at
+	writeDay(t, dir, day, line(day, "gw", "m", 1, 10, 5, 100))
+	// And a genuinely old file, so the test can tell "clamped to the maximum" from "pruned
+	// nothing at all" — a clamp that disabled retention entirely would also keep today.
+	old := day.AddDate(0, 0, -(maxRetentionDays + 5))
+	writeDay(t, dir, old, line(old, "gw", "m", 1, 10, 5, 100))
+
+	s, err := newStore(dir, math.MaxInt64/2, time.Local)
+	if err != nil {
+		t.Fatalf("newStore: %v", err)
+	}
+	if s.retainDays != maxRetentionDays {
+		t.Fatalf("retainDays = %d, want the clamp at %d", s.retainDays, maxRetentionDays)
+	}
+	if err := s.prune(day); err != nil {
+		t.Fatalf("prune: %v", err)
+	}
+
+	if _, err := os.Stat(filepath.Join(dir, day.Format(dayLayout)+".jsonl")); err != nil {
+		t.Errorf("today's day file is gone after a prune with an absurd retention: %v — the "+
+			"cutoff wrapped into the future and took the ledger with it", err)
+	}
+	if _, err := os.Stat(filepath.Join(dir, old.Format(dayLayout)+".jsonl")); err == nil {
+		t.Errorf("the %d-day-old file survived, so retention did not run at all — the clamp must "+
+			"bound the window, not disable it", maxRetentionDays+5)
+	}
+}
+
+// The two copies of the ceiling must agree, on the same reasoning as the floor's own
+// agreement test: config owns the derivation and cannot be imported here, so the guarantee is
+// a test rather than a shared constant.
+func TestMaxRetentionDays_MatchesTheConfigCeiling(t *testing.T) {
+	// The literal from config.maxCostLedgerRetentionDays. If that constant moves, this fails
+	// here rather than leaving the durable side clamping to a different number than the
+	// validator admits — which would make a config that loads produce a store that quietly
+	// keeps less than it was told to.
+	const configCeiling = 3650
+	if maxRetentionDays != configCeiling {
+		t.Errorf("maxRetentionDays = %d, config.maxCostLedgerRetentionDays = %d", maxRetentionDays, configCeiling)
 	}
 }

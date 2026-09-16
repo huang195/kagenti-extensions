@@ -169,6 +169,15 @@ is safe*), so make the edit when that is convenient.
 Turning it off stops new files being written; it does not delete the ones already there.
 `rm -rf ~/.cortex/cost` does that.
 
+**Expired files are renamed before they are deleted**, so you may see
+`2026-08-01.jsonl.expired` in that directory. Retention is counted back from a clock the proxy
+cannot verify, and a host clock that steps forward — then records a day file at the wrong date
+— makes a wrong cutoff indistinguishable from time having genuinely passed. A condemned file is
+therefore invisible to every query but kept until a *second* prune agrees, and **restored if
+the cutoff moves back**, so a clock fault costs a delay in retention rather than your cost
+history. The cost is disk: between the two passes the directory can hold up to two retention
+windows (roughly 20 MB at the default), and `rm ~/.cortex/cost/*.expired` is always safe.
+
 Two other knobs, same restart rule:
 
 | Setting | Default | Notes |

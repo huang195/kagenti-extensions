@@ -8,6 +8,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"slices"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -1243,6 +1244,27 @@ func TestPrune_KeepsExactlyRetainDaysFiles(t *testing.T) {
 		t.Fatalf("prune: %v", perr)
 	}
 
+	// READABLE files, not directory entries, and the distinction is the mechanism: prune
+	// CONDEMNS by renaming to expiredSuffix and unlinks only when a later pass agrees. An
+	// expired file is invisible to every read — dayFromName rejects the extension — so the
+	// guarantee "at most retainDays days are answerable" holds from the first pass, while the
+	// guarantee about disk takes two. The cost of that is stated where the suffix is defined.
+	if live := liveDayFiles(t, dir); len(live) != retain {
+		t.Errorf("%d readable day files after a %d-day retention (%v), want %d — today and the "+
+			"%d before it", len(live), retain, live, retain, retain-1)
+	}
+	// And the condemned ones really are condemned rather than merely renamed in place: a read
+	// over the whole span must not see them.
+	if rows := readDaysBack(t, s, at.AddDate(0, 0, -retain), 7-retain); len(rows) != 0 {
+		t.Errorf("a read over the CONDEMNED days returned %d rows; an expired file must be "+
+			"invisible to every window", len(rows))
+	}
+
+	// The second pass is what deletes. Two independent agreements, which one wrong cutoff
+	// cannot supply — see expiredSuffix.
+	if perr := s.prune(at); perr != nil {
+		t.Fatalf("second prune: %v", perr)
+	}
 	entries, rerr := os.ReadDir(dir)
 	if rerr != nil {
 		t.Fatalf("readdir: %v", rerr)
@@ -1252,8 +1274,103 @@ func TestPrune_KeepsExactlyRetainDaysFiles(t *testing.T) {
 		for _, e := range entries {
 			names = append(names, e.Name())
 		}
-		t.Errorf("%d files survived a %d-day retention (%v), want %d — today and the %d before it",
-			len(entries), retain, names, retain, retain-1)
+		t.Errorf("%d files on disk after a second prune (%v), want %d: the pass that agrees is "+
+			"the one that unlinks", len(entries), names, retain)
+	}
+}
+
+// readDaysBack reads n ledger days ending at end, so a test can ask what a window would see
+// rather than what the directory listing says.
+func readDaysBack(t *testing.T, s *store, end time.Time, n int) []Row {
+	t.Helper()
+	var out []Row
+	for i := 0; i < n; i++ {
+		rows, _, err := s.readDay(end.AddDate(0, 0, -i))
+		if err != nil {
+			t.Fatalf("readDay: %v", err)
+		}
+		out = append(out, rows...)
+	}
+	return out
+}
+
+// liveDayFiles lists the day files a read can still see — everything prune has not condemned.
+func liveDayFiles(t *testing.T, dir string) []string {
+	t.Helper()
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatalf("readdir: %v", err)
+	}
+	var out []string
+	for _, e := range entries {
+		if filepath.Ext(e.Name()) == ".jsonl" {
+			out = append(out, e.Name())
+		}
+	}
+	return out
+}
+
+// A PRUNE DRIVEN BY A WRONG CLOCK IS A DELAY, NOT A LOSS — the property the rename buys, and
+// the only one available once detection is off the table.
+//
+// The floor that guards the cutoff counts retention back from the older of the clock's day and
+// the newest day file. That defeats itself the moment a forward-skewed process WRITES a file:
+// the file then agrees with the wrong clock, both readings move together, and no rule using
+// only those two inputs can separate the state from time having genuinely passed. So this test
+// drives exactly that — a skewed clock condemning real history — and asserts the recovery.
+func TestPrune_RestoresWhatASkewedClockCondemned(t *testing.T) {
+	dir := t.TempDir()
+	const retain = 3
+	s, err := newStore(dir, retain, time.Local)
+	if err != nil {
+		t.Fatalf("newStore: %v", err)
+	}
+	// Three days of real history, all inside retention by the true clock.
+	for i := 0; i < retain; i++ {
+		day := at.AddDate(0, 0, -i)
+		if werr := os.WriteFile(s.path(day), []byte(line(day, "gw", "m", 1, 10, 5, 100)+"\n"), 0o600); werr != nil {
+			t.Fatalf("seed: %v", werr)
+		}
+	}
+
+	// The clock steps four years forward AND THE SKEWED PROCESS WRITES A DAY FILE. That
+	// second step is what makes the state undetectable, and this fixture failed without it:
+	// with only the clock wrong, prune's floor works exactly as designed — it counts back from
+	// the newest FILE instead, and every real day survives. It is the file dated by the bad
+	// clock that makes both readings agree and releases the floor. So the fixture has to do
+	// what a skewed process really does.
+	skewed := at.AddDate(4, 0, 0)
+	if werr := os.WriteFile(s.path(skewed), []byte(line(skewed, "gw", "m", 1, 10, 5, 100)+"\n"), 0o600); werr != nil {
+		t.Fatalf("seed the skewed day: %v", werr)
+	}
+	if perr := s.prune(skewed); perr != nil {
+		t.Fatalf("prune under a skewed clock: %v", perr)
+	}
+	// The REAL days must all be condemned. The skewed file itself legitimately survives — by
+	// the wrong clock it is today — so the premise is about the history that was lost, not
+	// about the directory being empty.
+	for i := 0; i < retain; i++ {
+		name := filepath.Base(s.path(at.AddDate(0, 0, -i)))
+		if slices.Contains(liveDayFiles(t, dir), name) {
+			t.Fatalf("fixture premise is wrong: %s survived the skewed prune, so the floor was "+
+				"never released and this test is not reproducing the case it names", name)
+		}
+	}
+
+	// The clock is corrected. The next prune must give the history back rather than finish
+	// deleting it — this is the assertion the whole mechanism exists for.
+	if perr := s.prune(at); perr != nil {
+		t.Fatalf("prune after the clock was corrected: %v", perr)
+	}
+	live := liveDayFiles(t, dir)
+	if len(live) != retain {
+		t.Fatalf("%d readable day files after the clock was corrected (%v), want %d — the rename "+
+			"is only worth anything if the correction restores them", len(live), live, retain)
+	}
+	// And the rows are readable again, not merely the names back.
+	if rows := readDaysBack(t, s, at, retain); len(rows) != retain {
+		t.Errorf("read %d rows after the restore, want %d: the files came back but their contents "+
+			"did not reach a window", len(rows), retain)
 	}
 }
 
@@ -1942,8 +2059,19 @@ func assertOwnership(t *testing.T, w *Writer, dir, step string) {
 	if err := w.sync(); err != nil {
 		t.Fatalf("sync: %v", err)
 	}
-	_, open, _ := w.pending()
+	held, open, _ := w.pending()
 	if open.IsZero() {
+		// NOT A PASS — a state to check in its own right. This helper returned here silently,
+		// and step 3 of the caller below constructs exactly this state on purpose (a Flush,
+		// then an event in the already-flushed minute), so the one step whose invariant is
+		// most interesting was asserting nothing at all. With no minute held, the rule "disk
+		// carries nothing at or above the held minute" is vacuous — but only if nothing is
+		// held, so that is what gets checked instead. Rows retained with no open minute are
+		// invisible to Window's reconciliation either way.
+		if len(held) != 0 {
+			t.Errorf("after %s: %d row(s) held in memory with no open minute — Window stitches "+
+				"the open minute, so these rows reach no reader and no day file", step, len(held))
+		}
 		return
 	}
 	for _, r := range readAllRows(t, dir) {
@@ -1985,6 +2113,18 @@ func TestPendingMinute_IsNeverAlsoOnDisk(t *testing.T) {
 	sameMinute.At = now
 	w.Record("s1", sameMinute)
 	assertOwnership(t, w, dir, "an event in an already-flushed minute")
+	// The step's OWN claim, which assertOwnership cannot make for it: "must not be re-held".
+	// The helper can only check the rule about a held minute, and this step's whole point is
+	// that no minute is held afterwards — so without this the assertion above passes for both
+	// the correct behaviour and the bug.
+	if _, open, _ := w.pending(); !open.IsZero() {
+		t.Errorf("after a flush, an event in the already-flushed minute re-opened %v; that "+
+			"minute is already on disk, so Window would count it twice", open)
+	}
+	if n := len(readAllRows(t, dir)); n != 4 {
+		t.Errorf("disk holds %d rows after the same-minute event, want 4 — the guard must send "+
+			"it to disk rather than drop it or hold it", n)
+	}
 
 	// And that last event must still be recorded somewhere — the guard sends it to
 	// disk rather than dropping it.

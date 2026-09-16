@@ -144,13 +144,14 @@ tls_bridge:
 # restarts several times a day, so without this "what did today cost" answers
 # over whatever is left in that ring, and window=7d cannot be answered at all.
 #
-# WRITTEN OUT RATHER THAN LEFT TO THE BINARY'S DEFAULT, and that is a fix
-# rather than a style choice. The default is on for --local and off otherwise,
-# and "abctl service install" runs this file with --config, not --local -- so
-# the documented "on by default" was true only for a hand-run
-# "authbridge-proxy --local", and every INSTALLED laptop had the ledger off
-# while the docs said otherwise. Stating it here makes the file that the
-# service actually runs say what happens.
+# WRITTEN OUT RATHER THAN LEFT TO THE DEFAULT, which is belt-and-braces now
+# rather than the mechanism. The default used to be "on for --local, off
+# otherwise", and since "abctl service install" runs this file with --config
+# and never --local, every INSTALLED laptop had the ledger off while the docs
+# promised it was on. The default is no longer keyed on the flag at all: it is
+# on wherever the ledger can survive a restart, which a resolvable home
+# directory satisfies -- see ledgerDefaultOn. This line therefore states what
+# would happen anyway, and keeps saying it if that rule ever changes.
 #
 # Set enabled: false to turn it off. Restart-only, not hot-reloaded: the ledger
 # is opened once at startup, so an edit here is REFUSED by the reloader (the

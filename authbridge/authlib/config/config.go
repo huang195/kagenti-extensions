@@ -177,8 +177,31 @@ const minCostLedgerRetentionDays = 9
 // where a bound this far away is obviously so.
 const maxCostLedgerRetentionDays = 3650
 
+// DirSet reports whether an operator named a directory for the ledger.
+//
+// IT IS THE STRONGEST AVAILABLE SIGNAL THAT THE LEDGER CAN DELIVER, which is why the caller
+// uses it to pick the default. The ledger's whole purpose is surviving a restart; writing to a
+// path nobody chose achieves the opposite in a container, where the only place left is the
+// image's writable layer — wiped on every restart and counted against the pod's
+// ephemeral-storage limit, which is an eviction rather than a lost figure. An operator who
+// names a path has mounted something to put it on, and that is a fact this package can see
+// where "is there a volume here" is not.
+//
+// A method rather than a field read, and nil-safe, because the block is absent in the common
+// Kubernetes case and every caller would otherwise repeat the same check.
+func (c *CostLedgerConfig) DirSet() bool {
+	return c != nil && c.Dir != ""
+}
+
 // LedgerEnabled reports whether the ledger should run, given the default for this
 // deployment shape.
+//
+// WHAT defaultOn USED TO MEAN, AND WHY IT CHANGED. It was localMode — true under --local,
+// false otherwise — and that made the default a property of WHICH FLAG STARTED THE BINARY
+// rather than of whether the ledger could do its job. Every service install runs --config, so
+// the documented "on by default" was false for every installed laptop. The caller now derives
+// defaultOn from whether a durable location exists at all (see DirSet), so the answer no
+// longer depends on the command line.
 //
 // A method on the pointer receiver so a nil block — the common case in Kubernetes —
 // answers without every caller writing the same nil check and one of them getting it

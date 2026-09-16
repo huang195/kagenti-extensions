@@ -71,11 +71,11 @@ func TestFold_AnAxisNoLedgerRowCarriesReportsNoResidualAtAll(t *testing.T) {
 			if series != nil {
 				t.Errorf("series = %v, want nil: a ledger row carries no value for %s", series, g)
 			}
-			if ungrouped != 0 {
+			if ungrouped.Micros != 0 {
 				t.Errorf("residual = %d over a total of %d for group=%s — a response disclosing "+
 					"100%% of its own spend as unaccounted for; the ledger cannot group by this "+
 					"axis at all, which is a different answer from a breakdown that fell short",
-					ungrouped, totals.CostMicros, g)
+					ungrouped.Micros, totals.CostMicros, g)
 			}
 		})
 	}
@@ -97,10 +97,10 @@ func TestFold_AnAxisTheLedgerCanLabelStillDisclosesItsResidual(t *testing.T) {
 	if len(series) != 1 {
 		t.Fatalf("series = %v, want one entry keyed by the model that IS present", series)
 	}
-	if ungrouped != 1_000_000 {
-		t.Errorf("residual = %d, want 1000000 — the modelless row's dollars", ungrouped)
+	if ungrouped.Micros != 1_000_000 {
+		t.Errorf("residual = %d, want 1000000 — the modelless row's dollars", ungrouped.Micros)
 	}
-	if got := series["m"].CostMicros + ungrouped; got != totals.CostMicros {
+	if got := series["m"].CostMicros + ungrouped.Micros; got != totals.CostMicros {
 		t.Errorf("series + residual = %d, want %d: sum(series) + residual == total is the "+
 			"promise usage.Snapshot.UngroupedCostMicros makes", got, totals.CostMicros)
 	}

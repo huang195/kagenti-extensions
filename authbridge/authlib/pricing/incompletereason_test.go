@@ -54,12 +54,48 @@ func TestIncompleteReason(t *testing.T) {
 		want: "",
 	}, {
 		// The tally is what the figure needs; the reason is only the signal that the
-		// tally is final. Having the tally without the reason is still exact.
-		name: "output tallied without a stop reason is exact",
+		// tally is final. A response that arrived WHOLE — Stream unset — has a final
+		// tally whether or not the dialect names a stop reason, so demanding one here
+		// would attach a permanent caveat to exact money.
+		name: "output tallied without a stop reason, not a stream, is exact",
 		inf: &pipeline.InferenceExtension{
 			InputTokens: 1000, OutputTokens: 12,
 			PromptTokens: 1000, CompletionTokens: 12,
 			PresentKinds: presentInput | presentOutput,
+		},
+		want: "",
+	}, {
+		// THE SAME EXTENSION, PLUS Stream, AND THE OPPOSITE ANSWER — the case the
+		// function used to get wrong, and the reason the row above cannot be read as a
+		// general rule.
+		//
+		// foldOpenAIFrame REPLACES the accumulated usage with each usage-bearing chunk's
+		// totals ("OpenAI streams cumulative usage: each usage-bearing chunk restates the
+		// full totals"), so on that dialect a mid-generation tally is a RUNNING total. A
+		// stream that dies there has output > 0 and no stop reason, and the old
+		// `OutputTokens > 0 -> exact` early return — which sat ABOVE the stop-reason check
+		// — published that floor as a whole figure. That is the same failure as the
+		// truncated-Anthropic case at the top of this table, reached from the other side.
+		name: "truncated OpenAI-shaped stream: running tally, no stop reason",
+		inf: &pipeline.InferenceExtension{
+			Stream:      true,
+			InputTokens: 1000, OutputTokens: 12,
+			PromptTokens: 1000, CompletionTokens: 12,
+			PresentKinds: presentInput | presentOutput,
+		},
+		want: ReasonOutputUncounted,
+	}, {
+		// And the stream that FINISHED stays exact, so the row above is a statement about
+		// truncation and not about streaming. Without this, gating on Stream would be
+		// indistinguishable from caveating every streamed response — which is most of the
+		// traffic, and would make the marker meaningless.
+		name: "completed stream with a tally and a stop reason is exact",
+		inf: &pipeline.InferenceExtension{
+			Stream:      true,
+			InputTokens: 1000, OutputTokens: 240,
+			PromptTokens: 1000, CompletionTokens: 240,
+			PresentKinds: presentInput | presentOutput,
+			FinishReason: "stop",
 		},
 		want: "",
 	}, {

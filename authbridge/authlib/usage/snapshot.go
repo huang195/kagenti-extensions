@@ -415,7 +415,26 @@ func (g Group) Reconcilable() bool {
 // Both callers get it for free, which is why the disclosure lives here rather than in an
 // error return: an error would need every caller to hold a logger (this package has none)
 // and would let a caller drop the signal again, which is the defect being fixed.
-func (s *Snapshot) SetUngroupedCost(micros int64) {
+//
+// IT TAKES A CostSum RATHER THAN AN int64 so that a clamped residual cannot arrive here
+// looking like an exact one. Both callers accumulated the residual with a bare `+=` — a
+// wrap there produced a NEGATIVE figure, which the second case below then published as
+// SeriesOvershootMicros: a field whose own doc tells the reader this process is wrong about
+// its own arithmetic. Correct-but-saturated data therefore fabricated a defect report,
+// while the real residual it should have carried was lost. Making the parameter a type that
+// carries its own saturation flag is what stops the two conditions ever being confused
+// again; the alternative — an int64 plus a bool a caller could forget — is the shape that
+// produced this.
+func (s *Snapshot) SetUngroupedCost(sum CostSum) {
+	// SATURATION FIRST, and unconditionally: it is a statement about the money in this
+	// snapshot, not about which of the two residual fields gets set, and it holds even when
+	// the residual itself lands on zero. Totals.Saturated already means "read every money
+	// figure here as a bound" and is OR-ed through Counts.Add, so the flag reaches a client
+	// through the field it already has to consult.
+	if sum.Saturated {
+		s.Totals.Saturated = true
+	}
+	micros := sum.Micros
 	switch {
 	case micros > 0:
 		s.UngroupedCostMicros = &micros
@@ -438,10 +457,14 @@ func (s *Snapshot) SetUngroupedCost(micros int64) {
 //
 // Reads Counts.CostMicros per entry rather than any running total, because the series
 // is what a client sums and this has to be exactly that arithmetic.
-func seriesCost(series map[string]Counts) int64 {
-	var total int64
+//
+// Returns a CostSum rather than an int64 because two saturated entries wrapped it, and a
+// wrap here does not stay here: the caller subtracts this from a bucket total, so a
+// negative sum inflates the residual past the total it is a residual of. See CostSum.
+func seriesCost(series map[string]Counts) CostSum {
+	var total CostSum
 	for _, v := range series {
-		total += v.CostMicros
+		total.Add(v.CostMicros)
 	}
 	return total
 }
@@ -894,7 +917,10 @@ func (a *Aggregator) Snapshot(window, resolution time.Duration, sessionID string
 	// The dollars no series entry will carry. Accumulated per raw bucket and set once
 	// below, for the reason Totals is: the figure must not change with the resolution the
 	// caller asked for. See Snapshot.UngroupedCostMicros.
-	var ungrouped int64
+	//
+	// A CostSum, not an int64: this is money, and a wrapped residual is read downstream as
+	// the series overshooting its own total. See CostSum.
+	var ungrouped CostSum
 	reconcilable := group.Reconcilable()
 
 	for i := n - 1; i >= 0; i-- {
@@ -918,7 +944,16 @@ func (a *Aggregator) Snapshot(window, resolution time.Duration, sessionID string
 			// being read, so the entries sum to the cost of the events that had a label for
 			// this axis, and the rest is the shortfall. Group.Reconcilable is what keeps
 			// group=plugin, whose entries deliberately double-count, out of this arithmetic.
-			ungrouped += b.CostMicros - seriesCost(b.Series)
+			//
+			// Three saturating steps rather than one expression, because all three can clamp
+			// and dropping any one of the flags reinstates a silent wrap: the series sum, the
+			// bucket total going in, and the subtraction.
+			sc := seriesCost(b.Series)
+			ungrouped.Add(b.CostMicros)
+			ungrouped.Sub(sc.Micros)
+			if sc.Saturated {
+				ungrouped.Saturated = true
+			}
 		}
 		if ring != nil {
 			if src := &ring[slot(t)]; src.start.Equal(t) {

@@ -204,3 +204,51 @@ func TestCostLedgerDir_DefaultsUnderCortexDirAndIsAbsolute(t *testing.T) {
 		}
 	}
 }
+
+// THE LEDGER MUST BE ON FOR A CONFIG LAUNCHED WITH --config, because that is how every
+// INSTALLED laptop launches: `abctl service install` writes a plist/unit whose ExecStart is
+// `authbridge-proxy --config ~/.cortex/config.yaml`, never --local.
+//
+// The default alone could not deliver that. LedgerEnabled(defaultOn) is asked with
+// defaultOn = localMode, localMode is set only by --local, and a config with no cost_ledger
+// block falls through to false — so "Every local install keeps a cost ledger on disk, on by
+// default" (docs/laptop-service.md) was true only for a hand-run
+// `authbridge-proxy --local`. The service had it off, for its whole life, silently: cost
+// history is the one thing a laptop restart is supposed not to lose, and window=7d had
+// nothing to read.
+//
+// So the assertion is deliberately made with defaultOn = FALSE. Passing true here would
+// assert the binary's --local default and pass with no cost_ledger block at all, which is
+// exactly the hole this closes.
+func TestDemoConfig_CostLedgerIsOnWhenLaunchedWithConfigNotLocal(t *testing.T) {
+	cortexDir := t.TempDir()
+	p, err := writeBuiltinConfig(cortexDir, filepath.Join(cortexDir, "ca"))
+	if err != nil {
+		t.Fatalf("writeBuiltinConfig: %v", err)
+	}
+	cfg, err := config.Load(p)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	config.ApplyPreset(cfg)
+	if err := config.Validate(cfg); err != nil {
+		t.Fatalf("Validate: %v", err)
+	}
+
+	if cfg.CostLedger == nil {
+		t.Fatal("the generated config carries no cost_ledger block, so an installed service " +
+			"(--config, not --local) gets the ledger OFF while the docs promise it is on")
+	}
+	if !cfg.CostLedger.LedgerEnabled(false) {
+		t.Error("LedgerEnabled(false) = false: the block is present but does not enable the " +
+			"ledger for the launch path every installed laptop uses")
+	}
+	// The ledger runs by registering as a Recorder on the session store, so an enabled
+	// ledger over a disabled store is inert — and config.Validate refuses that combination
+	// outright. Asserted here so the preset cannot start shipping a config that fails to
+	// load precisely because this block was added.
+	if !cfg.Session.SessionEnabled() {
+		t.Error("sessions are disabled in the generated config, which makes the ledger above " +
+			"unreachable; see warnCostLedgerNeedsSessions")
+	}
+}

@@ -137,6 +137,29 @@ tls_bridge:
 # For a gateway whose prices are genuinely negotiated per model rather than
 # derived from list, give rates instead of a multiplier -- see
 # docs/plugin-catalog.md.
+#
+# Cost history on disk. Per-minute totals only -- no prompts, no completions,
+# no tool arguments -- under ~/.cortex/cost/YYYY-MM-DD.jsonl, kept 30 days
+# (roughly 10 MB). The in-memory counters are a 6-hour ring and this proxy
+# restarts several times a day, so without this "what did today cost" answers
+# over whatever is left in that ring, and window=7d cannot be answered at all.
+#
+# WRITTEN OUT RATHER THAN LEFT TO THE BINARY'S DEFAULT, and that is a fix
+# rather than a style choice. The default is on for --local and off otherwise,
+# and "abctl service install" runs this file with --config, not --local -- so
+# the documented "on by default" was true only for a hand-run
+# "authbridge-proxy --local", and every INSTALLED laptop had the ledger off
+# while the docs said otherwise. Stating it here makes the file that the
+# service actually runs say what happens.
+#
+# Set enabled: false to turn it off. Restart-only, not hot-reloaded: the ledger
+# is opened once at startup, so an edit here is REFUSED by the reloader (the
+# whole save with it) rather than accepted and ignored. "abctl service restart"
+# applies it, and cuts attached Claude Code sessions.
+cost_ledger:
+  enabled: true
+  # dir: /absolute/path        # default ~/.cortex/cost; a RELATIVE path is refused
+  # retention_days: 30         # minimum 9 -- window=7d can open nine local day files
 pipeline:
   outbound:
     plugins:

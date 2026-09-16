@@ -77,15 +77,15 @@ func TestSnapshot_GatewayPricedTrafficWithNoModelIsDisclosedAsUngrouped(t *testi
 	if snap.UngroupedCostMicros == nil {
 		t.Fatalf("UngroupedCostMicros is absent while the group=model series accounts for only "+
 			"%d of %d micros: a client summing the breakdown is short by 250000 dollars-worth "+
-			"and nothing in the response says so", seriesCost(series), snap.Totals.CostMicros)
+			"and nothing in the response says so", seriesCost(series).Micros, snap.Totals.CostMicros)
 	}
 	if *snap.UngroupedCostMicros != 250_000 {
 		t.Errorf("UngroupedCostMicros = %d, want 250000", *snap.UngroupedCostMicros)
 	}
 	// The arithmetic the field exists to restore, asserted rather than assumed.
-	if sum := seriesCost(series) + *snap.UngroupedCostMicros; sum != snap.Totals.CostMicros {
+	if sum := seriesCost(series).Micros + *snap.UngroupedCostMicros; sum != snap.Totals.CostMicros {
 		t.Errorf("series (%d) + ungrouped (%d) = %d, want Totals.CostMicros = %d",
-			seriesCost(series), *snap.UngroupedCostMicros, sum, snap.Totals.CostMicros)
+			seriesCost(series).Micros, *snap.UngroupedCostMicros, sum, snap.Totals.CostMicros)
 	}
 }
 
@@ -173,7 +173,7 @@ func TestSetUngroupedCost_ANegativeResidualIsDisclosedNotDropped(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			var snap Snapshot
-			snap.SetUngroupedCost(tc.micros)
+			snap.SetUngroupedCost(CostSum{Micros: tc.micros})
 			for _, f := range []struct {
 				name      string
 				got, want *int64
@@ -196,12 +196,93 @@ func TestSetUngroupedCost_ANegativeResidualIsDisclosedNotDropped(t *testing.T) {
 	}
 }
 
+// seriesCost IS THE STEP THAT TURNS A CLAMP INTO A FABRICATED DEFECT REPORT, so it is
+// pinned separately from the residual that consumes it.
+//
+// Snapshot subtracts this sum from the bucket total to get the residual. When the sum
+// wrapped negative, that subtraction produced a residual LARGER than the total it was
+// computed from — and past the ceiling, so it wrapped in turn, to -1. SetUngroupedCost then
+// published SeriesOvershootMicros: 1, telling an operator the series double-counted, from a
+// bucket where nothing had. One bucket was enough; it did not need two.
+//
+// WHY THIS AND NOT THE RING PATH END TO END. The ring cannot be driven here through Record:
+// every event's cost is capped at pricing.MaxPlausibleRequestCostMicros ($10,000, 1e10
+// micros), so saturating an int64 through the front door takes ~9.2e8 requests inside one
+// six-hour ring. The accumulate in Snapshot is therefore DEFENSIVE, and this is the honest
+// place to prove the arithmetic: costledger.Fold is the reachable half, because its rows
+// come off disk with no bound at all (TestFold_ASaturatedResidualIsABoundNotAFabricatedOvershoot).
+//
+// Reverting either accumulate to `+=` fails the first assertion, which is the sign.
+func TestSeriesCost_ClampsInsteadOfWrappingAndSaysSo(t *testing.T) {
+	// Two entries that sum to math.MaxInt64+1 — the first value past the range.
+	half := int64(math.MaxInt64/2) + 1
+	series := map[string]Counts{
+		"claude-opus-5":    {Requests: 1, CostMicros: half},
+		"claude-haiku-4-5": {Requests: 1, CostMicros: half},
+	}
+
+	got := seriesCost(series)
+
+	if got.Micros < 0 {
+		t.Fatalf("seriesCost = %d — negative, so it wrapped. Subtracted from a bucket total that "+
+			"is a positive int64, a negative series sum yields a residual bigger than the total "+
+			"it came from, and SetUngroupedCost publishes that as the series overshooting",
+			got.Micros)
+	}
+	if got.Micros != math.MaxInt64 {
+		t.Errorf("seriesCost = %d, want math.MaxInt64", got.Micros)
+	}
+	if !got.Saturated {
+		t.Error("seriesCost clamped silently: the residual that consumes this sum has no other " +
+			"way to learn the breakdown it is being compared against is itself a bound")
+	}
+
+	// The consequence, stated as the thing a client sees. Old arithmetic on one bucket
+	// holding a saturated total and this series: MaxInt64 - MinInt64 wraps to -1, and -1
+	// becomes SeriesOvershootMicros: 1.
+	var ungrouped CostSum
+	ungrouped.Add(math.MaxInt64)
+	ungrouped.Sub(got.Micros)
+	if got.Saturated {
+		ungrouped.Saturated = true
+	}
+	var snap Snapshot
+	snap.SetUngroupedCost(ungrouped)
+	if snap.SeriesOvershootMicros != nil {
+		t.Errorf("SeriesOvershootMicros = %d from a bucket whose series sums to its own total: "+
+			"that field means this process counted an event twice, and it has not",
+			*snap.SeriesOvershootMicros)
+	}
+	if !snap.Totals.Saturated {
+		t.Error("the clamp reached no field a client reads — Totals.Saturated is the one that " +
+			"means every money figure here is a bound")
+	}
+}
+
+// Sub's one special input, which is the input SetUngroupedCost already needed a guard for:
+// math.MinInt64 has no positive counterpart, so a naive Add(-micros) would ADD it and the
+// residual would come out with the wrong sign — the exact confusion the overshoot field
+// exists to make impossible.
+func TestCostSum_SubtractingTheInt64FloorClampsRatherThanChangingSign(t *testing.T) {
+	var s CostSum
+	s.Add(1_000)
+	s.Sub(math.MinInt64)
+
+	if s.Micros != math.MaxInt64 {
+		t.Errorf("Micros = %d, want math.MaxInt64: subtracting the floor adds 2^63, which is out "+
+			"of range whatever the accumulator held", s.Micros)
+	}
+	if !s.Saturated {
+		t.Error("clamped without disclosing it")
+	}
+}
+
 // The overshoot is absent from a clean response and present when it is not, on the same wire
 // rule as every other disclosure here: a client must be able to tell "checked and fine" from
 // "not checked", and a zero cannot say both.
 func TestSnapshot_SeriesOvershootIsOmittedUnlessItHappened(t *testing.T) {
 	var clean Snapshot
-	clean.SetUngroupedCost(0)
+	clean.SetUngroupedCost(CostSum{})
 	body, err := json.Marshal(clean)
 	if err != nil {
 		t.Fatalf("marshal: %v", err)
@@ -211,7 +292,7 @@ func TestSnapshot_SeriesOvershootIsOmittedUnlessItHappened(t *testing.T) {
 	}
 
 	var broken Snapshot
-	broken.SetUngroupedCost(-1)
+	broken.SetUngroupedCost(CostSum{Micros: -1})
 	body, err = json.Marshal(broken)
 	if err != nil {
 		t.Fatalf("marshal: %v", err)

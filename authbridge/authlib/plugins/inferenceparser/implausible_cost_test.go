@@ -166,9 +166,9 @@ func TestParsedEndpoint_ImplausibleCostIsUnchanged(t *testing.T) {
 // TestUnparsedEndpoint_RefusalIsPublishedExactlyOnce holds the latch on the new publish
 // path.
 //
-// A listener can dispatch the terminal frame more than once — extproc settles once per
-// ResponseBody message Envoy sends, see settleCost. The refusal record is the first thing
-// this plugin publishes with no figure in it, so
+// A listener can dispatch the terminal frame more than once — the latch is what makes that
+// safe, whichever listener does it, and no plugin can verify from the inside that none will.
+// The refusal record is the first thing this plugin publishes with no figure in it, so
 // the latch is exercised on a shape it has never carried before — and a second publish would
 // double a disclosure, which is how a coverage report grows requests that never happened.
 func TestUnparsedEndpoint_RefusalIsPublishedExactlyOnce(t *testing.T) {

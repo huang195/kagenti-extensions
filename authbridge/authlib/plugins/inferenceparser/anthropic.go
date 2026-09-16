@@ -410,7 +410,9 @@ func mergeAnthropicPromptMaxSeen(state *inferenceStreamState, incoming parsercom
 // foldAnthropicFrame via OnResponseFrame instead.
 func parseAnthropicSSE(body []byte, ext *pipeline.InferenceExtension) {
 	state := &inferenceStreamState{}
-	for _, line := range bytes.Split(body, []byte("\n")) {
+	// normalizeSSE for the reason given where it is defined: a BOM or CR-only line endings are
+	// wire-legal, and splitting on LF alone reads such a body as one unparseable line.
+	for _, line := range bytes.Split(normalizeSSE(body), []byte("\n")) {
 		line = bytes.TrimSpace(line)
 		if !bytes.HasPrefix(line, []byte("data:")) {
 			continue

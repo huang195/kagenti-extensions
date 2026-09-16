@@ -467,10 +467,38 @@ func (p *InferenceParser) OnResponseFrame(_ context.Context, pctx *pipeline.Cont
 // parses nothing, and feeding a bare payload to the SSE reader parses nothing — each of
 // them silently, which is why the shapes are told apart here instead.
 func carriesSSEFraming(frame []byte) bool {
+	frame = normalizeSSE(frame)
 	if bytes.HasPrefix(bytes.TrimLeft(frame, " \t\r\n"), []byte("data:")) {
 		return true
 	}
 	return bytes.Contains(frame, []byte("\ndata:"))
+}
+
+// normalizeSSE puts a buffered SSE body into the one shape the parsers below read: no leading
+// byte-order mark, and LF line endings.
+//
+// BOTH HALVES ARE WIRE-LEGAL AND BOTH WERE MISSED. The event-stream format allows CRLF, LF or
+// CR as the line terminator and requires a decoder to strip one leading BOM — while detection
+// looked for "data:" after trimming " \t\r\n" (which does not include a BOM) or for a literal
+// "\ndata:" (which a CR-only stream never contains), and the parsers split on LF alone. So a
+// BOM-prefixed body, or a CR-only body whose first field is not `data:`, fell through to the
+// JSON arm: unmarshalling failed, usage stayed unset, and the request kept only whatever a cost
+// header happened to say. With no cost header there was nothing left to settle from.
+//
+// USED BY DETECTION AND PARSING, deliberately the same function. Fixing only the detector would
+// route such a body to a parser that still cannot read it, which trades a silent miss for a
+// silent empty parse.
+//
+// Allocation-free for the overwhelming majority: a body with no BOM and no CR is returned as
+// it came.
+func normalizeSSE(body []byte) []byte {
+	body = bytes.TrimPrefix(body, []byte("\xef\xbb\xbf"))
+	if !bytes.ContainsRune(body, '\r') {
+		return body
+	}
+	// CRLF first, so a CRLF stream does not become a blank line between every field.
+	out := bytes.ReplaceAll(body, []byte("\r\n"), []byte("\n"))
+	return bytes.ReplaceAll(out, []byte("\r"), []byte("\n"))
 }
 
 // foldResponseFrame folds one streamed frame into the running state via the dialect the
@@ -587,7 +615,7 @@ func parseInferenceSSE(body []byte, ext *pipeline.InferenceExtension) {
 	var completion strings.Builder
 	var usage parsercommon.TokenUsage
 	var hasUsage bool
-	for _, line := range bytes.Split(body, []byte("\n")) {
+	for _, line := range bytes.Split(normalizeSSE(body), []byte("\n")) {
 		line = bytes.TrimSpace(line)
 		if !bytes.HasPrefix(line, []byte("data:")) {
 			continue

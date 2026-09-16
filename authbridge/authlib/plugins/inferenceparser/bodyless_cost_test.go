@@ -102,11 +102,10 @@ func bodylessSites() []bodylessSite {
 		},
 	}, {
 		// plugin.go OnResponseFrame, one-shot arm: the listener buffered the response and
-		// there was nothing in it. This is the arm a 204/304 takes on both proxy listeners.
-		// It is NOT reached on extproc today — that listener's response-header phase returns
-		// early to ask Envoy for a buffered body (server.go:616) whenever any plugin reads a
-		// body, and for a header-only response Envoy then sends no body message at all, so
-		// nothing dispatches a terminal frame. See TestCapabilities_ReadsBodyDecidesTheExtprocBranch.
+		// there was nothing in it. This is the arm a 204/304 takes on every listener. On
+		// extproc it is reached from the response-HEADERS phase, which dispatches the terminal
+		// frame when Envoy sets end_of_stream there — a header-only response never produces a
+		// body message to hang it off.
 		name: "OnResponseFrame/json-one-shot-empty-frame",
 		drive: func(p *InferenceParser, pctx *pipeline.Context) {
 			p.OnResponseFrame(context.Background(), pctx, nil, true)
@@ -332,12 +331,12 @@ func TestBodylessResponse_StreamPlaceholderZeroPublishesNothing(t *testing.T) {
 //
 // ReadsBody is undirected, so it counts toward NeedsRequestBody and NeedsResponseBody alike
 // (pipeline.NeedsRequestBody says why). Any pipeline containing this parser therefore reports
-// NeedsBody() == true unconditionally — and extproc's handleResponseHeaders returns on
-// exactly that condition, before the RunResponse and the header-only
-// RunResponseFrame(nil, true) below it. That branch is dead for every shipped pipeline, so on
-// extproc a response with no body at all — 204, 304, an error status ended on headers —
-// dispatches nothing: Envoy sends no ResponseBody message for it, whatever ModeOverride was
-// asked for, and the cost is never settled and no response row is recorded.
+// NeedsBody() == true unconditionally — which is why extproc's response-header phase cannot
+// gate its early return on that condition alone. It gates on `NeedsBody() && !endOfStream`, so
+// a response with no body at all — 204, 304, an error status ended on headers — takes the
+// terminal dispatch from the HEADERS phase, and a stream that ends before any end_of_stream
+// arrives is finalized by the flush in Process. What this test pins is the capability shape
+// those two paths rest on.
 //
 // The fix belongs in that listener, not here: gate the early return on the response headers'
 // end_of_stream, mirroring the request side's requestHasBody guard at server.go:113. This

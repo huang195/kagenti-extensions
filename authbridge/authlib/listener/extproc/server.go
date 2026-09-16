@@ -70,10 +70,15 @@ func (s *Server) Process(stream extprocv3.ExternalProcessor_ProcessServer) error
 	var pctx *pipeline.Context
 	var requestDirection string
 
-	// sawResponseBody says at least one ResponseBody message arrived, which is what makes
-	// the flush in the deferred block below meaningful: it distinguishes "the response
-	// body never finished" from "there was no response".
-	var sawResponseBody bool
+	// sawResponseHeaders / sawResponseBody say which response phases Envoy actually
+	// delivered, which is what makes the flush in the deferred block below meaningful: they
+	// distinguish "the response never finished" from "there was no response at all".
+	//
+	// BOTH, because they fail differently. A body that never said end_of_stream leaves the
+	// parsers holding accumulated state; a response that ended after its HEADERS never ran
+	// the response phase at all, because handleResponseHeaders defers to a body phase that
+	// then never came — and the gateway's own cost header arrived on those headers.
+	var sawResponseHeaders, sawResponseBody bool
 
 	// Finisher dispatch runs once when Process returns — stream end is
 	// Envoy's signal that the request is finalized (response sent or
@@ -97,7 +102,16 @@ func (s *Server) Process(stream extprocv3.ExternalProcessor_ProcessServer) error
 		//
 		// Stream end is Envoy's own statement that the transaction is over, so it is both
 		// the last safe point to finalize and a point that is always reached.
-		if sawResponseBody && !responseWasRecorded(pctx) {
+		if (sawResponseHeaders || sawResponseBody) && !responseWasRecorded(pctx) {
+			finalCtx := context.WithoutCancel(ctx)
+			if !sawResponseBody {
+				// HEADERS ONLY. handleResponseHeaders deferred the response phase to a body
+				// message that never arrived, so nothing has run it — unlike the body case
+				// below, where handleResponseBody already did. Rejecting is meaningless here
+				// (the response is downstream, or the stream is gone), so the action is
+				// dropped, exactly as it is for the terminal frame.
+				_ = p.RunResponse(finalCtx, pctx)
+			}
 			if p.HasStreamingResponders() {
 				// DETACHED FROM THE STREAM'S CONTEXT, which is the difference between this
 				// flush working and only appearing to. ctx here is stream.Context(), and the
@@ -113,7 +127,11 @@ func (s *Server) Process(stream extprocv3.ExternalProcessor_ProcessServer) error
 				// Terminal frame, so the parsers settle from whatever state they accumulated.
 				// Rejecting here would be pointless — the response has already gone downstream —
 				// so the action is deliberately dropped.
-				p.RunResponseFrame(context.WithoutCancel(ctx), pctx, nil, true)
+				// dispatchBufferedFrames rather than a bare nil frame: on the non-SSE arm
+				// the accumulated body has never been dispatched, and a nil terminal frame
+				// would finalize the parsers over a body nothing ever read. The SSE arm sends
+				// only the terminal frame, since its frames went out per message.
+				dispatchTerminalFrame(finalCtx, p, pctx)
 			}
 			s.recordResponseSession(pctx, requestDirection)
 		}
@@ -177,6 +195,7 @@ func (s *Server) Process(stream extprocv3.ExternalProcessor_ProcessServer) error
 			// end_of_stream is carried through because it is the only thing that
 			// distinguishes "a body is coming" from "this response is over" — the
 			// same question requestHasBody answers for the request phase above.
+			sawResponseHeaders = true
 			resp = s.handleResponseHeaders(ctx, r.ResponseHeaders.Headers, pctx, requestDirection,
 				r.ResponseHeaders.GetEndOfStream())
 
@@ -771,7 +790,23 @@ func (s *Server) handleResponseBody(ctx context.Context, body []byte, pctx *pipe
 		}
 	}
 
-	pctx.ResponseBody = body
+	// ACCUMULATED FOR A NON-SSE BODY, REPLACED FOR AN SSE ONE, and the asymmetry is what each
+	// arm of dispatchBufferedFrames needs.
+	//
+	// Envoy sends one ResponseBody message per chunk in a STREAMED response mode, so a plain
+	// JSON body can arrive in pieces. Replacing per message meant each piece was handed to the
+	// parser as a whole response: neither fragment is valid JSON, so the usage never landed,
+	// and the parser's settle latch pinned the first empty answer where a later message could
+	// not correct it. Nothing ever saw the whole body.
+	//
+	// The SSE arm must NOT accumulate: it re-parses what it is given into frames, and it has
+	// already dispatched the frames from every earlier message, so an accumulated buffer would
+	// fold the same frames again and double the usage it counts.
+	if isEventStream(pctx.ResponseHeaders.Get("Content-Type")) {
+		pctx.ResponseBody = body
+	} else {
+		pctx.ResponseBody = appendBoundedBody(pctx.ResponseBody, body)
+	}
 
 	p := s.OutboundPipeline
 	if direction == "inbound" {
@@ -1117,6 +1152,33 @@ func immediateResponse(httpStatus int, reason string) *extprocv3.ProcessingRespo
 	}
 }
 
+// appendBoundedBody appends src to dst, stopping at maxBodySize.
+//
+// The per-message check in Process bounds one message; this bounds the SUM, which is what a
+// STREAMED response mode can make arbitrarily large. Truncating rather than refusing keeps the
+// prefix a parser may still be able to read — and says so, because a JSON body cut short parses
+// as nothing and the silence would otherwise look like a response that carried no usage.
+func appendBoundedBody(dst, src []byte) []byte {
+	if len(dst) == 0 {
+		if len(src) <= maxBodySize {
+			return src
+		}
+		src = src[:maxBodySize]
+	}
+	room := maxBodySize - len(dst)
+	if room <= 0 {
+		slog.Warn("extproc: response body past the buffer limit; the rest is dropped",
+			"limit", maxBodySize, "have", len(dst), "dropped", len(src))
+		return dst
+	}
+	if len(src) > room {
+		slog.Warn("extproc: response body reached the buffer limit; truncating",
+			"limit", maxBodySize, "dropped", len(src)-room)
+		src = src[:room]
+	}
+	return append(dst, src...)
+}
+
 func requestHasBody(headers *corev3.HeaderMap) bool {
 	method := getHeader(headers, ":method")
 	if method == "GET" || method == "HEAD" || method == "OPTIONS" || method == "DELETE" {
@@ -1167,13 +1229,27 @@ func getHeader(headers *corev3.HeaderMap, key string) string {
 // last=false lets the state accumulate and leaves exactly one finalization, with the whole
 // figure.
 //
-// The NON-SSE arm keeps its unconditional terminal frame. Its cost comes off the response
-// HEADERS, which are identical on every pass, so the latch pinning the first figure costs
-// nothing there — and a partial JSON body folded as an SSE chunk would parse as nothing and
-// then send the last message down the streaming arm, which is a different answer to a
-// question this change is not about. Multi-message non-SSE bodies are mis-parsed either way;
-// that is a separate gap, and widening the blast radius of a money fix to touch it would be
-// the wrong trade.
+// THE NON-SSE ARM HONOURS `last` TOO, and the reasoning that once left it unconditional does
+// not hold. "Its cost comes off the response HEADERS, which are identical on every pass, so
+// the latch pinning the first figure costs nothing" is true only when a gateway sends a cost
+// header. Without one the modelled figure from the token counters is the only figure there is,
+// and finalizing each fragment loses it completely: measured at TotalTokens 0 and no cost
+// record at all for a JSON body split across two messages. So this arm waits for the whole
+// body, which handleResponseBody accumulates for exactly this purpose.
+// dispatchTerminalFrame finalizes the parsers at teardown, sending whatever has not been sent.
+//
+// The two arms differ because the body path treats them differently. An SSE body is dispatched
+// frame by frame as each message arrives, so only the terminal marker is left; a non-SSE body
+// is accumulated and dispatched once, so at teardown it has not been dispatched at all and the
+// terminal call has to carry it.
+func dispatchTerminalFrame(ctx context.Context, p *pipeline.Holder, pctx *pipeline.Context) {
+	if isEventStream(pctx.ResponseHeaders.Get("Content-Type")) {
+		_ = p.RunResponseFrame(ctx, pctx, nil, true)
+		return
+	}
+	_ = p.RunResponseFrame(ctx, pctx, pctx.ResponseBody, true)
+}
+
 func dispatchBufferedFrames(ctx context.Context, p *pipeline.Holder, pctx *pipeline.Context, last bool) pipeline.Action {
 	contentType := pctx.ResponseHeaders.Get("Content-Type")
 	if isEventStream(contentType) && len(pctx.ResponseBody) > 0 {
@@ -1197,6 +1273,14 @@ func dispatchBufferedFrames(ctx context.Context, p *pipeline.Holder, pctx *pipel
 			return pipeline.Action{Type: pipeline.Continue}
 		}
 		return p.RunResponseFrame(ctx, pctx, nil, true)
+	}
+	if !last {
+		// NOTHING IS DISPATCHED UNTIL A NON-SSE BODY IS WHOLE. The parser's contract for this
+		// arm is one call carrying the entire body, so handing it a fragment would ask it to
+		// parse an incomplete document — and its settle latch would pin that answer. The bytes
+		// are accumulating on pctx (see handleResponseBody); the terminal call below gets all
+		// of them, whether it comes from the last body message or from Process's teardown flush.
+		return pipeline.Action{Type: pipeline.Continue}
 	}
 	return p.RunResponseFrame(ctx, pctx, pctx.ResponseBody, true)
 }

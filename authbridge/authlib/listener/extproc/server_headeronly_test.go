@@ -231,7 +231,26 @@ func TestExtProc_ResponseWithBody_StillAsksEnvoyToBuffer(t *testing.T) {
 	if mode.GetResponseBodyMode() != extprocfilterv3.ProcessingMode_BUFFERED {
 		t.Errorf("ResponseBodyMode = %v, want BUFFERED", mode.GetResponseBodyMode())
 	}
-	if ev := responseEvent(t, store); ev != nil {
-		t.Errorf("a response row was recorded on the headers phase of a response that has a body still to come; the body phase records it, and both would charge twice (row = %+v)", ev)
+	// EXACTLY ONE ROW, AND IT COMES FROM THE TEARDOWN FLUSH.
+	//
+	// The headers phase itself must not record — the body phase does, and both recording is
+	// the double charge this listener's latch exists to prevent (pinned by
+	// TestExtProc_SplitResponseBody_ChargesTheWholeFigureExactlyOnce, where a body does
+	// follow). But this fixture ENDS the stream after the headers, so no body is coming and
+	// the response has to be finalized somewhere: Envoy said the transaction is over, the
+	// gateway reported 0.002 on those headers, and without the flush that figure reaches no
+	// aggregate, no ledger and no budget. responseEvent fatals on more than one match, so
+	// this assertion carries the no-double-charge half too.
+	ev := responseEvent(t, store)
+	if ev == nil {
+		t.Fatal("no response row for a stream that ended after its response headers; the " +
+			"header cost is lost")
+	}
+	rec, ok := costevent.Record(ev)
+	if !ok {
+		t.Fatalf("no cost record on the row (Plugins keys = %v)", pluginKeys(ev))
+	}
+	if rec.CostUSD != 0.002 {
+		t.Errorf("CostUSD = %v, want 0.002 from the response header", rec.CostUSD)
 	}
 }

@@ -255,10 +255,10 @@ func TestUnparsedEndpoint_NonTerminalFrameSettlesNothing(t *testing.T) {
 	}
 }
 
-// TestUnparsedEndpoint_SettlesExactlyOnce guards the money against the listener behaviour
-// settleCost's idempotence key exists for: a repeated terminal dispatch, which extproc
-// produces once per ResponseBody message when Envoy delivers a body in more than one (see
-// settleCost for why the old "once for headers, once for the body" reading was wrong).
+// TestUnparsedEndpoint_SettlesExactlyOnce guards the money against the behaviour settleCost's
+// idempotence key exists for: a repeated terminal dispatch. It is listener-independent by
+// construction — a plugin cannot verify from the inside how many times a listener will
+// finalize it — so the guard belongs on the plugin rather than on any one caller's discipline.
 //
 // Asserted on this path specifically because it is the path with no extension to inspect —
 // the other paths' finalize functions are assignments and are self-idempotent, while here

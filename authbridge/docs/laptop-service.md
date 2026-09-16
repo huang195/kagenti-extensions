@@ -119,17 +119,35 @@ does survive a restart; see below.
 **A local install keeps a cost ledger on disk, on by default.** Sessions themselves —
 prompts, completions, tool arguments — stay in memory and die with the process. Per-minute
 cost totals do not: they are appended to `~/.cortex/cost/YYYY-MM-DD.jsonl`, one file per
-local day, **kept for 30 days** (roughly 10 MB).
+local day, **kept for 30 days**.
 
-**Where that default comes from, because it is not the binary's.** The generated
-`~/.cortex/config.yaml` contains an explicit `cost_ledger: {enabled: true}`, written by
-`authbridge-proxy --local --write-config`. The *binary's* default is on only under `--local`
-— and the installed service runs `authbridge-proxy --config ~/.cortex/config.yaml`, never
-`--local`, so the file is what decides. That matters for one case: **a config generated
-before this was added has no `cost_ledger` block, and such an install has the ledger OFF.**
-Check with `grep -A1 cost_ledger ~/.cortex/config.yaml`; add the two lines and
-`abctl service restart` if it is missing. This paragraph exists because the sentence above
-it was, for a while, true only for a hand-run `authbridge-proxy --local`.
+**Sizing, because "roughly 10 MB" was a laptop figure and is not general.** A row is about 418
+bytes, and there is one per minute *per distinct (endpoint, model, agent, provenance)*. A laptop
+writes rows only for minutes with traffic, which is where 10 MB comes from. Continuous traffic
+populates all 1,440 minutes of a day:
+
+| Distinct combinations per minute | Per day | Per 30 days |
+|---|---|---|
+| 2 | 1.2 MB | 36 MB |
+| 8 | 4.8 MB | 144 MB |
+| 64 (the per-minute cap) | 38.5 MB | 1.16 GB |
+
+Size a mounted volume from that table, not from the laptop number, and lower
+`retention_days` if the top row is closer to your traffic.
+
+**Where that default comes from.** It is **on wherever the ledger can survive a restart** —
+which means either an explicit `cost_ledger.dir` (in Kubernetes, a path on a mounted volume) or
+a resolvable home directory, so `~/.cortex/cost` persists. A container with neither can only
+write to a layer that is discarded on restart, so there it stays off and says why in a startup
+log line.
+
+That rule replaced an earlier one keyed on `--local`, which was the cause of a real bug: the
+installed service runs `authbridge-proxy --config ~/.cortex/config.yaml` and never `--local`, so
+"on by default" was false for every install. The generated config also writes
+`cost_ledger: {enabled: true}` explicitly, which is now belt-and-braces rather than the
+mechanism — a config generated before that was added still gets the ledger, because the default
+no longer depends on the file. `grep -A1 cost_ledger ~/.cortex/config.yaml` shows which you
+have.
 
 It exists because the in-memory counters are a 6-hour ring, and the proxy restarts several
 times a day. Without the ledger, "what did today cost" answers over whatever is left in

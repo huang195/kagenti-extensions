@@ -143,11 +143,53 @@ func pluginUsesSPIFFEIdentity(p config.PluginEntry) bool {
 //
 // Names both settings, because the fix is a decision between them and a message that
 // named only one would send the reader to the wrong file.
-func warnCostLedgerNeedsSessions(cfg *config.Config, localMode bool, logger *slog.Logger) {
+// ledgerDefaultOn decides whether an unset cost_ledger.enabled means ON, and says why.
+//
+// ON WHEREVER THE LEDGER CAN ACTUALLY DELIVER, which is the rule that replaces localMode. The
+// old default was true under --local and false otherwise, so it described which FLAG started
+// the process rather than whether durable cost history was achievable — and since every
+// service install runs --config, the documented default was false on every installed laptop.
+//
+// Two ways to be durable, either sufficient:
+//
+//	an explicit cost_ledger.dir   an operator named a path, which in Kubernetes means a
+//	                              volume is mounted there. Nothing else in this process can
+//	                              see a volume, so this is the signal.
+//	a resolvable home directory   the laptop case: ~/.cortex/cost persists across restarts,
+//	                              which is the entire point of the feature.
+//
+// And one way to be neither: no dir, no $HOME. That is a container with no volume, where the
+// only writable place is the image layer — wiped on every restart, so the ledger would pay
+// its whole cost and keep nothing, and counted against ephemeral-storage, where exceeding the
+// limit EVICTS the pod. Measured growth is 36 MB to 1.2 GB per 30 days depending on label
+// cardinality, so that is not a hypothetical limit. Off, with the reason said out loud.
+//
+// The reason is returned rather than logged here so the caller can log it once, next to the
+// other ledger lines, instead of this being a function with a side effect.
+func ledgerDefaultOn(cfg *config.Config) (bool, string) {
+	if cfg.CostLedger.DirSet() {
+		return true, "cost_ledger.dir names a durable location"
+	}
+	if _, err := defaultCortexDir(); err == nil {
+		return true, "a home directory resolves, so ~/.cortex/cost persists across restarts"
+	}
+	return false, "no cost_ledger.dir and no resolvable home directory, so the only writable " +
+		"location is a container layer that is discarded on restart"
+}
+
+// ledgerDefaultOnValue is ledgerDefaultOn without the reason, for call sites that only need
+// the decision. Kept separate rather than making the reason optional, so no caller can pass a
+// default that disagrees with the one the ledger was built from.
+func ledgerDefaultOnValue(cfg *config.Config) bool {
+	on, _ := ledgerDefaultOn(cfg)
+	return on
+}
+
+func warnCostLedgerNeedsSessions(cfg *config.Config, defaultOn bool, logger *slog.Logger) {
 	if logger == nil {
 		logger = slog.Default()
 	}
-	if cfg.Session.SessionEnabled() || !cfg.CostLedger.LedgerEnabled(localMode) {
+	if cfg.Session.SessionEnabled() || !cfg.CostLedger.LedgerEnabled(defaultOn) {
 		return
 	}
 	logger.Warn("cost ledger will NOT run — session tracking is disabled",
@@ -434,15 +476,18 @@ func main() {
 		// by-endpoint, by-provenance) rather than the joint distribution a ledger row
 		// needs, so summing them would double-count. See authlib/costledger.
 		//
-		// ON for --local, OFF in Kubernetes, and that asymmetry is the decision rather
-		// than an oversight. A laptop has a home directory, a developer who wants
-		// yesterday's number, and a process that restarts several times a day — which is
-		// exactly the case the aggregator's 6-hour in-memory ring cannot answer. A pod
-		// has none of those: its filesystem is ephemeral, one replica's files are
-		// invisible to the next, and the right sink for fleet-wide spend is a central
-		// collector rather than N per-pod files nobody collects. cost_ledger.enabled
-		// overrides the default in either direction.
-		if cfg.CostLedger.LedgerEnabled(localMode) {
+		// ON WHEREVER IT CAN DELIVER, which is not the same as "on for --local". The
+		// default used to be localMode, so it described which flag started the binary
+		// rather than whether durable history was achievable — and every service install
+		// runs --config, which made the documented default false on every installed
+		// laptop. ledgerDefaultOn asks the question that actually decides it: is there a
+		// location that survives a restart? An explicit cost_ledger.dir (a mounted volume
+		// in Kubernetes) or a resolvable home directory both qualify; a container with
+		// neither does not, because its only writable place is discarded on restart and
+		// counted against ephemeral-storage, where the limit evicts the pod rather than
+		// dropping a figure. cost_ledger.enabled still overrides in either direction.
+		defaultOn, whyDefault := ledgerDefaultOn(cfg)
+		if cfg.CostLedger.LedgerEnabled(defaultOn) {
 			dir, derr := costLedgerDir(cfg)
 			if derr != nil {
 				// Not fatal. The ledger is observability, and refusing to start the proxy
@@ -463,6 +508,10 @@ func main() {
 					sessions.AddRecorder(costLedger)
 					slog.Info("cost ledger enabled — durable cost history for window=today and window=7d",
 						"dir", dir, "retentionDays", retention,
+						// WHY it is on, because the default is now derived rather than
+						// keyed on a flag: an operator reading this line can tell an
+						// explicit choice from a resolved one without reading main.go.
+						"default", whyDefault,
 						"note", "closed minutes only, written off the request path; an unclean stop loses up to 60s of cost")
 				}
 			}
@@ -471,7 +520,12 @@ func main() {
 			// absence is what makes window=today degrade to the ring's 6 hours — and a
 			// degraded answer with no log line behind it reads as a bug in abctl.
 			slog.Info("cost ledger disabled — window=today and window=7d will be served from the 6h in-memory ring",
-				"reason", "not a local install (files in a pod are the wrong sink; use a central collector)")
+				// The DERIVED reason, not a guess about the deployment. It used to say
+				// "not a local install", which was the old localMode default describing
+				// itself — and it was wrong on the machine where it mattered most, since an
+				// installed laptop service is not a local install by that definition either.
+				"reason", whyDefault,
+				"fix", "set cost_ledger.dir to a path on a mounted volume, or cost_ledger.enabled: true if this filesystem does persist")
 		}
 
 		// Through lim.LogAttrs, not a hand-rolled attribute list. #999 gave the session
@@ -490,7 +544,7 @@ func main() {
 	// anything to say, so this call is unconditional rather than branch-local —
 	// a warning that only exists down one arm of an if is the shape that produced
 	// the silence in the first place.
-	warnCostLedgerNeedsSessions(cfg, localMode, slog.Default())
+	warnCostLedgerNeedsSessions(cfg, ledgerDefaultOnValue(cfg), slog.Default())
 
 	var httpServers []*http.Server
 

@@ -209,17 +209,19 @@ func TestCostLedgerDir_DefaultsUnderCortexDirAndIsAbsolute(t *testing.T) {
 // INSTALLED laptop launches: `abctl service install` writes a plist/unit whose ExecStart is
 // `authbridge-proxy --config ~/.cortex/config.yaml`, never --local.
 //
-// The default alone could not deliver that. LedgerEnabled(defaultOn) is asked with
-// defaultOn = localMode, localMode is set only by --local, and a config with no cost_ledger
-// block falls through to false — so "Every local install keeps a cost ledger on disk, on by
-// default" (docs/laptop-service.md) was true only for a hand-run
-// `authbridge-proxy --local`. The service had it off, for its whole life, silently: cost
-// history is the one thing a laptop restart is supposed not to lose, and window=7d had
-// nothing to read.
+// The default alone could not deliver that WHEN THIS WAS WRITTEN, and that is now the weaker
+// half of the guarantee. LedgerEnabled(defaultOn) was asked with defaultOn = localMode,
+// localMode is set only by --local, and a config with no cost_ledger block fell through to
+// false — so "on by default" was true only for a hand-run `authbridge-proxy --local`, and the
+// installed service had it off for its whole life, silently.
 //
-// So the assertion is deliberately made with defaultOn = FALSE. Passing true here would
-// assert the binary's --local default and pass with no cost_ledger block at all, which is
-// exactly the hole this closes.
+// ledgerDefaultOn has since replaced that rule with one keyed on whether anything survives a
+// restart, so a resolvable home directory is enough and this block is no longer the mechanism.
+// The test stays, and stays written with defaultOn = FALSE, because it now pins something
+// different and still worth pinning: that the generated config states the intent explicitly
+// rather than relying on a derivation, so a future change to that derivation cannot silently
+// turn an installed laptop's ledger off again. Passing true here would assert the derivation
+// instead and pass with no cost_ledger block at all.
 func TestDemoConfig_CostLedgerIsOnWhenLaunchedWithConfigNotLocal(t *testing.T) {
 	cortexDir := t.TempDir()
 	p, err := writeBuiltinConfig(cortexDir, filepath.Join(cortexDir, "ca"))

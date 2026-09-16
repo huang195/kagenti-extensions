@@ -107,6 +107,17 @@ func TestParseUserAgent_SanitisesControlCharactersBeforeLabel(t *testing.T) {
 		{"invalid byte", "newagent/1\x9b", "newagent/1\uFFFD"},
 		// A newline breaks a table apart wherever the label is rendered in one.
 		{"newline", "newagent/1\nfake-row", "newagent/1\uFFFDfake-row"},
+		// NO ESCAPE SEQUENCE AND NO TERMINAL NEEDED, which is why these belong in the same
+		// set as C1 rather than in a separate "cosmetic" one. U+202E reorders the glyphs that
+		// follow it, so a self-reported agent string can be made to RENDER as another agent's
+		// name in the column beside real spend — in a browser, in a chart, anywhere at all,
+		// not only in a pane that decodes escape sequences.
+		{"bidi override", "newagent/1\u202egnitcepsus", "newagent/1\uFFFDgnitcepsus"},
+		{"bidi isolate", "newagent/1\u2066x\u2069", "newagent/1\uFFFDx\uFFFD"},
+		// Zero-width: two DISTINCT keys that render identically, so a reader comparing rows
+		// cannot see that they are different agents — and the aggregate keeps them apart.
+		{"zero-width space", "newagent/1\u200b", "newagent/1\uFFFD"},
+		{"zero-width joiner", "newagent/1\u200d2", "newagent/1\uFFFD2"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			c := ParseUserAgent(tc.ua)
@@ -279,11 +290,27 @@ func TestContextClientInfo_MemoizesIncludingTheNilAnswer(t *testing.T) {
 	c.Headers.Set("User-Agent", "something-else/9.9")
 	second := c.ClientInfo()
 
-	if first != second {
-		t.Errorf("ClientInfo() returned different pointers across calls: %p then %p", first, second)
+	// VALUE EQUALITY, NOT POINTER IDENTITY, and the change is the point rather than an
+	// accommodation. This asserted `first != second` on the pointers, which is the wrong
+	// instrument for the property the test is named for: "memoized" is a claim about WHICH
+	// ANSWER, and the pointer was standing in for it. It also pinned the aliasing bug —
+	// ClientInfo handed out the memo itself, so ten recording sites shared one mutable
+	// struct and a single write through it relabelled events already appended.
+	if *first != *second {
+		t.Errorf("ClientInfo() gave different answers across calls: %+v then %+v", *first, *second)
 	}
 	if second.Name != "claude-code" {
 		t.Errorf("second call re-parsed the mutated header: %+v", second)
+	}
+	// And the copies really are distinct, which is the new half: a caller storing this on a
+	// SessionEvent must not be able to reach any other event's label through it.
+	if first == second {
+		t.Error("ClientInfo() returned the memo itself: the label an event is attributed to " +
+			"is then mutable by anyone holding another event's copy — see SnapshotClient")
+	}
+	first.Name = "impostor"
+	if third := c.ClientInfo(); third.Name != "claude-code" {
+		t.Errorf("writing through one caller's copy changed the memo: %+v", third)
 	}
 }
 

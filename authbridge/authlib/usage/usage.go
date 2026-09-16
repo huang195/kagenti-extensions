@@ -1326,10 +1326,27 @@ func hasControlRunes(s string) bool {
 	return false
 }
 
-// isControlRune is the shared rule: C0, DEL, C1. Identical to costledger.isControlRune and
-// pipeline's, deliberately — see sanitizeLabel.
+// isControlRune is the shared rule: C0, DEL, C1, and the bidi and zero-width runes that
+// rewrite or hide the text around them. Identical to costledger.isControlRune and pipeline's,
+// deliberately — see sanitizeLabel.
+//
+// THE THREE COPIES MOVE TOGETHER. This one is the /v1/usage serving path, so a rune that gets
+// past it reaches every client of that endpoint whatever the other two do — which is the
+// reason the identical-rule rule exists rather than being tidiness. See
+// pipeline.isControlRune for why bidi and zero-width belong in the same set as C1.
 func isControlRune(r rune) bool {
-	return r < 0x20 || r == 0x7f || (r >= 0x80 && r <= 0x9f)
+	if r < 0x20 || r == 0x7f || (r >= 0x80 && r <= 0x9f) {
+		return true
+	}
+	switch r {
+	case // Bidi overrides and isolates: reorder the glyphs around them.
+		'\u202a', '\u202b', '\u202c', '\u202d', '\u202e',
+		'\u2066', '\u2067', '\u2068', '\u2069',
+		// Zero-width: make two distinct labels render identically.
+		'\u200b', '\u200c', '\u200d', '\u2060', '\ufeff':
+		return true
+	}
+	return false
 }
 
 func addLabel(m *map[string]Counts, key string, c Counts) {

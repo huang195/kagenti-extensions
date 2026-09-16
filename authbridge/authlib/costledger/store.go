@@ -514,6 +514,19 @@ func (s *store) readDay(day time.Time) ([]Row, dayIssues, error) {
 			issues.skippedLines++
 			continue
 		}
+		// RE-APPLIED ON READ, not trusted from the file. rowLabel caps and sanitises every
+		// label the WRITER produces, and until this the read path assumed that was the only
+		// way a line could get here — so a day file this process did not write, or wrote
+		// before the cap existed, handed a multi-KB series key carrying a C1 CSI escape
+		// straight through Fold to the session API and into any terminal rendering it
+		// (CWE-150). The files are 0600 under $HOME, so the writer is the user; the point is
+		// that the CONTENT is not this process's own output and nothing downstream re-checks
+		// it. A reader that sanitises is the only place that can be sure.
+		//
+		// Idempotent by construction, so a row this writer produced is unchanged: rowLabel is
+		// truncateLabel(sanitizeLabel(...)) and both are fixed points on their own output.
+		// That is what makes doing it twice free rather than lossy.
+		r.Endpoint, r.Model, r.Agent = rowLabel(r.Endpoint), rowLabel(r.Model), rowLabel(r.Agent)
 		out = append(out, r)
 	}
 	if serr := sc.Err(); serr != nil {

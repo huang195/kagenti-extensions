@@ -325,15 +325,22 @@ type Context struct {
 // caller is an event-construction site that already dereferences pctx for Host and
 // Method on adjacent lines. A guard here would convert a programming error into a
 // silently unattributed event instead of a stack trace.
+// A COPY IS RETURNED, NOT THE MEMO. Every caller is an event-construction site that stores
+// the result on a SessionEvent, so handing out the memoized pointer made ten events share one
+// mutable struct: a single write through it relabelled events already appended to the store
+// and already being served by the session API. See SnapshotClient — this is the same rule the
+// other extensions on that event have followed all along, applied to the one field that was
+// missing it. The memo is still what stops the header being parsed ten times; what it no
+// longer does is escape.
 func (c *Context) ClientInfo() *EventClient {
 	if c.clientParsed {
-		return c.client
+		return SnapshotClient(c.client)
 	}
 	c.clientParsed = true
 	if c.Headers != nil {
 		c.client = ParseUserAgent(c.Headers.Get("User-Agent"))
 	}
-	return c.client
+	return SnapshotClient(c.client)
 }
 
 // ResolveClient pins ClientInfo's answer to the User-Agent AS THE CLIENT SENT IT.

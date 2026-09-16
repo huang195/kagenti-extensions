@@ -9,6 +9,7 @@ import (
 
 	"github.com/rossoctl/cortex/authbridge/authlib/costevent"
 	"github.com/rossoctl/cortex/authbridge/authlib/pipeline"
+	"github.com/rossoctl/cortex/authbridge/authlib/pricing"
 	"github.com/rossoctl/cortex/authbridge/authlib/usage"
 )
 
@@ -317,8 +318,27 @@ func agentLabel(c *pipeline.EventClient) string {
 // zero" rather than "not exposed", which is a smaller error than a negative total, and
 // smaller still because PresentKinds is a UNION over the minute: any other response
 // reporting that kind sets the same bit anyway.
+// THE CEILING IS CHECKED TOO, and the argument above is exactly why it has to be. This
+// function used to bound only the negative side, which made the DURABLE, UNREPAIRABLE
+// surface the LENIENT one: usage.plausibleTokenReport refuses a whole report where any
+// counter exceeds pricing.MaxPlausibleTokens and counts it in Counts.RefusedTokenRequests,
+// while this admitted it and wrote it to a file kept for thirty days. So one response could
+// make the ring and the ledger report different token totals for identical traffic on one
+// endpoint, and abctl renders both.
+//
+// PER FIELD RATHER THAN ALL-OR-NOTHING, which is the one place this deliberately differs
+// from the ring. The ring refuses the whole report because it can say so — it has a counter
+// for exactly that, so a client learns the split is short and by how many requests. A ledger
+// row has no such field, and adding one to the on-disk shape for a case that means "a
+// provider sent an impossible number" would spend a schema change on it. Zeroing the
+// offending field keeps every other counter in the row and keeps the DOLLARS, which are
+// bounded separately by pricing.MaxPlausibleRequestCostMicros and are what the row is for.
+//
+// The residual is that a refused field reads as a reported zero here where the ring says
+// "refused". That asymmetry is worth stating and is not worth a new column: both refuse the
+// impossible figure, which is what stops it reaching a total.
 func tokenCount(n int) int64 {
-	if n < 0 {
+	if n < 0 || n > pricing.MaxPlausibleTokens {
 		return 0
 	}
 	return int64(n)

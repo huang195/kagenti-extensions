@@ -102,14 +102,25 @@ func (s *Server) Process(stream extprocv3.ExternalProcessor_ProcessServer) error
 		//
 		// Stream end is Envoy's own statement that the transaction is over, so it is both
 		// the last safe point to finalize and a point that is always reached.
+		// A REJECTED RESPONSE IS ALREADY FINISHED, and finalizing it here would be a
+		// behaviour change nobody asked for. A plugin that rejects on the response phase has
+		// already had its ImmediateResponse returned to Envoy; the response never went
+		// downstream, the parsers hold nothing, and recording a SessionResponse row for it
+		// would label a denial as an ordinary response. Request-phase rejects never reach this
+		// defer at all — those paths return a nil pctx. If a response-phase reject should
+		// produce a row, it wants its own denied-phase recorder and its own decision.
+		if pctx.RejectingPlugin() != "" {
+			p.RunFinish(ctx, pctx, pipeline.OutcomeFromContext(pctx))
+			return
+		}
 		if (sawResponseHeaders || sawResponseBody) && !responseWasRecorded(pctx) {
 			finalCtx := context.WithoutCancel(ctx)
-			if !sawResponseBody {
-				// HEADERS ONLY. handleResponseHeaders deferred the response phase to a body
-				// message that never arrived, so nothing has run it — unlike the body case
-				// below, where handleResponseBody already did. Rejecting is meaningless here
-				// (the response is downstream, or the stream is gone), so the action is
-				// dropped, exactly as it is for the terminal frame.
+			if !responsePhaseWasRun(pctx) {
+				// THE PHASE NEVER RAN. handleResponseHeaders deferred it to a body message
+				// that never arrived, so unlike the body case there is nothing to double.
+				// Asked as "did it run", not "was there a body" — see responsePhaseKey for
+				// what the inference cost. Rejecting is meaningless here (the stream is gone),
+				// so the action is dropped, exactly as it is for the terminal frame.
 				_ = p.RunResponse(finalCtx, pctx)
 			}
 			if p.HasStreamingResponders() {
@@ -713,6 +724,8 @@ func (s *Server) handleResponseHeaders(ctx context.Context, headers *corev3.Head
 		}
 	}
 
+	markResponsePhaseRun(pctx)
+	markResponsePhaseRun(pctx)
 	action := p.RunResponse(ctx, pctx)
 	if action.Type == pipeline.Reject {
 		return rejectFromAction(action)
@@ -738,6 +751,30 @@ func (s *Server) handleResponseHeaders(ctx context.Context, headers *corev3.Head
 			ResponseHeaders: &extprocv3.HeadersResponse{},
 		},
 	}
+}
+
+// responsePhaseKey and responsePhaseRun mark the response phase as already dispatched.
+//
+// TRACKED, NOT INFERRED, and the difference is a plugin running twice. The teardown flush has
+// to know whether RunResponse has happened; "no body message arrived" is not that question.
+// handleResponseHeaders runs the response phase itself whenever it does NOT defer — which is
+// every response Envoy ends on headers — so inferring from the body flag made the flush run it
+// a second time for any such response that was not recorded, most visibly a REJECTED one:
+// rejectFromAction only builds the ImmediateResponse, so nothing is recorded and the inference
+// held. Response-phase plugins ran twice, Invocations gained a second reject row, and
+// setRejectingPlugin re-fired immediately before RunFinish read the outcome.
+const responsePhaseKey = "extproc.response-phase-run"
+
+type responsePhaseRun struct{}
+
+// markResponsePhaseRun records that the response phase has been dispatched for this request.
+func markResponsePhaseRun(pctx *pipeline.Context) {
+	pipeline.SetState(pctx, responsePhaseKey, &responsePhaseRun{})
+}
+
+// responsePhaseWasRun reports whether RunResponse has already been dispatched.
+func responsePhaseWasRun(pctx *pipeline.Context) bool {
+	return pipeline.GetState[responsePhaseRun](pctx, responsePhaseKey) != nil
 }
 
 // responseRecordedKey and responseRecorded mark this request's response event as appended.
@@ -1159,11 +1196,13 @@ func immediateResponse(httpStatus int, reason string) *extprocv3.ProcessingRespo
 // prefix a parser may still be able to read — and says so, because a JSON body cut short parses
 // as nothing and the silence would otherwise look like a response that carried no usage.
 func appendBoundedBody(dst, src []byte) []byte {
-	if len(dst) == 0 {
-		if len(src) <= maxBodySize {
-			return src
-		}
-		src = src[:maxBodySize]
+	// The first message is returned as it came: nothing to append to, so nothing to copy.
+	// Only when it is within the bound — an oversized first message falls through to the
+	// warning path below rather than being truncated silently, which is what the special case
+	// used to do. Process rejects a single message past maxBodySize before this is reached, so
+	// that path is defence in depth.
+	if len(dst) == 0 && len(src) <= maxBodySize {
+		return src
 	}
 	room := maxBodySize - len(dst)
 	if room <= 0 {

@@ -998,6 +998,13 @@ func (a *Aggregator) Snapshot(window, resolution time.Duration, sessionID string
 	// must render "cost unavailable", a declared-free window must render $0.0000. See
 	// costevent.Event.Settled, and TestPricing_SettledZeroIsNotRePriced, which pins it.
 	out.Priced = out.Totals.PricedRequests > 0
+	// BOUNDED BEFORE IT IS SERVED, and after the totals and the residual are computed from
+	// the raw buckets — so folding a label into (other) changes what the breakdown NAMES and
+	// nothing about what it sums to. Doing it earlier would move UngroupedCostMicros, which is
+	// a statement about labels this axis could not carry rather than about labels that did not
+	// make the cut. See MaxSeriesInResponse for the 4.7 MB this bounds.
+	capSeriesAcrossWindow(out.Buckets, MaxSeriesInResponse)
+
 	// Absent unless there is something to disclose, which is the whole convention: see
 	// SetUngroupedCost.
 	out.SetUngroupedCost(ungrouped)

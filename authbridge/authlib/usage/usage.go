@@ -15,6 +15,7 @@ package usage
 
 import (
 	"math"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -1214,6 +1215,28 @@ const maxLabelsPerBucket = 64
 // is missing.
 const overflowLabel = "(other)"
 
+// MaxSeriesInResponse bounds how many label series ONE RESPONSE carries, per bucket.
+//
+// A SEPARATE BOUND FROM maxLabelsPerBucket, and the reason both exist is that they bound
+// different things. That one is a MEMORY bound at record time: 64 per axis, so a caller
+// varying a label per request cannot grow this process. This one is a RESPONSE bound, and
+// nothing was enforcing it — the two multiply. Measured on the endpoint as shipped:
+// window=6h&resolution=1m&group=session is 360 buckets times up to 64 series, which produced
+// a 4.7 MB response from a single unauthenticated GET.
+//
+// SIXTEEN, because the response is something a person reads. A by-model or by-agent breakdown
+// past a dozen rows is not a breakdown anyone consumes; the rest belongs in the (other) band,
+// which every client already renders because the record-time cap has always produced it. That
+// is the property that makes this cheap: no new wire vocabulary, and a client written against
+// the old shape shows a correct total with one extra row.
+//
+// RANKED ACROSS THE WHOLE WINDOW, not per bucket, which is the part that has to be got right.
+// Capping each bucket independently would let the SAME label be a series in one minute and
+// part of (other) in the next, so a chart would show a line appearing and vanishing while the
+// traffic behind it was steady. The ranking is by cost, because this is a cost API and the
+// question "where did the money go" is the one the top of the list has to answer.
+const MaxSeriesInResponse = 16
+
 // maxLabelLen bounds one retained label. The model name is request-controlled, so
 // without this a caller could park a megabyte of string in a bucket that lives
 // for a full ring lap. Long enough for any real model id, including provider
@@ -1347,6 +1370,99 @@ func isControlRune(r rune) bool {
 		return true
 	}
 	return false
+}
+
+// CapSeries folds everything past the n costliest entries into the (other) band.
+//
+// EXPORTED FOR costledger, which serves the symbolic windows from disk and had no bound of its
+// own at all: its rows come from day files, so the number of distinct (endpoint, model, agent)
+// keys in a response is however many a month of traffic produced. One map rather than a whole
+// snapshot, because that source answers with a single bucket.
+//
+// Ranked by cost, ties broken by requests and then by label, so the answer is deterministic —
+// a breakdown whose membership changed between two identical requests would be worse than an
+// unbounded one, because a client could not tell a traffic change from a tie-break.
+//
+// The (other) entry is Counts.Add-ed, so every field it carries is summed by the one
+// summation point and a field added to Counts is carried here with no edit.
+func CapSeries(series map[string]Counts, n int) map[string]Counts {
+	if len(series) <= n {
+		return series
+	}
+	keys := make([]string, 0, len(series))
+	for k := range series {
+		keys = append(keys, k)
+	}
+	sort.Slice(keys, func(i, j int) bool {
+		a, b := series[keys[i]], series[keys[j]]
+		if a.CostMicros != b.CostMicros {
+			return a.CostMicros > b.CostMicros
+		}
+		if a.Requests != b.Requests {
+			return a.Requests > b.Requests
+		}
+		return keys[i] < keys[j]
+	})
+	out := make(map[string]Counts, n+1)
+	var other Counts
+	for i, k := range keys {
+		if i < n {
+			out[k] = series[k]
+			continue
+		}
+		other.Add(series[k])
+	}
+	// Merged rather than assigned: a label spelled "(other)" by a caller is already in the
+	// map, and overwriting it would drop that traffic. The band is not a reserved key — see
+	// costledger's overflowLabel, which makes the same point about spoofability.
+	cur := out[overflowLabel]
+	cur.Add(other)
+	out[overflowLabel] = cur
+	return out
+}
+
+// capSeriesAcrossWindow applies MaxSeriesInResponse to every bucket using ONE ranking taken
+// over the whole window, so a label is either a series everywhere or (other) everywhere.
+//
+// See MaxSeriesInResponse for why per-bucket capping is the wrong shape. The ranking is built
+// from the same Counts.Add the totals use, so "costliest" means the same thing here as in the
+// figure the client renders above the chart.
+func capSeriesAcrossWindow(buckets []Bucket, n int) {
+	window := map[string]Counts{}
+	for _, b := range buckets {
+		for k, v := range b.Series {
+			cur := window[k]
+			cur.Add(v)
+			window[k] = cur
+		}
+	}
+	if len(window) <= n {
+		return
+	}
+	keep := make(map[string]bool, n)
+	for k := range CapSeries(window, n) {
+		keep[k] = true
+	}
+	for i := range buckets {
+		if len(buckets[i].Series) == 0 {
+			continue
+		}
+		out := make(map[string]Counts, n+1)
+		var other Counts
+		for k, v := range buckets[i].Series {
+			if keep[k] {
+				out[k] = v
+				continue
+			}
+			other.Add(v)
+		}
+		if other != (Counts{}) {
+			cur := out[overflowLabel]
+			cur.Add(other)
+			out[overflowLabel] = cur
+		}
+		buckets[i].Series = out
+	}
 }
 
 func addLabel(m *map[string]Counts, key string, c Counts) {

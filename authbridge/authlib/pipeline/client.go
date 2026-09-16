@@ -157,12 +157,39 @@ func hasControlRunes(s string) bool {
 	return false
 }
 
-// isControlRune reports whether r is a C0 control, DEL, or a C1 control.
+// isControlRune reports whether r is a C0 control, DEL, a C1 control, or a rune that
+// rewrites or hides the text around it without being a control character at all.
 //
 // The one predicate both the scan and the rewrite read, so they cannot disagree about
-// what a control character is. costledger has the same three clauses in the same order.
+// what a control character is. costledger has the same clauses in the same order.
+//
+// THE FOURTH CLAUSE IS THE SAME ARGUMENT AS THE THIRD, applied to the characters the C1
+// reasoning missed. C1 is here because U+009B opens an escape sequence in a terminal, so a
+// User-Agent could paint over a chart. A bidi override does the same job in any renderer at
+// all, without an escape sequence and without a terminal: U+202E makes a label display
+// right-to-left, so "claude-code/2.1.14" can be made to read as another agent's name in the
+// column beside real spend, and a zero-width joiner or space hides the difference between two
+// keys that a reader is comparing. These are display-spoofing runes reaching a 30-day file and
+// a chart through a self-reported header, which is exactly the class the C1 clause was added
+// for — so leaving them out was an oversight about scope, not a judgement about risk.
+//
+// NOT A GENERAL UNICODE POLICY, and deliberately narrow: the members named are the ones with
+// no legitimate use in a product token. A User-Agent is ASCII by RFC 9110's grammar, so
+// nothing here is refusing text a compliant client would send; the substitution exists
+// because non-compliant clients are the interesting ones.
 func isControlRune(r rune) bool {
-	return r < 0x20 || r == 0x7f || (r >= 0x80 && r <= 0x9f)
+	if r < 0x20 || r == 0x7f || (r >= 0x80 && r <= 0x9f) {
+		return true
+	}
+	switch r {
+	case // Bidi overrides and isolates: reorder the glyphs around them.
+		'\u202a', '\u202b', '\u202c', '\u202d', '\u202e',
+		'\u2066', '\u2067', '\u2068', '\u2069',
+		// Zero-width: make two distinct labels render identically.
+		'\u200b', '\u200c', '\u200d', '\u2060', '\ufeff':
+		return true
+	}
+	return false
 }
 
 // capUA cuts s to at most maxClientLen BYTES, on a rune boundary.

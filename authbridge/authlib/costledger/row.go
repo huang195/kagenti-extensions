@@ -311,13 +311,35 @@ func hasControlRunes(s string) bool {
 	return false
 }
 
-// isControlRune reports whether r is a C0 control, DEL, or a C1 control.
+// isControlRune reports whether r is a C0 control, DEL, a C1 control, or a rune that
+// rewrites or hides the text around it without being a control character at all.
 //
 // The one predicate the scan and the rewrite both read, so they cannot disagree about
-// what a control character is. pipeline.isControlRune has the same three clauses in the
-// same order; see sanitizeLabel for why there are two of them.
+// what a control character is. pipeline.isControlRune has the same clauses in the same
+// order; see sanitizeLabel for why there are two of them, and note that BOTH copies move
+// together — that file's doc says so in as many words, and this is what honouring it
+// looks like. There is a THIRD copy in cmd/abctl/tui/usage_render.go which is still C0+DEL
+// only; it belongs to the abctl PR and is named here so the divergence is recorded rather
+// than discovered.
+//
+// The bidi and zero-width clause is the C1 argument applied to the runes that reasoning
+// missed. C1 is here because U+009B opens a terminal escape sequence; a bidi override needs
+// no escape sequence and no terminal to make one label render as another's name, and a
+// zero-width rune makes two distinct keys look identical in a table a reader is comparing.
+// Same class, same choke point. See pipeline.isControlRune for the full argument.
 func isControlRune(r rune) bool {
-	return r < 0x20 || r == 0x7f || (r >= 0x80 && r <= 0x9f)
+	if r < 0x20 || r == 0x7f || (r >= 0x80 && r <= 0x9f) {
+		return true
+	}
+	switch r {
+	case // Bidi overrides and isolates: reorder the glyphs around them.
+		'\u202a', '\u202b', '\u202c', '\u202d', '\u202e',
+		'\u2066', '\u2067', '\u2068', '\u2069',
+		// Zero-width: make two distinct labels render identically.
+		'\u200b', '\u200c', '\u200d', '\u2060', '\ufeff':
+		return true
+	}
+	return false
 }
 
 // rowLabel prepares one string for a durable row: sanitised, then capped.

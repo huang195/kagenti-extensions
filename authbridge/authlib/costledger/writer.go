@@ -49,57 +49,21 @@ type batch struct {
 
 // Writer accumulates the open minute in memory and appends closed minutes.
 //
-// Only CLOSED minutes reach disk. The open one stays in this writer's own
-// accumulator, and Window stitches the two — so a minute never exists in both
-// places and cannot be double-counted. The cost of that boundary is that a restart
-// mid-minute loses up to 60 seconds of cost, which is documented rather than
-// hidden: Flush on shutdown closes the gap for an orderly stop, and nothing can
-// close it for a kill.
+// Only CLOSED minutes reach disk; the open one stays here and Window stitches the two, so
+// a minute never exists in both places. The cost is that an unclean kill loses up to 60
+// seconds of cost — Flush closes that for an orderly stop, and nothing can for a kill.
 //
-// NOTHING HERE TOUCHES DISK ON THE REQUEST PATH. Record is called inside
-// session.Store.Append, under the store's write lock, with every other request in the
-// proxy waiting behind it; it takes a mutex, folds into a map, and hands any IO to a
-// single background goroutine over a buffered channel that drops rather than blocks.
-// Constraint 5 — a ledger failure must never break the proxy — was previously true
-// only for ledger FAILURE and only by discipline, since the per-minute append and the
-// once-a-day prune both ran inline. It is now true for ledger LATENCY too, and by
-// construction.
+// NOTHING HERE TOUCHES DISK ON THE REQUEST PATH. Record runs inside session.Store.Append,
+// under the store's write lock, with every other request waiting behind it: it takes a
+// mutex, folds into a map, and hands any IO to one background goroutine over a buffered
+// channel that drops rather than blocks. The work is BOUNDED but not constant — one call
+// in sixty closes a minute and walks the accumulator, which foldLocked caps at
+// maxLabelsPerMinute. Anything added to this path has to keep that bound.
 //
-// It is NOT, however, constant work. An earlier version of this paragraph said "all
-// it does is take a mutex, fold into a map", and that was wrong for the one call in
-// sixty that closes a minute: that call also runs takeLocked, which walks the whole
-// accumulator and allocates a slice of every row in it, under mu, inside the session
-// store's write lock. The honest statement is that the work is BOUNDED — the
-// accumulator holds at most maxLabelsPerMinute rows, so the walk is at most 64
-// entries and the allocation at most 64 rows, once a minute. It is bounded because
-// foldLocked caps it; before that cap the same walk was O(distinct labels), and the
-// labels are request-chosen, so a caller could make one request in sixty pay for an
-// arbitrarily large map (50,000 keys was measured). Anything added to this path has
-// to keep that bound.
-//
-// The cost of the hand-off is a brief window in which a just-closed minute is in
-// neither half: it has left the map and its batch has not yet been written. That is
-// microseconds, and it self-heals on the next read. The alternative — keeping the
-// in-flight batch visible to readers — cannot work, because a minute can be split
-// across two batches (a whole minute from the roll, plus a late row afterwards) and
-// disk rows carry nothing that says which batch they came from, so "memory wins for
-// this minute" would drop the batch already written. Under-reporting for microseconds
-// beats a rule that can double-count.
-//
-// OWNERSHIP, stated precisely: while pending() reports a minute, nothing THIS WRITER has
-// put on disk carries that minute or a later one. Three write paths have to keep that
-// true, and each is guarded below — takeLocked advances flushedThrough as it hands rows
-// off, and the two direct-append paths in add only ever write a minute strictly below the
-// one being held. TestPendingMinute_IsNeverAlsoOnDisk drives all three and asserts it.
-//
-// WINDOW NO LONGER RESTS ON IT, and the qualifier above is why. The rule is about this
-// writer's own writes and says nothing about the day files another writer left there — a
-// previous process that restarted inside the same minute, or a second proxy sharing
-// cost_ledger.dir. Read as a statement about the DIRECTORY it is false, and Window read
-// it that way: it dropped every disk row for the held minute as a duplicate, which hid
-// $1.00 of committed spend on the ordinary restart path. See Window. The rule is still
-// worth keeping and still tested, because it is what makes a minute leave memory exactly
-// once; it is simply not something a reader may infer anything about the disk from.
+// OWNERSHIP: while pending() reports a minute, nothing THIS WRITER has put on disk carries
+// that minute or a later one. Three write paths keep it and TestPendingMinute_IsNeverAlsoOnDisk
+// drives all three. Note the qualifier — it says nothing about day files another writer
+// left there, and Window must not infer anything about the disk from it.
 type Writer struct {
 	store *store
 	now   func() time.Time

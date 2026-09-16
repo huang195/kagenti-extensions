@@ -1,93 +1,47 @@
-// Package costledger persists per-minute cost and token totals to disk so a
-// question like "what did today cost" survives a restart.
+// Package costledger persists per-minute cost and token totals to disk so "what did
+// today cost" survives a restart. The usage aggregator's ring is six hours of
+// in-memory buckets and dies with the process; a coding session spans days.
 //
-// It exists because the usage aggregator's ring is 6 hours of in-memory buckets
-// (usage.NumBuckets x usage.BucketWidth) and dies with the process. A coding
-// session spans days; the release bar asks for numbers that are still there
-// tomorrow.
+// It is a SECOND session.Recorder beside the aggregator, not a reader of it: the
+// aggregator keeps independent marginals (by model, by endpoint, by plugin), so it
+// could never reconstruct "this endpoint x this model x this provenance", and summing
+// marginals double-counts. Recording independently also means this package cannot
+// regress charting.
 //
-// It is a SECOND session.Recorder, registered alongside the usage aggregator,
-// rather than a reader of it. The aggregator keeps independent marginals —
-// by-model, by-endpoint, by-plugin — not a joint distribution, so reading it
-// could never reconstruct "this endpoint x this model x this provenance", and
-// summing marginals would double-count. Recording independently also means this
-// package cannot regress charting.
+// TWO HALVES, ONE ANSWER. Closed minutes live on disk, the minute still accumulating
+// lives in the Writer, and Window returns both — it is the only entry point a reader
+// should use. The open minute comes from THIS package's accumulator rather than the
+// ring, which also holds it, because the ring prices by a different rule and counts a
+// different denominator: a total assembled from both would have one minute priced one
+// way and the rest another. Reading it from the writer that owns it also makes the
+// non-overlap provable rather than probable.
 //
-// TWO HALVES, ONE ANSWER. Closed minutes live on disk; the minute still
-// accumulating lives in the Writer. Window returns both, and that is the only
-// entry point a reader should use — see its doc for how non-overlap is enforced.
+// IT PRICES NOTHING. Every figure is the one authlib/costing settled and
+// inference-parser published; this package decodes and adds. That is the invariant
+// cortex #972 protects: one component turns tokens into dollars.
 //
-// The open minute comes from THIS package's accumulator and not from the usage
-// aggregator's ring, though the ring also holds it. Four reasons, because an
-// earlier draft of this doc claimed the ring and it would have been wrong:
+// Which produces four differences a reader will otherwise find by comparing two totals
+// on one screen. The dollars agree on the live pipeline; the ratios need not:
 //
-//   - The ring prices independently. usage.Aggregator.costOf falls back to the
-//     process rate table where this package does not (see the divergence paragraph
-//     below), so a total assembled from both would have one minute priced by one
-//     rule and the rest by another — an internally inconsistent figure, which is
-//     harder to explain than either rule on its own.
-//   - The ring's request denominator is different. It counts every response
-//     carrying a Host, including MCP and health traffic; this package counts
-//     inference only. Requests would jump for exactly one minute of the window.
-//   - The ring is 6 hours. A minute held while the proxy sits idle overnight has
-//     rotated out of the ring, but is still in the map right here.
-//   - Ownership would become a timing question. The ring knows nothing about what
-//     has been flushed, so any periodic flush could put a minute in both halves.
-//     Reading the open minute from the writer that owns it makes the boundary exact
-//     and provable rather than probable.
+//   - usage.Aggregator.costOf falls back to the process rate table for a request with
+//     no settled record. This does not, and records it priceable-but-unpriced.
+//   - costOf counts ANY settled record as priceable; the writer requires a model and
+//     non-zero tokens, so a cost reported over zero usage is priceable only in the ring.
+//   - A REFUSED figure (costevent.RejectedImplausible) is priceable here and invisible
+//     in the ring, deliberately: the refusal exists to keep a coverage gap nameable, and
+//     this is the surface still there tomorrow to name it on.
+//   - Only the modern token fields are read, so a producer emitting the legacy
+//     Prompt/Completion pair yields a ring figure with usage and a row with zero tokens.
+//     The fix is upstream normalisation, not new columns — see the schema rule below.
 //
-// It prices NOTHING. Every figure here is the one authlib/costing settled and
-// inference-parser published on the event; this package only decodes and adds.
-// That is the invariant cortex #972 exists to protect: one component turns
-// tokens into dollars.
+// On disk: hosts, model names, counts, dollars, timestamps. No prompt content, no
+// completions, no tool arguments, ever — TestWriter_HoldsNoPromptContent asserts that
+// against the serialized bytes.
 //
-// CONSEQUENCES of pricing nothing, stated because they are real differences a reader
-// will otherwise discover by comparing two totals on one screen. THREE of them, not
-// one — the first is about dollars and the other two about the denominator those
-// dollars are a fraction of:
-//
-//   - usage.Aggregator.costOf falls back to the process rate table for a request that
-//     arrives with no settled record, and this package does not. Where that fallback
-//     fires, /v1/usage over a ring window reports dollars the ledger records as
-//     priceable-but-unpriced. On the live pipeline inference-parser settles every
-//     inference response, so the two agree; a composition without it would show the
-//     gap rather than a wrong number, which is the failure mode to prefer.
-//
-//   - PriceableRequests is counted differently. costOf sets priceable for ANY request
-//     carrying a settled cost record, whatever its token counts, while the writer here
-//     requires Model != "" and Tokens > 0. A settled record over zero tokens — a
-//     gateway that reported a cost and no usage — therefore lands in the ring's
-//     coverage denominator and not in the ledger's. It is priced in both, so the
-//     dollars match and only the ratio differs.
-//
-//   - A REFUSED FIGURE is counted as priceable here and nowhere in the ring. A record
-//     carrying costevent.RejectedImplausible says a cost was on the wire and this proxy
-//     declined it, and the writer records that as priceable-and-unpriced so the coverage
-//     gap survives to tomorrow. usage.Aggregator.costOf reaches the record through
-//     costevent.Decode, which reports nothing at all for an unpriced one, so the ring
-//     counts the response in Requests and in no other counter. The dollars are zero in
-//     both and only the ratio differs — the same shape as the bullet above, in the
-//     opposite direction. It is deliberate: the refusal exists to keep a coverage gap
-//     nameable, and this is the surface that is still there tomorrow to name it on.
-//
-//   - The token fields read here are the modern ones only. pricing.UsageFromInference
-//     still falls back to InferenceExtension.PromptTokens and CompletionTokens when the
-//     split counters are absent, so a producer emitting only the legacy pair yields a
-//     ring figure with usage and a ledger row with Tokens == 0 — which then fails the
-//     priceable test above. Not fixed by adding the legacy fields to Row: the schema
-//     rule at the bottom of this doc is add-never-rename, and adding two columns for a
-//     shape parsercommon.Fill no longer produces would put them on every future row.
-//     The right fix is upstream, where the legacy pair is normalised into the split.
-//
-// On disk it holds hosts, model names, counts, dollars and timestamps. No prompt
-// content, no completions, no tool arguments — ever. That is a user-facing promise
-// and TestWriter_HoldsNoPromptContent asserts it against the serialized bytes.
-//
-// SCHEMA STABILITY: Row embeds usage.Counts, so a field added there changes what
-// lands on disk with no edit here. That is the point — one vocabulary — but it
-// means the ledger's JSON is only as stable as Counts'. Additive changes keep old
-// files readable, because an absent field decodes to its zero; a RENAME would
-// silently read every historical row as zero for that column. Add, never rename.
+// SCHEMA: Row embeds usage.Counts, so a field added there lands on disk with no edit
+// here. Additive changes keep old files readable because an absent field decodes to
+// zero; a RENAME would read every historical row as zero for that column. Add, never
+// rename.
 package costledger
 
 import (

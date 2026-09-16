@@ -13,181 +13,59 @@ import (
 	"github.com/rossoctl/cortex/authbridge/authlib/usage"
 )
 
-// handleUsage serves GET /v1/usage — time-bucketed volume, error, latency and
-// cost aggregates for charting.
+// handleUsage serves GET /v1/usage — time-bucketed volume, error, latency and cost
+// aggregates for charting.
 //
 // Query parameters:
 //
-//	window      10m (default), 1h, 6h — any multiple of the bucket width up to
-//	            the ring's retained maximum — or the SYMBOLIC windows "today"
-//	            (local midnight to now) and "7d" (a rolling 7x24h). A symbolic
-//	            window is answered from the durable cost ledger, which is on for a
-//	            local install and off in Kubernetes; where it is off, the ring's
-//	            maximum window is served instead and the response's own "window"
-//	            field names what was actually served, never what was asked for.
-//	            "today" is LOCAL midnight because a laptop crossing a timezone
-//	            must not have its day reset mid-afternoon.
-//
-//	            THE TWO KINDS OF WINDOW CAN DISAGREE ABOUT THE SAME TRAFFIC, and a
-//	            client showing both — "$X today" beside "$Y /1h" is exactly that —
-//	            has to expect it. A duration window is answered from the ring,
-//	            which prices a request the parser left unpriced from the process
-//	            rate table; the ledger does not, and records such a request as
-//	            priceable-but-unpriced instead. The ring also counts non-inference
-//	            traffic in requests where the ledger counts inference only. On the
-//	            live pipeline inference-parser settles every inference response, so
-//	            the dollar figures agree; a composition without it shows the gap
-//	            (pricedRequests below priceableRequests) rather than a wrong number.
-//	            Do not compute a difference between a ledger figure and a ring
-//	            figure and present it as spend.
-//	resolution  bucket width to return, e.g. 5m for a 1h window rendered as 12
-//	            bars. Defaults to the 1m storage resolution. Folding is done
-//	            here, not in the client, so every consumer gets the same
-//	            arithmetic — see usage.fold for why latency in particular cannot
-//	            be folded naively.
-//	session     session ID; omit for all sessions combined. REJECTED alongside a
-//	            symbolic window — the ledger holds no session ids, and serving
-//	            all-sessions data under a session label would be worse than
-//	            refusing. See the guard in handleUsage.
+//	window      10m (default), or any multiple of the bucket width up to the ring's
+//	            maximum, or the SYMBOLIC windows "today" (LOCAL midnight to now, so a
+//	            laptop crossing a timezone does not reset its day mid-afternoon) and
+//	            "7d" (a rolling 7x24h). Symbolic windows are served from the durable
+//	            cost ledger; where it is off, the ring's maximum is served instead and
+//	            the response's own "window" field names what was served.
+//	resolution  bucket width to return; defaults to the 1m storage resolution. Folded
+//	            here rather than in the client so every consumer gets the same
+//	            arithmetic — see usage.fold for why latency cannot be folded naively.
+//	session     session ID; omit for all sessions. REFUSED alongside a symbolic window:
+//	            the ledger holds no session ids, and serving all-sessions data under a
+//	            session label would be worse than refusing.
 //	group       none (default), model, endpoint, session, agent, status, plugin.
-//	            "method" is accepted as an alias for "model" — the series shipped
-//	            under that name before it was clear the aggregator only ever
-//	            populated it from the inference model. "session" is meant for
-//	            session="" (all sessions), where one response answers for every
-//	            session a client is listing.
+//	            "method" is an alias for "model".
 //
-// UNAUTHENTICATED, like every endpoint on this listener. Bind it on in-cluster
-// addresses only, never behind ingress — the trust model is documented in
-// authbridge/CLAUDE.md and applies here unchanged.
+// THREE THINGS A CLIENT MUST NOT GET WRONG:
 //
-// This response is less sensitive than /v1/sessions, which serves raw prompts,
-// completions and tool results. It carries no message content at all: only
-// counts, timings and cost. But it is not free of information either, and five
-// groupings leak deployment shape to anyone who can reach the port:
+//  1. The two window kinds disagree about the same traffic, by design. A duration
+//     window comes from the ring, which prices an unpriced request from the process
+//     rate table and counts non-inference traffic; the ledger does neither. Never
+//     subtract a ledger figure from a ring figure and present the result as spend.
+//  2. priceableRequests is the coverage denominator, never requests — which counts
+//     tool calls, health checks and tunnels that can never carry a price, so a client
+//     using it would mark every total "partial" forever and train readers to ignore
+//     the one caveat that matters.
+//  3. priced:false means nothing was priced. Render "cost unavailable", never $0.00,
+//     which reads as "this traffic was free".
 //
-//   - group=model exposes the model names in use (claude-sonnet-5, and any
-//     internal or preview model an operator is testing against). group=method is
-//     an alias for it and exposes exactly the same thing.
+// UNAUTHENTICATED, like every endpoint on this listener; bind it in-cluster only,
+// never behind ingress. It carries no message content, but it is not free of
+// information: group=endpoint discloses every upstream host including internal ones,
+// group=agent discloses which coding agents at which versions run on a workstation,
+// group=session pairs client-chosen ids with spend, and cost figures disclose spend.
 //
-//   - group=endpoint exposes every upstream host the proxy talked to, not only the
-//     inference ones: the accumulator is populated for any response or denial
-//     carrying a Host, with no inference guard, so MCP servers, A2A peers and tool
-//     backends appear alongside model gateways — internal hostnames included. That
-//     is deployment topology rather than model choice, which makes it the most
-//     sensitive of the groupings.
+// THE SYMBOLIC WINDOWS RAISE THAT MATERIALLY and are the first thing here that would
+// need a credential if this port were ever exposed. Everything else is bounded by the
+// six-hour ring — the worst an unauthenticated reader takes is an afternoon from a
+// process that happened to be up. window=7d answers "what has this developer's agent
+// cost over a week", which is a fact about a person. Two things bound it and neither
+// is authentication: the ledger needs a durable location (so in Kubernetes it is
+// usually off, and the --local config pins every listener to loopback), and session=
+// is refused for a symbolic window, so a week of spend cannot be pinned to one named
+// session through this path.
 //
-//     It also means the two axes of one cost table have different denominators:
-//     group=endpoint rows can carry requests with no tokens and no cost, while
-//     group=model is inference-only because that accumulator requires a model name.
-//     Their request totals will not reconcile, and that is correct rather than a
-//     bug — but a client putting the two side by side has to say so.
-//
-//   - group=session exposes session identifiers, and attaches spend to each one.
-//     /v1/sessions already lists the ids (along with the message content), so the
-//     ids themselves are no new exposure on this listener; pairing them with cost
-//     is.
-//
-//     Unlike every other grouping, its keys are not drawn from a vocabulary this
-//     process controls: the id arrives from the client. How much it discloses is
-//     therefore set off-host — an opaque uuid discloses nothing, an id derived
-//     from a user, agent or ticket name discloses a great deal. That is why it is
-//     not ranked against group=endpoint above rather than placed below it.
-//
-//   - group=agent exposes which coding agents, AT WHICH VERSIONS, run on the
-//     operator's workstation, and attaches spend to each one. That is
-//     fingerprinting-adjacent and the most PERSONAL of the groupings: the others
-//     describe a deployment, this one describes a person's tooling. A reader learns
-//     that this machine runs claude-code 2.1.14, and — combined with a symbolic
-//     window — what that person's use of it has cost over a week. An outdated version
-//     in the answer is also a hint about unpatched local software.
-//
-//     Unlike group=session, its keys ARE drawn from a vocabulary this process
-//     controls: they are parsed from the User-Agent, so the values are predictable
-//     rather than set off-host. That cuts both ways. It bounds what an unrecognised
-//     agent can put in the response, but it does not make the axis less sensitive —
-//     a predictable key that names software on someone's laptop discloses more than
-//     an opaque id does, which is why this bullet sits below group=session rather
-//     than above it.
-//
-//     The key is also CLIENT-ASSERTED and trivially spoofable, so nothing here may be
-//     read as an authenticated statement about what called the proxy. Its accumulator
-//     has no inference guard, so — like group=endpoint — its request denominator
-//     differs from group=model's.
-//
-//   - group=plugin exposes the active pipeline composition — though /v1/pipeline
-//     already publishes that in full, so this adds no new exposure.
-//
-// Cost figures also disclose spend, which is business-sensitive in a way raw
-// request counts are not.
-//
-// And the symbolic windows raise that last exposure materially — the largest single
-// increase in it on this endpoint. Until they existed, everything served here was
-// bounded by the in-memory ring: six hours, gone on restart, so the worst an
-// unauthenticated reader could take was an afternoon's traffic from a process that
-// happened to be up. window=today and window=7d serve a DURABLE spend history from
-// disk, so the same port now answers "what has this developer's agent cost over the
-// last week", which is a business fact about a person and their project rather than
-// a snapshot of current load. Combined with group=model and group=endpoint it also
-// says which models and which gateways that money went to, over a week rather than
-// over an afternoon.
-//
-// Two things bound it rather than remove it: the ledger is off in Kubernetes, so
-// this reach exists only where the listener is already pinned to loopback (the
-// --local config pins every listener to 127.0.0.1 for exactly this class of
-// reason), and session= is refused for a symbolic window, so a week of spend cannot
-// be attributed to one named session through this path. Neither is authentication.
-// If this endpoint is ever exposed beyond loopback or beyond a cluster-internal
-// address, the ledger-backed windows are the first thing that needs a credential.
-//
-// None of this changes the listener's existing posture; it is written down so the
-// decision to expose it is a decision rather than an oversight.
-//
-// costMicros is populated from the figure authlib/costing settles for one
-// response. It prefers the gateway's own post-discount cost header — the
-// authoritative figure — and falls back to pricing the parsed token counters when
-// the header is absent or reports 0, which every streamed response does.
-//
-// costing is its own package rather than logic inside the parser or inside a
-// plugin, and deliberately so: a gateway's cost header is vendor-specific knowledge
-// with no place in a provider-shaped body parser, and a ledger has no business
-// deciding what a request cost. inference-parser CALLS it at the point the token
-// counters are final, because that is the only place that knows when they are.
-//
-// Cost used to be decided in two places with two shapes — inside
-// litellm-budget-track and again inside the usage aggregator — and the two could
-// disagree about the same request: one could carry a token count with no money in a
-// live abctl view while showing dollars here. litellm-budget-track now amends the
-// settled record to enforce a budget rather than computing a figure of its own.
-//
-// Requests that arrive with no settled figure contribute no cost and appear as the gap
-// between totals.pricedRequests and totals.priceableRequests. Where those differ the
-// dollar total covers only the priced subset, so a client rendering it must
-// present it as partial rather than complete. priced:false means nothing at all
-// was priced — render "cost unavailable", never $0.00, which would read as "this
-// traffic was free".
-//
-// PRICEABLE is the denominator, never requests. requests counts every proxied
-// response, including MCP tool calls, health checks and tunnels, none of which can
-// ever carry a price — so priced-over-requests never reaches parity and a client
-// obeying it would mark every total "partial" forever, which trains a reader to
-// ignore the one caveat that matters. This paragraph named the wrong pair until it
-// was corrected; the agreeing statement is on totals.priceableRequests, and both this
-// endpoint's own clients (abctl's spend strip and `abctl cost`) use the priceable
-// pair.
-//
-// Traffic that carries no settled figure is still priced here, from the process
-// rate table: the pricing resolver has landed, so modelled rates are no longer
-// something that arrives later — usage.Aggregator.costOf resolves a rate for any
-// request carrying a model and tokens but no cost record. See
-// docs/superpowers/specs/2026-09-09-pricing-consolidation-design.md.
-//
-// Which means cost is NOT single-sourced, and this comment deliberately stops
-// short of claiming that it is. authlib/costing settles the figure most requests
-// arrive with, but the aggregator still prices independently when none is present,
-// so the two can answer differently about the same request — and the aggregator's
-// path does not go through costing's precedence rule at all. Collapsing them onto
-// the settled figure alone is a later change; until it lands, do not write here
-// that cost is computed in exactly one place, because it is not.
+// COST IS NOT SINGLE-SOURCED, and this comment deliberately does not claim it is.
+// authlib/costing settles the figure most requests arrive with, but the aggregator
+// still prices independently when none is present, so the two can answer differently
+// about the same request. Do not write here that cost is computed in one place.
 func (s *Server) handleUsage(w http.ResponseWriter, r *http.Request) {
 	if s.usage == nil {
 		// Aggregation not wired up (session store disabled, or an older binary

@@ -405,66 +405,20 @@ func lostRows(ends []int, n int) int {
 }
 
 // appendBytes writes b in ONE call and, if that write landed only partly, appends a
-// single newline so the fragment cannot swallow whatever is appended next. IT NEVER
-// SHORTENS THE FILE.
+// newline so the torn row cannot be joined to the next one.
 //
-// It used to roll back. os.File.Write reports an error whenever it wrote fewer bytes
-// than asked and the bytes it DID write are in the file, so this took the file's size
-// before the write and Truncate'd back to it afterwards, on the reasoning that losing
-// this minute beats leaving a corrupt line.
+// IT DOES NOT ROLL BACK, and that is the decision. A rollback truncates to a size read
+// before the write, which in a directory two writers share can destroy rows this process
+// never wrote — and a rollback that can be wrong is worse than none, because the failure
+// it prevents (one unreadable line) is smaller than the one it causes (another writer's
+// committed rows gone).
 //
-// THAT ROLLBACK COULD DESTROY ROWS THIS WRITER NEVER WROTE. The size was read before
-// the write and used after it, and a day file is not private to one writer:
-// ~/.cortex/cost is a fixed default that every proxy on the host opens, so a second
-// proxy — a spare on another port, an overlapping restart — can append in that window,
-// and Close's inline-write branch could do it from inside this process. Anything that
-// landed in between sat inside the range being truncated away, so one bad minute took
-// the rest of the day with it, and the file said nothing about it afterwards.
+// THE FENCE ONLY RUNS IF THIS PROCESS IS STILL ALIVE. A crash mid-write leaves no
+// terminator, so the next append joins onto the fragment and readDay loses BOTH rows —
+// measured, and why Caveats.SkippedLines is documented as a floor rather than a count.
 //
-// A ROLLBACK THAT CAN BE WRONG IS WORSE THAN NO ROLLBACK, because of what the two
-// failures cost. Not rolling back leaves one undecodable line: readDay steps over it and
-// COUNTS it, and the count reaches a caller in Caveats, so the loss is bounded and it is
-// visible. Rolling back over another writer's rows deletes committed history with no
-// error, no count and nothing left in the file to say it happened. Bounded and reported
-// beats unbounded and silent, and that is the whole trade.
-//
-// Hence the newline. A torn write ends mid-row, and with no terminator the NEXT append
-// concatenates onto that fragment and makes its first row unreadable too — so one byte
-// fences the damage to the fragment alone. Best effort: the write that just tore will
-// often refuse this too, and then the file is merely back to the bounded case above. It
-// can only ever ADD a byte, which is what makes it safe to attempt on a file another
-// writer has open.
-//
-// THE FENCE ONLY RUNS IF THIS PROCESS IS STILL ALIVE, which is the load-bearing
-// qualification and used to be missing. It covers a SHORT WRITE — the device refused some
-// bytes and returned an error, and the next statement appends the newline. It cannot cover
-// power loss, SIGKILL or a panic between the write and the fence: nothing runs, the file
-// keeps an unterminated fragment, and the next append concatenates onto it.
-//
-// WHAT THAT COSTS, measured rather than reasoned about: TWO rows are missing from the
-// answer — the fragment and the row appended onto it, which the scanner reads as one
-// undecodable line — while the caveat for that day says ONE skipped line. So the reported
-// count is a FLOOR on rows lost, not an exact figure, and the doc that called it exact was
-// wrong. It is still bounded (one extra row per fragment, and only ever the first row
-// appended after a crash), still visible, and still better than a silent rollback over
-// another writer's committed spend. The honest statement of the guarantee is: a live short
-// write costs the rows it tore and no more; a crash mid-append costs those plus the first
-// row written afterwards, and the skipped-line count under-reports it by that one row.
-// Making the count exact would need the reader to distinguish a fragment from a corrupt
-// line, which the bytes do not support.
-//
-// NO LOCK, and that is a decision rather than an omission. With nothing on this path
-// that shortens a file, concurrent writers can only append: each flush is one write to
-// an O_APPEND handle, so rows land whole and interleaved instead of over one another.
-// See TestWriteLines_ConcurrentWritersDoNotLoseEachOthersRows. What two writers still
-// cannot do is make each other's TOTALS right — two processes pricing the same traffic
-// would double-count it — but that is a question about who may write a ledger, not
-// about whether a write destroys what is already in it.
-//
-// RETURNS THE BYTE COUNT OF b THAT IS NOW IN THE FILE, so the caller can say which rows
-// survived a tear instead of assuming none did. It deliberately does NOT include the
-// fence newline: that byte is damage control, not row data, and adding it would make the
-// row straddling the tear look complete.
+// No lock: this path is reached only from the single writer goroutine. Returns the bytes
+// of b now in the file, so the caller can say which rows did not make it.
 func appendBytes(f io.Writer, b []byte) (int, error) {
 	n, err := f.Write(b)
 	if err == nil {
@@ -610,81 +564,28 @@ type dayIssues struct {
 	truncated bool
 }
 
-// prune deletes day files older than the retention window, measured back from now's
-// ledger day.
+// prune condemns day files outside the retention window, in both directions.
 //
-// retainDays FILES SURVIVE, counting today: the cutoff is today minus retainDays-1,
-// so a 3-day retention keeps today and the two days before it. It used to be today
-// minus retainDays, an inclusive range that kept retainDays+1 files — off by one
-// against what the option and the config field both say the number means.
+// retainDays FILES SURVIVE, counting today: the cutoff is today minus retainDays-1. Files
+// it cannot date are never touched — deleting an unrecognised file under an
+// operator-configured path is the one unrecoverable mistake available here. It returns the
+// first error and keeps going, so one undeletable file does not strand the rest.
 //
-// Never touches a file it cannot date: an unrecognised name in the directory is
-// left alone rather than deleted, because this runs against a path an operator
-// configured and deleting something we do not understand is the one unrecoverable
-// mistake available here.
+// THE CUTOFF IS FLOORED AT THE NEWEST DAY FILE'S DATE, which stops a clock that has
+// stepped forward from deleting history that is still inside the real window. It is a
+// floor rather than a plausibility threshold because no threshold separates a wrong clock
+// from a long idle period; deleting nothing is recoverable and deleting today is not. The
+// cost is that retention is then measured from the newest DATA rather than from now, so an
+// archive nothing writes to keeps its last retainDays files indefinitely.
 //
-// Returns the first error but keeps going, for the reason append does: one
-// undeletable file must not leave the rest of the backlog in place.
+// THE FUTURE END IS PRUNED TOO, AND ASYMMETRICALLY. A past file beyond the window is
+// ordinary ageing; a FUTURE one cannot be, since a day file exists only because this
+// process wrote rows dated then. The horizon is a whole retention window ahead rather than
+// tomorrow, because the near future is where an ordinary DST or timezone move lands.
 //
-// THE CUTOFF IS FLOORED AT THE NEWEST DAY FILE'S OWN DATE, which is what stops a
-// wrong clock from deleting the ledger. It used to be today-minus-retention and
-// nothing else, so a host whose clock STEPPED FORWARD past the window — NTP
-// correcting after a resume, a restored VM image, a dead CMOS battery — put every
-// existing file behind the cutoff and unlinked all of them, TODAY'S INCLUDED. This
-// runs synchronously in New, i.e. at the one moment a laptop's clock is least
-// trustworthy. See TestPrune_AForwardClockStepDoesNotDeleteTheLedger.
-//
-// Deleting nothing is always recoverable and deleting today is not, so where the two
-// available readings of "how old is this file" disagree, the older reference wins and
-// fewer files go. A file only ever goes when it is past the window under BOTH
-// readings — the clock's day and the newest day the ledger itself has on disk.
-//
-// A FLOOR RATHER THAN A PLAUSIBILITY THRESHOLD because no threshold can separate the
-// two cases. From the directory alone, "the clock jumped 40 days" and "this ledger was
-// idle for 40 days" look identical, and one of them is a legitimate prune. The floor is
-// sound either way: everything it still deletes is past the window relative to real
-// recorded activity.
-//
-// The cost is that retention is measured from the ledger's newest DATA rather than
-// from the clock, so an ARCHIVE nothing writes to any more keeps its last retainDays
-// files instead of emptying out. The moment writing resumes, today becomes the newest
-// day and the old era ages out normally.
-//
-// THE FUTURE END IS PRUNED TOO, AND THE TWO DIRECTIONS ARE NOT SYMMETRIC.
-//
-// A file dated in the PAST beyond the window is ordinary: history ages out, which is
-// what retention is for, and the only real question is whether the clock or the ledger's
-// own newest day is the better reading of "now" — which the floor above answers.
-//
-// A file dated in the FUTURE cannot be ordinary. A day file exists only because
-// something wrote a row it dated that day, so a date ahead of the clock means the clock
-// was ahead when that row was written and has since been corrected. Nothing could ever
-// reclaim it: the floor only ever LOWERS the reference day, and a future date is never
-// Before a cutoff derived from it, so ONE skewed write left that file in the directory
-// for as long as the directory lived and the guarantee "at most retainDays files
-// survive" quietly stopped holding. Ordinary retention kept advancing, which is why this
-// was a leak rather than a freeze, and why nothing surfaced it.
-//
-// THE HORIZON IS A WHOLE RETENTION WINDOW AHEAD, not tomorrow, because the near future
-// is not evidence of anything. A clock a few seconds fast across midnight writes a real
-// minute of spend into tomorrow's file, and a clock that steps BACK — a restored VM
-// snapshot, an NTP correction after a resume — makes several days of genuine history
-// look future-dated. Everything within retainDays of the clock's day is swept by
-// ordinary retention as the clock advances into it, so it needs no rule here; only a
-// file that would outlive the entire window is deleted. See
-// TestPrune_ADayFileWithinTheWindowAheadOfTheClockIsKept.
-//
-// What that costs, stated rather than left to be discovered: while such a file exists
-// the surviving set spans [cutoff, horizon], so the disk bound is twice retainDays
-// rather than exactly retainDays — bounded and said out loud, where before it was
-// unbounded and silent. Reaching the bound takes one skewed write per day of it.
-//
-// The residual is a clock that steps BACKWARD BY MORE THAN THE WHOLE WINDOW (a dead RTC
-// reading 1970, a long-stale snapshot): its genuine files read as artefacts here and are
-// deleted. Deliberate, and the lesser harm — while that clock stands, no window it can
-// express reaches those rows anyway, so what is lost is data already unreadable, and the
-// removal is logged at Warn naming the file. Fixing the clock before the next prune
-// keeps them.
+// See expiredSuffix for why this renames rather than unlinks, and for the residual: a
+// clock stepping backward by more than the whole window is indistinguishable from time
+// having passed.
 func (s *store) prune(now time.Time) error {
 	entries, err := os.ReadDir(s.dir)
 	if err != nil {

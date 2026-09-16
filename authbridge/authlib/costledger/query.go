@@ -8,90 +8,36 @@ import (
 	"github.com/rossoctl/cortex/authbridge/authlib/usage"
 )
 
-// Window returns everything the ledger knows about [from, to]: the closed minutes
-// on disk plus the open minute still in memory.
+// Window returns everything the ledger knows about [from, to]: the closed minutes on
+// disk plus the open minute still in memory.
 //
 // THIS is what a reader calls. Query alone answers only for what has been flushed,
-// which systematically omits the minute currently accumulating — and omits it
-// indefinitely once traffic stops, since the flush is driven by the next event. A
-// "today" figure that silently excluded live spend was the defect this exists to
-// close; worse, a session whose whole conversation fit inside one minute produced no
-// disk rows at all and rendered as "cost unavailable" over real money.
+// which omits the minute currently accumulating — and omits it indefinitely once
+// traffic stops, since the flush is driven by the next event. A session whose whole
+// conversation fit inside one minute produced no disk rows at all.
 //
-// NON-OVERLAP IS RECONCILED, NOT ASSUMED, in three steps, because a minute counted
-// twice is a worse answer than a minute counted late:
+// NON-OVERLAP IS RECONCILED, NOT ASSUMED, because a minute counted twice is worse than
+// one counted late. The accumulator is read first together with its GENERATION (see
+// Writer.flushGen), then the day files, then the generation again. Unchanged means
+// nothing left the accumulator during the read, so its rows are still memory-only and
+// are added; changed means they may now be on disk too, so the MEMORY half is dropped
+// and only disk is returned.
 //
-//  1. The accumulator is read FIRST, together with its GENERATION — how many times
-//     rows have left it (see Writer.flushGen). Memory first, because its rows cannot
-//     then be missed by a flush landing between the two reads, which is the failure
-//     mode of reading disk first.
-//  2. The day files are read.
-//  3. The generation is read AGAIN. Unchanged means nothing left the accumulator while
-//     this read ran, so the rows from step 1 are still only in memory and are added.
-//     Changed means they may now be on disk as well — the day-file read may or may not
-//     have seen them — so the MEMORY half is discarded and only what is on disk is
-//     returned.
+// NOTHING ON DISK IS EVER DROPPED. This function can only ADD to what the day files
+// hold, and that rule is load-bearing rather than tidy: a disk row for the held minute
+// is indistinguishable from this writer's own racing flush versus another process's
+// committed spend — same key, same counters — so no matching on the row can decide it.
+// What CAN be decided exactly is whether this writer flushed during this read, which is
+// what the generation asks. Dropping the disk copy instead lost $1.00 of $1.25 on an
+// ordinary restart, with no drop count and no caveat anywhere in the response.
 //
-// NOTHING ON DISK IS EVER DROPPED, which is the whole of the arithmetic: this function
-// can only ever ADD to what the day files hold. A row in the accumulator has never been
-// written (every exit from it is counted in flushGen, and add's direct-append paths
-// write rows that were never in the map), so an unmoved generation makes the two halves
-// disjoint by construction rather than by assumption.
+// The cost is that a flush racing a read can leave the just-flushed minute out of that
+// one answer; it is bounded by one read and self-heals on the next.
 //
-// IT USED TO DROP DISK ROWS FOR THE HELD MINUTE, and that silently hid committed money.
-// The rule was: the writer's ownership rule (see the Writer doc) says nothing on disk
-// carries the minute pending() reports, so a disk row for that minute must be the
-// pending rows themselves, landed from a flush that raced the two reads — drop it. The
-// premise holds INSIDE one process lifetime. It does not survive a process boundary, and
-// nothing re-established it at startup: New seeds neither flushedThrough nor open from
-// disk, so the first event after a restart re-opens a minute that already has rows in
-// the day file, and every one of those rows was then dropped as a duplicate. Measured on
-// the ORDINARY restart path — config reload, crash loop, rollout — with process 1
-// recording $1.00 and flushing, and process 2 restarting inside the same minute and
-// recording $0.25:
-//
-//	on disk after p1: 1000000 micros
-//	Window() saw:      250000 micros
-//	Dropped():              0
-//
-// $1.00 gone, with no drop count, no skipped line and no caveat anywhere in the
-// response. Two live processes sharing cost_ledger.dir reach the same state with no
-// restart at all, which the ~/.cortex/cost default makes plausible.
-//
-// A READER CANNOT TELL THOSE TWO STATES APART FROM THE ROWS THEMSELVES. A disk row for
-// the held minute carrying the same (endpoint, model, agent, provenance) key and the
-// same counters is identical whether it is this writer's own racing flush or another
-// writer's committed spend — the common case, since a restart usually resumes the same
-// traffic — so no matching on the row, by key or by counts or by both, can decide it.
-// What CAN be decided exactly is whether THIS writer flushed during THIS read, which is
-// what step 3 asks. So the drop moved from the disk half to the memory half: in the one
-// case where the two might overlap, the copy still in memory goes and the committed copy
-// on disk stays.
-//
-// THE COST is that a flush racing a read can leave the just-flushed minute out of that
-// one answer, when its write has not landed by the time the day files are read — the
-// same microseconds-wide, self-healing gap the Writer doc already documents for a batch
-// in flight. It is bounded by one read and it corrects itself on the next one.
-//
-// SEEDING flushedThrough FROM DISK IN New was the other candidate, and is deliberately
-// not what this does. It would re-establish the ownership rule for a SEQUENTIAL restart
-// and only for that: two live writers over one directory still put a disk row in the
-// minute one of them holds, so a reader would still need a rule for it — this one. It
-// also puts a whole day file's read in New, which must not fail hard (a ledger that
-// cannot read yesterday is still a ledger that can record today), and it would have to
-// be clamped against a future-dated file or it would disable the accumulator outright.
-// Cheaper to stop the reader trusting a promise it cannot verify.
-//
-// THE DROP THAT IS NOW GONE WAS AN EQUALITY, and before that "at or after", justified by
-// the same claim: that a concurrent flush could only ever produce rows step 1 already
-// holds. That claim was FALSE twice over. A flush landing between pending() and Query()
-// can advance the writer several
-// minutes, and those newer minutes are on disk and NOT in the pending snapshot, which
-// was taken before them — so dropping everything at or above the held minute dropped
-// real spend. Measured: writer holding minute M, one disk row at M+1, Window returned
-// 250,000 micros instead of 1,250,000. Recorded here because it is the same mistake
-// twice — a reader deciding what to discard from an invariant it cannot check — and the
-// second fix is what removes the class rather than the instance.
+// Seeding flushedThrough from disk in New was the other candidate and is deliberately
+// not what this does: it would re-establish the ownership rule for a sequential restart
+// only, since two live writers over one directory still put a disk row in the minute one
+// of them holds — so a reader would still need this rule.
 func (w *Writer) Window(ctx context.Context, from, to time.Time) ([]Row, Caveats, error) {
 	fromMin, toMin := span(from, to)
 	pending, _, gen := w.pending()

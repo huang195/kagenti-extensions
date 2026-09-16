@@ -103,60 +103,22 @@ type CostLedgerConfig struct {
 	RetentionDays int `yaml:"retention_days,omitempty" json:"retention_days,omitempty"`
 }
 
-// minCostLedgerRetentionDays is the floor a NON-ZERO retention_days has to clear.
+// minCostLedgerRetentionDays is the floor a NON-ZERO retention_days has to clear, so
+// window=7d cannot be answered over a partial week without saying so.
 //
-// The usage API serves window=7d, and it serves it from these day files. With
-// retention_days: 2, six of the eight local days a 7d window spans have already been
-// deleted, the ledger reads nothing for each of them, and the response still says
-// window:"7d", priced:true over two days of spend. Nothing downstream can tell that
-// figure from a genuinely quiet week — the label is the same, the priced flag is the
-// same, and the number is wrong by however much was pruned.
+// NINE, not seven. window=7d is a rolling 7x24h, so it starts part-way through a date
+// and reads EIGHT local day files — and nine in a spring-forward week, which is 167
+// hours long and so reaches an hour further back. Both corrections had the same shape:
+// counting days instead of counting the files the span opens.
 //
-// DERIVED FROM THE WINDOW RATHER THAN WRITTEN AS ITS OWN NUMBER, because as its own
-// number it was WRONG. It was the literal 7, on the reading that "7d" spans seven days;
-// but usage.ParseWindowSpec defines 7d as a ROLLING seven times twenty-four hours, and
-// unless that begins exactly at midnight it starts part-way through one date and ends
-// part-way through another, so the ledger opens EIGHT day files to answer it in an ordinary
-// week. A retention of 7 keeps today and the six before it, so the eighth — the oldest, the
-// one the window opens ON — had already been unlinked: retention_days: 7 passed validation
-// and then answered window:"7d" over a partial week, which is exactly the case this floor
-// exists to refuse. The paragraph above was already saying "eight" while the constant said 7.
+// Refused at load rather than clamped: an operator who chose the number should hear that
+// it is wrong, and a silent clamp makes /config disagree with what was written.
 //
-// NINE, NOT EIGHT, and the second correction has the same shape as the first. Eight assumed
-// every day in the week is 24 hours long: a spring-forward week is 167 hours, so a 168-hour
-// rolling span reaches an hour further back than a calendar week and touches a NINTH local
-// date — measured at 00:00 on 2026-03-15 in America/New_York as much as in America/Havana,
-// because 7d's From is a duration subtraction and has nothing to do with where in the day a
-// transition falls. At eight, retention_days: 8 passed validation and then answered
-// window:"7d" over a partial week on the two mornings a year that happens. It is
-// usage.Window7dLocalDays, which is now documented as a CEILING rather than a count for
-// exactly this reason; see there for the alternative fix (making 7d calendar-aligned) and why
-// it is a product decision rather than a bound to correct.
-//
-// One surviving file per day retained is exact rather than approximate: store.prune
-// keeps the days in [ref-(retainDays-1), ref], so retainDays IS the number of dates
-// that survive, and clearing usage.Window7dLocalDays means every date the window opens
-// is still on disk.
-//
-// Refused at load rather than clamped, because the operator who chose the number is
-// the one who should learn that the window they will be served does not mean what it
-// says. Zero is untouched by the floor and still means "the package default" (30).
-//
-// This does NOT cover the other half of the same defect: an install younger than the
-// window has no files for the missing days either, and answers window:"7d" over however
-// long it has been running. Retention is not what limits that, so it cannot be fixed
-// here — it needs the response to carry the span actually covered.
-// A LITERAL, with the agreement enforced by a test rather than by an import. Deriving it
-// as usage.Window7dLocalDays read better and cost a layering inversion: this package is the
-// leaf every binary loads to parse its config, and pointing it at the aggregator to learn a
-// number drags that dependency into every binary — including ones that never aggregate
-// anything. TestMinCostLedgerRetentionDays_MatchesTheWindowItProtects asserts the two are
-// equal, so the protection the derivation bought (a window change that outgrows the floor
-// fails loudly instead of silently admitting a partial week) is kept without the import.
-//
-// A test-only dependency is the right shape for a cross-package invariant that is not a
-// runtime relationship: config does not need to KNOW about windows, it needs to AGREE with
-// them, and agreement is a thing to check rather than to compute.
+// A literal rather than derived from usage.Window7dLocalDays, because this package is the
+// leaf every binary loads to parse its config and must not import the aggregator.
+// TestMinCostLedgerRetentionDays_MatchesTheWindowItProtects keeps the two equal, which is
+// the right shape for a cross-package invariant that is agreement rather than a
+// dependency.
 const minCostLedgerRetentionDays = 9
 
 // maxCostLedgerRetentionDays is the ceiling a retention_days has to stay under, and the

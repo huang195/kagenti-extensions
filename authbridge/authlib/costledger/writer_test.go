@@ -570,12 +570,12 @@ func TestWriter_AFailedAppendIsCountedAsADrop(t *testing.T) {
 
 // THE COUNT IS WHAT THE STORE COULD NOT WRITE, NOT THE SIZE OF THE BATCH.
 //
-// It used to be len(b.rows), which over-reports in both of the ways a partly-failed
-// append can happen: a torn write leaves the rows before the tear durably on disk (see
+// len(b.rows) over-reports in both of the ways a partly-failed append can happen: a torn
+// write leaves the rows before the tear durably on disk (see
 // TestWriteLines_ATornAppendCountsOnlyTheRowsItLost), and store.append writes one file per
-// day, so a batch spanning two of them can fail on one and land the other. Dropped() is
-// the only exported "is my cost history complete" signal, and over-reporting trains an
-// operator to disbelieve it exactly as thoroughly as under-reporting hides loss.
+// day, so a batch spanning two of them can fail on one and land the other. Dropped() is the
+// only exported "is my cost history complete" signal, and over-reporting trains an operator
+// to disbelieve it exactly as thoroughly as under-reporting hides loss.
 //
 // write() is driven DIRECTLY here. Record cannot produce a two-day batch today — the
 // accumulator holds one minute — so going through it would assert nothing about this
@@ -810,8 +810,8 @@ func stalledWriter(t *testing.T, depth int, clock func() time.Time) *Writer {
 // blocking hand-off would stall every other request in the proxy. A blocking
 // implementation hangs here rather than failing.
 //
-// The count is asserted EXACTLY. It used to be "not zero", which passed against an
-// implementation that lost 1,024 rows and counted 49.
+// The count is asserted EXACTLY, never as "not zero": that weaker form passes against an
+// implementation that loses 1,024 rows and counts 49.
 func TestRecord_DropsRatherThanBlocksWhenTheWriterCannotKeepUp(t *testing.T) {
 	const depth, events = 4, 20
 	now := at
@@ -982,12 +982,11 @@ func TestAbandon_CountsTheQueueAndTheAccumulator(t *testing.T) {
 // flips immediately and the parked goroutine sees it; with it set after, the flag
 // cannot move until this clock has returned and the goroutine has exited.
 //
-// THE OBSERVATION WINDOW STARTS AT close(quit), NOT AT AN ARBITRARY 250 ms. It used to
-// park for a fixed 250 ms from whenever the settle tick happened to fire and then give up
-// silently, so on a loaded runner — a CI box under -race with the rest of the suite in
-// flight — Close could still be waiting to be scheduled when the window expired, and the
-// test passed without ever having looked. That is the vacuous-pass shape this review keeps
-// finding: green because nothing was checked.
+// THE OBSERVATION WINDOW STARTS AT close(quit), NOT AT AN ARBITRARY 250 ms. Parking for a
+// fixed 250 ms from whenever the settle tick happened to fire, and then giving up silently,
+// lets a loaded runner — a CI box under -race with the rest of the suite in flight — leave
+// Close still waiting to be scheduled when the window expires, so the test passes without
+// ever having looked. That is the vacuous-pass shape: green because nothing was checked.
 //
 // Close does Flush, close(quit), wg.Wait, drain, closed.Store(true). Waiting for quit to
 // close is therefore a deterministic report that Close is INSIDE its ordering, and it can
@@ -1181,11 +1180,10 @@ func TestPrune_OnADayRollRunsThroughTheWriter(t *testing.T) {
 	}
 }
 
-// N4: prunedDay used to advance when the batch carrying pruneAt was BUILT, on the
-// request path, before the prune had run. A batch the queue dropped, or a prune that
-// failed, therefore disarmed retention for the rest of that day — permanently, on a
-// laptop proxy that may not restart for weeks, which is the exact case day-roll pruning
-// exists for.
+// prunedDay must not advance when the batch carrying pruneAt is BUILT, on the request path,
+// before the prune has run: a batch the queue dropped, or a prune that failed, would then
+// disarm retention for the rest of that day — permanently, on a laptop proxy that may not
+// restart for weeks, which is the exact case day-roll pruning exists for.
 func TestPrune_StaysArmedUntilAPruneActuallyRuns(t *testing.T) {
 	dir := t.TempDir()
 	now := at
@@ -1205,7 +1203,7 @@ func TestPrune_StaysArmedUntilAPruneActuallyRuns(t *testing.T) {
 	}
 
 	// The batch carrying it never landed, so nothing was pruned. The next minute has to
-	// ask again — this used to answer "already done" forever.
+	// ask again rather than answer "already done" for the rest of the day.
 	w.mu.Lock()
 	second := w.pruneDueLocked(next.Add(time.Minute))
 	w.mu.Unlock()
@@ -1880,15 +1878,14 @@ func TestWriteLines_ATornAppendDoesNotSwallowTheNextRowAppended(t *testing.T) {
 	}
 }
 
-// A TORN APPEND LOSES THE ROW IT TORE AND THE ONES AFTER IT — NOT THE WHOLE BATCH, which
-// is what the count used to say.
+// A TORN APPEND LOSES THE ROW IT TORE AND THE ONES AFTER IT — NOT THE WHOLE BATCH.
 //
-// Counting the batch was correct only while a failed append truncated itself away, and
-// that rollback is gone: the bytes a short write stored are in the file and nothing
-// shortens it afterwards, so every row that ended before the tear is on disk and
-// readable. Writer.Dropped is the only exported "is my cost history complete" signal, and
-// over-reporting it is not a safe direction to be wrong in — an operator who learns it
-// cries wolf stops believing it when it is right.
+// Counting the batch would only be correct if a failed append truncated itself away, and
+// nothing here does: the bytes a short write stored are in the file and nothing shortens it
+// afterwards, so every row that ended before the tear is on disk and readable. Writer.Dropped
+// is the only exported "is my cost history complete" signal, and over-reporting it is not a
+// safe direction to be wrong in — an operator who learns it cries wolf stops believing it
+// when it is right.
 func TestWriteLines_ATornAppendCountsOnlyTheRowsItLost(t *testing.T) {
 	dir := t.TempDir()
 	s, err := newStore(dir, 30, time.Local)
@@ -1933,14 +1930,13 @@ func TestWriteLines_ATornAppendCountsOnlyTheRowsItLost(t *testing.T) {
 	}
 }
 
-// THE FENCE HAS TO BE FSYNCED, and on the torn path the sync used to be skipped
-// altogether.
+// THE FENCE HAS TO BE FSYNCED, on the torn path as much as the clean one.
 //
-// Two claims rest on it. The rows before the tear are exactly the ones writeLinesTo now
-// reports as not lost, and that is a claim about the device rather than about the page
-// cache. And the newline appendBytes appends after a tear exists purely for the crash
-// case — an unterminated fragment swallowing the next row appended — so leaving the one
-// byte whose whole purpose is crash-durability unsynced defeats the purpose of writing it.
+// Two claims rest on it. The rows before the tear are exactly the ones writeLinesTo reports
+// as not lost, and that is a claim about the device rather than about the page cache. And the
+// newline appendBytes appends after a tear exists purely for the crash case — an unterminated
+// fragment swallowing the next row appended — so leaving the one byte whose whole purpose is
+// crash-durability unsynced defeats the purpose of writing it.
 func TestWriteLines_ATornAppendStillSyncsWhatLanded(t *testing.T) {
 	dir := t.TempDir()
 	s, err := newStore(dir, 30, time.Local)

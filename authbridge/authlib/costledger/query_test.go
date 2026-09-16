@@ -288,15 +288,13 @@ func TestQuery_FragmentConcatenatedWithTheNextAppendCostsOneLine(t *testing.T) {
 // A line past maxLineBytes ends that day's read, and this asserts the LAST-RESORT
 // guard, not a tolerated outcome.
 //
-// It used to bless the truncation on a false premise — that a line this long is
-// "damage of a kind no ledger write can produce". It was: Model went to disk uncapped,
-// so one request naming a megabyte-long model wrote a single valid line past this
-// limit and permanently destroyed the rest of that day ($3.00 of a $3.25 day,
-// measured). The write path now caps every label, so a line this long can only come
-// from a file something else corrupted —
-// TestRecord_LabelsAreCappedSoALineCanNeverExceedTheReadLimit is the half that keeps
-// this unreachable from a request, and this half only says the reader stays bounded
-// and keeps what preceded the damage.
+// "A line this long is damage no ledger write can produce" is a false premise: with Model
+// going to disk uncapped, one request naming a megabyte-long model wrote a single valid line
+// past this limit and permanently destroyed the rest of that day ($3.00 of a $3.25 day,
+// measured). The write path caps every label, so a line this long can only come from a file
+// something else corrupted — TestRecord_LabelsAreCappedSoALineCanNeverExceedTheReadLimit is
+// the half that keeps this unreachable from a request, and this half only says the reader
+// stays bounded and keeps what preceded the damage.
 func TestQuery_LineBeyondTheBufferLimitEndsThatDay(t *testing.T) {
 	dir := t.TempDir()
 	base := time.Date(2026, 9, 13, 9, 0, 0, 0, time.Local)
@@ -404,9 +402,9 @@ func TestRecord_ControlCharactersNeverReachADayFile(t *testing.T) {
 		if hasControlRunes(got) {
 			t.Errorf("%s = %q on disk: a control character reached a durable row", name, got)
 		}
-		// The C1 half asserted on its own, because the byte-scanning predicate this test
-		// used to read reported the row clean while the CSI was still in it — two bytes,
-		// 0xC2 0x9B, which a terminal decoding UTF-8 acts on exactly as it acts on ESC [.
+		// The C1 half asserted on its own, because a byte-scanning predicate reports the row
+		// clean while the CSI is still in it — two bytes, 0xC2 0x9B, which a terminal decoding
+		// UTF-8 acts on exactly as it acts on ESC [.
 		if strings.ContainsRune(got, '\u009b') {
 			t.Errorf("%s = %q on disk: U+009B (CSI) survived; a C0-only filter does not "+
 				"protect the operator who cats this file", name, got)
@@ -463,12 +461,11 @@ func TestRecord_ASanitisedLabelIsStillCappedInBYTES(t *testing.T) {
 
 // A label is cut on a RUNE boundary, and the cap is still counted in BYTES.
 //
-// The cut used to be a plain byte slice, so a multi-byte rune straddling byte 96 was
-// halved and an invalid UTF-8 sequence went into an append-only file that other tools
-// parse and that cannot be corrected afterwards. Two ways to reach it, both here: a model
-// name a workload chose (ordinary non-ASCII), and a label this package rewrote itself,
-// where every replacement is a 3-byte U+FFFD and a byte cut has a two-in-three chance of
-// splitting one.
+// A plain byte slice halves a multi-byte rune straddling byte 96 and puts an invalid UTF-8
+// sequence into an append-only file that other tools parse and that cannot be corrected
+// afterwards. Two ways to reach it, both here: a model name a workload chose (ordinary
+// non-ASCII), and a label this package rewrote itself, where every replacement is a 3-byte
+// U+FFFD and a byte cut has a two-in-three chance of splitting one.
 //
 // THE BYTE CAP STAYS. It is what bounds the line length maxLabelLen exists to guarantee,
 // so the assertion is <= maxLabelLen bytes AND valid UTF-8 — not a rune count.
@@ -720,12 +717,12 @@ func TestWindow_ARestartInTheSameMinuteHidesNothingAlreadyCommitted(t *testing.T
 // The other side of that trade: a flush that lands in exactly the gap Window's
 // reconciliation exists for must still be counted ONCE.
 //
-// DRIVEN, not hand-seeded. This test used to write a row for the held minute straight
-// into the day file and assert that Window dropped it — a fixture that is
-// indistinguishable from the restart above, so it pinned the behaviour that hid $1.00.
-// betweenWindowReads lands a real flush between the memory read and the disk read
-// instead, which is the only state the drop was ever justified by, and the assertion
-// becomes about arithmetic rather than about a state nothing produced.
+// DRIVEN, NOT HAND-SEEDED, and it has to stay that way. Writing a row for the held minute
+// straight into the day file and asserting that Window dropped it is a fixture
+// indistinguishable from the restart above, so it pins the behaviour that hid $1.00.
+// betweenWindowReads lands a real flush between the memory read and the disk read instead —
+// the only state the drop is justified by — so the assertion is about arithmetic rather than
+// about a state nothing produced.
 func TestWindow_AFlushRacingTheReadIsCountedExactlyOnce(t *testing.T) {
 	dir := t.TempDir()
 	now := at
@@ -792,14 +789,14 @@ func TestQuery_ACancelledContextStopsTheReadBeforeAnyIO(t *testing.T) {
 	}
 }
 
-// J3, the case step 2 used to swallow: a disk row for a minute ABOVE the one held.
+// A disk row for a minute ABOVE the one held must survive the read.
 //
-// Step 2 dropped everything "at or after" the held minute, justified by the claim that
-// a concurrent flush could only produce rows the pending snapshot already had. False —
-// a flush landing between pending() and Query() can advance the writer several minutes,
-// and those newer minutes are on disk and NOT in a snapshot taken before them. Measured
-// as $1.00 dropped from $1.25. Two processes sharing cost_ledger.dir reach the same
-// state with no race at all, which the ~/.cortex/cost default makes plausible.
+// Dropping everything "at or after" the held minute rests on the claim that a concurrent
+// flush can only produce rows the pending snapshot already had. False — a flush landing
+// between pending() and Query() can advance the writer several minutes, and those newer
+// minutes are on disk and NOT in a snapshot taken before them. Measured as $1.00 dropped from
+// $1.25. Two processes sharing cost_ledger.dir reach the same state with no race at all,
+// which the ~/.cortex/cost default makes plausible.
 func TestWindow_KeepsADiskRowAboveTheHeldMinute(t *testing.T) {
 	dir := t.TempDir()
 	now := at
@@ -909,8 +906,8 @@ func TestFold_ByModelSumsToTotals(t *testing.T) {
 		t.Errorf("series sums to %d, residual is %d, totals is %d; a client cannot reconcile "+
 			"the table it was given with the figure above it", sum, ungrouped.Micros, totals.CostMicros)
 	}
-	// And the residual is not vacuously zero, which would make the identity above the
-	// tautology this test used to be.
+	// And the residual is not vacuously zero, which would make the identity above a
+	// tautology.
 	if ungrouped.Micros == 0 {
 		t.Fatal("the residual is zero, so the reconciliation above proves nothing")
 	}
@@ -1025,10 +1022,9 @@ func TestFold_GroupingsTheLedgerCannotAnswerReturnNoSeries(t *testing.T) {
 		if totals.CostMicros != 10 {
 			t.Errorf("group=%s totals.CostMicros = %d, want 10", g, totals.CostMicros)
 		}
-		// NO RESIDUAL, and this assertion used to demand the opposite: that an axis a
-		// persisted row cannot represent leaves the WHOLE total outside the breakdown, so
-		// the residual says "the series is short by everything". That is what shipped, and
-		// it made GET /v1/usage?window=today&group=status answer with series: null and
+		// NO RESIDUAL, and the opposite reading is the one that shipped: treating an axis a
+		// persisted row cannot represent as a breakdown short by everything made
+		// GET /v1/usage?window=today&group=status answer with series: null and
 		// ungroupedCostMicros equal to Totals.CostMicros — a response asserting that none of
 		// the money in it could be accounted for, over traffic where every dollar had an
 		// endpoint, a model and an agent. usage.Group.Reconcilable refuses GroupNone for
@@ -1047,10 +1043,9 @@ func TestFold_GroupingsTheLedgerCannotAnswerReturnNoSeries(t *testing.T) {
 	}
 }
 
-// THE RESIDUAL A PRICED ROW WITH NO MODEL LEAVES IN group=model, which nothing used to
-// disclose.
+// THE RESIDUAL A PRICED ROW WITH NO MODEL LEAVES IN group=model.
 //
-// The ledger now keeps a gateway-priced response the inference parser could not read —
+// The ledger keeps a gateway-priced response the inference parser could not read —
 // /v1/embeddings, /v1/rerank — and such a row is stored with Model "" because there was
 // no model on the wire. It counts toward the total, labelFor returns ok=false for it,
 // and so a client summing the group=model series got less than Totals.CostMicros with
@@ -1276,13 +1271,13 @@ func TestLedgerAndRingAgreeOnASpoofedUnknownAgent(t *testing.T) {
 	}
 }
 
-// TestQuery_TwoReadersDoNotSwapEachOthersCaveats is the fourth defect, and the reason
-// Caveats is a return value rather than two counters on the Writer.
+// TestQuery_TwoReadersDoNotSwapEachOthersCaveats is the reason Caveats is a return value
+// rather than two counters on the Writer.
 //
-// They used to be atomics set by whichever Query ran last, sampled by the caller in a
-// separate call — which is exactly what sessionapi does, once per /v1/usage request, on an
-// endpoint a chart polls. Measured on this fixture, with the reads INTERLEAVED and no
-// concurrency at all:
+// As atomics set by whichever Query ran last and sampled by the caller in a separate call —
+// which is exactly what sessionapi does, once per /v1/usage request, on an endpoint a chart
+// polls — this fixture produced the following with the reads INTERLEAVED and no concurrency
+// at all:
 //
 //	reader A read the day holding an undecodable line, then reported SkippedLines() = 0
 //	reader B read the CLEAN day, then reported SkippedLines() = 1
@@ -1302,8 +1297,8 @@ func TestQuery_TwoReadersDoNotSwapEachOthersCaveats(t *testing.T) {
 	writeDay(t, dir, clean, line(clean, "gw", "m", 1, 10, 5, 100))
 	w := newTestWriter(t, dir, func() time.Time { return base })
 
-	// A starts on the corrupt day, B answers from the clean one in between, A finishes.
-	// The interleaving that used to hand each the other's answer.
+	// A starts on the corrupt day, B answers from the clean one in between, A finishes: the
+	// interleaving that hands each reader the other's answer when the counts live on the Writer.
 	_, aCaveats, aErr := w.Query(context.Background(), base, base.Add(time.Hour))
 	if aErr != nil {
 		t.Fatalf("A Query: %v", aErr)

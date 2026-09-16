@@ -302,28 +302,20 @@ func assertBothPhasesName(t *testing.T, shape uaShape, evs []pipeline.SessionEve
 	}
 }
 
-// TestExtProc_ClientIsResolvedAtConstructionNotOnFirstUse is the ordering guard extproc
-// lacked while forwardproxy had it, over all four of this listener's Context-construction
-// sites — six of the ten `Client:` recording sites in the tree live behind them.
+// TestExtProc_ClientIsResolvedAtConstructionNotOnFirstUse is the ordering guard over all four
+// of this listener's Context-construction sites — six of the ten `Client:` recording sites in
+// the tree live behind them. forwardproxy's
+// TestForwardProxy_ClientIsResolvedAtConstructionNotOnFirstUse carries the full argument for
+// why the pin has to be at construction; the short version is that Context.ClientInfo memoizes
+// on FIRST CALL over headers plugins can write to, so without it the attribution of a request
+// is decided by whichever recorder asks first, AFTER the pipeline has had its way with the
+// header.
 //
-// Context.ClientInfo memoizes on FIRST CALL, and every call site in server.go is an
-// event-construction site downstream of the pipeline. pctx.Headers is the listener's own
-// copy of the wire headers and plugins write to it, so without the pin at construction the
-// attribution of a request is decided by whichever recorder asks first, AFTER the pipeline
-// has had its way with the header.
-//
-// This distinguishes the two: the plugin rewrites User-Agent to an agent that never made
-// the call, and every event must still name the one that did. It fails if the pin is
-// removed and equally if it is merely MOVED after Run — which is the whole difference
-// between "resolved once" and "resolved before anything can change it".
-//
-// The delete row is the same defect in the other direction: a plugin that removes the
-// header cannot turn a named agent into untagged traffic. Kept separate because a
-// "resolve later" bug that happens to preserve names could still lose them.
-//
-// Latent today (no plugin in the tree touches this header) and asserted anyway, because
-// the failure mode is silent: spend re-filed under another program's name, with nothing
-// in the event to say it happened.
+// Two mutations, because they fail independently. The rewrite row: the plugin names an agent
+// that never made the call, and every event must still name the one that did — which fails if
+// the pin is removed and equally if it is merely MOVED after Run. The delete row: a plugin
+// that removes the header cannot turn a named agent into untagged traffic, which a "resolve
+// later" bug that happens to preserve names could still do.
 func TestExtProc_ClientIsResolvedAtConstructionNotOnFirstUse(t *testing.T) {
 	const sentUA = "claude-cli/2.1.14 (external, cli)"
 

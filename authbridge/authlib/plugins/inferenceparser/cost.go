@@ -51,6 +51,17 @@ import (
 // The guard is therefore load-bearing on the shipped configuration; only its old
 // explanation was wrong.
 //
+// AND THAT REPETITION IS NOW GATED AT THE LISTENER, which changes what this guard is for
+// rather than making it redundant. extproc dispatches the terminal frame only on the body
+// message carrying end_of_stream, because the per-message version was worse than a double
+// charge: the FIRST message of an Anthropic stream holds message_start alone, so it
+// finalized into a floor, THIS LATCH PINNED IT, and the pass carrying message_delta was
+// short-circuited — the output tokens went unbilled by the very guard added to stop a
+// double charge. A latch cannot distinguish a repeated dispatch from a continuing one, so
+// the fix belonged where the repetition is decided. What remains this guard's job is a
+// terminal frame repeated by ANY listener, which is a property no plugin can verify from
+// the inside.
+//
 // A NIL Extensions.Inference IS A SUPPORTED INPUT, and that is the whole reason this
 // guard reads the way it does. It used to return on nil, which silently made "this
 // parser understood the request" the precondition for charging anything — so

@@ -70,6 +70,11 @@ func (s *Server) Process(stream extprocv3.ExternalProcessor_ProcessServer) error
 	var pctx *pipeline.Context
 	var requestDirection string
 
+	// sawResponseBody says at least one ResponseBody message arrived, which is what makes
+	// the flush in the deferred block below meaningful: it distinguishes "the response
+	// body never finished" from "there was no response".
+	var sawResponseBody bool
+
 	// Finisher dispatch runs once when Process returns — stream end is
 	// Envoy's signal that the request is finalized (response sent or
 	// abandoned). A stream that never reached Run (no RequestHeaders
@@ -82,6 +87,24 @@ func (s *Server) Process(stream extprocv3.ExternalProcessor_ProcessServer) error
 		p := s.OutboundPipeline
 		if requestDirection == "inbound" {
 			p = s.InboundPipeline
+		}
+		// THE FALLBACK FOR A RESPONSE WHOSE LAST BODY MESSAGE NEVER SAID end_of_stream, and
+		// the reason gating on that flag is safe at all. Envoy sets it on the final body
+		// message — but not when TRAILERS follow, and this server asks for no trailer phase,
+		// so the flag can legitimately never arrive. Without this, such a response would
+		// never finalize and never be recorded: its cost would reach no ledger, which is a
+		// strictly worse failure than the double-count the gate exists to remove.
+		//
+		// Stream end is Envoy's own statement that the transaction is over, so it is both
+		// the last safe point to finalize and a point that is always reached.
+		if sawResponseBody && !responseWasRecorded(pctx) {
+			if p.HasStreamingResponders() {
+				// Terminal frame, so the parsers settle from whatever state they
+				// accumulated. Rejecting here would be pointless — the response has
+				// already gone downstream — so the action is deliberately dropped.
+				p.RunResponseFrame(ctx, pctx, nil, true)
+			}
+			s.recordResponseSession(pctx, requestDirection)
 		}
 		p.RunFinish(ctx, pctx, pipeline.OutcomeFromContext(pctx))
 	}()
@@ -147,7 +170,13 @@ func (s *Server) Process(stream extprocv3.ExternalProcessor_ProcessServer) error
 				r.ResponseHeaders.GetEndOfStream())
 
 		case *extprocv3.ProcessingRequest_ResponseBody:
-			resp = s.handleResponseBody(ctx, r.ResponseBody.Body, pctx, requestDirection)
+			sawResponseBody = true
+			// end_of_stream carried through for the same reason the response-header phase
+			// above carries it: it is the only thing that distinguishes the last chunk of a
+			// body from a middle one, and everything that must happen exactly once per
+			// response hangs off that distinction.
+			resp = s.handleResponseBody(ctx, r.ResponseBody.Body, pctx, requestDirection,
+				r.ResponseBody.GetEndOfStream())
 
 		default:
 			resp = &extprocv3.ProcessingResponse{}
@@ -672,11 +701,7 @@ func (s *Server) handleResponseHeaders(ctx context.Context, headers *corev3.Head
 	// No body phase will run; record the response event here. A2A responses
 	// need the body to extract contextId, so the rekey path is body-only;
 	// skip it on this header-only path.
-	if direction == "inbound" {
-		s.recordInboundResponseSession(pctx)
-	} else {
-		s.recordOutboundResponseSession(pctx)
-	}
+	s.recordResponseSession(pctx, direction)
 
 	return &extprocv3.ProcessingResponse{
 		Response: &extprocv3.ProcessingResponse_ResponseHeaders{
@@ -685,7 +710,48 @@ func (s *Server) handleResponseHeaders(ctx context.Context, headers *corev3.Head
 	}
 }
 
-func (s *Server) handleResponseBody(ctx context.Context, body []byte, pctx *pipeline.Context, direction string) *extprocv3.ProcessingResponse {
+// responseRecordedKey and responseRecorded mark this request's response event as appended.
+const responseRecordedKey = "extproc.response-recorded"
+
+type responseRecorded struct{}
+
+// responseWasRecorded reports whether the response session event has already been appended.
+func responseWasRecorded(pctx *pipeline.Context) bool {
+	return pipeline.GetState[responseRecorded](pctx, responseRecordedKey) != nil
+}
+
+// recordResponseSession appends the response session event, AT MOST ONCE per request.
+//
+// THE COUNT IS MONEY, which is why the guard is here rather than at each caller. This
+// listener runs the whole buffered dispatch — terminal frame included — once per
+// ResponseBody message it receives (handleResponseBody -> dispatchBufferedFrames), and it
+// appended a response event at the end of each one. The cost record lives in
+// pctx.Extensions.Custom and is never cleared, so SnapshotPlugins serialised the SAME
+// figure into every one of those events, and the aggregator and the ledger summed them: one
+// request charged N times, where N is however many body messages Envoy chose to send.
+//
+// Reachable only OFF the shipped configuration — buffered mode delivers one message with
+// end_of_stream set — but "reachable only when Envoy is configured differently" is not a
+// guarantee this process makes, and a statically configured STREAMED response body mode or
+// a filter with allow_mode_override off produces it. See the ModeOverride this server asks
+// for in handleResponseHeaders, which is a request and not a contract.
+//
+// The guard is a pctx state entry rather than a local in Process because the header-only
+// path records too: a 204 records from handleResponseHeaders, and the flush at stream end
+// must be able to see that it already happened.
+func (s *Server) recordResponseSession(pctx *pipeline.Context, direction string) {
+	if responseWasRecorded(pctx) {
+		return
+	}
+	pipeline.SetState(pctx, responseRecordedKey, &responseRecorded{})
+	if direction == "inbound" {
+		s.recordInboundResponseSession(pctx)
+	} else {
+		s.recordOutboundResponseSession(pctx)
+	}
+}
+
+func (s *Server) handleResponseBody(ctx context.Context, body []byte, pctx *pipeline.Context, direction string, endOfStream bool) *extprocv3.ProcessingResponse {
 	if pctx == nil {
 		return &extprocv3.ProcessingResponse{
 			Response: &extprocv3.ProcessingResponse_ResponseBody{
@@ -717,7 +783,7 @@ func (s *Server) handleResponseBody(ctx context.Context, body []byte, pctx *pipe
 	// event arrives as its own frame; otherwise dispatch the whole
 	// body as one last=true frame.
 	if p.HasStreamingResponders() {
-		if frameAction := dispatchBufferedFrames(ctx, p, pctx); frameAction.Type == pipeline.Reject {
+		if frameAction := dispatchBufferedFrames(ctx, p, pctx, endOfStream); frameAction.Type == pipeline.Reject {
 			return rejectFromAction(frameAction)
 		}
 	}
@@ -730,10 +796,13 @@ func (s *Server) handleResponseBody(ctx context.Context, body []byte, pctx *pipe
 	// the real contextId rather than being orphaned in "default".
 	s.rekeyInboundSession(pctx, direction)
 
-	if direction == "inbound" {
-		s.recordInboundResponseSession(pctx)
-	} else {
-		s.recordOutboundResponseSession(pctx)
+	// ONLY ON THE LAST BODY MESSAGE. Envoy sends one per chunk in a streamed response body
+	// mode, and this used to append a session event at the end of every one — each carrying
+	// the same cost record, because that record sits in pctx.Extensions.Custom and is never
+	// cleared. See recordResponseSession, and the flush in Process for the case where
+	// end_of_stream never arrives.
+	if endOfStream {
+		s.recordResponseSession(pctx, direction)
 	}
 
 	// A plugin that declared WritesResponseBody: true and called pctx.SetResponseBody
@@ -1075,7 +1144,26 @@ func getHeader(headers *corev3.HeaderMap, key string) string {
 // sseframe so each event arrives as its own non-last frame followed
 // by a final last=true — matches the per-message dispatch shape
 // streaming-aware plugins expect.
-func dispatchBufferedFrames(ctx context.Context, p *pipeline.Holder, pctx *pipeline.Context) pipeline.Action {
+// last says this body message is the final one, so the terminal frame belongs on it.
+//
+// THE SSE ARM IS THE ONE THAT NEEDED IT, and only that arm takes it, deliberately. A
+// streamed SSE body arrives as several ResponseBody messages, and this function used to end
+// each one with a terminal frame — so every parser FINALIZED per message. On the Anthropic
+// dialect the first message holds message_start alone: prompt counted, output not, no stop
+// reason. That finalizes into a floor, the parser's settle latch pins it, and the pass that
+// finally carries message_delta is short-circuited by the very guard added to stop a double
+// charge. The output tokens — the expensive half, at 10x burndown on Bedrock — were then
+// never billed. Folding the earlier messages with last=false instead lets the state
+// accumulate and leaves exactly one finalization, with the whole figure.
+//
+// The NON-SSE arm keeps its unconditional terminal frame. Its cost comes off the response
+// HEADERS, which are identical on every pass, so the latch pinning the first figure costs
+// nothing there — and a partial JSON body folded as an SSE chunk would parse as nothing and
+// then send the last message down the streaming arm, which is a different answer to a
+// question this change is not about. Multi-message non-SSE bodies are mis-parsed either way;
+// that is a separate gap, and widening the blast radius of a money fix to touch it would be
+// the wrong trade.
+func dispatchBufferedFrames(ctx context.Context, p *pipeline.Holder, pctx *pipeline.Context, last bool) pipeline.Action {
 	contentType := pctx.ResponseHeaders.Get("Content-Type")
 	if isEventStream(contentType) && len(pctx.ResponseBody) > 0 {
 		reader := sseframe.NewReader(bytes.NewReader(pctx.ResponseBody), maxBodySize)
@@ -1091,6 +1179,11 @@ func dispatchBufferedFrames(ctx context.Context, p *pipeline.Holder, pctx *pipel
 			if action := p.RunResponseFrame(ctx, pctx, frame, false); action.Type == pipeline.Reject {
 				return action
 			}
+		}
+		if !last {
+			// More body to come. The scratch a StreamingResponder allocated on those frames
+			// survives on pctx, so the next message continues the same stream.
+			return pipeline.Action{Type: pipeline.Continue}
 		}
 		return p.RunResponseFrame(ctx, pctx, nil, true)
 	}

@@ -88,10 +88,9 @@ func (p *InferenceParser) OnRequest(_ context.Context, pctx *pipeline.Context) p
 	}
 	if ext == nil {
 		// "no telemetry", not "skipping": this request is still charged if the gateway
-		// says it cost something. The old wording ("no/invalid body, skipping") described
-		// the whole request as dropped, which is what the code used to do and is now the
-		// wrong half of what it does — an operator reading it while hunting for missing
-		// spend would rule out the one path that still records some.
+		// says it cost something. Wording that describes the whole request as dropped would
+		// make an operator hunting for missing spend rule out the one path that still
+		// records some.
 		slog.Debug("inference-parser: no/invalid body; no request telemetry, response still priced from the gateway header", "path", pctx.Path)
 		return pipeline.Action{Type: pipeline.Continue}
 	}
@@ -162,6 +161,11 @@ func (p *InferenceParser) OnResponse(_ context.Context, pctx *pipeline.Context) 
 		// Priced anyway. Same rule as the OnResponseFrame guard below, which carries the
 		// full argument: whether this parser understood the REQUEST decides what can be
 		// parsed, never what the gateway may charge.
+		//
+		// DEFENCE IN DEPTH, NOT THE LIVE PATH. RunResponse skips this plugin (see the method
+		// doc), so under every listener the arm that actually settles a nil-extension
+		// response is OnResponseFrame's. This one answers identically for a direct caller,
+		// and would become live the day this plugin stops being a StreamingResponder.
 		p.settleCost(pctx)
 		return pipeline.Action{Type: pipeline.Continue}
 	}
@@ -175,10 +179,14 @@ func (p *InferenceParser) OnResponse(_ context.Context, pctx *pipeline.Context) 
 		// gateway reports its own post-discount figure in a RESPONSE HEADER, and
 		// costing.Settle prefers that figure over anything modelled from token
 		// counters — so a LiteLLM-costed response whose body was empty or
-		// unrecognised is real spend. Returning before settleCost dropped it
+		// unrecognised is real spend. Returning without settling would drop it
 		// entirely: no cost record, nothing in the aggregator's dollar total, and
-		// nothing in litellm-budget-track's ledger, so the money escaped the budget
-		// as well as the chart.
+		// nothing in litellm-budget-track's ledger — money escaping the budget as
+		// well as the chart.
+		//
+		// DEFENCE IN DEPTH, like the nil-extension arm above: RunResponse skips this
+		// plugin, so the settle that closes that path for a real listener is
+		// OnResponseFrame's. This keeps a direct caller's answer identical.
 		//
 		// This cannot flood the aggregate with settled zeros. With no body there are
 		// no token counters, and pricing.Cost refuses an all-zero Usage as UNPRICED
@@ -309,10 +317,14 @@ func (p *InferenceParser) OnResponseFrame(_ context.Context, pctx *pipeline.Cont
 		// On last only, so an unparsed endpoint settles where every other path does — at
 		// end of stream — rather than on whichever frame arrived first. Both proxy listeners
 		// always terminate with RunResponseFrame(..., nil, true), so the arm is reached
-		// whenever a response has any body phase at all. On extproc it is reached from the
-		// body phase only: for a response with NO body that listener dispatches nothing —
-		// see TestCapabilities_ReadsBodyDecidesTheExtprocBranch, which names the gap and
-		// where it has to be closed.
+		// whenever a response has any body phase at all.
+		//
+		// ON EXTPROC IT IS REACHED WITH OR WITHOUT A BODY. A response Envoy ends on headers
+		// — a 204, a 304, an error status — has no body phase for the arm to hang off, so
+		// that listener dispatches the terminal frame from its HEADERS phase when
+		// end_of_stream is set (see its `NeedsBody() && !endOfStream` gate), and its deferred
+		// flush covers a stream torn down before any end-of-stream arrives at all. Between
+		// them the arm is reached on every shape either listener can produce.
 		//
 		// No Skip and no Observe row: the body may be perfectly fine and simply not ours,
 		// so "no_response_body" would be a false diagnostic, and there is no model to name
@@ -331,9 +343,9 @@ func (p *InferenceParser) OnResponseFrame(_ context.Context, pctx *pipeline.Cont
 	// text/event-stream gets one call per SSE event followed by a terminal empty
 	// last=true, anything else gets a single last=true frame holding the whole body
 	// (reverseproxy.modifyResponse, forwardproxy.serveOutbound,
-	// extproc.dispatchBufferedFrames). This used to switch on ext.Stream, which comes off
-	// the REQUEST — so the two disagreed whenever the response's shape was not the one the
-	// request asked for, and the parser then ran the wrong arm over the listener's frames:
+	// extproc.dispatchBufferedFrames). DO NOT switch this on ext.Stream, which comes off the
+	// REQUEST: the two disagree whenever the response's shape is not the one the request asked
+	// for, and the parser then runs the wrong arm over the listener's frames:
 	//
 	//   - Streamed response, non-streaming request: every folded frame was thrown away.
 	//     The terminal frame took the one-shot arm, found it empty, recorded a
@@ -415,9 +427,10 @@ func (p *InferenceParser) OnResponseFrame(_ context.Context, pctx *pipeline.Cont
 		// identical guard: a positive gateway cost header needs no body at all.
 		//
 		// This is the arm a genuinely body-less response takes in production — a 204/304,
-		// or an error status ended on headers. It is reached whatever the request asked
-		// for, which is the point: a header-only reply to a streaming request used to land
-		// on the streaming arm and be described there as an "empty stream".
+		// or an error status ended on headers. It is reached whatever the request asked for,
+		// which is the point: keyed on the request instead, a header-only reply to a
+		// streaming request lands on the streaming arm and is described as an "empty
+		// stream".
 		p.settleCost(pctx)
 		return pipeline.Action{Type: pipeline.Continue}
 	}

@@ -30,9 +30,9 @@ import (
 // a future adapter for a gateway that reports cost differently needs to say which of these
 // it is standing in for.
 //
-// MEASURED 2026-09-11 against ete-litellm (LiteLLM 1.85.5), because an earlier version of
-// this comment had the semantics backwards and a reviewer reasonably concluded from it
-// that drift detection would false-positive on every Anthropic-format request:
+// MEASURED 2026-09-11 against ete-litellm (LiteLLM 1.85.5), because the semantics are easy
+// to state backwards — and stated backwards, they read as though drift detection would
+// false-positive on every Anthropic-format request:
 //
 //	/v1/chat/completions  both headers present, IDENTICAL values
 //	/v1/messages          only "-original", same value the other path reports
@@ -327,8 +327,9 @@ type Settled struct {
 	// separately, so two rounded halves need not sum to the rounded whole. costing_test.go
 	// uses a 1e-6 tolerance for exactly this reason.
 	//
-	// This paragraph used to open by claiming equality "to the micro, by construction" and
-	// then deny it two lines later. The denial was the true half.
+	// So this is NOT equality "to the micro, by construction" — a tempting way to state it
+	// that the rounding above contradicts.
+	//
 	// Neither sums to CostUSD, which may be the gateway's; comparing their sum against a
 	// reported total is a drift measurement, and ModelledUSD is the figure kept for it.
 	OutputUSD float64

@@ -10,8 +10,15 @@
 // Dependency-light on purpose: the aggregator links this on every build,
 // including the trimmed "lite" images that exclude the plugin entirely. authlib/pricing
 // is the one non-pipeline dependency, for the single micros bound both packages must
-// agree on (see Micros); every importer of this package already links it, so nothing
-// grew a new transitive dependency.
+// agree on (see Micros).
+//
+// THAT EDGE ADDS NOTHING ANYWHERE, and the check is `go list -deps`, not a grep for a
+// direct import — the difference matters, because abctl imports pricing through NEITHER of
+// its costevent files. Every module that links this package already linked pricing before
+// the edge existed: authlib and authbridge-proxy price traffic, and abctl reaches it
+// transitively through authlib/usage and authlib/config. A grep under cmd/abctl finds no
+// direct import and reads like a new dependency; `go list -deps ./...` in that module shows
+// pricing on both sides of the change.
 package costevent
 
 import (
@@ -101,12 +108,12 @@ type Event struct {
 
 	// Settled marks a figure the producer settled deliberately, INCLUDING zero.
 	//
-	// Cost of zero used to be indistinguishable from "no figure": litellm-budget-track
-	// charges nothing for a gateway that reported a present 0 cost — a genuine free
-	// call, a cache hit or an error — and then emitted no event, because it gates on
-	// cost > 0. Decode rejected CostUSD <= 0 for the same reason. So the usage
-	// aggregator saw nothing, fell through to its rate table, and FABRICATED a cost
-	// for a call the gateway had explicitly declared free, counting it as priced.
+	// A COST OF ZERO MUST NOT READ AS "NO FIGURE". Gate a producer on cost > 0 — as
+	// litellm-budget-track's own charging does — and a gateway that reported a present 0
+	// (a genuine free call, a cache hit, an error) emits no event at all; have Decode
+	// reject CostUSD <= 0 and the same figure disappears on the read side. The usage
+	// aggregator then sees nothing, falls through to its rate table, and FABRICATES a cost
+	// for a call the gateway explicitly declared free, counting it as priced.
 	//
 	// A settled zero is now a real answer that suppresses the fallback.
 	Settled bool `json:"settled,omitempty"`
@@ -271,9 +278,8 @@ func (e Event) TotalAvoidedUSD() float64 {
 // to −2 micros — an aggregate that then sat in the durable ledger for thirty days
 // with no repair path.
 //
-// The bound removed the SATURATION, not the wrap: 1024 figures at the bound still wrap
-// the same sum, and no per-request bound can fix that. See MaxCostMicros, which used to
-// claim otherwise.
+// The bound removes the SATURATION, not the wrap: 1024 figures at the bound still wrap the
+// same sum, and no per-request bound can fix that — see MaxCostMicros.
 //
 // Zero for an out-of-range figure, and Priced returns false for the same one, so no
 // consumer reaches this value believing it is a price. NOT clamped to the bound: a

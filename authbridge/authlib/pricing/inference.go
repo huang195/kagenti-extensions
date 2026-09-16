@@ -118,11 +118,11 @@ const (
 // pipeline.InferenceExtension.PresentKinds a plain uint8 with the layout written into
 // its doc comment.
 //
-// NOTHING IN THIS FILE READS THE MASK ANY MORE. Both predicates that used to were
-// dialect-unreliable — see outputUncounted's block comment and the call site of
-// totalsOnly. The two bits stay declared because the tests that assert what the mask
-// CANNOT discriminate need names for them, and a fixture built from bare shifts would
-// stop saying which kinds it means.
+// NO PREDICATE IN THIS FILE READS THE MASK, and none should: it is dialect-unreliable for
+// both questions asked here — see outputUncounted's block comment and the call site of
+// totalsOnly. The two bits stay declared because the tests that assert what the mask CANNOT
+// discriminate need names for them, and a fixture built from bare shifts would stop saying
+// which kinds it means.
 const (
 	presentInput  uint8 = 1 << 0 // parsercommon.KindInput
 	presentOutput uint8 = 1 << 3 // parsercommon.KindOutput
@@ -162,9 +162,9 @@ func IncompleteReason(inf *pipeline.InferenceExtension) string {
 	// only total_tokens. Gated on the total because with no counters at all there is no
 	// figure to qualify — costing publishes nothing for that request.
 	//
-	// THE COUNTERS ARE THE INSTRUMENT HERE, NOT THE PRESENCE MASK. This used to read
-	// `PresentKinds&(presentInput|presentOutput) == 0`, which asked a question neither the
-	// reason nor the arithmetic is about, and got it wrong in both directions:
+	// THE COUNTERS ARE THE INSTRUMENT HERE, NOT THE PRESENCE MASK. Do not rewrite this as
+	// `PresentKinds&(presentInput|presentOutput) == 0`: that asks a question neither the
+	// reason nor the arithmetic is about, and gets it wrong in both directions:
 	//
 	//	FALSE POSITIVE  A response reporting only cache counts has the Input and Output bits
 	//	                clear, so the mask called it "no split at all" — while a split
@@ -203,10 +203,10 @@ func totalsOnly(inf *pipeline.InferenceExtension) bool {
 // outputUncounted reports the floor case: a prompt was counted, the output tally cannot be
 // shown to be final, and the provider never said why it stopped.
 //
-// "CANNOT BE SHOWN TO BE FINAL" RATHER THAN "IS ZERO", which is the correction below. The
-// function used to return "complete" on any non-zero output tally, before consulting the
-// stop reason at all — so it answered "was anything counted" when the question is "is what
-// was counted all there is".
+// "CANNOT BE SHOWN TO BE FINAL" RATHER THAN "IS ZERO", and the difference is the whole
+// predicate. Returning "complete" on any non-zero output tally answers "was anything
+// counted" when the question is "is what was counted all there is" — which calls a truncated
+// stream exact.
 func outputUncounted(inf *pipeline.InferenceExtension) bool {
 	// THE DISCRIMINATOR, and it is deliberately not the Output presence bit.
 	//
@@ -249,9 +249,9 @@ func outputUncounted(inf *pipeline.InferenceExtension) bool {
 	// A COUNTED OUTPUT IS NOT A FINAL ONE ON A STREAM, and treating the two as identical
 	// re-entered the defect this whole function exists to catch — from the opposite side.
 	//
-	// The early return here used to be unconditional: `OutputTokens > 0 -> return false`,
-	// placed ABOVE the stop reason, so a non-zero tally ended the question. That is right
-	// for a body that arrived whole and wrong for one still arriving. foldOpenAIFrame
+	// DO NOT HOIST THIS ABOVE THE STOP REASON, and do not make it unconditional:
+	// `OutputTokens > 0 -> return false` ends the question on a non-zero tally, which is
+	// right for a body that arrived whole and wrong for one still arriving. foldOpenAIFrame
 	// REPLACES the accumulated usage with each usage-bearing chunk's totals, under a comment
 	// stating why — "OpenAI streams cumulative usage: each usage-bearing chunk restates the
 	// full totals" — so on that shape a mid-generation tally is a RUNNING total. A stream of
@@ -286,6 +286,14 @@ func outputUncounted(inf *pipeline.InferenceExtension) bool {
 	// total includes the completion, so it is the approximate case above, not this one.
 	// PromptTokens is checked alongside the split because Fill derives it from them, and
 	// a producer that set only one of the two should still be read.
+	//
+	// NOT GATED ON Stream, UNLIKE THE BRANCH ABOVE, and the asymmetry is deliberate rather
+	// than an oversight. Up there a counted output on a non-streamed response is FINAL — the
+	// body arrived whole — so flagging it would print the caveat over exact money. Here there
+	// is no output count at all and no stop reason, on a response that reported what the
+	// prompt cost: whether or not the request asked for a stream, the completion is unaccounted
+	// for, and "at least this much" is the only claim the data supports. A predicate whose job
+	// is to under-claim precision takes the safe direction when the two arguments disagree.
 	return inf.PromptTokens > 0 || inf.InputTokens > 0 ||
 		inf.CacheReadTokens > 0 || inf.CacheWriteTokens > 0
 }

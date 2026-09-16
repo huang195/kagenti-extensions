@@ -3,8 +3,8 @@ package pricing
 import "math"
 
 // MaxCostMicros bounds ONE request's conversion into the micros unit. It is a
-// REPRESENTABILITY bound and nothing more — see "what it does not bound" below, which is
-// the half an earlier version of this comment got wrong.
+// REPRESENTABILITY bound and nothing more — see "what it does not bound" below, which is the
+// half that is easy to overstate.
 //
 // float64 counts every integer exactly only up to 2^53, so a total beyond that cannot
 // round-trip through int64 meaningfully even when it fits. $9 billion for one request
@@ -17,12 +17,11 @@ import "math"
 // ledger row was expected. A second bound declared over there would be free to drift from
 // this one; there is only ever one answer to "past which figure is this a bug".
 //
-// WHAT IT DOES NOT BOUND: THE ACCUMULATED SUM. This comment used to claim it closed the
-// aggregate wrap — "two such requests wrapped usage.Counts.Add to a NEGATIVE total" — and
-// that overclaimed. It moved the threshold; it did not remove it. math.MaxInt64 /
-// MaxCostMicros is 1023, so 1024 requests each priced at the bound would wrap Counts.Add
-// to a large negative total (measured: -9214364837600034816), which then sat in the
-// durable ledger for its full retention with no repair path.
+// WHAT IT DOES NOT BOUND: THE ACCUMULATED SUM. A per-request bound moves that threshold; it
+// does not remove it. math.MaxInt64 / MaxCostMicros is 1023, so 1024 requests each priced at
+// the bound wrap usage.Counts.Add to a large negative total (measured:
+// -9214364837600034816), which then sits in the durable ledger for its full retention with no
+// repair path.
 //
 // NO per-request bound can close that, and the arithmetic says so in one line: for any
 // bound C > 0 the sum wraps after ceil(math.MaxInt64/C) requests, and nothing here bounds
@@ -30,20 +29,20 @@ import "math"
 // ACCUMULATE where the sum is kept, which is a different package's invariant and not this
 // constant's to hold. TestNoPerRequestBoundClosesTheAccumulationWrap pins that reasoning.
 //
-// AND IT IS NOW CLOSED THERE, so read the paragraph above as arithmetic rather than as an
-// open defect: usage.Counts.Add routes every field through a checked accumulate that
-// saturates instead of wrapping and sets Counts.Saturated to disclose that the figure has
-// become a floor. What remains true is the part this constant is responsible for — a
-// per-request bound cannot do it, and pushing MaxCostMicros lower would not have.
+// AND IT IS CLOSED THERE BY THE AGGREGATE WORK LATER IN THIS SERIES, not here and not yet:
+// usage.Counts.Add will route every field through a checked accumulate that saturates
+// instead of wrapping, and disclose on the totals that the figure has become a floor. None
+// of that exists at this commit — read the paragraph above as an open defect until it lands.
+// What is settled either way is the part this constant is responsible for: a per-request
+// bound cannot close an accumulation wrap, and pushing MaxCostMicros lower would not have.
 //
 // EXCLUSIVE: a figure of exactly MaxCostMicros is out of range (MicrosFromUSD rejects
 // `micros >= MaxCostMicros`). 2^53 is the first integer whose successor float64 cannot
 // represent, so it is the one value in the range whose neighbourhood is two micros wide —
 // 2^53+1 rounds back onto it, which makes an out-of-range figure indistinguishable from an
 // in-range one at exactly that point. Excluding it makes "accepted" mean "exactly
-// representable and distinct from its neighbours", which is the property the bound was
-// chosen for to begin with. The doc said "above MaxCostMicros" is out of range while the
-// code admitted the edge; the doc was the true half.
+// representable and distinct from its neighbours", which is the property the bound was chosen
+// for to begin with.
 const MaxCostMicros = 1 << 53
 
 // The plausibility ceiling for ONE inference call, and the two figures it is derived from.
@@ -78,12 +77,11 @@ const (
 	// the table but the dearest rate a legitimate config can PRODUCE from it: 7.5e-05 x 10
 	// = 7.5e-04/token, against a ceiling of 1e-03. That is 1.33x of headroom.
 	//
-	// The comment used to claim the 13x and stop there, which overstated its own
-	// protection: a $100/Mtok model at a 10x markup reaches the cap, and
-	// TestMaxPlausibleRequestCostMicros_Derivation only ever scanned the raw Bundled()
-	// rates, so it would have gone green while it happened. It now applies maxMultiplier
-	// to the scan, and fails when the REAL headroom is exhausted rather than when the raw
-	// rate is.
+	// THE 13x IS NOT THE HEADROOM, and quoting it alone overstates this bound: a $100/Mtok
+	// model at a 10x markup reaches the cap. TestMaxPlausibleRequestCostMicros_Derivation
+	// therefore applies maxMultiplier to its scan of Bundled(), so it fails when the REAL
+	// headroom is exhausted rather than when the raw rate is — a scan of the raw rates alone
+	// would stay green through it.
 	//
 	// 1.33x is thin but it is not the number to raise on its own: this ceiling times
 	// maxPlausibleTokens is what gives the cap three orders of magnitude over the worst
@@ -150,9 +148,9 @@ func PlausibleRequestCostUSD(usd float64) bool {
 // MicrosFromUSD converts a dollar figure to integer micros — millionths of a dollar —
 // reporting false when the result is not a usable ledger figure.
 //
-// The one conversion, because there is one bound. Both callers previously wrote
-// `int64(math.Round(usd * 1e6))` by hand and only this package's checked the range;
-// see MaxCostMicros for what the unchecked one produced.
+// The one conversion, because there is one bound. `int64(math.Round(usd * 1e6))` written by
+// hand at a call site is the shape this replaces — unchecked, it saturates to MaxInt64 and
+// puts a garbage figure where a ledger row is expected; see MaxCostMicros.
 //
 // ok is false for NaN, an infinity, a negative figure, or anything AT OR ABOVE
 // MaxCostMicros. A caller must treat that as UNPRICED and not as a large number: a
@@ -216,10 +214,12 @@ func MicrosFromUSD(usd float64) (int64, bool) {
 //     counts arrived here and was believed, bounded only by MaxCostMicros, which is
 //     $9 billion. So one response could have its tokens called impossible and its
 //     dollars kept, in the same aggregate, side by side in the same client.
-//     Bounding the COUNTS rather than the resulting figure is deliberate: it names
-//     the cause, and it makes the cost bound follow arithmetically, since
-//     MaxPlausibleRequestCostMicros IS maxPlausibleTokens times the dearest
-//     plausible per-token rate.
+//   - A modelled figure past MaxPlausibleRequestCostMicros ($10,000), which is the
+//     ceiling a gateway's own figure is already held to. Bounding the counts does NOT
+//     make this bound follow arithmetically, tempting as that reading is: the token
+//     check is per TIER, so a request can carry maxPlausibleTokens several times over,
+//     and a base rate has no magnitude bound at all. The two are checked separately
+//     because neither implies the other.
 //   - No rates at all, which is the ProvNone case reaching here directly.
 //   - A rate that is negative or non-finite, wherever it came from. Trusting the
 //     rate while checking the count would let a hostile or buggy producer emit
@@ -245,10 +245,10 @@ func Cost(r Rates, u Usage) (int64, bool) {
 		if !eff.Set[i] {
 			return 0, false
 		}
-		// The RATE is validated here, not only at config time. Cost previously
-		// checked the token count and trusted the rate, so a negative rate yielded
-		// ok=true with negative micros, +Inf yielded MaxInt64, and NaN was
-		// architecture-dependent. Only config.Build validated rates, which leaves
+		// The RATE is validated here, not only at config time. Checking the token
+		// count and trusting the rate is not enough: a negative rate yields ok=true
+		// with negative micros, +Inf yields MaxInt64, and NaN is
+		// architecture-dependent. config.Build validates rates it loads, which leaves
 		// every other producer unguarded — including the ProvDiscovered /model/info
 		// path, where the numbers come from a remote gateway.
 		if r := eff.Base[i]; r < 0 || math.IsNaN(r) || math.IsInf(r, 0) {
@@ -260,5 +260,24 @@ func Cost(r Rates, u Usage) (int64, bool) {
 	// but a finite rate times a large token count still accumulates past int64: the
 	// conversion would then be undefined and return ok=true with a garbage ledger
 	// figure, which is worse than reporting the request unpriced.
-	return MicrosFromUSD(usd)
+	micros, ok := MicrosFromUSD(usd)
+	if !ok {
+		return 0, false
+	}
+	// AND HELD TO THE SAME PER-REQUEST CEILING AS A GATEWAY'S OWN FIGURE. MicrosFromUSD
+	// alone bounds this at MaxCostMicros — $9 billion, the figure this file calls a garbage
+	// ledger figure — while costing applies PlausibleRequestCostUSD ($10,000) to the header
+	// path. Two ways to reach the gap: the token check above is PER TIER, so a request can
+	// carry maxPlausibleTokens several times over, and a base RATE has no magnitude bound at
+	// all (config.Build validates only sign and finiteness, and the ProvDiscovered
+	// /model/info path is not config). So an operator typo or a remote gateway's number
+	// could produce a modelled figure between $10,000 and $9 billion, priced and settled,
+	// where the same figure in a response header would have been refused and named.
+	//
+	// Refused rather than clamped, like every other implausible input here: the request
+	// stays priceable-and-unpriced, which is a coverage gap a client already renders.
+	if micros > MaxPlausibleRequestCostMicros {
+		return 0, false
+	}
+	return micros, true
 }

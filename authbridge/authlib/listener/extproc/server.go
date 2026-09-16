@@ -99,10 +99,21 @@ func (s *Server) Process(stream extprocv3.ExternalProcessor_ProcessServer) error
 		// the last safe point to finalize and a point that is always reached.
 		if sawResponseBody && !responseWasRecorded(pctx) {
 			if p.HasStreamingResponders() {
-				// Terminal frame, so the parsers settle from whatever state they
-				// accumulated. Rejecting here would be pointless — the response has
-				// already gone downstream — so the action is deliberately dropped.
-				p.RunResponseFrame(ctx, pctx, nil, true)
+				// DETACHED FROM THE STREAM'S CONTEXT, which is the difference between this
+				// flush working and only appearing to. ctx here is stream.Context(), and the
+				// case this whole block exists for — Envoy tearing the stream down on a client
+				// hangup, a filter timeout or a shutdown — is precisely the case where that
+				// context is already done. RunResponseFrame refuses a cancelled context before
+				// it calls any plugin, so on the teardown path the terminal frame would be a
+				// no-op: the parsers keep their accumulated counters, nothing settles, and the
+				// request's spend reaches no aggregate, no ledger and no budget. Same reasoning
+				// and same fix as forwardproxy's finish path and the reverse proxy's finalCtx;
+				// RunFinish below needs no wrapper because dispatchFinish detaches internally.
+				//
+				// Terminal frame, so the parsers settle from whatever state they accumulated.
+				// Rejecting here would be pointless — the response has already gone downstream —
+				// so the action is deliberately dropped.
+				p.RunResponseFrame(context.WithoutCancel(ctx), pctx, nil, true)
 			}
 			s.recordResponseSession(pctx, requestDirection)
 		}
@@ -797,10 +808,11 @@ func (s *Server) handleResponseBody(ctx context.Context, body []byte, pctx *pipe
 	s.rekeyInboundSession(pctx, direction)
 
 	// ONLY ON THE LAST BODY MESSAGE. Envoy sends one per chunk in a streamed response body
-	// mode, and this used to append a session event at the end of every one — each carrying
-	// the same cost record, because that record sits in pctx.Extensions.Custom and is never
-	// cleared. See recordResponseSession, and the flush in Process for the case where
-	// end_of_stream never arrives.
+	// mode, so appending a session event at the end of every one would emit N events each
+	// carrying the SAME cost record — that record sits in pctx.Extensions.Custom and is never
+	// cleared, so the aggregator and the ledger would sum it once per chunk. See
+	// recordResponseSession, and the flush in Process for the case where end_of_stream never
+	// arrives.
 	if endOfStream {
 		s.recordResponseSession(pctx, direction)
 	}
@@ -840,10 +852,9 @@ func (s *Server) handleResponseBody(ctx context.Context, body []byte, pctx *pipe
 }
 
 // withHeaderMutation emits every header mutation the request pipeline made to
-// pctx.Headers — including the Authorization replacement. ext_proc forwards no
-// header change it does not explicitly emit, so only Authorization used to be
-// propagated, silently dropping any other injected header (e.g. static-inject's
-// x-api-key). Symmetric to withBodyMutation, and to reverseproxy's
+// pctx.Headers — including the Authorization replacement. ext_proc forwards no header change
+// it does not explicitly emit, so emitting Authorization alone silently drops every other
+// injected header (e.g. static-inject's x-api-key). Symmetric to withBodyMutation, and to reverseproxy's
 // forwarded-request header sync. Skipped: HTTP/2 pseudo-headers, which
 // headerMapToHTTP copies into pctx.Headers and whose :authority governs routing;
 // and Content-Length / Content-Encoding, managed by withBodyMutation and the
@@ -1146,15 +1157,15 @@ func getHeader(headers *corev3.HeaderMap, key string) string {
 // streaming-aware plugins expect.
 // last says this body message is the final one, so the terminal frame belongs on it.
 //
-// THE SSE ARM IS THE ONE THAT NEEDED IT, and only that arm takes it, deliberately. A
-// streamed SSE body arrives as several ResponseBody messages, and this function used to end
-// each one with a terminal frame — so every parser FINALIZED per message. On the Anthropic
-// dialect the first message holds message_start alone: prompt counted, output not, no stop
-// reason. That finalizes into a floor, the parser's settle latch pins it, and the pass that
-// finally carries message_delta is short-circuited by the very guard added to stop a double
-// charge. The output tokens — the expensive half, at 10x burndown on Bedrock — were then
-// never billed. Folding the earlier messages with last=false instead lets the state
-// accumulate and leaves exactly one finalization, with the whole figure.
+// THE SSE ARM IS THE ONE THAT NEEDS IT, and only that arm takes it, deliberately. A streamed
+// SSE body arrives as several ResponseBody messages, so ending each one with a terminal frame
+// would make every parser FINALIZE per message. On the Anthropic dialect the first message
+// holds message_start alone: prompt counted, output not, no stop reason. That finalizes into a
+// floor, the parser's settle latch pins it, and the pass that finally carries message_delta is
+// short-circuited by the very guard that stops a double charge — so the output tokens, the
+// expensive half at 10x burndown on Bedrock, go unbilled. Folding the earlier messages with
+// last=false lets the state accumulate and leaves exactly one finalization, with the whole
+// figure.
 //
 // The NON-SSE arm keeps its unconditional terminal frame. Its cost comes off the response
 // HEADERS, which are identical on every pass, so the latch pinning the first figure costs

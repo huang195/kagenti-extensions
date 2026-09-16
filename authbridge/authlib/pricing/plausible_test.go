@@ -264,3 +264,54 @@ func TestNoPerRequestBoundClosesTheAccumulationWrap(t *testing.T) {
 	t.Logf("wrap threshold: %d requests at MaxCostMicros, %d at MaxPlausibleRequestCostMicros (%.0fx further)",
 		math.MaxInt64/int64(MaxCostMicros)+1, wrapAt, float64(MaxCostMicros)/float64(MaxPlausibleRequestCostMicros))
 }
+
+// A MODELLED FIGURE IS HELD TO THE SAME PER-REQUEST CEILING AS A GATEWAY'S OWN.
+//
+// costing applies PlausibleRequestCostUSD ($10,000) to a cost header and names the refusal;
+// Cost used to bound its own arithmetic only at MaxCostMicros ($9 billion), which this file
+// calls a garbage ledger figure. Two independent ways to reach the gap, both exercised here:
+// the token check inside Cost is PER TIER, so one request can carry maxPlausibleTokens
+// several times over, and a base RATE has no magnitude bound at all — config.Build validates
+// only sign and finiteness, and the ProvDiscovered /model/info path is not config.
+//
+// The refusal is what makes the two paths agree. Priced, it would put an operator typo or a
+// remote gateway's number into a thirty-day ledger row as fact.
+func TestCost_RefusesAModelledFigurePastThePerRequestCeiling(t *testing.T) {
+	perToken := func(usd float64) Rates {
+		return Rates{
+			Base: [numTiers]float64{TierInput: usd, TierOutput: usd},
+			Set:  [numTiers]bool{TierInput: true, TierOutput: true},
+		}
+	}
+
+	// An absurd rate on a perfectly ordinary request: 2M tokens at $0.01 each is $20,000.
+	if micros, ok := Cost(perToken(0.01), Usage{Input: 2_000_000}); ok {
+		t.Errorf("Cost reported priced at %d micros ($%.0f) for one request; anything past "+
+			"MaxPlausibleRequestCostMicros ($%.0f) is refused on the header path and has to be "+
+			"refused here too", micros, float64(micros)/1e6,
+			float64(MaxPlausibleRequestCostMicros)/1e6)
+	}
+
+	// And the per-tier route to the same place: each tier is inside maxPlausibleTokens, the
+	// request as a whole is not, at a rate that is plausible per token.
+	huge := Usage{Input: maxPlausibleTokens, Output: maxPlausibleTokens}
+	if micros, ok := Cost(perToken(float64(maxPlausibleMicrosPerToken)/1e6), huge); ok {
+		t.Errorf("Cost reported priced at %d micros for %d tokens spread across two tiers; the "+
+			"token bound is per tier, so it does not imply the cost bound", micros,
+			huge.Input+huge.Output)
+	}
+
+	// The ceiling itself still prices, so the refusal is a bound and not an off-by-one that
+	// unprices legitimate traffic. maxPlausibleTokens at the dearest plausible per-token rate
+	// IS MaxPlausibleRequestCostMicros by construction.
+	atTheBound := Usage{Input: maxPlausibleTokens}
+	micros, ok := Cost(perToken(float64(maxPlausibleMicrosPerToken)/1e6), atTheBound)
+	if !ok {
+		t.Fatal("a request at exactly the plausibility ceiling reported unpriced; the bound is " +
+			"inclusive by construction — see MaxPlausibleRequestCostMicros")
+	}
+	if micros != MaxPlausibleRequestCostMicros {
+		t.Errorf("micros = %d, want exactly MaxPlausibleRequestCostMicros %d", micros,
+			MaxPlausibleRequestCostMicros)
+	}
+}

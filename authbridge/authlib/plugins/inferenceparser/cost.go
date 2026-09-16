@@ -38,11 +38,11 @@ import (
 // publish, never on a pass that had nothing to say. See the two comments at the bottom of
 // this function.
 //
-// WHICH LISTENER REPEATS IT — corrected, because this comment used to say extproc dispatches
-// once for headers and once for the buffered body, and it does not. Its response-header
-// phase returns as soon as Pipeline.NeedsBody() is true (extproc/server.go:616), which this
-// plugin's ReadsBody makes unconditionally true, so the header-only dispatch below it is
-// unreachable for any pipeline containing this parser. What extproc really does is run the
+// WHICH LISTENER REPEATS IT, and extproc does NOT repeat it once for headers and once for
+// the buffered body — the reading that looks right from its message loop. Its response-header
+// phase returns as soon as Pipeline.NeedsBody() is true, which this plugin's ReadsBody makes
+// unconditionally true, so the header-only dispatch below that is unreachable for any pipeline
+// containing this parser. What extproc really does is run the
 // WHOLE buffered dispatch — terminal frame included — once per ResponseBody message it
 // receives (handleResponseBody -> dispatchBufferedFrames), so a body delivered in more than
 // one message settles once per chunk. That is reachable whenever Envoy is not in buffered
@@ -62,12 +62,11 @@ import (
 // terminal frame repeated by ANY listener, which is a property no plugin can verify from
 // the inside.
 //
-// A NIL Extensions.Inference IS A SUPPORTED INPUT, and that is the whole reason this
-// guard reads the way it does. It used to return on nil, which silently made "this
-// parser understood the request" the precondition for charging anything — so
-// /v1/embeddings, /v1/rerank, /v1/moderations, any endpoint not on the request-side
-// allowlist, and any request whose body was empty or unparseable were free of charge
-// however much the gateway said they cost. The spend reached no ledger, no /v1/usage
+// A NIL Extensions.Inference IS A SUPPORTED INPUT, and that is the whole reason this guard
+// reads the way it does. Returning on nil makes "this parser understood the request" the
+// precondition for charging anything — so /v1/embeddings, /v1/rerank, /v1/moderations, any
+// endpoint not on the request-side allowlist, and any request whose body was empty or
+// unparseable would be free of charge however much the gateway said they cost. The spend reached no ledger, no /v1/usage
 // total and no budget, because litellm-budget-track amends a settled record rather than
 // settling its own: no record meant no enforcement.
 //

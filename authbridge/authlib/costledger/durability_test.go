@@ -52,15 +52,23 @@ func TestReadDay_ACrashFragmentSwallowsTheNextRowAndTheCountSaysOne(t *testing.T
 		t.Fatalf("read %d rows (%+v), want only the one complete row that preceded the "+
 			"fragment", len(rows), rows)
 	}
-	if issues.skippedLines != 1 {
-		t.Fatalf("skippedLines = %d, want 1: the fragment and the row appended onto it are "+
-			"one line to a scanner", issues.skippedLines)
-	}
-	// THE POINT: two rows are gone — the fragment and next — and the count says one. Pinned
-	// as an inequality so the test states the guarantee rather than the arithmetic of this
+	// THE POINT: two rows are gone — the fragment and next — and the count says one. Stated
+	// as a RANGE so the test asserts the guarantee rather than the arithmetic of this
 	// fixture: the count may under-report, and must never over-report.
+	//
+	// IT USED TO BE UNREACHABLE, and that is worth recording because the shape is so
+	// plausible. A `skippedLines != 1` Fatalf sat above the inequality and hard-pinned the
+	// very value it compared, so `rowsLost <= issues.skippedLines` was `2 <= 1` — dead code
+	// under a comment explaining what it was for. Anything that made the count exact would
+	// have tripped the Fatalf first, with a message about a fixture detail instead of the one
+	// below about the documentation that would then be wrong. Both bounds are now live.
 	const rowsLost = 2
-	if rowsLost <= issues.skippedLines {
+	if issues.skippedLines < 1 {
+		t.Fatalf("skippedLines = %d over a day file with a torn line, want at least 1: the "+
+			"fence stopped counting, so a short total now reports as a clean one",
+			issues.skippedLines)
+	}
+	if issues.skippedLines >= rowsLost {
 		t.Errorf("this fixture lost %d rows and reported %d skipped lines; the assertion this "+
 			"test exists for is that the count is a FLOOR — if it is now exact, the fence must "+
 			"have started covering the crash case, and the docs in appendBytes and Caveats "+

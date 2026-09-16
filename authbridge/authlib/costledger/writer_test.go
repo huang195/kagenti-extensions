@@ -1942,8 +1942,19 @@ func assertOwnership(t *testing.T, w *Writer, dir, step string) {
 	if err := w.sync(); err != nil {
 		t.Fatalf("sync: %v", err)
 	}
-	_, open, _ := w.pending()
+	held, open, _ := w.pending()
 	if open.IsZero() {
+		// NOT A PASS — a state to check in its own right. This helper returned here silently,
+		// and step 3 of the caller below constructs exactly this state on purpose (a Flush,
+		// then an event in the already-flushed minute), so the one step whose invariant is
+		// most interesting was asserting nothing at all. With no minute held, the rule "disk
+		// carries nothing at or above the held minute" is vacuous — but only if nothing is
+		// held, so that is what gets checked instead. Rows retained with no open minute are
+		// invisible to Window's reconciliation either way.
+		if len(held) != 0 {
+			t.Errorf("after %s: %d row(s) held in memory with no open minute — Window stitches "+
+				"the open minute, so these rows reach no reader and no day file", step, len(held))
+		}
 		return
 	}
 	for _, r := range readAllRows(t, dir) {
@@ -1985,6 +1996,18 @@ func TestPendingMinute_IsNeverAlsoOnDisk(t *testing.T) {
 	sameMinute.At = now
 	w.Record("s1", sameMinute)
 	assertOwnership(t, w, dir, "an event in an already-flushed minute")
+	// The step's OWN claim, which assertOwnership cannot make for it: "must not be re-held".
+	// The helper can only check the rule about a held minute, and this step's whole point is
+	// that no minute is held afterwards — so without this the assertion above passes for both
+	// the correct behaviour and the bug.
+	if _, open, _ := w.pending(); !open.IsZero() {
+		t.Errorf("after a flush, an event in the already-flushed minute re-opened %v; that "+
+			"minute is already on disk, so Window would count it twice", open)
+	}
+	if n := len(readAllRows(t, dir)); n != 4 {
+		t.Errorf("disk holds %d rows after the same-minute event, want 4 — the guard must send "+
+			"it to disk rather than drop it or hold it", n)
+	}
 
 	// And that last event must still be recorded somewhere — the guard sends it to
 	// disk rather than dropping it.

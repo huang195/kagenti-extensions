@@ -38,42 +38,29 @@ import (
 // publish, never on a pass that had nothing to say. See the two comments at the bottom of
 // this function.
 //
-// WHICH LISTENER REPEATS IT, and extproc does NOT repeat it once for headers and once for
-// the buffered body — the reading that looks right from its message loop. Its response-header
-// phase returns as soon as Pipeline.NeedsBody() is true, which this plugin's ReadsBody makes
-// unconditionally true, so the header-only dispatch below that is unreachable for any pipeline
-// containing this parser. What extproc really does is run the
-// WHOLE buffered dispatch — terminal frame included — once per ResponseBody message it
-// receives (handleResponseBody -> dispatchBufferedFrames), so a body delivered in more than
-// one message settles once per chunk. That is reachable whenever Envoy is not in buffered
-// mode for the response: a statically configured STREAMED body mode, or a filter with
-// allow_mode_override off, which makes the ModeOverride this listener asks for a no-op.
-// The guard is therefore load-bearing on the shipped configuration.
+// WHICH LISTENER REPEATS IT: extproc does NOT repeat it once for headers and once for the body —
+// the reading its message loop invites. Its header phase returns as soon as NeedsBody() is true,
+// which this plugin's ReadsBody makes unconditional, so that dispatch is unreachable here. What it
+// can repeat is the WHOLE buffered dispatch, once per ResponseBody message, whenever Envoy is not
+// in buffered response mode.
 //
-// AND THAT REPETITION IS NOW GATED AT THE LISTENER, which changes what this guard is for
-// rather than making it redundant. extproc dispatches the terminal frame only on the body
-// message carrying end_of_stream, because the per-message version was worse than a double
-// charge: the FIRST message of an Anthropic stream holds message_start alone, so it
-// finalized into a floor, THIS LATCH PINNED IT, and the pass carrying message_delta was
-// short-circuited — the output tokens went unbilled by the very guard added to stop a
-// double charge. A latch cannot distinguish a repeated dispatch from a continuing one, so
-// the fix belonged where the repetition is decided. What remains this guard's job is a
-// terminal frame repeated by ANY listener, which is a property no plugin can verify from
-// the inside.
+// THAT REPETITION IS NOW GATED AT THE LISTENER, which changes what this guard is for rather than
+// making it redundant — and the per-message version was worse than a double charge: the first
+// message of an Anthropic stream holds message_start alone, so it finalized into a floor, THIS
+// LATCH PINNED IT, and the pass carrying message_delta was short-circuited. A latch cannot tell a
+// repeated dispatch from a continuing one, so the fix belonged where the repetition is decided.
+// What remains this guard's job is a terminal frame repeated by ANY listener.
 //
-// A NIL Extensions.Inference IS A SUPPORTED INPUT, and that is the whole reason this guard
-// reads the way it does. Returning on nil makes "this parser understood the request" the
-// precondition for charging anything — so /v1/embeddings, /v1/rerank, /v1/moderations, any
-// endpoint not on the request-side allowlist, and any request whose body was empty or
-// unparseable would be free of charge however much the gateway said they cost. The spend reached no ledger, no /v1/usage
-// total and no budget, because litellm-budget-track amends a settled record rather than
-// settling its own: no record meant no enforcement.
+// A NIL Extensions.Inference IS A SUPPORTED INPUT, and that is why this guard reads as it does.
+// Returning on nil makes "this parser understood the request" the precondition for charging
+// anything, so /v1/embeddings, /v1/rerank and any body the parser could not read would be free
+// however much the gateway charged — reaching no ledger, no /v1/usage total and no budget, since
+// litellm-budget-track amends a settled record rather than settling its own.
 //
-// costing.Settle is safe with a nil extension and needs no model to answer. headerCost
-// runs first off the RESPONSE HEADERS alone, and every read of Extensions.Inference below
-// it is behind a nil check — pricing.UsageFromInference(nil) is the zero Usage, which
-// modelledCost refuses outright, so a header-only figure settles and a modelled one
-// cannot be invented. That is what keeps this from charging for traffic nobody priced.
+// costing.Settle is safe with a nil extension: headerCost runs off the RESPONSE HEADERS alone and
+// every read of the extension below it is nil-checked, with UsageFromInference(nil) the zero Usage
+// that modelledCost refuses. So a header-only figure settles and a modelled one cannot be
+// invented.
 func (p *InferenceParser) settleCost(pctx *pipeline.Context) {
 	if pctx == nil {
 		return
@@ -99,24 +86,17 @@ func (p *InferenceParser) settleCost(pctx *pipeline.Context) {
 	// table that prices every prompt tier but not a populated output tier yields a prompt
 	// figure and no total. Dropping the record there would lose a figure a request row
 	// can legitimately show, and the total stays absent rather than invented.
-	// A REFUSED figure is also something to say, and it is the only case here that
-	// publishes a record with no money in it. costing declined a cost header this process
-	// could not corroborate (see costing.implausibleUnparsedCost), and publishing nothing
-	// would make that response indistinguishable from one that reported no cost at all —
-	// hiding both the misconfiguration and the forgery. The record is unpriced, so no
-	// consumer counts it as spend: costevent.Priced returns false on a set RejectedReason,
-	// which is what the aggregator's Decode and the ledger writer's admission guard both
-	// ask.
+	// A REFUSED figure is also something to say, and the only case here that publishes a record
+	// with no money in it: publishing nothing would make a declined header indistinguishable from
+	// a response that reported no cost, hiding both the misconfiguration and the forgery. The
+	// record is unpriced — costevent.Priced returns false on a set RejectedReason, which is what
+	// the aggregator's Decode and the ledger's admission guard both ask.
 	if !settled.Priced && !settled.HasPrompt && settled.RejectedReason == "" && len(avoided) == 0 {
-		// NOT LATCHED, exactly as litellm-budget-track's bill() does not latch when
-		// costing.Load finds nothing priced. Nothing was published here, so there is
-		// nothing to charge twice and nothing for a latch to protect — and latching
-		// anyway would lock this request out of ever being settled by a LATER pass that
-		// does have a figure. The two guards exist for one reason and must agree on the
-		// rule: the latch protects a PUBLISHED figure, not the attempt.
-		//
-		// A second pass costs a Settle and a Store, both pure and both idempotent: Store
-		// overwrites the same key with the same or a better outcome.
+		// NOT LATCHED, as litellm-budget-track's bill() is not when costing.Load finds nothing
+		// priced. Nothing was published, so there is nothing to charge twice — and latching anyway
+		// would lock this request out of a LATER pass that does have a figure. The latch protects
+		// a PUBLISHED figure, not the attempt; a second pass costs a Settle and a Store, both pure
+		// and idempotent.
 		return
 	}
 	// Latched immediately before the publish it protects, and after the decision to

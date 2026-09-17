@@ -158,14 +158,10 @@ func parseOpenAIRequest(body []byte) *pipeline.InferenceExtension {
 // the streaming path has already populated state.
 func (p *InferenceParser) OnResponse(_ context.Context, pctx *pipeline.Context) pipeline.Action {
 	if pctx.Extensions.Inference == nil {
-		// Priced anyway. Same rule as the OnResponseFrame guard below, which carries the
-		// full argument: whether this parser understood the REQUEST decides what can be
-		// parsed, never what the gateway may charge.
-		//
-		// DEFENCE IN DEPTH, NOT THE LIVE PATH. RunResponse skips this plugin (see the method
-		// doc), so under every listener the arm that actually settles a nil-extension
-		// response is OnResponseFrame's. This one answers identically for a direct caller,
-		// and would become live the day this plugin stops being a StreamingResponder.
+		// Priced anyway, on the rule OnResponseFrame's guard carries in full: whether this parser
+		// understood the REQUEST decides what can be parsed, never what the gateway may charge.
+		// Defence in depth rather than the live path — RunResponse skips this plugin, so the arm
+		// that settles a nil-extension response under a real listener is OnResponseFrame's.
 		p.settleCost(pctx)
 		return pipeline.Action{Type: pipeline.Continue}
 	}
@@ -175,28 +171,15 @@ func (p *InferenceParser) OnResponse(_ context.Context, pctx *pipeline.Context) 
 	}
 	if len(pctx.ResponseBody) == 0 {
 		pctx.Skip("no_response_body")
-		// Priced anyway, because a body is not what makes a response cost money. The
-		// gateway reports its own post-discount figure in a RESPONSE HEADER, and
-		// costing.Settle prefers that figure over anything modelled from token
-		// counters — so a LiteLLM-costed response whose body was empty or
-		// unrecognised is real spend. Returning without settling would drop it
-		// entirely: no cost record, nothing in the aggregator's dollar total, and
-		// nothing in litellm-budget-track's ledger — money escaping the budget as
-		// well as the chart.
+		// Priced anyway, because a body is not what makes a response cost money: the gateway
+		// reports its figure in a RESPONSE HEADER and costing.Settle prefers it over anything
+		// modelled, so a costed response with an empty or unrecognised body is real spend.
+		// Returning without settling drops it from the cost record, the aggregate and the budget.
 		//
-		// DEFENCE IN DEPTH, like the nil-extension arm above: RunResponse skips this
-		// plugin, so the settle that closes that path for a real listener is
-		// OnResponseFrame's. This keeps a direct caller's answer identical.
-		//
-		// This cannot flood the aggregate with settled zeros. With no body there are
-		// no token counters, and pricing.Cost refuses an all-zero Usage as UNPRICED
-		// rather than as free (costing.modelledCost short-circuits on it first), so
-		// settleCost's own gate publishes nothing when neither a header nor a
-		// modelled figure exists. A body-less response with no cost header therefore
-		// records only the Skip row above, exactly as before.
-		//
-		// The Skip is a diagnostic that pairs the response row with the request row;
-		// it is not a reason to stop charging. Both happen, in that order.
+		// It cannot flood the aggregate with settled zeros: with no body there are no counters, and
+		// modelledCost short-circuits on an all-zero Usage, so settleCost publishes nothing unless
+		// a header or a modelled figure exists. The Skip row above pairs the response with its
+		// request; it is not a reason to stop charging.
 		p.settleCost(pctx)
 		return pipeline.Action{Type: pipeline.Continue}
 	}
@@ -282,16 +265,11 @@ const streamStateKey = "inference-parser/stream-state"
 // code path for both shapes.
 func (p *InferenceParser) OnResponseFrame(_ context.Context, pctx *pipeline.Context, frame []byte, last bool) pipeline.Action {
 	if pctx.Extensions.Inference == nil {
-		// THE FOURTH BODY-LESS PATH, and the one that is not about a body at all.
-		//
-		// The three guards further down handle a response whose BODY we could not read.
-		// This one handles a response whose REQUEST we never parsed: OnRequest populates
-		// Extensions.Inference only for the six OpenAI spellings and the Anthropic
-		// Messages path, and leaves it nil for /v1/embeddings, /v1/rerank,
-		// /v1/moderations, anything else the gateway mounts, and any request whose body
-		// was empty or not JSON. Returning here made all of that free — the gateway's
-		// figure was on the response headers and nothing read it, so the spend was in no
-		// /v1/usage total, no ledger and no budget. See settleCost for why nil is safe.
+		// THE FOURTH BODY-LESS PATH, and the one not about a body at all: the guards below handle a
+		// response whose BODY could not be read, this one a response whose REQUEST was never
+		// parsed. OnRequest leaves Extensions.Inference nil for /v1/embeddings, /v1/rerank,
+		// anything else the gateway mounts, and any body that was not JSON — and returning here
+		// made all of it free, with the gateway's figure sitting unread on the response headers.
 		//
 		// EVERY path, not an allowlist of the ones that look priceable. The predicate that
 		// decides whether money moves is "the gateway reported a cost", which

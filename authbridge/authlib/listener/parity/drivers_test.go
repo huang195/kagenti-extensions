@@ -46,6 +46,28 @@ type fixture struct {
 	upstreamBody        []byte
 	upstreamContentType string
 
+	// upstreamHeaders are extra RESPONSE headers, applied identically by all three
+	// drivers. A gateway's cost header lives here: it is the input half of every
+	// precedence rule in costing, so a fixture that cannot set one cannot compare what
+	// the listeners do with it.
+	upstreamHeaders map[string]string
+
+	// splitResponseBodyAt makes the ext_proc driver deliver the response body as TWO
+	// ResponseBody messages, cut at this byte offset, which is what a statically configured
+	// STREAMED body mode produces. Zero means one message.
+	//
+	// ext_proc ONLY, deliberately: on the HTTP listeners the transport decides its own chunk
+	// boundaries and nothing in a fixture can pin them. That asymmetry is the point — a chunk
+	// boundary is a shape only this listener can be handed, and the last undercount found in
+	// review lived exactly there.
+	splitResponseBodyAt int
+
+	// deps are the dependencies the pipeline is built with — the same injection production
+	// uses (plugins.BuildWithDeps). Zero value for the spy fixtures, a pricing registry for
+	// the cost fixtures, which is what lets this suite run the REAL cost owner instead of a
+	// plugin that only records that it was called.
+	deps plugins.Deps
+
 	// pipelineRefusedPreRun asserts the listener refused before the
 	// pipeline (e.g. body overflow). Default false: every listener must
 	// record. Combine with expectedWireStatus to pin the wire code.
@@ -73,10 +95,11 @@ func (f fixture) contentType() string {
 	return "application/json"
 }
 
-// buildSpyPipeline routes construction through plugins.BuildWithDeps
-// so Requires / RequiresLater fire at build time on every driver.
-func buildSpyPipeline(entries []config.PluginEntry) (*pipeline.Pipeline, error) {
-	return plugins.BuildWithDeps(entries, plugins.Deps{})
+// buildParityPipeline routes construction through plugins.BuildWithDeps
+// so Requires / RequiresLater fire at build time on every driver, and so a fixture's
+// dependencies are injected exactly as production injects them.
+func buildParityPipeline(entries []config.PluginEntry, deps plugins.Deps) (*pipeline.Pipeline, error) {
+	return plugins.BuildWithDeps(entries, deps)
 }
 
 // spyEntry builds a config.PluginEntry for spyPluginA/B with the given
@@ -126,6 +149,22 @@ type invocationSummary struct {
 // DefaultSessionID bucket, folded into the parity-comparable shape.
 // Returns nil when the bucket is empty or the phase is absent. Fails
 // on more than one match so duplicate-record drift surfaces here.
+// flattenHeaders turns a fixture's header map into makeHeaders' key/value sequence, sorted so
+// the extproc driver's header order is stable across runs — an unstable order would make a
+// fixture pass or fail on map iteration.
+func flattenHeaders(h map[string]string) []string {
+	keys := make([]string, 0, len(h))
+	for k := range h {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	out := make([]string, 0, 2*len(keys))
+	for _, k := range keys {
+		out = append(out, k, h[k])
+	}
+	return out
+}
+
 func observe(t *testing.T, store *session.Store, wantDir pipeline.Direction, wantPhase pipeline.SessionPhase) *observation {
 	t.Helper()
 	v := store.View(session.DefaultSessionID)
@@ -232,7 +271,7 @@ func makeHeaders(kvs ...string) *corev3.HeaderMap {
 func runExtproc(t *testing.T, f fixture, wantPhase pipeline.SessionPhase) *observation {
 	t.Helper()
 
-	spyPipe, err := buildSpyPipeline(f.entries)
+	spyPipe, err := buildParityPipeline(f.entries, f.deps)
 	if err != nil {
 		t.Fatalf("extproc: BuildWithDeps: %v", err)
 	}
@@ -283,11 +322,11 @@ func runExtproc(t *testing.T, f fixture, wantPhase pipeline.SessionPhase) *obser
 		reqs = append(reqs, &extprocv3.ProcessingRequest{
 			Request: &extprocv3.ProcessingRequest_ResponseHeaders{
 				ResponseHeaders: &extprocv3.HttpHeaders{
-					Headers: makeHeaders(
+					Headers: makeHeaders(append([]string{
 						":status", fmt.Sprintf("%d", f.upstreamStatus),
 						"content-type", f.contentType(),
 						"content-length", fmt.Sprintf("%d", len(f.upstreamBody)),
-					),
+					}, flattenHeaders(f.upstreamHeaders)...)...),
 					// Envoy sets end_of_stream on the header callback when the
 					// response is over at its headers, and this harness has to say
 					// so too: it is the only signal that distinguishes a body-less
@@ -309,11 +348,24 @@ func runExtproc(t *testing.T, f fixture, wantPhase pipeline.SessionPhase) *obser
 		// per-listener divergence stayed green. A harness that cannot express a
 		// shape cannot notice a listener mishandling it.
 		if spyPipe.NeedsBody() && len(f.upstreamBody) > 0 {
-			reqs = append(reqs, &extprocv3.ProcessingRequest{
-				Request: &extprocv3.ProcessingRequest_ResponseBody{
-					ResponseBody: &extprocv3.HttpBody{Body: f.upstreamBody, EndOfStream: true},
-				},
-			})
+			if cut := f.splitResponseBodyAt; cut > 0 && cut < len(f.upstreamBody) {
+				reqs = append(reqs, &extprocv3.ProcessingRequest{
+					Request: &extprocv3.ProcessingRequest_ResponseBody{
+						ResponseBody: &extprocv3.HttpBody{Body: f.upstreamBody[:cut], EndOfStream: false},
+					},
+				})
+				reqs = append(reqs, &extprocv3.ProcessingRequest{
+					Request: &extprocv3.ProcessingRequest_ResponseBody{
+						ResponseBody: &extprocv3.HttpBody{Body: f.upstreamBody[cut:], EndOfStream: true},
+					},
+				})
+			} else {
+				reqs = append(reqs, &extprocv3.ProcessingRequest{
+					Request: &extprocv3.ProcessingRequest_ResponseBody{
+						ResponseBody: &extprocv3.HttpBody{Body: f.upstreamBody, EndOfStream: true},
+					},
+				})
+			}
 		}
 	}
 
@@ -390,12 +442,15 @@ func runReverseProxy(t *testing.T, f fixture, wantPhase pipeline.SessionPhase) *
 			return
 		}
 		w.Header().Set("Content-Type", f.contentType())
+		for k, v := range f.upstreamHeaders {
+			w.Header().Set(k, v)
+		}
 		w.WriteHeader(f.upstreamStatus)
 		_, _ = w.Write(f.upstreamBody)
 	}))
 	t.Cleanup(upstream.Close)
 
-	p, err := buildSpyPipeline(f.entries)
+	p, err := buildParityPipeline(f.entries, f.deps)
 	if err != nil {
 		t.Fatalf("reverseproxy: BuildWithDeps: %v", err)
 	}
@@ -458,12 +513,15 @@ func runForwardProxy(t *testing.T, f fixture, wantPhase pipeline.SessionPhase) *
 			return
 		}
 		w.Header().Set("Content-Type", f.contentType())
+		for k, v := range f.upstreamHeaders {
+			w.Header().Set(k, v)
+		}
 		w.WriteHeader(f.upstreamStatus)
 		_, _ = w.Write(f.upstreamBody)
 	}))
 	t.Cleanup(upstream.Close)
 
-	p, err := buildSpyPipeline(f.entries)
+	p, err := buildParityPipeline(f.entries, f.deps)
 	if err != nil {
 		t.Fatalf("forwardproxy: BuildWithDeps: %v", err)
 	}
@@ -517,7 +575,7 @@ func runForwardProxy(t *testing.T, f fixture, wantPhase pipeline.SessionPhase) *
 // NewServer / Server init) and return the first error.
 
 func tryBuildExtproc(entries []config.PluginEntry) error {
-	spyPipe, err := buildSpyPipeline(entries)
+	spyPipe, err := buildParityPipeline(entries, plugins.Deps{})
 	if err != nil {
 		return err
 	}
@@ -533,7 +591,7 @@ func tryBuildExtproc(entries []config.PluginEntry) error {
 }
 
 func tryBuildReverseProxy(entries []config.PluginEntry) error {
-	p, err := buildSpyPipeline(entries)
+	p, err := buildParityPipeline(entries, plugins.Deps{})
 	if err != nil {
 		return err
 	}
@@ -542,7 +600,7 @@ func tryBuildReverseProxy(entries []config.PluginEntry) error {
 }
 
 func tryBuildForwardProxy(entries []config.PluginEntry) error {
-	p, err := buildSpyPipeline(entries)
+	p, err := buildParityPipeline(entries, plugins.Deps{})
 	if err != nil {
 		return err
 	}

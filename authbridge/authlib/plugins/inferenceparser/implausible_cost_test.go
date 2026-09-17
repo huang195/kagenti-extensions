@@ -171,6 +171,10 @@ func TestParsedEndpoint_ImplausibleCostIsUnchanged(t *testing.T) {
 // The refusal record is the first thing this plugin publishes with no figure in it, so
 // the latch is exercised on a shape it has never carried before — and a second publish would
 // double a disclosure, which is how a coverage report grows requests that never happened.
+// The negative control for this arm — that a record appears ONLY when a figure was refused,
+// never merely because the endpoint was unparsed — is
+// TestUnparsedEndpoint_NoCostHeaderPublishesNothing in unparsed_cost_test.go, which covers that
+// claim across four paths and every dispatch site rather than one of each.
 func TestUnparsedEndpoint_RefusalIsPublishedExactlyOnce(t *testing.T) {
 	p := NewInferenceParser()
 	p.SetPricingResolver(bodylessRates(t))
@@ -201,30 +205,5 @@ func TestUnparsedEndpoint_RefusalIsPublishedExactlyOnce(t *testing.T) {
 	}
 	if second.RejectedReason != costevent.RejectedImplausible {
 		t.Errorf("RejectedReason = %q after the repeat dispatches, want %q — a latch that dropped the disclosure would be as wrong as one that doubled it", second.RejectedReason, costevent.RejectedImplausible)
-	}
-}
-
-// TestUnparsedEndpoint_NoHeaderStillPublishesNothing is the negative control for the new
-// publish arm, and it is what stops the fix inflating the coverage denominator.
-//
-// The refusal is now a reason to publish a record where nothing else is. That must remain
-// scoped to a refusal: the same pipeline handles MCP calls, health checks and CONNECT
-// tunnels, and a record for each of those would put non-inference traffic in the cost
-// denominator — the mistake that made a correct deployment read "1/10 priced" forever.
-func TestUnparsedEndpoint_NoHeaderStillPublishesNothing(t *testing.T) {
-	for _, path := range []string{"/healthz", "/mcp", "/some/tunnel"} {
-		for _, site := range unparsedSites() {
-			t.Run(path+"/"+site.name, func(t *testing.T) {
-				p := NewInferenceParser()
-				p.SetPricingResolver(bodylessRates(t))
-				pctx := unparsedCtx(path, "")
-
-				site.drive(p, pctx)
-
-				if ev, ok := publishedCost(t, pctx); ok {
-					t.Errorf("published %+v for %s; only a REFUSED figure justifies a record with no money in it", ev, path)
-				}
-			})
-		}
 	}
 }

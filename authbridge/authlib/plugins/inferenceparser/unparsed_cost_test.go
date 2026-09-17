@@ -255,47 +255,6 @@ func TestUnparsedEndpoint_NonTerminalFrameSettlesNothing(t *testing.T) {
 	}
 }
 
-// TestUnparsedEndpoint_SettlesExactlyOnce guards the money against the behaviour settleCost's
-// idempotence key exists for: a repeated terminal dispatch. It is listener-independent by
-// construction — a plugin cannot verify from the inside how many times a listener will
-// finalize it — so the guard belongs on the plugin rather than on any one caller's discipline.
-//
-// Asserted on this path specifically because it is the path with no extension to inspect —
-// the other paths' finalize functions are assignments and are self-idempotent, while here
-// the ONLY thing standing between two dispatches and two charges is that key.
-func TestUnparsedEndpoint_SettlesExactlyOnce(t *testing.T) {
-	p := NewInferenceParser()
-	p.SetPricingResolver(bodylessRates(t))
-	pctx := unparsedCtx("/v1/embeddings", "0.0042")
-
-	p.OnResponseFrame(context.Background(), pctx, nil, true)
-	first, ok := publishedCost(t, pctx)
-	if !ok {
-		t.Fatal("no cost record published on the first terminal frame")
-	}
-
-	// A SECOND, DIFFERENT GATEWAY FIGURE, which is what makes this assertion capable of
-	// failing. Dispatching twice against an unchanged header compares the one published
-	// record to itself: settleCost's own map key is the only thing that could differ, so
-	// deleting the latch leaves it green. Rewriting the header first proves the latch
-	// short-circuits BEFORE Settle reads it — the shape settle_state_test.go's sibling uses.
-	pctx.ResponseHeaders.Set(costing.ResponseCostHeader, "99.0")
-
-	// The second terminal dispatch. Also the buffered hook, since a
-	// pipeline that ran both must not charge twice either.
-	p.OnResponseFrame(context.Background(), pctx, nil, true)
-	p.OnResponse(context.Background(), pctx)
-
-	second, _ := publishedCost(t, pctx)
-	if second.CostUSD != first.CostUSD {
-		t.Errorf("CostUSD moved from %v to %v across repeated terminal dispatches; a double charge is not recoverable from a later correction", first.CostUSD, second.CostUSD)
-	}
-	if second.CostUSD != 0.0042 {
-		t.Errorf("CostUSD = %v, want the FIRST figure 0.0042 — the second header said 99.0, so a "+
-			"latch that re-read it would show that instead", second.CostUSD)
-	}
-}
-
 // TestUnparsedEndpoint_DeclaredFreeZeroIsSettled keeps this path's rule identical to the
 // one the body-less paths already follow.
 //

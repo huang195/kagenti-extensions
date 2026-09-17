@@ -187,7 +187,9 @@ func pluginKeys(ev *pipeline.SessionEvent) []string {
 // stream's folded usage into a figure. Deleting the early return outright passes
 // the header-only test above and breaks every response that has a body.
 func TestExtProc_ResponseWithBody_StillAsksEnvoyToBuffer(t *testing.T) {
-	srv, store := newHeaderOnlyServer(t)
+	// The store is unused now that this test asserts only the ModeOverride; the teardown
+	// claim it used to duplicate lives in server_finalize_test.go.
+	srv, _ := newHeaderOnlyServer(t)
 
 	reqs := []*extprocv3.ProcessingRequest{
 		{Request: &extprocv3.ProcessingRequest_RequestHeaders{
@@ -231,26 +233,13 @@ func TestExtProc_ResponseWithBody_StillAsksEnvoyToBuffer(t *testing.T) {
 	if mode.GetResponseBodyMode() != extprocfilterv3.ProcessingMode_BUFFERED {
 		t.Errorf("ResponseBodyMode = %v, want BUFFERED", mode.GetResponseBodyMode())
 	}
-	// EXACTLY ONE ROW, AND IT COMES FROM THE TEARDOWN FLUSH.
+	// NO ROW ASSERTION HERE, deliberately. This test's subject is the ModeOverride: that a
+	// response with a body still to come asks Envoy to buffer. What happens when such a stream
+	// then ENDS without that body is the teardown flush's claim, and
+	// TestExtProc_HeadersThenTeardownStillSettlesTheHeaderCost owns it — asserting it here as
+	// well made this test carry two subjects and duplicated that one.
 	//
-	// The headers phase itself must not record — the body phase does, and both recording is
-	// the double charge this listener's latch exists to prevent (pinned by
-	// TestExtProc_SplitResponseBody_ChargesTheWholeFigureExactlyOnce, where a body does
-	// follow). But this fixture ENDS the stream after the headers, so no body is coming and
-	// the response has to be finalized somewhere: Envoy said the transaction is over, the
-	// gateway reported 0.002 on those headers, and without the flush that figure reaches no
-	// aggregate, no ledger and no budget. responseEvent fatals on more than one match, so
-	// this assertion carries the no-double-charge half too.
-	ev := responseEvent(t, store)
-	if ev == nil {
-		t.Fatal("no response row for a stream that ended after its response headers; the " +
-			"header cost is lost")
-	}
-	rec, ok := costevent.Record(ev)
-	if !ok {
-		t.Fatalf("no cost record on the row (Plugins keys = %v)", pluginKeys(ev))
-	}
-	if rec.CostUSD != 0.002 {
-		t.Errorf("CostUSD = %v, want 0.002 from the response header", rec.CostUSD)
-	}
+	// The no-double-charge half is not lost: responseEvent fatals on more than one match, and
+	// TestExtProc_SplitResponseBody_ChargesTheWholeFigureExactlyOnce drives a body that
+	// actually arrives.
 }

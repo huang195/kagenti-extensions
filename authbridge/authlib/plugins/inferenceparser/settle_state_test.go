@@ -79,6 +79,10 @@ func TestSettleCost_LatchesOncePublished(t *testing.T) {
 	// short-circuits before Settle reads it, rather than the two passes happening to agree.
 	pctx.ResponseHeaders.Set(costing.ResponseCostHeader, "99.0")
 	p.OnResponseFrame(context.Background(), pctx, nil, true)
+	// The buffered hook as well, since a pipeline that reached both must not charge twice
+	// either. It cannot fire under a real listener (RunResponse skips a StreamingResponder),
+	// so this is the direct-caller half of the same latch.
+	p.OnResponse(context.Background(), pctx)
 
 	ev, _ := publishedCost(t, pctx)
 	if ev.CostUSD != 0.0042 {

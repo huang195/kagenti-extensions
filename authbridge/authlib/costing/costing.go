@@ -96,18 +96,14 @@ const (
 func headerCost(pctx *pipeline.Context) (cost float64, state headerCostState) {
 	costStr := pctx.ResponseHeaders.Get(ResponseCostHeader)
 	if costStr == "" {
-		// Anthropic /v1/messages (and newer LiteLLM) omit the bare header, so the fallback is
+		// Anthropic /v1/messages (and newer LiteLLM) omit the bare header, so this fallback is
 		// what keeps Claude Code's shape from recording $0 for every request.
 		//
-		// PRE-DISCOUNT ON A GATEWAY THAT RUNS THAT LAYER, which the package doc measures and
-		// this line does not qualify. "Original" means the figure BEFORE LiteLLM's own
-		// discount/margin layer: on the gateway measured here both are zero so the two headers
-		// agree, but where an operator configures them, /v1/messages — the Anthropic shape, with
-		// no bare header at all — bills the pre-discount figure while /v1/chat/completions bills
-		// the post-discount one. The two paths then disagree about the same model, and the drift
-		// check cannot see it because checkDrift compares this figure against the MODELLED one,
-		// not against the discount headers it reads. Pre-existing and not introduced here;
-		// closing it means subtracting DiscountAmountHeader and MarginAmountHeader when they are
+		// PRE-DISCOUNT ON A GATEWAY THAT RUNS THAT LAYER. "Original" is the figure BEFORE
+		// LiteLLM's discount/margin layer, so where an operator configures one, /v1/messages
+		// bills pre-discount while /v1/chat/completions bills post-discount — and checkDrift
+		// cannot see it, because it compares against the modelled figure rather than the
+		// discount headers. Pre-existing; closing it means subtracting those headers when
 		// non-zero, which needs a gateway configured that way to verify against.
 		costStr = pctx.ResponseHeaders.Get(ResponseCostOriginalHeader)
 	}
@@ -124,26 +120,19 @@ func headerCost(pctx *pipeline.Context) (cost float64, state headerCostState) {
 	if implausibleUnparsedCost(pctx, c) {
 		return 0, headerImplausible
 	}
-	// UNREPRESENTABLE IS THE LAST QUESTION ASKED, and the order is the whole substance of this
-	// check. pricing.MicrosFromUSD is the predicate costevent.Event.Priced() applies to this
-	// same figure downstream, so calling it here is what makes the producer and the consumer
-	// agree BY CONSTRUCTION: written as two independent checks they disagreed over ($9.007
-	// billion, +Inf), where this arm set Priced while the record it produced read as unpriced —
-	// a budget accumulating a charge the ledger and the aggregate both filed as uncovered, and
-	// two headers near the float ceiling summing to a +Inf the ledger's json.Marshal cannot
-	// write at all.
+	// UNREPRESENTABLE IS THE LAST QUESTION ASKED, and the order is the substance. MicrosFromUSD
+	// is the predicate costevent.Event.Priced() applies downstream, so calling it here makes the
+	// producer and the consumer agree BY CONSTRUCTION — written as two independent checks they
+	// disagreed over ($9.007 billion, +Inf), this arm setting Priced while the record it produced
+	// read as unpriced.
 	//
-	// ASKED AFTER THE PLAUSIBILITY BRANCH, because every figure past the micros unit is also
-	// past the plausibility cap, so asking first would swallow the hostile-host case as noise
-	// and make the disclosure unreachable for exactly the values most likely to be forged.
+	// AFTER THE PLAUSIBILITY BRANCH, because every figure past the micros unit is also past the
+	// plausibility cap: asking first would swallow the hostile-host case as noise and make the
+	// disclosure unreachable for the values most likely to be forged.
 	//
-	// AND UNUSABLE RATHER THAN IMPLAUSIBLE, which is forced rather than chosen. What reaches
-	// here is a PARSED endpoint — the plausibility branch above already claimed the unparsed
-	// ones — and a parsed endpoint has usage to model, so Settle prices this response from the
-	// rate table. RejectedReason reads as unpriced to every consumer (see Event.Priced), so
-	// disclosing the refusal here would refuse the modelled figure along with the header and
-	// leave a record whose two halves contradict each other. Unusable keeps the header out and
-	// lets the modelled charge stand, which is the outcome that loses no money.
+	// AND UNUSABLE RATHER THAN IMPLAUSIBLE, which is forced. What reaches here is a PARSED
+	// endpoint, which has usage to model — and RejectedReason reads as unpriced to every
+	// consumer, so disclosing here would refuse the modelled figure along with the header.
 	if _, ok := pricing.MicrosFromUSD(c); !ok {
 		return 0, headerUnusable
 	}
@@ -153,58 +142,37 @@ func headerCost(pctx *pipeline.Context) (cost float64, state headerCostState) {
 // implausibleUnparsedCost is the CAP on what an endpoint nobody could parse is allowed to
 // charge, and the one thing standing between a hostile host and a poisoned ledger.
 //
-// THE HOLE IT CLOSES. This header is an unauthenticated string on a response, validated
-// here for nothing but its numeric shape, and nothing in the pipeline considers the HOST it
-// came from — inference-parser dispatches on the path alone. Cost is now settled on every
-// proxied response including the ones with no inference extension, so before this cap ANY
-// path on ANY host an agent was proxied to could name its own figure and have it published,
-// aggregated, written to the thirty-day ledger, and fed to litellm_budgettrack, which
-// denies with HTTP 429 once the daily total passes MaxBudget. One response from one hostile
-// site could therefore lock an agent out of all further inference and corrupt durable cost
-// reporting. inference-parser is in the default local pipeline, so this is the shipped
-// configuration.
+// THE HOLE IT CLOSES. This header is an unauthenticated string, validated for nothing but its
+// numeric shape, and nothing in the pipeline considers the HOST it came from. Cost is settled on
+// every proxied response now, including those with no inference extension, so without this cap
+// any path on any host an agent is proxied to could name its own figure and have it published,
+// aggregated, written to the thirty-day ledger and fed to litellm_budgettrack — which denies with
+// 429 once the daily total passes MaxBudget. One hostile response could lock an agent out of all
+// inference. inference-parser is in the default pipeline, so this is the shipped configuration.
 //
 // GATED ON A NIL EXTENSION, which is exactly the set of responses whose spend was newly
 // admitted — an endpoint off the parser's dialect list, or a body it could not read.
 //
-// WHY THE PARSED PATH IS LEFT ALONE, which is not merely a scope decision. Where the extension
-// is present there is a MODELLED figure from the token counters to compare the header against,
-// so an implausible header is DETECTABLE there: Settle publishes both and the drift check
-// notices them disagreeing (see Settled.HasReported and ModelledUSD). Refusing it instead would
-// throw away the one signal that a rate table has gone stale against a gateway — the case the
-// drift measurement exists for — to bound a figure that is already visible as wrong.
-// TestSettle_ParsedEndpointIsUnaffectedByTheCap pins that.
+// WHY THE PARSED PATH IS LEFT ALONE. Where the extension is present there is a MODELLED figure
+// to compare the header against, so an implausible one is DETECTABLE: Settle publishes both and
+// the drift check notices them disagreeing. Refusing it instead would discard the one signal that
+// a rate table has gone stale. TestSettle_ParsedEndpointIsUnaffectedByTheCap pins that.
 //
-// TWO LIMITS ON THAT ARGUMENT, both of which narrow it rather than restate it:
+// TWO LIMITS ON THAT ARGUMENT, which narrow it rather than restate it. DETECTABLE IS NOT
+// PREVENTED: the drift check logs, it does not withhold, so the figure still reaches Publish, the
+// aggregate, the ledger and the 429 lockout — a log line after the damage. And A NON-NIL
+// EXTENSION IS NOT A CORROBORATING FIGURE: it is populated on the REQUEST pass carrying no
+// counts, so HasModelled is false whenever the model has no rates or the usage block is empty,
+// and those responses get neither the cap nor the drift signal.
 //
-//   - DETECTABLE IS NOT PREVENTED. The drift check logs; it does not withhold. The figure still
-//     reaches Publish, the aggregate, the thirty-day ledger and litellm_budgettrack's 429
-//     lockout, so on the parsed path the disclosure buys an operator a log line after the
-//     damage, not instead of it.
-//   - A NON-NIL EXTENSION IS NOT A CORROBORATING FIGURE. The gate reads "the request parsed",
-//     and the extension is populated on the REQUEST pass carrying no counts, so it can be
-//     present with nothing to compare against: HasModelled is false whenever the resolver has
-//     no rates for the model or the usage block is empty. Those responses take this branch and
-//     get neither the cap nor the drift signal.
+// THE RESIDUAL, reachable and not closed here: a hostile host on a path the parser DOES recognise
+// can settle up to MaxCostMicros ($9.007 billion), published and aggregated while the drift check
+// merely notes it. Bounding it is not the fix — not believing that host's header is, which is the
+// allowlist in rossoctl/cortex#1027, and both limits above are why.
 //
-// Both are why cortex#1027 is an allowlist of hosts whose header is believed at all, rather
-// than a wider cap.
-//
-// THE RESIDUAL, stated because it is reachable and not closed here: a hostile host serving a
-// path the parser DOES recognise can settle a figure up to MaxCostMicros ($9.007 billion),
-// which is published, aggregated and written to the ledger while the drift check merely notes
-// the disagreement. Bounding it is not the fix — the fix is not believing that host's header at
-// all, which is the allowlist tracked in rossoctl/cortex#1027. It also feeds the accumulation
-// wrap pricing.MaxCostMicros documents, which the checked accumulate in this series' aggregate
-// PR closes.
-//
-// WHAT IT IS NOT. It is a blast-radius cap, NOT AUTHENTICATION. A forged figure UNDER the
-// cap still settles, because a plausible number from an unparsed endpoint is exactly what a
-// gateway-priced /v1/embeddings response looks like and refusing it would break the feature
-// that opened the hole. The stronger fix is an allowlist of hosts whose cost headers are
-// believed at all; it was considered and deprioritised, and this cap was preferred because
-// it also bounds a second disclosed gap (see pricing.MaxCostMicros on the aggregate wrap,
-// which it moves and does not close).
+// WHAT IT IS NOT: a blast-radius cap, NOT AUTHENTICATION. A forged figure UNDER the cap still
+// settles, because a plausible number from an unparsed endpoint is exactly what a gateway-priced
+// /v1/embeddings response looks like.
 //
 // REFUSED, NOT CLAMPED. Clamping to the cap would invent a $10,000 charge nobody made and
 // publish it wearing the same label a real figure wears. The refusal is published instead,
@@ -229,14 +197,11 @@ func implausibleUnparsedCost(pctx *pipeline.Context, usd float64) bool {
 // allocation driven by hostile input. Not unconditional either — the warning fires on a
 // path an attacker chooses and would be a log-flood amplifier.
 //
-// THE ARGUMENT IS ABOUT THE ALWAYS-ON LEVEL, and the split is deliberate rather than
-// inconsistent: Warn fires once per process, Debug fires per occurrence. An operator turning
-// debug on has asked for one line per event and needs every occurrence to be recoverable —
-// TestWarnImplausibleCost_NamesTheHost pins that — whereas a Warn per hostile request would
-// flood a log nobody opted into. The residual is real and worth naming: with debug enabled this
-// path emits a line per attacker-chosen request. The bounded trail that needs no logger at all
-// is the per-request record, costevent.RejectedImplausible, which the per-minute accumulator
-// caps.
+// THE SPLIT IS DELIBERATE: Warn once per process, Debug per occurrence. Turning debug on IS
+// asking for one line per event, and every occurrence has to be recoverable (pinned by
+// TestWarnImplausibleCost_NamesTheHost), while a Warn per hostile request floods a log nobody
+// opted into. Residual: with debug enabled this emits a line per attacker-chosen request. The
+// bounded trail is the per-request record, costevent.RejectedImplausible.
 // SWAPPED BY A TEST, WHICH MAKES IT A PACKAGE-WIDE CONSTRAINT. implausible_test.go resets this
 // and replaces slog.Default() to observe the one warning, so no test in this package may run in
 // parallel with another while that is true. TestNoTestInThisPackageRunsInParallel enforces it,
@@ -320,41 +285,30 @@ type Settled struct {
 	// pricing.ReasonOutputUncounted for a figure that is known-low, or
 	// pricing.ReasonSplitUnreported for one that is approximate in no known direction.
 	//
-	// It exists because a truncated stream was priced prompt-only and published as a
-	// complete figure. Prompt counts land on Anthropic's message_start and the output
-	// count only on message_delta, so a stream that dies in between yields real prompt
-	// tokens with output at zero — and Settle priced exactly what it was given, set
-	// Priced, and every consumer downstream read the result as an exact figure: the
-	// usage aggregator counted it in PricedRequests and CostMicros, and a budget
-	// enforced against it. A floor presented as a total understates spend by however
-	// much the completion would have cost, which on a long generation is most of it.
+	// It exists because a truncated stream was priced prompt-only and published as a complete
+	// figure: prompt counts land on message_start and the output count only on message_delta, so
+	// a stream dying in between yields real prompt tokens with output at zero. A floor presented
+	// as a total understates spend by whatever the completion would have cost.
 	//
-	// Honest by DISCLOSURE, not by adjustment. CostUSD keeps the figure and Priced stays
-	// TRUE, deliberately and on both counts:
+	// Honest by DISCLOSURE, not adjustment: CostUSD keeps the figure and Priced stays TRUE. The
+	// figure is the best available — estimating the missing completion is worse than a known-low
+	// number that says so — and the request IS priced, so dropping it from a priced count would
+	// misuse a counter that answers coverage instead, and send a consumer's own fallback off to
+	// recompute the identical figure and label THAT one exact.
 	//
-	//   - The figure is the best available. Estimating the missing completion would be
-	//     worse than reporting a known-low number and saying it is low.
-	//   - The request IS priced, so removing it from a priced count would misuse a
-	//     counter that answers a different question — coverage, "did anything price
-	//     this" — and would disclose the same fact twice in two vocabularies. It would
-	//     also send a consumer's own fallback down a rate table to recompute the
-	//     identical prompt-only figure and label THAT one exact.
-	//
-	// Never set on a gateway figure, including a declared-free zero: a reported cost is
-	// what the call actually charged whatever our counters saw, so completeness there is
-	// the gateway's assertion rather than an inference from token tallies.
+	// Never set on a gateway figure, including a declared-free zero: a reported cost is what the
+	// call charged whatever our counters saw.
 	Incomplete       bool
 	IncompleteReason string
 
 	// RejectedReason names a figure that WAS on the wire and was refused —
 	// costevent.RejectedImplausible, set by implausibleUnparsedCost.
 	//
-	// The counterpart to Incomplete, one step further out: Incomplete qualifies a figure
-	// that stands, this one records that there is no figure BECAUSE one was declined.
-	// Priced is false and CostUSD is zero whenever it is set — a refused figure is not a
-	// figure — and it travels onto the record so the gap is nameable instead of silent.
-	// Never set alongside HasReported: refusing the figure and then keeping it for the
-	// drift check would compare the rate table against a forgery.
+	// The counterpart to Incomplete, one step out: that qualifies a figure which stands, this
+	// records that there is none BECAUSE one was declined. Priced is false and CostUSD zero
+	// whenever it is set, and it travels onto the record so the gap is nameable. Never set
+	// alongside HasReported — refusing a figure and then keeping it for the drift check would
+	// compare the rate table against a forgery.
 	RejectedReason string
 
 	// ReportedUSD is the gateway's own figure, when it gave one.
@@ -370,13 +324,12 @@ type Settled struct {
 	// ModelledIncomplete says the MODELLED figure is not an exact total, whichever figure
 	// won, and ModelledIncompleteReason is pricing.IncompleteReason's answer for it.
 	//
-	// SEPARATE FROM Incomplete, which is a claim about the figure that was CHARGED. The two
-	// coincide on the usage-fallback arm and diverge whenever a gateway's header wins: the
-	// header is exact by assertion, so Incomplete is correctly false, and the knowledge that
-	// the modelled figure beside it is a FLOOR was simply dropped. The drift check then
-	// divided a known-low modelled figure by an authoritative one and reported the RATE TABLE
-	// as stale — for a response whose counters were short. Carried here so the one consumer
-	// that compares the pair can tell "the table is wrong" from "the counters were".
+	// SEPARATE FROM Incomplete, which is about the figure that was CHARGED. They coincide on the
+	// usage-fallback arm and diverge when a header wins: the header is exact by assertion, so
+	// Incomplete is correctly false, and the knowledge that the modelled figure beside it is a
+	// FLOOR was dropped — leaving the drift check to divide a known-low figure by an
+	// authoritative one and report the RATE TABLE as stale for a response whose counters were
+	// short.
 	ModelledIncomplete       bool
 	ModelledIncompleteReason string
 
@@ -410,15 +363,11 @@ type Settled struct {
 	// HasModelled, so a response row can show its own cost on a call where the total came
 	// from the gateway and the table has no opinion on the whole.
 	//
-	// PromptUSD + OutputUSD can differ from ModelledUSD IN THE LAST PLACE, and a caller
-	// comparing them needs a tolerance rather than equality. Both halves resolve at the
-	// same prompt size over a complementary tier partition, so they agree on the
-	// arithmetic — but each is rounded to micros on its own and the whole is rounded
-	// separately, so two rounded halves need not sum to the rounded whole. costing_test.go
-	// uses a 1e-6 tolerance for exactly this reason.
-	//
-	// So this is NOT equality "to the micro, by construction" — a tempting way to state it
-	// that the rounding above contradicts.
+	// PromptUSD + OutputUSD can differ from ModelledUSD IN THE LAST PLACE, so a caller comparing
+	// them needs a tolerance, not equality: both halves resolve at the same prompt size over a
+	// complementary partition, but each is rounded to micros on its own and the whole is rounded
+	// separately. NOT equality "to the micro, by construction", which the rounding contradicts;
+	// costing_test.go uses 1e-6.
 	//
 	// Neither sums to CostUSD, which may be the gateway's; comparing their sum against a
 	// reported total is a drift measurement, and ModelledUSD is the figure kept for it.

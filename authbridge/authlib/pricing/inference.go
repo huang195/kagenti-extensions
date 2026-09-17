@@ -60,74 +60,54 @@ func UsageFromInference(inf *pipeline.InferenceExtension) Usage {
 // Reasons a figure modelled from an inference extension's counters is not an exact
 // total. Returned by IncompleteReason and carried per-request on the cost record.
 //
-// Two, not one, because they are different claims and a consumer acts on them
-// differently: a partial figure is known-LOW and bounded on one side, while an
-// approximate one has no known direction at all. Collapsing them into a single
-// "incomplete" boolean would make a totals-only gateway — a permanent, unfixable
-// property of that gateway — indistinguishable from a truncated stream, which is a
-// transient failure worth chasing.
+// Separate reasons rather than one "incomplete" boolean because a consumer acts on them
+// differently: a floor is known-LOW and bounded on one side, an approximation has no known
+// direction. Collapsed, a totals-only gateway — a permanent property of that gateway — would be
+// indistinguishable from a truncated stream, which is a transient failure worth chasing.
 //
-// Values are wire strings: they travel on costevent.Event.IncompleteReason. Hyphenated
-// lowercase, matching Provenance's spellings ("authoritative", "configured").
+// Wire strings, travelling on costevent.Event.IncompleteReason: hyphenated lowercase, like
+// Provenance.
 const (
 	// ReasonOutputUncounted: the prompt was counted and whatever was generated never
 	// was, so the figure is a FLOOR — the real cost is this plus an unknown completion.
 	//
-	// The case it exists for is a truncated Anthropic stream. Prompt counts land on
-	// message_start; the output count only ever arrives on message_delta. A stream that
-	// dies in between — an upstream `error` event, a client disconnect, a proxy restart
-	// mid-turn — finalizes with real prompt tokens and output at zero, and the parser
-	// ALREADY knows: foldAnthropicFrame logs "token counts will be incomplete". Nothing
-	// consumed that knowledge, so costing priced the prompt, published Settled: true,
-	// and every consumer read a lower bound as a complete figure.
+	// The case it exists for is a truncated Anthropic stream: prompt counts land on
+	// message_start and the output count only on message_delta, so a stream dying in between
+	// finalizes with real prompt tokens and output at zero.
 	//
 	// KNOWN BOUNDARY, deliberately not closed. The discriminator is the stop reason (see
-	// the block comment in outputUncounted), so a response that carries a stop_reason but
-	// no usage block reads as EXACT even though its output was never tallied — a
-	// message_delta whose usage the wire omitted, or an intermediary that strips usage
-	// while forwarding the stop reason. Such a response is classified complete with
-	// OutputTokens == 0.
-	//
-	// That is the intended trade, not an oversight, and there is a test row pinning it
-	// ("stop reason with zero output is exact"). Closing it would mean flagging every
-	// response whose output legitimately WAS zero — an immediate refusal, a max_tokens of
-	// zero — because those are indistinguishable from it by counters alone. A false
-	// caveat on ordinary traffic is worse than a missed one on a wire shape we have no
-	// evidence of: it becomes a permanent warning with nothing to act on, which is how an
-	// operator learns to ignore the real signal. Do not "fix" this row into a false
-	// positive; if the omitted-usage shape is ever OBSERVED, the fix is a new reason
-	// keyed on something that actually distinguishes it, not a weakening of this one.
+	// outputUncounted), so a response carrying a stop_reason but no usage block reads as EXACT
+	// even though its output was never tallied. Closing that would flag every response whose
+	// output legitimately WAS zero — an immediate refusal, a max_tokens of zero — because those
+	// are indistinguishable by counters alone, and a false caveat on ordinary traffic is how an
+	// operator learns to ignore the real signal. A test row pins it ("stop reason with zero
+	// output is exact"). If the omitted-usage shape is ever OBSERVED, the fix is a new reason
+	// keyed on something that distinguishes it, not a weakening of this one.
 	ReasonOutputUncounted = "output-uncounted"
 
-	// ReasonSplitUnreported: the provider reported a total and no per-kind split at
-	// all, so the figure is APPROXIMATE rather than low. UsageFromInference above
-	// attributes such a total wholly to uncached input, which over-prices a cache-heavy
-	// request (a cache read bills at ~0.1x) and under-prices a generation-heavy one (an
-	// output token bills at ~5x), with no way to say which from one number.
+	// ReasonSplitUnreported: the provider reported a total and no per-kind split, so the figure
+	// is APPROXIMATE rather than low. UsageFromInference attributes such a total wholly to
+	// uncached input, which over-prices a cache-heavy request (a cache read bills at ~0.1x) and
+	// under-prices a generation-heavy one (~5x), with no way to say which from one number.
 	//
-	// A property of the gateway, not of the request: it will hold for every request
-	// that gateway answers. A consumer should present it as a standing caveat on the
-	// total's precision, never as an incident.
+	// A property of the gateway rather than the request, so a consumer presents it as a standing
+	// caveat on precision, never as an incident.
 	ReasonSplitUnreported = "split-unreported"
 
-	// ReasonCountersBelowTotal: the response's OWN total exceeds the counters that were
-	// priced, so tokens were reported and not attributed to any tier. The figure is a floor,
-	// like ReasonOutputUncounted, but the evidence is different and so is the honest label:
-	// there, a stop reason is missing and the output tally cannot be shown to be final; here,
-	// the gateway states a total and the parts do not add up to it.
+	// ReasonCountersBelowTotal: the response's OWN total exceeds the counters that were priced,
+	// so tokens were reported and attributed to no tier. A floor, like ReasonOutputUncounted, on
+	// different evidence — there a stop reason is missing, here the parts do not add up to the
+	// stated total.
 	//
-	// NAMED FOR THE EVIDENCE, not for the tier, because the tier is exactly what is unknown.
-	// Calling it output-uncounted would be the likeliest guess and still a guess — a
-	// short-reported prompt produces the identical arithmetic — and a wrong tier in the label
-	// sends an operator to the wrong side of the request.
+	// NAMED FOR THE EVIDENCE, not the tier, because the tier is what is unknown: a
+	// short-reported prompt produces identical arithmetic, and a wrong tier in the label sends
+	// an operator to the wrong side of the request.
 	ReasonCountersBelowTotal = "counters-below-total"
 )
 
-// NO PREDICATE IN THIS FILE READS pipeline.InferenceExtension.PresentKinds, and none should:
-// it is dialect-unreliable for both questions asked here — see outputUncounted's block comment
-// and the call site of totalsOnly. The bit names the tests need to say which kinds a fixture
-// means live in incompletereason_test.go, beside the assertions that use them, rather than as
-// production constants nothing in production reads.
+// NO PREDICATE IN THIS FILE READS pipeline.InferenceExtension.PresentKinds, and none should: it
+// is dialect-unreliable for both questions asked here — see outputUncounted. The bit names the
+// tests need live in incompletereason_test.go, beside the assertions that use them.
 
 // IncompleteReason names why a figure modelled from inf's counters is not an exact
 // total, or "" when the counters support one.
@@ -137,17 +117,14 @@ const (
 // is the gateway's assertion and not an inference from a token tally — costing.Settle
 // gates this call on the usage-fallback arm for that reason.
 //
-// The two reasons are decided by DIFFERENT instruments, and the asymmetry is the part
-// worth reading before changing anything here: the presence mask is the right test for
-// ReasonSplitUnreported and the wrong one for ReasonOutputUncounted. Not because one
-// reason is special, but because the mask's reliability is DIALECT-specific — OpenAI
-// gates each bit on a pointer while Anthropic asserts Input|Output unconditionally. See
-// the block comment at the discriminator itself, which is the single most important
-// comment in this file.
+// The reasons are decided by DIFFERENT instruments, and that asymmetry is what to read before
+// changing anything here: the presence mask is the right test for ReasonSplitUnreported and the
+// wrong one for ReasonOutputUncounted, because the mask's reliability is DIALECT-specific —
+// OpenAI gates each bit on a pointer, Anthropic asserts Input|Output unconditionally. See the
+// block comment at the discriminator.
 //
-// Takes the extension rather than a Usage because none of the three signals it needs —
-// the stop reason, the legacy aggregates, the presence mask — is inside Usage's four
-// tiers.
+// Takes the extension rather than a Usage because none of the signals it needs — the stop reason,
+// the legacy aggregates, the presence mask — is inside Usage's four tiers.
 func IncompleteReason(inf *pipeline.InferenceExtension) string {
 	if inf == nil {
 		return ""

@@ -12,13 +12,9 @@
 // is the one non-pipeline dependency, for the single micros bound both packages must
 // agree on (see Micros).
 //
-// THAT EDGE ADDS NOTHING ANYWHERE, and the check is `go list -deps`, not a grep for a
-// direct import — the difference matters, because abctl imports pricing through NEITHER of
-// its costevent files. Every module that links this package already linked pricing before
-// the edge existed: authlib and authbridge-proxy price traffic, and abctl reaches it
-// transitively through authlib/usage and authlib/config. A grep under cmd/abctl finds no
-// direct import and reads like a new dependency; `go list -deps ./...` in that module shows
-// pricing on both sides of the change.
+// THAT EDGE ADDS NOTHING ANYWHERE, and the check is `go list -deps`, not a grep for a direct
+// import: every module that links this package already linked pricing — authlib and
+// authbridge-proxy price traffic, and abctl reaches it through authlib/usage and authlib/config.
 package costevent
 
 import (
@@ -129,34 +125,20 @@ type Event struct {
 	// A settled zero is now a real answer that suppresses the fallback.
 	Settled bool `json:"settled,omitempty"`
 
-	// Incomplete marks CostUSD as not an EXACT total, and IncompleteReason says which
-	// way it is inexact: pricing.ReasonOutputUncounted for a known-LOW figure (a stream
-	// that died before the event carrying its output count — the producer's logs already
-	// said "token counts will be incomplete"; this is that knowledge on the wire, where
-	// the totals are actually read), or pricing.ReasonSplitUnreported for one that is
-	// approximate in no known direction (a gateway reporting only total_tokens).
+	// Incomplete marks CostUSD as not an EXACT total, and IncompleteReason says which way it is
+	// inexact — see pricing's reasons: a known-LOW figure (a stream that died before its output
+	// count arrived), or one approximate in no known direction (a gateway reporting only
+	// total_tokens). A reason beside the flag rather than one bit, because a floor is bounded on
+	// one side and usually transient while an approximation is a standing property of the
+	// gateway, and collapsed they would be indistinguishable.
 	//
-	// A reason string beside the flag rather than one undifferentiated boolean, because
-	// the two are different claims and a consumer acts on them differently. A floor is
-	// bounded on one side and usually a transient failure worth chasing; an approximation
-	// is unbounded and a standing property of the gateway. Collapsed into one bit they
-	// would be indistinguishable, and a permanent caveat reads as an incident.
+	// DISCLOSURE, not adjustment. CostUSD keeps the figure and Priced still returns true, so a
+	// consumer keeps these dollars in its total: the figure is the best available, and what the
+	// flag withdraws is only the claim of EXACTNESS. It stays in every priced count — coverage
+	// answers a different question — and is disclosed alongside.
 	//
-	// DISCLOSURE, not adjustment. CostUSD keeps the figure, Settled stays true, and
-	// Priced below still returns true — so a consumer must keep these dollars in its
-	// total. The figure is the best available; estimating the missing completion would be
-	// worse than reporting a known-low number and saying it is low. What the flag
-	// withdraws is the claim of EXACTNESS, nothing else.
-	//
-	// The obligation on a consumer: do not render this as an exact figure. It stays in
-	// every priced count it was already in — usage.Counts keeps it in PricedRequests,
-	// which answers a different question (coverage: did anything price this) — and is
-	// disclosed alongside in usage.Counts.IncompleteRequests.
-	//
-	// ADDITIVE and omitempty, like Provenance and OutputUSD: an event from an older
-	// producer decodes here with Incomplete false, which is the pre-fix reading — every
-	// figure claimed exact — so a consumer that ignores these fields is exactly as
-	// correct as it was before, just less informed.
+	// ADDITIVE and omitempty: an event from an older producer decodes with Incomplete false,
+	// which is the pre-fix reading, so a consumer ignoring these fields is as correct as before.
 	Incomplete       bool   `json:"incomplete,omitempty"`
 	IncompleteReason string `json:"incomplete_reason,omitempty"`
 
@@ -184,30 +166,22 @@ type Event struct {
 	// RejectedReason names a cost figure the producer REFUSED — RejectedImplausible
 	// today — and is the ONLY evidence that a figure was on the wire at all.
 	//
-	// It exists so a refusal is a DISCLOSED COVERAGE GAP rather than silence. The
-	// alternative to publishing this record is publishing nothing, and then a response
-	// that reported $9,000,000,000 and a response that reported nothing are the same
-	// event to every consumer — which hides both the misconfiguration and the attack.
+	// It exists so a refusal is a DISCLOSED COVERAGE GAP rather than silence: publishing nothing
+	// instead makes a response that reported $9,000,000,000 and one that reported nothing the same
+	// event to every consumer, hiding both the misconfiguration and the attack.
 	//
-	// NOT A FIGURE, and never clamped to the bound. CostUSD stays 0 with Settled false,
-	// and Priced() returns false whenever this is set, so no consumer can read a refused
-	// figure as money however the other fields arrive. A clamped figure would be a wrong
-	// number wearing a right label, which is worse than a named gap: the ring forgets a
-	// gap in six hours, while the durable ledger keeps a wrong number for thirty days
-	// with no repair path.
+	// NOT A FIGURE, and never clamped. CostUSD stays 0 and Priced() returns false whenever this is
+	// set, so no consumer can read a refused figure as money however the other fields arrive. A
+	// clamped figure is a wrong number wearing a right label, and worse than a named gap: the ring
+	// forgets a gap in six hours, the durable ledger keeps a wrong number for thirty days.
 	//
-	// LIMIT OF THE DISCLOSURE, stated because a reader will otherwise assume more: this
-	// gap does not reach usage.Snapshot.UnpricedBy. That map keys on "<endpoint>
-	// <model>" and counts requests that COULD have been priced, and the traffic this
-	// refusal lands on carries no model at all — the extension is nil, which is
-	// precisely why the figure could not be corroborated. Naming it there would mean
-	// widening what "priceable" counts, in a package this record only travels to. The
-	// evidence available today is this field on the record plus the operator warning
-	// costing emits with the host on it.
+	// LIMIT OF THE DISCLOSURE: it does not reach usage.Snapshot.UnpricedBy, which keys on
+	// "<endpoint> <model>" and counts requests that COULD have been priced — and this refusal
+	// lands on traffic carrying no model at all, which is why the figure could not be
+	// corroborated. The evidence is this field plus the operator warning costing emits.
 	//
-	// ADDITIVE and omitempty, like Provenance and Incomplete: an older consumer decodes
-	// an event carrying it and sees an unsettled zero, which is the pre-fix reading of a
-	// refused figure — unpriced — so it is exactly as correct as it was before.
+	// ADDITIVE and omitempty: an older consumer sees an unsettled zero, which is the pre-fix
+	// reading of a refused figure.
 	RejectedReason string `json:"rejected_reason,omitempty"`
 
 	// Avoided is cost that was NOT incurred. Nothing in here is spend.
@@ -281,16 +255,13 @@ func (e Event) TotalAvoidedUSD() float64 {
 // below half a micro rounds to 0 while still counting as priced — a real
 // sub-micro charge, not an unknown one.
 //
-// BOUNDED, through the same pricing.MicrosFromUSD that prices a token tally. This
-// was `int64(math.Round(e.CostUSD * 1e6))` with no bound at all while pricing.Cost
-// guarded the identical conversion and called the unguarded form "a garbage ledger
-// figure". The header path accepts any finite non-negative float, so a gateway
-// reporting 1e13 saturated to MaxInt64 and two such requests wrapped usage.Counts.Add
-// to −2 micros — an aggregate that then sat in the durable ledger for thirty days
-// with no repair path.
+// BOUNDED, through the same pricing.MicrosFromUSD that prices a token tally: the header path
+// accepts any finite non-negative float, so a gateway reporting 1e13 saturated to MaxInt64 and two
+// such requests wrapped usage.Counts.Add to −2 micros — an aggregate that then sat in the durable
+// ledger for thirty days.
 //
-// The bound removes the SATURATION, not the wrap: 1024 figures at the bound still wrap the
-// same sum, and no per-request bound can fix that — see MaxCostMicros.
+// The bound removes the SATURATION, not the wrap: 1024 figures at the bound wrap the same sum, and
+// no per-request bound can fix that — see MaxCostMicros.
 //
 // Zero for an out-of-range figure, and Priced returns false for the same one, so no
 // consumer reaches this value believing it is a price. NOT clamped to the bound: a

@@ -36,6 +36,10 @@ func TestOnResponseFrame_BufferedSSEShapesStillYieldUsage(t *testing.T) {
 		body string
 	}{
 		{"LF, the ordinary shape", sseBody(openAIFrames, "\n\n")},
+		// EXERCISE, NOT DISCRIMINATION, and worth saying so: both parsers TrimSpace each line, so a
+		// trailing \r needs no normalisation and this row passes with normalizeSSE's CRLF branch
+		// removed. It stays as regression coverage for the shape; the rows that DISCRIMINATE are
+		// the CR-only and BOM ones below.
 		{"CRLF", sseBody(openAIFrames, "\r\n\r\n")},
 		// CR-only, which no "\ndata:" scan can see.
 		{"CR only", sseBody(openAIFrames, "\r\r")},

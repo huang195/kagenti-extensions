@@ -163,6 +163,21 @@ type Event struct {
 	// a free completion.
 	OutputUSD float64 `json:"output_usd,omitempty"`
 
+	// UsageRefused says the response's TOKEN COUNTS were impossible — negative, or past
+	// pricing.MaxPlausibleTokens — whatever happened to the money.
+	//
+	// SEPARATE FROM RejectedReason, which is about a figure and reads as UNPRICED everywhere. When
+	// a gateway's header priced the response, that header is what the call charged whatever the
+	// counters claimed, so refusing the money would discard a real charge; but the counts are still
+	// impossible, and a client renders them beside it. Carried alone, this is the only way to say
+	// "the dollars are good, the token totals are not" — and without it that record read as fully
+	// exact, with impossible counts next to exact money.
+	//
+	// Never spendable on its own and never a reason to drop the charge: Trust() is unaffected,
+	// because trust is about the FIGURE. A consumer rendering token totals is the one that must
+	// read this.
+	UsageRefused bool `json:"usage_refused,omitempty"`
+
 	// RejectedReason names a cost figure the producer REFUSED — RejectedImplausible
 	// today — and is the ONLY evidence that a figure was on the wire at all.
 	//

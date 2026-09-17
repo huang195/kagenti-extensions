@@ -445,3 +445,45 @@ func TestSettle_AnImpossibleCountIsRefusedWhateverElseIsWrong(t *testing.T) {
 		})
 	}
 }
+
+// TestSettle_AHeaderKeepsItsFigureAndTheCountsAreStillRefused is round 8's disclosure gap.
+//
+// When a gateway header prices the response, an impossible token report produced NO disclosure at
+// all: RejectedReason is deliberately withheld there, because it reads as unpriced everywhere and
+// would discard a real charge — so Trust() came back "exact" and a client rendered exact money
+// beside counts nobody could have counted.
+//
+// RejectedReason was the wrong carrier for it. UsageRefused says the thing that is true — the
+// dollars stand, the token totals do not — without touching what may be spent.
+func TestSettle_AHeaderKeepsItsFigureAndTheCountsAreStillRefused(t *testing.T) {
+	pctx := ctx(map[string]string{
+		ResponseCostHeader: "0.25",
+		"Content-Type":     "application/json",
+	}, 1000, -5)
+
+	got := Settle(pctx, rates(t))
+
+	if !got.Priced || got.CostUSD != 0.25 {
+		t.Errorf("Priced = %v / CostUSD = %v, want true / 0.25: the header is what the call charged, whatever the counters claimed",
+			got.Priced, got.CostUSD)
+	}
+	if !got.UsageRefused {
+		t.Error("UsageRefused = false: the counts were impossible and nothing on the record said so")
+	}
+	if got.RejectedReason != "" {
+		t.Errorf("RejectedReason = %q: that reads as unpriced to every consumer and would discard a real charge", got.RejectedReason)
+	}
+	rec := NewRecord(got, nil)
+	if !rec.UsageRefused {
+		t.Error("the record does not carry UsageRefused: a consumer rendering token totals cannot see it")
+	}
+	// AND THE MONEY IS UNTOUCHED, which is the whole point of a separate carrier.
+	if !rec.Priced() || rec.Trust() != costevent.TrustExact {
+		t.Errorf("record Priced = %v / Trust = %q, want true / %q: an impossible token report must not unprice a gateway's own figure",
+			rec.Priced(), rec.Trust(), costevent.TrustExact)
+	}
+	// AND NO SAVING IS CALIBRATED ON THE REFUSED COUNTS.
+	if avoided := Avoided(pctx, rates(t)); len(avoided) != 0 {
+		t.Errorf("avoided = %+v on a response whose counters were refused: the saving is a slice of those same counters", avoided)
+	}
+}

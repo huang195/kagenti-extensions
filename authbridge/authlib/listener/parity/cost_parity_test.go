@@ -292,6 +292,9 @@ func TestCostRecordParity(t *testing.T) {
 		}
 		for _, cf := range costFixtures(t, direction) {
 			t.Run(fmt.Sprintf("%s/%s", direction, cf.name), func(t *testing.T) {
+				// Collected in this scope for the reason parity_test.go's loop explains: a
+				// comparison assembled inside a subtest closure compares nothing the moment the
+				// subtests run in parallel, and passes.
 				records := map[string]*costevent.Event{}
 				for _, l := range listeners {
 					obs := l.run(t, cf.fixture, pipeline.SessionResponse)
@@ -375,7 +378,10 @@ func costRecord(t *testing.T, listener string, obs *observation) *costevent.Even
 	// either the concern name or the producer's, so both are tried.
 	raw, ok := obs.PluginEventJSON[costevent.Key]
 	if !ok {
-		if raw, ok = obs.PluginEventJSON[costevent.PluginName]; !ok {
+		// costevent.PluginName is deprecated in favour of the concern-named key, and reading it
+		// here is the point: Record accepts EITHER, so a consumer written against the old key must
+		// keep working. Nothing else in this repo should reach for it.
+		if raw, ok = obs.PluginEventJSON[costevent.PluginName]; !ok { //nolint:staticcheck // deliberate: the compatibility key Record still accepts
 			return nil
 		}
 	}

@@ -88,14 +88,43 @@ func TestIncompleteReason(t *testing.T) {
 		// `OutputTokens > 0 -> exact` early return — which sat ABOVE the stop-reason check
 		// — published that floor as a whole figure. That is the same failure as the
 		// truncated-Anthropic case at the top of this table, reached from the other side.
+		//
+		// StreamedResponse, not Stream: the shape that decides whether a tally is final is the
+		// RESPONSE's, and the request's flag is a different fact. See the two rows below.
 		name: "truncated OpenAI-shaped stream: running tally, no stop reason",
 		inf: &pipeline.InferenceExtension{
-			Stream:      true,
+			StreamedResponse: true,
+			InputTokens:      1000, OutputTokens: 12,
+			PromptTokens: 1000, CompletionTokens: 12,
+			PresentKinds: presentInput | presentOutput,
+		},
+		want: ReasonOutputUncounted,
+	}, {
+		// A STREAMED RESPONSE TO A NON-STREAMING REQUEST, truncated. Reachable — a gateway
+		// answers with SSE whatever the request asked — and keyed on the request flag this was
+		// classified EXACT: a running tally, no stop reason, Stream false. A floor labelled whole,
+		// which is the failure this table exists for.
+		name: "truncated stream that the request never asked for",
+		inf: &pipeline.InferenceExtension{
+			Stream: false, StreamedResponse: true,
 			InputTokens: 1000, OutputTokens: 12,
 			PromptTokens: 1000, CompletionTokens: 12,
 			PresentKinds: presentInput | presentOutput,
 		},
 		want: ReasonOutputUncounted,
+	}, {
+		// AND THE OTHER DIRECTION, which is why this is the response's shape rather than either
+		// flag: a client asked for a stream and got a buffered body. The tally arrived whole, so
+		// caveating it would print "the real total is higher" over money that is exact — the
+		// false-positive direction that teaches a reader to ignore the marker.
+		name: "a buffered response to a streaming request is exact",
+		inf: &pipeline.InferenceExtension{
+			Stream: true, StreamedResponse: false,
+			InputTokens: 1000, OutputTokens: 240,
+			PromptTokens: 1000, CompletionTokens: 240,
+			PresentKinds: presentInput | presentOutput,
+		},
+		want: "",
 	}, {
 		// And the stream that FINISHED stays exact, so the row above is a statement about
 		// truncation and not about streaming. Without this, gating on Stream would be
@@ -103,8 +132,8 @@ func TestIncompleteReason(t *testing.T) {
 		// traffic, and would make the marker meaningless.
 		name: "completed stream with a tally and a stop reason is exact",
 		inf: &pipeline.InferenceExtension{
-			Stream:      true,
-			InputTokens: 1000, OutputTokens: 240,
+			StreamedResponse: true,
+			InputTokens:      1000, OutputTokens: 240,
 			PromptTokens: 1000, CompletionTokens: 240,
 			PresentKinds: presentInput | presentOutput,
 			FinishReason: "stop",

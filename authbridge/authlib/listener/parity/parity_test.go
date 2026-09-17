@@ -319,15 +319,27 @@ func assertParity(t *testing.T, f fixture, wantPhase pipeline.SessionPhase, list
 		listener string
 		observed *observation
 	}
+	// COLLECTED OUTSIDE t.Run, WHICH IS NOT A STYLE CHOICE. Appending inside the subtest closure
+	// makes this whole suite FAIL OPEN the moment anyone adds t.Parallel to it: the parent
+	// continues past the loop before any subtest body has run, `got` is empty, the `len(got) < 2`
+	// return below fires, and every comparison below it is skipped — verified, exit 0 with zero
+	// drift errors and nothing compared. A suite whose entire purpose is catching per-listener
+	// divergence would then pass having compared nothing, silently.
+	//
+	// This is the hazard costing's TestNoTestInThisPackageRunsInParallel guards against in that
+	// package; the fix here is structural instead, so it holds however this file is run.
 	got := make([]namedObs, 0, len(listeners))
 	for _, l := range listeners {
+		var obs *observation
 		t.Run(f.name+"/"+l.name, func(t *testing.T) {
-			obs := l.run(t, f, wantPhase)
+			obs = l.run(t, f, wantPhase)
 			if obs == nil {
 				t.Fatalf("listener %q produced no matching event for fixture %q (phase=%v)", l.name, f.name, wantPhase)
 			}
-			got = append(got, namedObs{listener: l.name, observed: obs})
 		})
+		if obs != nil {
+			got = append(got, namedObs{listener: l.name, observed: obs})
+		}
 	}
 
 	// Partial-presence drift: some listeners produced an event, others
@@ -339,6 +351,12 @@ func assertParity(t *testing.T, f fixture, wantPhase pipeline.SessionPhase, list
 			present = append(present, g.listener)
 		}
 		t.Errorf("parity presence drift on fixture %q: only these listeners produced an event: %v", f.name, present)
+	}
+	// AND A FIXTURE THAT COMPARED NOTHING IS A BROKEN SUITE, not a pass. Without this, any future
+	// change that stops the loop from collecting — a t.Parallel, an early return, a driver that
+	// silently skips — turns every comparison below into a no-op that reports success.
+	if len(got) == 0 {
+		t.Fatalf("fixture %q collected no observations from %d listeners: nothing was compared", f.name, len(listeners))
 	}
 	if len(got) < 2 {
 		return // one or more legs failed in the subtest; presence drift already reported.

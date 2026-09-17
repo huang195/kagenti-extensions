@@ -312,3 +312,49 @@ func TestCost_RefusesAModelledFigurePastThePerRequestCeiling(t *testing.T) {
 			MaxPlausibleRequestCostMicros)
 	}
 }
+
+// TestPlausibilityCeilingIsTenThousandDollars pins the MAGNITUDE, which every other test in this
+// file takes as given.
+//
+// Enforcement is well covered — figures either side of the bound, the inclusive edge, the derivation
+// from its two halves — but all of it is relative to the constant, so halving maxPlausibleTokens
+// moves the ceiling to $1,000 and leaves the suite green. The number is a JUDGEMENT ("what could one
+// inference call plausibly cost"), and the whole point of the cap is its distance from real traffic:
+// the worst call anyone can construct is about $7, so a ceiling that quietly slid two orders of
+// magnitude would start refusing real bills as forgeries and record them as coverage gaps.
+//
+// So this asserts the dollars, in the units an operator reads, exactly once.
+func TestPlausibilityCeilingIsTenThousandDollars(t *testing.T) {
+	const wantUSD = 10_000.0
+	if got := float64(MaxPlausibleRequestCostMicros) / 1e6; got != wantUSD {
+		t.Errorf("the plausibility ceiling is $%.2f, want $%.2f — moving it is a judgement about how far a bound should sit from real traffic (~$7 worst case), not a refactor",
+			got, wantUSD)
+	}
+	// Either side of it, in dollars rather than in constants, so the predicate is pinned to the
+	// same figure a reader would quote.
+	if !PlausibleRequestCostUSD(wantUSD) {
+		t.Errorf("$%.2f is refused: the derivation reads \"the most a request could plausibly cost\", so the ceiling itself is plausible", wantUSD)
+	}
+	if PlausibleRequestCostUSD(wantUSD + 0.01) {
+		t.Errorf("$%.2f is accepted: the bound has stopped bounding", wantUSD+0.01)
+	}
+}
+
+// TestIncompleteReasonWireStringsArePinned covers what travels, which is the string and not the
+// identifier.
+//
+// These reach abctl as incomplete_reason JSON and costevent switches on them to decide whether a
+// figure is a floor or an approximation, so a rename is a wire break. ReasonOutputUncounted was
+// pinned by a marshalling test; the other two were not — renaming either to "MUTANT" left
+// ./authlib/... green.
+func TestIncompleteReasonWireStringsArePinned(t *testing.T) {
+	for want, got := range map[string]string{
+		"output-uncounted":     ReasonOutputUncounted,
+		"split-unreported":     ReasonSplitUnreported,
+		"counters-below-total": ReasonCountersBelowTotal,
+	} {
+		if got != want {
+			t.Errorf("reason string = %q, want %q: it travels as incomplete_reason JSON and a consumer switches on it", got, want)
+		}
+	}
+}

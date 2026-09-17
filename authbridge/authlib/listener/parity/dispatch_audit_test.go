@@ -6,7 +6,6 @@ import (
 	"go/parser"
 	"go/printer"
 	"go/token"
-	"os"
 	"path/filepath"
 	"sort"
 	"strings"
@@ -103,21 +102,20 @@ var dispatchSites = map[string]dispatchClass{
 	"extproc/server.go:dispatchBufferedFrames:ctx": inherited,
 }
 
-// listenerFiles are the packages this table covers. Named rather than discovered, so a new
-// listener package is a deliberate addition here.
-var listenerFiles = []string{
-	"reverseproxy/server.go",
-	"forwardproxy/server.go",
-	"extproc/server.go",
-}
+// listenerPackages are the packages this table covers. Named rather than discovered, so adding a
+// listener is a deliberate addition here — but every .go file INSIDE them is globbed, which is the
+// difference between an audit and a list.
+//
+// Naming files was a blind spot with a proof: a new forwardproxy/zz_blindspot.go containing exactly
+// the defect this table exists for — a finalization dispatch on r.Context() — left the audit green,
+// because the file was not one of the three it looked at. The bug it guards against arrives in new
+// code, so the check has to look at code that is new.
+var listenerPackages = []string{"reverseproxy", "forwardproxy", "extproc"}
 
 func TestEveryResponseDispatchSiteIsClassified(t *testing.T) {
 	seen := map[string]bool{}
-	for _, rel := range listenerFiles {
+	for _, rel := range sourceFiles(t) {
 		path := filepath.Join("..", rel)
-		if _, err := os.Stat(path); err != nil {
-			t.Fatalf("%s: %v — this table names its files, so a move has to be reflected here", rel, err)
-		}
 		fset := token.NewFileSet()
 		file, err := parser.ParseFile(fset, path, nil, 0)
 		if err != nil {
@@ -179,6 +177,33 @@ func TestEveryResponseDispatchSiteIsClassified(t *testing.T) {
 	for _, key := range stale {
 		t.Errorf("dispatchSites has %q, which matches no dispatch in the source: remove it, or fix the key — a table entry for code that no longer exists is a claim nothing checks", key)
 	}
+}
+
+// sourceFiles lists every non-test .go file in the covered packages, and fails when a package
+// contributes none — an empty glob is how a path change turns this audit into a no-op that reports
+// success.
+func sourceFiles(t *testing.T) []string {
+	t.Helper()
+	var out []string
+	for _, pkg := range listenerPackages {
+		matches, err := filepath.Glob(filepath.Join("..", pkg, "*.go"))
+		if err != nil {
+			t.Fatalf("glob %s: %v", pkg, err)
+		}
+		found := 0
+		for _, m := range matches {
+			if strings.HasSuffix(m, "_test.go") {
+				continue
+			}
+			out = append(out, filepath.Join(pkg, filepath.Base(m)))
+			found++
+		}
+		if found == 0 {
+			t.Fatalf("package %q contributed no source files: this audit would then pass over nothing", pkg)
+		}
+	}
+	sort.Strings(out)
+	return out
 }
 
 type dispatchSite struct {

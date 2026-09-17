@@ -119,24 +119,8 @@ func TestCompleteAnthropicStream_CarriesNoCaveat(t *testing.T) {
 	}
 }
 
-// A stream that dies before ANY usage arrives must not be disclosed as a floor: there is
-// no figure to be a lower bound of. It takes the no_response_body path instead, which the
-// body-less-cost fix now routes through settleCost — so this asserts the two changes
-// compose rather than colliding.
-func TestStreamDyingBeforeAnyUsage_IsNotAFloor(t *testing.T) {
-	p := NewInferenceParser()
-	p.SetPricingResolver(bodylessRates(t))
-	pctx := anthropicStreamCtx()
-
-	p.OnResponseFrame(context.Background(), pctx, nil, true)
-
-	if pctx.Extensions.Inference.TotalTokens != 0 {
-		t.Fatalf("TotalTokens = %d, want 0; the fixture carried usage after all", pctx.Extensions.Inference.TotalTokens)
-	}
-	if ev, ok := publishedCost(t, pctx); ok {
-		t.Errorf("published %+v; with no counters and no cost header there is nothing to say, and a caveat on nothing would count unpriced traffic as partially priced", ev)
-	}
-	if n := skipRows(pctx); n != 1 {
-		t.Errorf("no_response_body Skip rows = %d, want 1", n)
-	}
-}
+// The claim "a stream that dies before ANY usage publishes nothing" lives in
+// bodyless_cost_test.go as TestBodylessResponse_StreamPlaceholderZeroPublishesNothing. It was
+// written twice: anthropicStreamCtx() and bodylessCtx("0", true) with an SSE content type are the
+// same context, driven the same way, asserting the same thing — and the surviving copy sits in the
+// family whose subject is exactly that Content-Type discrimination.

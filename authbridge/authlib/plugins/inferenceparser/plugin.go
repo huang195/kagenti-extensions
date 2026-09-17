@@ -474,7 +474,18 @@ func normalizeSSE(body []byte) []byte {
 	if !bytes.ContainsRune(body, '\r') {
 		return body
 	}
-	// CRLF first, so a CRLF stream does not become a blank line between every field.
+	// WHAT IS LOAD-BEARING HERE, MEASURED RATHER THAN ASSUMED. The BOM strip and the CR-only
+	// replacement are: a CR-only body is ONE line to bytes.Split(body, "\n"), so every `data:`
+	// prefix check misses it and the usage is lost, and a leading BOM defeats the same check on the
+	// first line. Both have rows in sse_shapes_test.go that fail without them.
+	//
+	// THE CRLF-FIRST ORDERING IS NOT. Both parsers are line-based and TrimSpace each line, so a
+	// trailing \r is already handled — dropping this replacement entirely, leaving CR->LF alone,
+	// changes no observable behaviour in either dialect (mutation-tested). It stays as defence in
+	// depth for a future consumer that splits on a blank line rather than scanning lines, where
+	// CRLF collapsed by CR->LF alone WOULD become a blank line between every field; the PR body's
+	// claim that CRLF was a fix is wrong, and the CRLF rows in the tests are exercise rather than
+	// discrimination.
 	out := bytes.ReplaceAll(body, []byte("\r\n"), []byte("\n"))
 	return bytes.ReplaceAll(out, []byte("\r"), []byte("\n"))
 }
@@ -523,6 +534,14 @@ func foldOpenAIFrame(frame []byte, state *inferenceStreamState, ext *pipeline.In
 }
 
 func getOrCreateStreamState(pctx *pipeline.Context) *inferenceStreamState {
+	// THE RESPONSE WAS OBSERVED STREAMING, recorded here because this is the one place that runs
+	// exactly when a stream is being folded — a non-terminal frame, or an SSE body on a terminal
+	// one. pricing.IncompleteReason needs it to decide whether an output tally is FINAL, and the
+	// request's own stream flag cannot answer that: a gateway may answer a non-streaming request
+	// with SSE, in which case a running tally read as final publishes a floor as an exact figure.
+	if pctx.Extensions.Inference != nil {
+		pctx.Extensions.Inference.StreamedResponse = true
+	}
 	if s := pipeline.GetState[inferenceStreamState](pctx, streamStateKey); s != nil {
 		return s
 	}

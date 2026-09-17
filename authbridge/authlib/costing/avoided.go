@@ -76,6 +76,13 @@ func Avoided(pctx *pipeline.Context, rates pricing.Resolver) []costevent.Saving 
 		if tokens <= 0 {
 			continue
 		}
+		// NOT CALIBRATED ON A REPORT THIS PACKAGE REFUSED. AvoidedUsage slices the response's own
+		// counters, so an impossible report produced an impossible saving — measured: 2,000,000
+		// tokens avoided at $20, on a record marked refused. The saving comes from the same numbers
+		// Settle declined, so it goes with them.
+		if !pricing.PlausibleUsage(usage) {
+			continue
+		}
 		saved, tier := pricing.AvoidedUsage(usage, tokens)
 		s := costevent.Saving{
 			Component:     component,

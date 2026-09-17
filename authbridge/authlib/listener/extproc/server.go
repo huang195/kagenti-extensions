@@ -907,7 +907,11 @@ func (s *Server) handleResponseBody(ctx context.Context, body []byte, pctx *pipe
 	// what goes missing is the OUTPUT tally while the response still settles at the prompt-only
 	// floor.
 	if isEventStream(pctx.ResponseHeaders.Get("Content-Type")) {
-		pctx.ResponseBody = withCarriedSSETail(pctx, body)
+		// BOUNDED LIKE THE OTHER ARM. The carry itself is capped at one frame's worth, but the join
+		// below is carry + THIS MESSAGE, and nothing else caps the message: the maxBodySize check in
+		// Process covers the REQUEST body only. appendBoundedBody puts both under the same ceiling
+		// the non-SSE arm has, warning and truncating rather than growing without limit.
+		pctx.ResponseBody = appendBoundedBody(nil, withCarriedSSETail(pctx, body))
 	} else {
 		pctx.ResponseBody = appendBoundedBody(pctx.ResponseBody, body)
 	}

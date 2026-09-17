@@ -156,6 +156,17 @@ type InferenceExtension struct {
 	Tools       []InferenceTool    `json:"tools,omitempty"`
 	ToolChoice  any                `json:"toolChoice,omitempty"` // "auto" | "none" | {type,function:{name}}
 
+	// StreamedResponse says the RESPONSE arrived as a stream, which is a different fact from
+	// Stream above — that one is what the request ASKED for, read off the request body.
+	//
+	// They come apart in both directions and the difference decides whether a token tally is
+	// FINAL: a gateway may answer a non-streaming request with SSE, and a client asking for a
+	// stream may get a buffered body. A parser reading the request flag then calls a running
+	// tally final (a floor labelled exact) or calls a final one running (a caveat on correct
+	// money). Set by whoever observed the frames — see inferenceparser's per-frame arm — and read
+	// by pricing.IncompleteReason.
+	StreamedResponse bool `json:"streamedResponse,omitempty"`
+
 	// Response fields (populated after OnResponse runs).
 	Completion   string `json:"completion,omitempty"`
 	FinishReason string `json:"finishReason,omitempty"`

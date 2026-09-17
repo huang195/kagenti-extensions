@@ -31,7 +31,11 @@ import (
 // micros conversion every consumer accumulates in, and not costevent.Priced, which is the
 // admission guard the aggregator's Decode and the ledger writer's own gate both go through.
 func TestUnparsedEndpoint_ImplausibleCostContributesNothing(t *testing.T) {
-	for _, header := range []string{"1000000000", "10000.000001", "1e13"} {
+	// ONE VALUE, EVERY SITE. Which figures fall either side of the cap is costing's boundary and
+	// costing/implausible_test.go walks it — three values here only restated that, once per
+	// dispatch site. What this file owns is the PUBLICATION: that the refusal reaches the wire
+	// from every site a listener can drive.
+	for _, header := range []string{"1000000000"} {
 		for _, site := range unparsedSites() {
 			t.Run(header+"/"+site.name, func(t *testing.T) {
 				p := NewInferenceParser()
@@ -87,12 +91,12 @@ func TestUnparsedEndpoint_ImplausibleCostContributesNothing(t *testing.T) {
 //
 // Walked to the cap's edge, not just at a typical figure: $10,000 exactly must still settle.
 func TestUnparsedEndpoint_PlausibleCostStillSettles(t *testing.T) {
+	// One value, every site, for the reason above: costing owns the boundary, this owns the
+	// publication. The value kept is the one at the cap, which is the interesting end.
 	for _, tc := range []struct {
 		header string
 		want   float64
 	}{
-		{"0.0042", 0.0042},
-		{"20", 20},
 		{"10000", 10000},
 	} {
 		for _, site := range unparsedSites() {

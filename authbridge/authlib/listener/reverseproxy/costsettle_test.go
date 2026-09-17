@@ -230,7 +230,7 @@ func litellmSSEBackend(t *testing.T) *httptest.Server {
 			`{"choices":[],"usage":{"prompt_tokens":5,"completion_tokens":3,"total_tokens":8}}`,
 			`[DONE]`,
 		} {
-			fmt.Fprintf(w, "data: %s\n\n", chunk)
+			_, _ = fmt.Fprintf(w, "data: %s\n\n", chunk)
 			flusher.Flush()
 		}
 	}))
@@ -299,7 +299,7 @@ func TestReverseProxy_BufferedResponseToStreamRequest_ParsesTheEnvelope(t *testi
 		w.Header().Set("Content-Type", "application/json")
 		w.Header().Set(costing.ResponseCostHeader, "0.0004")
 		w.WriteHeader(http.StatusOK)
-		w.Write([]byte(`{"choices":[{"message":{"role":"assistant","content":"buffered reply"},` +
+		_, _ = w.Write([]byte(`{"choices":[{"message":{"role":"assistant","content":"buffered reply"},` +
 			`"finish_reason":"stop"}],"usage":{"prompt_tokens":7,"completion_tokens":2,"total_tokens":9}}`))
 	}))
 	defer backend.Close()
@@ -377,7 +377,7 @@ func TestReverseProxy_StreamedUnparsedEndpoint_CoverageBoundary(t *testing.T) {
 				w.Header().Set(costing.ResponseCostHeader, tc.costHeader)
 				w.WriteHeader(http.StatusOK)
 				flusher := w.(http.Flusher)
-				fmt.Fprint(w, "data: {\"type\":\"response.output_text.delta\",\"delta\":\"hi\"}\n\n")
+				_, _ = fmt.Fprint(w, "data: {\"type\":\"response.output_text.delta\",\"delta\":\"hi\"}\n\n")
 				flusher.Flush()
 			}))
 			defer backend.Close()
@@ -473,7 +473,7 @@ func TestReverseProxy_BufferedAnthropicEnvelopeToStreamRequest(t *testing.T) {
 	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusOK)
-		w.Write([]byte(`{"id":"msg_1","type":"message","role":"assistant",` +
+		_, _ = w.Write([]byte(`{"id":"msg_1","type":"message","role":"assistant",` +
 			`"content":[{"type":"text","text":"buffered reply"}],"stop_reason":"end_turn",` +
 			`"usage":{"input_tokens":7,"output_tokens":2}}`))
 	}))
@@ -531,7 +531,7 @@ func TestReverseProxy_ClientDisconnectMidStreamStillSettles(t *testing.T) {
 		w.Header().Set("Content-Type", "text/event-stream")
 		w.WriteHeader(http.StatusOK)
 		flusher := w.(http.Flusher)
-		fmt.Fprint(w, "data: {\"type\":\"message_start\",\"message\":{\"usage\":"+
+		_, _ = fmt.Fprint(w, "data: {\"type\":\"message_start\",\"message\":{\"usage\":"+
 			"{\"input_tokens\":1000,\"cache_read_input_tokens\":30000,\"output_tokens\":1}}}\n\n")
 		flusher.Flush()
 		// Never send message_stop: the turn is still generating when the client leaves.
@@ -591,7 +591,7 @@ func TestReverseProxy_ClientDisconnectMidStreamStillSettles(t *testing.T) {
 		t.Fatal("no SSE event downstream within 5s; the fold this test depends on never happened")
 	}
 	cancel()
-	resp.Body.Close()
+	_ = resp.Body.Close()
 
 	select {
 	case <-probe.terminal:
@@ -644,15 +644,15 @@ func TestReverseProxy_LongStreamGetsAFullTeardownBudget(t *testing.T) {
 		w.Header().Set("Content-Type", "text/event-stream")
 		w.WriteHeader(http.StatusOK)
 		flusher := w.(http.Flusher)
-		fmt.Fprint(w, "data: {\"type\":\"message_start\",\"message\":{\"usage\":"+
+		_, _ = fmt.Fprint(w, "data: {\"type\":\"message_start\",\"message\":{\"usage\":"+
 			"{\"input_tokens\":1000,\"cache_read_input_tokens\":30000,\"output_tokens\":1}}}\n\n")
 		flusher.Flush()
 		// The turn keeps generating. This is the whole point: on the shipped path the gap
 		// between the first event and the last is the model's thinking time, which for a long
 		// agent turn is minutes, not milliseconds.
 		time.Sleep(hold)
-		fmt.Fprint(w, "data: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":500}}\n\n")
-		fmt.Fprint(w, "data: {\"type\":\"message_stop\"}\n\n")
+		_, _ = fmt.Fprint(w, "data: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":500}}\n\n")
+		_, _ = fmt.Fprint(w, "data: {\"type\":\"message_stop\"}\n\n")
 		flusher.Flush()
 	}))
 	defer backend.Close()
@@ -763,5 +763,57 @@ func TestReverseProxy_BufferedResponseAfterAHangupStillSettles(t *testing.T) {
 	}
 	if _, terminals := probe.dispatches(); terminals != 1 {
 		t.Errorf("terminal dispatches = %d, want exactly 1", terminals)
+	}
+}
+
+// TestReverseProxy_TruncatedStreamToANonStreamRequest_IsAFloor is round 8's instrument finding,
+// driven through a real listener because that is where the two facts come apart.
+//
+// The request does NOT ask for a stream; the gateway answers with SSE anyway and the stream dies
+// before its stop reason — an OpenAI-shaped body, where each usage-bearing chunk RESTATES the
+// running totals, so the last tally seen is not final. Keyed on the REQUEST's stream flag, this
+// response was classified exact: a floor published as a whole figure, which is the failure the
+// incompleteness machinery exists to prevent, reached by a route it could not see.
+//
+// The shape that decides finality is the RESPONSE's, and the parser learns it the same way it
+// picks its dispatch arm — by being handed frames.
+func TestReverseProxy_TruncatedStreamToANonStreamRequest_IsAFloor(t *testing.T) {
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		flusher := w.(http.Flusher)
+		// A running total and no finish_reason: the generation was still going.
+		_, _ = fmt.Fprint(w, "data: {\"choices\":[{\"delta\":{\"content\":\"partial\"}}],"+
+			"\"usage\":{\"prompt_tokens\":1000,\"completion_tokens\":12,\"total_tokens\":1012}}\n\n")
+		flusher.Flush()
+	}))
+	defer backend.Close()
+
+	probe := &costProbe{}
+	srv, err := NewServer(costPipeline(t, probe), nil, backend.URL, nil)
+	if err != nil {
+		t.Fatalf("NewServer: %v", err)
+	}
+	proxy := httptest.NewServer(srv.Handler())
+	defer proxy.Close()
+
+	// NO stream flag on the request, which is the whole point.
+	postThrough(t, proxy.URL, "/v1/chat/completions",
+		`{"model":"claude-opus-5","messages":[{"role":"user","content":"hi"}]}`)
+
+	settled, loaded, _, output, _ := probe.snapshotCost()
+	if !loaded {
+		t.Fatal("no Settled stored: the parser's terminal pass never ran")
+	}
+	if !settled.Priced {
+		t.Fatalf("settled = %+v; want Priced — a floor is still the best figure available", settled)
+	}
+	if !settled.Incomplete || settled.IncompleteReason != pricing.ReasonOutputUncounted {
+		t.Errorf("Incomplete = %v / reason = %q, want true / %q: the tally of %d output tokens was a RUNNING total, and the stream died before its stop reason",
+			settled.Incomplete, settled.IncompleteReason, pricing.ReasonOutputUncounted, output)
+	}
+	// AND THE RECORD CARRIES IT, since the caveat only matters where the money is read.
+	if rec := costing.NewRecord(settled, nil); !rec.Incomplete || rec.Trust() != costevent.TrustFloor {
+		t.Errorf("record Incomplete = %v / Trust = %q, want true / %q", rec.Incomplete, rec.Trust(), costevent.TrustFloor)
 	}
 }

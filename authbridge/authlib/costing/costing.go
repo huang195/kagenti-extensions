@@ -154,16 +154,19 @@ func headerCost(pctx *pipeline.Context) (cost float64, state headerCostState) {
 // admitted — an endpoint off the parser's dialect list, or a body it could not read.
 //
 // WHY THE PARSED PATH IS LEFT ALONE. Where the extension is present there is a MODELLED figure
-// to compare the header against, so an implausible one is DETECTABLE: Settle publishes both and
-// the drift check notices them disagreeing. Refusing it instead would discard the one signal that
-// a rate table has gone stale. TestSettle_ParsedEndpointIsUnaffectedByTheCap pins that.
+// beside the header, so refusing the header would discard the one comparison that can show a rate
+// table has gone stale against a gateway. TestSettle_ParsedEndpointIsUnaffectedByTheCap pins that.
 //
-// TWO LIMITS ON THAT ARGUMENT, which narrow it rather than restate it. DETECTABLE IS NOT
-// PREVENTED: the drift check logs, it does not withhold, so the figure still reaches Publish, the
-// aggregate, the ledger and the 429 lockout — a log line after the damage. And A NON-NIL
-// EXTENSION IS NOT A CORROBORATING FIGURE: it is populated on the REQUEST pass carrying no
-// counts, so HasModelled is false whenever the model has no rates or the usage block is empty,
-// and those responses get neither the cap nor the drift signal.
+// AND THE COMPARISON IS NOT WHAT THIS JUSTIFICATION RESTS ON, which is a correction: the drift
+// check now returns early whenever the modelled figure is a floor, so on many of these responses it
+// says nothing at all. What stays true is narrower — the pair is PUBLISHED, so a consumer holding
+// the record can see them disagree — and the reason not to cap here is that capping is not the fix.
+//
+// TWO LIMITS, which narrow it rather than restate it. DETECTABLE IS NOT PREVENTED: nothing here
+// withholds the figure, so it reaches Publish, the aggregate, the ledger and the 429 lockout
+// regardless. And A NON-NIL EXTENSION IS NOT A CORROBORATING FIGURE: it is populated on the REQUEST
+// pass carrying no counts, so HasModelled is false whenever the model has no rates or the usage
+// block is empty, and those responses get neither the cap nor any comparison.
 //
 // THE RESIDUAL, reachable and not closed here: a hostile host on a path the parser DOES recognise
 // can settle up to MaxCostMicros ($9.007 billion), published and aggregated while the drift check
@@ -321,6 +324,12 @@ type Settled struct {
 	HasModelled bool
 	// ModelledProv is the provenance behind ModelledUSD.
 	ModelledProv pricing.Provenance
+	// UsageRefused says the token counters were impossible, whatever happened to the money. Set
+	// alongside a REFUSED figure, and — the case it exists for — alongside a gateway figure that
+	// was believed anyway: the header is what the call charged, so it stands, while the counts
+	// beside it do not. See costevent.Event.UsageRefused.
+	UsageRefused bool
+
 	// ModelledIncomplete says the MODELLED figure is not an exact total, whichever figure
 	// won, and ModelledIncompleteReason is pricing.IncompleteReason's answer for it.
 	//
@@ -449,6 +458,7 @@ func Settle(pctx *pipeline.Context, rates pricing.Resolver) Settled {
 	// rate the report refused as "no-rate" and this branch never ran — leaving the output half,
 	// which zeroes the offending tier, priced at $0.0005 on a record disclosing nothing.
 	if !pricing.PlausibleUsage(usage) {
+		out.UsageRefused = true
 		return withRefusal(out, cost, state, pctx, costevent.RejectedImplausibleUsage)
 	}
 
@@ -689,8 +699,10 @@ func NewRecord(s Settled, avoided []costevent.Saving) costevent.Event {
 		// in — it published nothing at all and looked identical to a response that
 		// reported no cost.
 		RejectedReason: s.RejectedReason,
-		PromptUSD:      s.PromptUSD,
-		OutputUSD:      s.OutputUSD,
-		Avoided:        avoided,
+		// Carried on its own, because it survives a believed header: see Settled.UsageRefused.
+		UsageRefused: s.UsageRefused,
+		PromptUSD:    s.PromptUSD,
+		OutputUSD:    s.OutputUSD,
+		Avoided:      avoided,
 	}
 }

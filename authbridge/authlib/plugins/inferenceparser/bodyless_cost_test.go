@@ -308,6 +308,10 @@ func TestBodylessResponse_DeclaredFreeZeroIsPublishedAsSettled(t *testing.T) {
 // Same header value, same body-less path, opposite outcome — separated only by
 // Content-Type. Without this row, a change that dropped costing's IsEventStream check
 // would still pass the declared-free test above.
+//
+// It also covers "a stream that died before ANY usage arrived", which incomplete_cost_test.go
+// asserted separately with an identical context: no counters and a placeholder zero publish
+// nothing, and a caveat on nothing would count unpriced traffic as partially priced.
 func TestBodylessResponse_StreamPlaceholderZeroPublishesNothing(t *testing.T) {
 	p := NewInferenceParser()
 	p.SetPricingResolver(bodylessRates(t))

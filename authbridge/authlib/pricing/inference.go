@@ -280,18 +280,23 @@ func outputUncounted(inf *pipeline.InferenceExtension) bool {
 	// that appears on correct figures is one a reader learns to ignore, which costs more than
 	// the case it was added for.
 	//
-	// Stream comes from the REQUEST body, so it is false whenever this process did not read
-	// the request — an unparsed endpoint, extproc without a request body, a body past the
-	// size cap. The change can only ever add a caveat to traffic we know asked for a stream,
-	// and never to traffic we did not read: the safe direction for a predicate whose job is
-	// to under-claim precision rather than over-claim it (see IncompleteReason's ordering).
+	// AND THE SHAPE READ IS THE RESPONSE'S, NOT THE REQUEST'S. StreamedResponse is set by whoever
+	// folded the frames; Stream is what the request asked for, and the two come apart in both
+	// directions. A gateway answering a NON-streaming request with SSE was the case that mattered:
+	// keyed on the request flag, a truncated stream of that shape had a running tally, no stop
+	// reason, and Stream false — so it was classified EXACT, a floor labelled whole, which is the
+	// failure this function exists to prevent. The parser already refuses to take its dispatch arm
+	// from the request flag for the same reason; this is that argument applied one level up.
 	//
-	// ANTHROPIC WAS ALREADY SAFE and stays unaffected: Output is assigned only in the
-	// message_delta arm, which carries delta.stop_reason on the same frame, so a truncated
-	// Anthropic stream has no tally to be misread. This closes the OpenAI-shaped half, which
-	// is the half nothing was watching.
+	// False whenever nothing observed a stream — an unparsed endpoint, a body past the size cap —
+	// which is the safe direction: a caveat can only be added to traffic seen streaming, never to
+	// traffic nobody read (see IncompleteReason's ordering).
+	//
+	// ANTHROPIC IS UNAFFECTED either way: Output is assigned only in the message_delta arm, which
+	// carries delta.stop_reason on the same frame, so a truncated Anthropic stream has no tally to
+	// be misread. This closes the OpenAI-shaped half.
 	if inf.OutputTokens > 0 || inf.CompletionTokens > 0 {
-		return inf.Stream
+		return inf.StreamedResponse
 	}
 	// A prompt-side count is what makes this a FLOOR rather than simply unpriced:
 	// without one there is nothing for the figure to be a lower bound OF, and costing

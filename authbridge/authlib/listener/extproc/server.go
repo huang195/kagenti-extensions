@@ -116,7 +116,21 @@ func (s *Server) Process(stream extprocv3.ExternalProcessor_ProcessServer) error
 		if (sawResponseHeaders || sawResponseBody) && !responseWasRecorded(pctx) {
 			finalCtx, cancelFinal := httpx.TeardownContext(ctx)
 			defer cancelFinal()
+			// THE OUTCOME AS IT STOOD BEFORE THE FLUSH RAN ANYTHING, captured here and passed
+			// to RunFinish below.
+			//
+			// The flush dispatches plugins, and a plugin can reject in a response phase. The
+			// action is dropped — the response has already gone downstream, so there is nothing
+			// left to refuse — but the REJECTION is still recorded on the context, and
+			// OutcomeFromContext maps any deny to OutcomeDeny. Derived after the flush, every
+			// Finisher then reads "this request was denied" for a response Envoy delivered with
+			// a 200, which inverts the rule this defer states two blocks up: a rejected response
+			// is left alone precisely so a denial and an ordinary response are not confused. A
+			// late refusal cannot change what happened.
+			delivered := pipeline.OutcomeFromContext(pctx)
+			defer func() { p.RunFinish(ctx, pctx, delivered) }()
 			if !responsePhaseWasRun(pctx) {
+				markResponsePhaseRun(pctx)
 				// THE PHASE HAS NOT RUN YET, which on this path means handleResponseHeaders
 				// deferred it to a body message that never arrived. Asked as "did it run", not
 				// "was there a body": both dispatch sites mark it, so a stream that delivered
@@ -124,7 +138,14 @@ func (s *Server) Process(stream extprocv3.ExternalProcessor_ProcessServer) error
 				// get a second one — see responsePhaseKey for what inferring it cost.
 				// Rejecting is meaningless here (the stream is gone), so the action is dropped,
 				// exactly as it is for the terminal frame.
-				_ = p.RunResponse(finalCtx, pctx)
+				if action := p.RunResponse(finalCtx, pctx); action.Type == pipeline.Reject {
+					// Said out loud rather than swallowed: a plugin refusing a response that
+					// Envoy has already delivered is a policy decision that did not take
+					// effect, and an operator reading an allow-shaped row needs to know one
+					// was attempted.
+					slog.Warn("ext_proc: a plugin rejected during teardown, after the response was delivered",
+						"plugin", pctx.RejectingPlugin(), "code", violationCode(action))
+				}
 			}
 			if p.HasStreamingResponders() {
 				// DETACHED FROM THE STREAM'S CONTEXT, which is the difference between this
@@ -148,6 +169,7 @@ func (s *Server) Process(stream extprocv3.ExternalProcessor_ProcessServer) error
 				dispatchTerminalFrame(finalCtx, p, pctx)
 			}
 			s.recordResponseSession(pctx, requestDirection)
+			return
 		}
 		p.RunFinish(ctx, pctx, pipeline.OutcomeFromContext(pctx))
 	}()
@@ -755,6 +777,15 @@ func (s *Server) handleResponseHeaders(ctx context.Context, headers *corev3.Head
 	}
 }
 
+// violationCode names a rejected action's code for a log line, tolerating a nil Violation —
+// pipeline.Deny always sets one, but an action assembled by hand need not.
+func violationCode(a pipeline.Action) string {
+	if a.Violation == nil {
+		return ""
+	}
+	return a.Violation.Code
+}
+
 // responsePhaseKey and responsePhaseRun mark the response phase as already dispatched.
 //
 // TRACKED, NOT INFERRED, and the difference is a plugin running twice. The teardown flush has
@@ -935,17 +966,26 @@ func (s *Server) handleResponseBody(ctx context.Context, body []byte, pctx *pipe
 		p = s.InboundPipeline
 	}
 
-	// MARKED HERE TOO, because this is the second of the two places that run the phase. The
-	// teardown flush asks whether RunResponse has happened, and on the route where body
-	// messages arrive but Envoy never says end-of-stream it used to get the wrong answer from
-	// this site's silence: every non-streaming plugin ran its response phase again, and the
-	// extra Invocation rows landed in the recorded snapshot. Marked BEFORE the dispatch so a
-	// plugin that rejects — which returns from inside RunResponse's fan-out — still leaves the
-	// phase marked as run.
-	markResponsePhaseRun(pctx)
-	action := p.RunResponse(ctx, pctx)
-	if action.Type == pipeline.Reject {
-		return rejectFromAction(action)
+	// ONCE PER RESPONSE, ON THE LAST MESSAGE — not once per ResponseBody message.
+	//
+	// A statically configured STREAMED body mode delivers N messages, and this ran the response
+	// phase on every one of them, each time over a PARTIAL body: opa, cpex, lineage and sparc
+	// would decide N times on N prefixes of a document, and their Invocation rows would all land
+	// in the recorded snapshot. That contradicts what responsePhaseKey says the phase is, and it
+	// is the same "wait for the whole body" rule the frame dispatch and the session record
+	// already follow. No double CHARGE was possible — both cost owners are StreamingResponders,
+	// which RunResponse skips — so what this protects is the audit trail and any plugin that
+	// reads pctx.ResponseBody expecting a document.
+	//
+	// MARKED, because the teardown flush asks whether the phase has run. A stream that never says
+	// end-of-stream never reaches this branch, so the flush runs the phase once itself; a stream
+	// that does reach it must not be run again. Marked BEFORE the dispatch so a plugin that
+	// rejects still leaves the phase marked.
+	if endOfStream {
+		markResponsePhaseRun(pctx)
+		if action := p.RunResponse(ctx, pctx); action.Type == pipeline.Reject {
+			return rejectFromAction(action)
+		}
 	}
 
 	// Streaming-aware plugins use a single code path for both shapes

@@ -114,11 +114,10 @@ func bodylessSites() []bodylessSite {
 		// plugin.go OnResponseFrame, streaming arm: a stream that finalized with no
 		// completion, no finish reason, no usage and no tool calls.
 		//
-		// THIS SITE WAS NAMED AND NOT DRIVEN, and the driver below is the correction. It
-		// used to be `OnResponseFrame(nil, true)` — byte-identical to the one-shot site
-		// above it — and with no earlier frame there is no stream state, so the terminal
-		// call took the `state == nil` branch and this table exercised two of the three
-		// sites it claims. Mutation-verified in both directions: deleting the settle in the
+		// THE STREAMING SITE HAS TO BE DRIVEN AS A STREAM. `OnResponseFrame(nil, true)`
+		// alone is byte-identical to the one-shot site above it: with no earlier frame there
+		// is no stream state, so the terminal call takes the `state == nil` branch and this
+		// table exercises two of the three sites it claims. Mutation-verified in both directions: deleting the settle in the
 		// streaming arm passed all 59 packages of authlib, while deleting the one in the
 		// arm below it failed two tests, so the method was sound and this row was the hole.
 		//

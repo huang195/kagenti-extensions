@@ -8,10 +8,9 @@ import (
 // TestMicrosFromUSD_RejectsANegativeFigureHoweverSmall is the boundary the sign check
 // exists to hold, walked from both sides of zero.
 //
-// The conversion used to check the sign of the ROUNDED figure, and the sign does not
-// survive the rounding: math.Round(-1e-07 * 1e6) is math.Round(-0.1), which is negative
-// zero, and `-0.0 < 0` is false in Go. Every figure in (-5e-07, 0) therefore came back
-// (0, true) — a priced zero standing in for a wrong-signed figure, which is the one class
+// THE SIGN HAS TO BE CHECKED ON THE INPUT, because it does not survive the rounding:
+// math.Round(-1e-07 * 1e6) is math.Round(-0.1), which is negative zero, and `-0.0 < 0` is
+// false in Go. Checked after rounding, every figure in (-5e-07, 0) comes back (0, true) — a priced zero standing in for a wrong-signed figure, which is the one class
 // of arithmetic error this package cannot detect after the fact: a total that says "free"
 // is indistinguishable from a call that was free.
 //

@@ -300,10 +300,10 @@ func runExtproc(t *testing.T, f fixture, wantPhase pipeline.SessionPhase) *obser
 		// Send ResponseBody only when the plugin asked for body buffering AND
 		// THERE IS A BODY.
 		//
-		// The second half is not a tidy-up. This append used to fire on
-		// NeedsBody() alone, so every fixture with an empty upstream body got a
-		// synthetic zero-length ResponseBody message that real Envoy never
-		// sends — which made the body-less shape unrepresentable here and let
+		// The second half is not a tidy-up. Firing this append on NeedsBody()
+		// alone gives every fixture with an empty upstream body a synthetic
+		// zero-length ResponseBody message that real Envoy never sends — which
+		// makes the body-less shape unrepresentable here and lets
 		// extproc drop the cost and the response row for every 204, 304 and
 		// error-status-on-headers while a suite whose entire purpose is catching
 		// per-listener divergence stayed green. A harness that cannot express a

@@ -19,15 +19,16 @@ import (
 	"github.com/rossoctl/cortex/authbridge/authlib/pricing"
 )
 
-// These tests exist because the listener and the inference parser used to disagree about
-// what shape a response was, and nothing in either package could see the disagreement.
+// These tests exist because the listener and the inference parser can disagree about what
+// shape a response was, and nothing in either package sees the disagreement on its own.
 //
 // The listener picks its dispatch arm from the RESPONSE Content-Type (see modifyResponse:
 // text/event-stream => per-frame + a terminal last=true; anything else => one buffered
-// last=true frame). The parser used to pick its arm from the REQUEST's stream flag. When
-// those two differ the parser runs the wrong arm over the listener's frames, and every
-// earlier test missed it by calling the parser's hook directly with a hand-built sequence
-// that could not contradict itself.
+// last=true frame). The parser must take its arm from the same evidence — a non-terminal
+// frame only ever comes from a per-frame dispatch — and NOT from the REQUEST's stream flag:
+// when those two differ the parser runs the wrong arm over the listener's frames. A test that
+// calls the parser's hook directly with a hand-built sequence cannot contradict itself, which
+// is why these drive a real listener.
 //
 // So the assertions below go through the real listener: a real backend sets the
 // Content-Type, a real request body sets (or omits) the stream flag, and the cost is read
@@ -262,8 +263,8 @@ func TestReverseProxy_StreamedResponseToNonStreamRequest_StillCosts(t *testing.T
 // direction of the same disagreement, and the one a gateway produces routinely: the
 // client asked for a stream and got a single application/json envelope back (a 200 from a
 // gateway that ignored the flag, or any 4xx/5xx error page). The listener buffers it and
-// delivers ONE last=true frame; the parser used to fold that envelope as if it were an
-// SSE chunk, which yields no completion and a Skip row claiming there was no body.
+// delivers ONE last=true frame, and folding that envelope as if it were an SSE chunk yields
+// no completion and a Skip row claiming there was no body.
 func TestReverseProxy_BufferedResponseToStreamRequest_ParsesTheEnvelope(t *testing.T) {
 	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
@@ -487,10 +488,10 @@ func TestReverseProxy_BufferedAnthropicEnvelopeToStreamRequest(t *testing.T) {
 // A client that hangs up mid-stream is a normal event — a cancelled turn, a closed tab, a
 // timeout — and the tokens the model already reported are real spend. The terminal
 // last=true dispatch is the only thing that turns folded state into a settled cost, and it
-// used to run on the REQUEST's context: cancelled by the disconnect, so
-// pipeline.RunResponseFrame returned Deny("pipeline.cancelled") before calling any plugin
-// (pipeline.go:203) and the charge was dropped on the floor. forwardproxy detaches the
-// finalization context for exactly this reason (server.go:958).
+// must not run on the REQUEST's context: that context is cancelled by the disconnect, so
+// pipeline.RunResponseFrame returns Deny("pipeline.cancelled") before calling any plugin and
+// the charge is dropped on the floor. Every listener detaches its finalization context for
+// this reason — see httpx.TeardownContext, which also bounds it.
 //
 // The Anthropic shape is what makes this cost money rather than telemetry: message_start
 // carries the whole prompt split, including cache reads, so the expensive half of a long

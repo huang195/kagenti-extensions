@@ -44,9 +44,9 @@ type budgetTrackConfig struct {
 
 	// There are deliberately no rate knobs here any more.
 	//
-	// Four of them (input / output / cache_write / cache_read per token) used to
-	// price streamed responses, duplicating both the rates in tool-prune's config
-	// and the token parser in inference-parser. Rates now come from the top-level
+	// Four of them (input / output / cache_write / cache_read per token) priced
+	// streamed responses here, duplicating both the rates in tool-prune's config
+	// and the token parser in inference-parser. Rates come from the top-level
 	// `pricing:` section via authlib/pricing, which also gives them endpoint
 	// scoping — the same model bills differently per gateway, and a per-plugin
 	// table had no way to say so.
@@ -57,9 +57,9 @@ const stateKey = "litellm-budget-track"
 
 // settleState records that the terminal frame already priced this request.
 //
-// It no longer accumulates token counts. The plugin used to run its own SSE parser
-// to gather them, duplicating inference-parser frame for frame; it now reads the
-// counts that parser publishes, so all that is left to remember is exactly-once.
+// It accumulates no token counts. Gathering them here means a second SSE parser duplicating
+// inference-parser frame for frame; this reads the counts that parser publishes instead, so all
+// that is left to remember is exactly-once.
 type settleState struct {
 	settled bool
 }
@@ -130,10 +130,10 @@ func (p *BudgetTrack) Capabilities() pipeline.PluginCapabilities {
 
 func (p *BudgetTrack) Configure(raw json.RawMessage) error {
 	// DisallowUnknownFields, matching tool-prune's Configure. Without it the four
-	// rate knobs this plugin used to accept — input_cost_per_token and friends —
-	// were silently dropped from an existing config: no error, no warning, no log
-	// line, and the deployment switched to bundled vendor-list rates, which by this
-	// change's own accounting OVERSTATES a discounted gateway. An operator would
+	// rate knobs this plugin no longer accepts — input_cost_per_token and friends —
+	// are silently dropped from an existing config: no error, no warning, no log
+	// line, and the deployment switches to bundled vendor-list rates, which
+	// OVERSTATES a discounted gateway. An operator would
 	// see their cost figures move and have nothing pointing at the cause.
 	dec := json.NewDecoder(bytes.NewReader(raw))
 	dec.DisallowUnknownFields()
@@ -216,14 +216,13 @@ func (p *BudgetTrack) OnResponseFrame(_ context.Context, pctx *pipeline.Context,
 // is the LEDGER: double-counting money is not recoverable from a later correction, since the
 // file has already been written.
 //
-// WHICH LISTENER REPEATS A TERMINAL FRAME — corrected, because this comment used to say
-// "extproc does, once for headers and once for the buffered body" and that is not what
-// happens. extproc's response-header phase returns early whenever the pipeline needs a body
-// (server.go), which inference-parser's undirected ReadsBody makes true for every shipped
-// pipeline, so the header-only dispatch is unreachable there. What extproc really did was
-// run the whole buffered dispatch once per ResponseBody MESSAGE, which is now gated on
-// end_of_stream at the listener (see dispatchBufferedFrames). The same wrong explanation was
-// corrected in inferenceparser's settleCost; it had been copied here.
+// WHICH LISTENER REPEATS A TERMINAL FRAME, and "extproc does, once for headers and once for
+// the buffered body" is the reading to avoid: its response-header phase returns early whenever
+// the pipeline needs a body, which inference-parser's undirected ReadsBody makes true for every
+// shipped pipeline, so the header-only dispatch is unreachable there. What extproc can repeat is
+// the whole buffered dispatch, once per ResponseBody MESSAGE, which is gated on end_of_stream at
+// the listener (see dispatchBufferedFrames). inferenceparser's settleCost carries the same
+// analysis.
 //
 // The guard therefore protects against a repeated terminal frame from any listener rather
 // than a named one — which is the right shape for a plugin that cannot see who is calling

@@ -192,10 +192,10 @@ func TestParity_ReadsBodySSE(t *testing.T) {
 // body — must still reach the terminal RunResponseFrame(nil, true) on every
 // listener, because that dispatch is where a streaming-aware plugin finalizes:
 // where inference-parser settles the cost off the gateway's response header and
-// records its no_response_body Skip. extproc used to reach it on neither branch
-// (its header phase deferred to a body phase Envoy never opened), so on that
-// listener a body-less response settled nothing and recorded no response row at
-// all. The proxies got it right, which is exactly the divergence this suite is
+// records its no_response_body Skip. On extproc that dispatch hangs off a gate
+// that has to consider end_of_stream: keyed on NeedsBody() alone its header phase
+// defers to a body phase Envoy never opens, and a body-less response then settles
+// nothing and records no response row at all. The proxies got it right, which is exactly the divergence this suite is
 // for and exactly what it could not see: the old harness handed extproc a
 // zero-length ResponseBody message no Envoy would send, papering over the gap.
 //

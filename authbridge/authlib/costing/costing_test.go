@@ -12,9 +12,9 @@ import (
 
 // tierMicros is what rates charges per token in each tier, in micro-dollars.
 //
-// DISTINCT PER TIER, and that is the entire point of the numbers. This helper used to
-// charge 1e-6 in all four tiers, which made every expectation built on it a function of
-// the token TOTAL and of nothing else: 1,000 tokens priced as uncached input and 1,000
+// DISTINCT PER TIER, and that is the entire point of the numbers. Charging 1e-6 in all four
+// tiers would make every expectation built on this a function of the token TOTAL and of
+// nothing else: 1,000 tokens priced as uncached input and 1,000
 // priced as cache reads — a 10x error on the real card, and the exact mistake the
 // four-way split exists to prevent — settled to the identical figure, so no test using
 // this table could see a transposition anywhere between pricing.UsageFromInference and
@@ -85,8 +85,8 @@ func ctx(headers map[string]string, input, output int) *pipeline.Context {
 	}
 }
 
-// The precedence rule, which is the reason this package exists: it used to be implemented
-// twice, in two shapes, and the two could disagree about the same request.
+// The precedence rule, which is the reason this package exists: implemented twice, in two
+// shapes, the two can disagree about the same request.
 func TestSettle_Precedence(t *testing.T) {
 	const json = "application/json"
 	for _, tc := range []struct {

@@ -227,10 +227,9 @@ func TestPlausibleRequestCostUSD(t *testing.T) {
 
 // TestNoPerRequestBoundClosesTheAccumulationWrap is the DISCLOSURE, not a fix.
 //
-// MaxCostMicros' comment used to claim it closed the usage.Counts.Add wrap. It did not: it
-// moved the threshold from two requests to 1,024. The cap in this file moves it again, by
-// nearly six orders of magnitude and only on the path it applies to, and it does not close
-// it either — because no per-request bound can. For any bound C > 0 the sum wraps after
+// A PER-REQUEST BOUND CANNOT CLOSE THE usage.Counts.Add WRAP, only move it. MaxCostMicros
+// moves the threshold to 1,024 requests; the plausibility cap moves it again, by nearly six
+// orders of magnitude and only on the path it applies to. Neither closes it. For any bound C > 0 the sum wraps after
 // ceil(MaxInt64/C) requests and nothing here bounds the request count.
 //
 // This test exists so that arithmetic is checked rather than asserted in prose, and so
@@ -266,7 +265,7 @@ func TestNoPerRequestBoundClosesTheAccumulationWrap(t *testing.T) {
 // A MODELLED FIGURE IS HELD TO THE SAME PER-REQUEST CEILING AS A GATEWAY'S OWN.
 //
 // costing applies PlausibleRequestCostUSD ($10,000) to a cost header and names the refusal;
-// Cost used to bound its own arithmetic only at MaxCostMicros ($9 billion), which this file
+// bounded only at MaxCostMicros ($9 billion), Cost's own arithmetic would admit what this file
 // calls a garbage ledger figure. Two independent ways to reach the gap, both exercised here:
 // the token check inside Cost is PER TIER, so one request can carry maxPlausibleTokens
 // several times over, and a base RATE has no magnitude bound at all — config.Build validates

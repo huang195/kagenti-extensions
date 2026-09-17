@@ -78,9 +78,8 @@ func TestIncompleteReason(t *testing.T) {
 		},
 		want: "",
 	}, {
-		// THE SAME EXTENSION, PLUS Stream, AND THE OPPOSITE ANSWER — the case the
-		// function used to get wrong, and the reason the row above cannot be read as a
-		// general rule.
+		// THE SAME EXTENSION, PLUS Stream, AND THE OPPOSITE ANSWER — which is why the row
+		// above cannot be read as a general rule.
 		//
 		// foldOpenAIFrame REPLACES the accumulated usage with each usage-bearing chunk's
 		// totals ("OpenAI streams cumulative usage: each usage-bearing chunk restates the
@@ -162,11 +161,11 @@ func TestIncompleteReason(t *testing.T) {
 		},
 		want: ReasonOutputUncounted,
 	}, {
-		// THE FALSE POSITIVE the presence mask used to produce, and the reason this
-		// predicate reads counters instead. Cache counts are a per-kind split: they were
-		// reported, UsageFromInference prices them, and no total was attributed to input —
-		// so there is nothing approximate to disclose. The Input and Output BITS are clear
-		// here, which is all the old mask looked at. The stop reason keeps this off the
+		// THE FALSE POSITIVE A PRESENCE-MASK TEST PRODUCES, and the reason this predicate
+		// reads counters instead. Cache counts are a per-kind split: they were reported,
+		// UsageFromInference prices them, and no total was attributed to input — so there is
+		// nothing approximate to disclose. The Input and Output BITS are clear here, which is
+		// all a mask test would look at. The stop reason keeps this off the
 		// floor branch, so the split branch is the one under test.
 		name: "cache-only split with a total is not a totals-only gateway",
 		inf: &pipeline.InferenceExtension{
@@ -243,12 +242,12 @@ func TestIncompleteReason_MaskAloneCannotDiscriminate(t *testing.T) {
 
 // tierMicros is what distinctTierRates charges per token in each tier, in micro-dollars.
 //
-// DISTINCT PER TIER, and that is the entire point of the numbers. The floor test below
-// used to charge 1e-6 in all four tiers, which made its expectation a function of the
-// token TOTAL and of nothing else: its 1,000 uncached-input and 500 cache-read tokens
-// priced identically to 500 input and 1,000 cache reads — a 10x error on the real card,
-// and the exact mistake the four-way split exists to prevent — so the assertion stayed
-// green with TierInput and TierCacheRead transposed in Usage.tokens.
+// DISTINCT PER TIER, and that is the entire point of the numbers. Charging 1e-6 in all four
+// tiers makes the floor test's expectation a function of the token TOTAL and of nothing else:
+// 1,000 uncached-input and 500 cache-read tokens price identically to 500 input and 1,000
+// cache reads — a 10x error on the real card, and the exact mistake the four-way split exists
+// to prevent — so the assertion stays green with TierInput and TierCacheRead transposed in
+// Usage.tokens.
 //
 // FOUR PRIMES, no two of which sum to or divide a third, so no transposition can
 // coincide. 1/2/4/8 would not do: a fixture carrying twice as many of the 4-tier's tokens

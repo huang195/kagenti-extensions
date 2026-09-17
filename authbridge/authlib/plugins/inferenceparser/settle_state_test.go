@@ -89,10 +89,9 @@ func TestSettleCost_LatchesOncePublished(t *testing.T) {
 // TestSettleCost_StoresOnEveryProxiedResponse is the claim costing.Load's contract now
 // rests on.
 //
-// Load's false used to be documented as "no inference at all", which was true only while
-// Store was reached from the parsed paths alone. It is now reached on every proxied
-// response, so false means the cost owner's response pass did not run — not anything about
-// the traffic. A consumer that keeps the old reading would treat a health check as an
+// Load's false does NOT mean "no inference at all" — a reading that holds only while Store is
+// reached from the parsed paths alone. It is reached on every proxied response, so false means
+// the cost owner's response pass did not run, which says nothing about the traffic. A consumer that keeps the old reading would treat a health check as an
 // inference request that failed to price, instead of as a decision that correctly found
 // nothing.
 //

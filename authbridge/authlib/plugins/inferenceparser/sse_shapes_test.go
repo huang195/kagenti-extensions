@@ -11,9 +11,9 @@ import (
 // A BUFFERED SSE BODY IS STILL SSE WITH A BOM, OR WITH CR-ONLY LINE ENDINGS.
 //
 // The event-stream format allows CRLF, LF or CR as the terminator and requires a decoder to
-// strip one leading byte-order mark. Both shapes used to fall through to the JSON arm — the BOM
-// defeated the `data:` prefix check, and a CR-only body contains no "\ndata:" for the fallback
-// to find — so unmarshalling failed and usage stayed unset. With no cost header there is nothing
+// strip one leading byte-order mark. Without normalisation both shapes fall through to the JSON
+// arm — a BOM defeats the `data:` prefix check, and a CR-only body contains no "\ndata:" for the
+// fallback to find — so unmarshalling fails and usage stays unset. With no cost header there is nothing
 // else to settle from, so the whole request went unpriced.
 //
 // Driven through OnResponseFrame with the WHOLE body on a terminal frame, which is how a

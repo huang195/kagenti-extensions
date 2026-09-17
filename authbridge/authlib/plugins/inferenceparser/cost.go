@@ -48,8 +48,7 @@ import (
 // one message settles once per chunk. That is reachable whenever Envoy is not in buffered
 // mode for the response: a statically configured STREAMED body mode, or a filter with
 // allow_mode_override off, which makes the ModeOverride this listener asks for a no-op.
-// The guard is therefore load-bearing on the shipped configuration; only its old
-// explanation was wrong.
+// The guard is therefore load-bearing on the shipped configuration.
 //
 // AND THAT REPETITION IS NOW GATED AT THE LISTENER, which changes what this guard is for
 // rather than making it redundant. extproc dispatches the terminal frame only on the body

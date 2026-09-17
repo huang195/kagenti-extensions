@@ -87,10 +87,10 @@ func TestExtProcRecordersCarryTheClient(t *testing.T) {
 		return v.Events[0]
 	}
 
-	// BOTH DIRECTIONS IN ONE SUBTEST, per recorder. They used to be two loops, and the
-	// absence half asserted only "want nil" — which a recorder that never populates Client
-	// at all satisfies, so deleting the `Client:` assignment left that half green while it
-	// read as coverage of the same contract. Present-then-absent through the same recorder
+	// BOTH DIRECTIONS IN ONE SUBTEST, per recorder. As two loops, the absence half asserts
+	// only "want nil" — which a recorder that never populates Client at all satisfies, so
+	// deleting the `Client:` assignment leaves that half green while it reads as coverage of
+	// the same contract. Present-then-absent through the same recorder
 	// is what makes each subtest able to fail on its own: the first assertion catches an
 	// unwired call site, the second catches one that fabricates a label for traffic that
 	// named no agent.

@@ -288,3 +288,46 @@ func TestDrift_ConfigureResetsTheReporter(t *testing.T) {
 		t.Error("still silent after a reset; a reload must give a fixed config a clean slate")
 	}
 }
+
+// TestDrift_NotMeasuredWhenTheModelledFigureIsAFloor is item 5 of review round 7.
+//
+// A FLOOR CANNOT MEASURE A RATE TABLE. The rates here are exactly right — 1e-6 per token against
+// a gateway that charges 1e-6 per token — but the response reports a total of 2,000 while
+// attributing only 1,000, so 1,000 tokens went unpriced and the modelled figure is half the
+// authoritative one. Measured as drift, that is a 50% divergence and a warning telling an
+// operator their pricing is stale; the truth is that the table is perfect and the RESPONSE was
+// short.
+//
+// The knowledge was available and thrown away: Settle computes IncompleteReason for the modelled
+// figure, but only ATTACHED it when the modelled figure was the one charged. Here the gateway's
+// header won, so Settled.Incomplete is correctly false — a header is exact by assertion — and
+// nothing carried the floor forward. Settled.ModelledIncomplete is that missing fact.
+func TestDrift_NotMeasuredWhenTheModelledFigureIsAFloor(t *testing.T) {
+	p := configurePriced(t, 100, map[pricing.Tier]float64{
+		pricing.TierInput:  1e-6,
+		pricing.TierOutput: 1e-6,
+	})
+	var buf bytes.Buffer
+	p.SetDriftLogger(slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelWarn})))
+
+	h := http.Header{}
+	h.Set("Content-Type", "application/json")
+	// The gateway charged for 2,000 tokens, which at these rates is what 2,000 tokens cost.
+	h.Set(costing.ResponseCostHeader, "0.002")
+	pctx := &pipeline.Context{Host: "gw.internal", ResponseHeaders: h}
+	pricedInference(pctx, 1000, 0, 0, 0)
+	// The response states its own total, and it exceeds the counters it attributed.
+	pctx.Extensions.Inference.TotalTokens = 2000
+	pctx.Extensions.Inference.FinishReason = "stop"
+
+	p.OnResponseFrame(context.Background(), pctx, nil, true)
+
+	if got := buf.String(); got != "" {
+		t.Errorf("drift warned on a response whose own counters were short: %s\nthe rate table is exact here, and blaming it sends an operator to the wrong problem", got)
+	}
+	// AND THE MONEY IS UNAFFECTED, which is the line this must not cross: suppressing a
+	// diagnostic must not suppress a charge.
+	if p.ledger.TotalSpend != 0.002 {
+		t.Errorf("TotalSpend = %v, want the gateway's 0.002", p.ledger.TotalSpend)
+	}
+}

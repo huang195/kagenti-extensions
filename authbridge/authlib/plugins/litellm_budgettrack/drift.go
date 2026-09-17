@@ -87,6 +87,20 @@ func (p *BudgetTrack) checkDrift(pctx *pipeline.Context, settled costing.Settled
 	if inf == nil || inf.Model == "" {
 		return
 	}
+	// A FLOOR CANNOT MEASURE A RATE TABLE. When the modelled figure is known-low — a truncated
+	// stream, a stop reason with no output tally, a response whose own total exceeds the
+	// counters it reported — the ratio below is short by whatever went uncounted, and every
+	// such response would be reported as rate-table drift. That is the wrong operator sent to
+	// the wrong problem: the table may be perfect and the RESPONSE was incomplete.
+	//
+	// Read off the modelled figure's own qualifier rather than Settled.Incomplete, which is a
+	// claim about the CHARGED figure and is correctly false here — the gateway's header won, and
+	// a header is exact by assertion. See Settled.ModelledIncomplete.
+	if settled.ModelledIncomplete {
+		slog.Debug("litellm-budget-track: drift not measured, the modelled figure is not an exact total",
+			"reason", settled.ModelledIncompleteReason, "model", inf.Model)
+		return
+	}
 	modelled, prov := settled.ModelledUSD, settled.ModelledProv
 	ratio := modelled / authoritative
 	// Inclusive bounds: the contract above says "more than 5%", and a strict compare

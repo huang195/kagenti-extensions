@@ -1147,8 +1147,15 @@ func (s *Server) streamFallbackBuffered(w http.ResponseWriter, r *http.Request, 
 		// recordOutboundResponseEvent below: no settled cost and no response row for a
 		// response that arrived complete. Detaching also restores the meaning of a Reject
 		// here — with the cancellation case gone, one can only come from a plugin.
-		finalCtx, cancelFinal := httpx.TeardownContext(r.Context())
-		defer cancelFinal()
+		//
+		// TWO CONTEXTS, ONE PER PIECE OF WORK. The fold below dispatches every frame through
+		// the pipeline, and a plugin doing anything slow per frame would spend the budget the
+		// SETTLE needs — the terminal dispatch is the one that turns the folded state into a
+		// charge, and it would inherit whatever was left. Each gets its own deadline, on the
+		// same rule the reverse proxy's finalize() follows: the clock starts when the work
+		// does, not when its parent did.
+		foldCtx, cancelFold := httpx.TeardownContext(r.Context())
+		defer cancelFold()
 		reader := sseframe.NewReader(bytes.NewReader(respBody), maxBodySize)
 		for {
 			frame, ferr := reader.ReadFrame()
@@ -1159,12 +1166,17 @@ func (s *Server) streamFallbackBuffered(w http.ResponseWriter, r *http.Request, 
 				slog.Warn("forward-proxy: streaming response read error in fallback", "host", r.Host, "error", ferr)
 				break
 			}
-			frameAction := s.OutboundPipeline.RunResponseFrame(finalCtx, pctx, frame, false)
+			frameAction := s.OutboundPipeline.RunResponseFrame(foldCtx, pctx, frame, false)
 			if frameAction.Type == pipeline.Reject {
 				httpx.WriteRejection(w, frameAction)
 				return
 			}
 		}
+		// A FRESH DEADLINE FOR THE SETTLE. See the two-contexts note above: the fold has had
+		// its own budget, and the dispatch that turns folded state into a charge gets a whole
+		// one rather than the remainder.
+		finalCtx, cancelFinal := httpx.TeardownContext(r.Context())
+		defer cancelFinal()
 		finalAction := s.OutboundPipeline.RunResponseFrame(finalCtx, pctx, nil, true)
 		if finalAction.Type == pipeline.Reject {
 			httpx.WriteRejection(w, finalAction)

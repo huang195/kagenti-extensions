@@ -501,7 +501,22 @@ func (s *Server) modifyResponse(resp *http.Response) error {
 		resp.Body = io.NopCloser(bytes.NewReader(body))
 	}
 
-	action := s.InboundPipeline.RunResponse(resp.Request.Context(), pctx)
+	// DETACHED AND BOUNDED, for the same reason the streaming path's finalize() is, and this is
+	// the arm that was missed. Everything below runs AFTER the whole body is in hand, so a
+	// client that hung up while it was being read leaves a done context — and
+	// RunResponseFrame refuses a done context before calling any plugin, returning a Deny that
+	// this call site cannot tell from a policy reject, because it only tests action.Type. The
+	// response then becomes a responseRejectedError: the cost never settles, and the
+	// SessionResponse append at the bottom of this function is skipped, for a response that
+	// arrived complete. Detaching also restores the meaning of a Reject here — with
+	// cancellation gone, one can only come from a plugin.
+	//
+	// Built here rather than at the top of modifyResponse: the deadline bounds this work, and a
+	// deadline that started while the body was still being read would bound the read instead.
+	finalCtx, cancelFinal := httpx.TeardownContext(resp.Request.Context())
+	defer cancelFinal()
+
+	action := s.InboundPipeline.RunResponse(finalCtx, pctx)
 	if action.Type == pipeline.Reject {
 		return &responseRejectedError{action: action}
 	}
@@ -510,7 +525,7 @@ func (s *Server) modifyResponse(resp *http.Response) error {
 	// for buffered application/json we deliver the body as one
 	// last=true frame so plugins can finalize via OnResponseFrame.
 	if s.InboundPipeline.HasStreamingResponders() && resp.Body != nil {
-		frameAction := s.InboundPipeline.RunResponseFrame(resp.Request.Context(), pctx, pctx.ResponseBody, true)
+		frameAction := s.InboundPipeline.RunResponseFrame(finalCtx, pctx, pctx.ResponseBody, true)
 		if frameAction.Type == pipeline.Reject {
 			return &responseRejectedError{action: frameAction}
 		}

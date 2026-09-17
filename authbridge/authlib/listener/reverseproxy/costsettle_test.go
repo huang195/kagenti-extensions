@@ -694,3 +694,74 @@ func TestReverseProxy_LongStreamGetsAFullTeardownBudget(t *testing.T) {
 		t.Errorf("settled = %+v; want Priced: a long turn is exactly the one that must be charged", settled)
 	}
 }
+
+// TestReverseProxy_BufferedResponseAfterAHangupStillSettles is must-fix 2 of review round 7.
+//
+// THE ONE ARM THAT WAS MISSED. The streaming path's finalize() detaches, the forward proxy's
+// buffered fallback detaches, and modifyResponse's buffered arm — the ordinary
+// application/json response, which is most inference traffic — still ran both of its dispatches
+// on the request context. Both happen AFTER io.ReadAll has the whole body, so a client that
+// hung up during the read leaves a done context: RunResponse and the terminal frame each come
+// back Deny("pipeline.cancelled"), and this call site only tests action.Type, so a cancellation
+// is indistinguishable from a policy reject. modifyResponse returns responseRejectedError, the
+// cost never settles, and the SessionResponse append at the bottom of it never runs — for a
+// response that arrived complete and whose tokens are real spend.
+//
+// DRIVEN BY CALLING modifyResponse DIRECTLY, for the same reason the forward proxy's fallback
+// test does: the condition is "the request context is already done when the response is
+// complete", which a live round trip cannot produce at a deterministic moment. Everything else
+// is real — a real pipeline holding the real parser, a real body, a real pctx off the request
+// context the way the handler puts it there.
+func TestReverseProxy_BufferedResponseAfterAHangupStillSettles(t *testing.T) {
+	probe := &costProbe{}
+	srv, err := NewServer(costPipeline(t, probe), nil, "http://backend.invalid", nil)
+	if err != nil {
+		t.Fatalf("NewServer: %v", err)
+	}
+
+	const requestBody = `{"model":"claude-opus-5","messages":[{"role":"user","content":"hi"}]}`
+	pctx := &pipeline.Context{Direction: pipeline.Inbound, Host: "gw.internal",
+		Method: http.MethodPost, Path: "/v1/messages", Body: []byte(requestBody)}
+	// The REQUEST phase first, as the handler runs it: the parser populates
+	// Extensions.Inference there, from the path and the request body, and its response pass
+	// fills in that extension rather than creating one. Skipping it left the fixture settling
+	// zero for a reason that had nothing to do with the context under test.
+	if action := srv.InboundPipeline.Run(context.Background(), pctx); action.Type == pipeline.Reject {
+		t.Fatalf("request phase rejected: %+v", action)
+	}
+	if pctx.Extensions.Inference == nil {
+		t.Fatal("no Inference extension after the request phase; this fixture would then prove nothing about the response path")
+	}
+	ctx, cancel := context.WithCancel(context.WithValue(context.Background(), pctxKey{}, pctx))
+	req := httptest.NewRequest(http.MethodPost, "http://gw.internal/v1/messages",
+		strings.NewReader(requestBody)).WithContext(ctx)
+	// The client leaves while the body is being read. Everything below is already on the wire.
+	cancel()
+
+	const body = `{"model":"claude-opus-5","usage":{"input_tokens":1000,"output_tokens":500},` +
+		`"content":[{"type":"text","text":"buffered reply"}]}`
+	resp := &http.Response{
+		StatusCode: http.StatusOK,
+		Header:     http.Header{"Content-Type": []string{"application/json"}},
+		Body:       io.NopCloser(strings.NewReader(body)),
+		Request:    req,
+	}
+
+	if err := srv.modifyResponse(resp); err != nil {
+		t.Fatalf("modifyResponse: %v — a cancelled request context produced a Deny this arm cannot tell apart from a policy reject, so a complete response was rendered as a rejection", err)
+	}
+
+	settled, loaded, prompt, output, _ := probe.snapshotCost()
+	if !loaded {
+		t.Fatal("no Settled stored: the parser's response pass never ran, so this turn's spend reaches no aggregate, ledger or budget")
+	}
+	if prompt != 1000 || output != 500 {
+		t.Errorf("usage = (%d,%d), want (1000,500)", prompt, output)
+	}
+	if !settled.Priced {
+		t.Errorf("settled = %+v; want Priced", settled)
+	}
+	if _, terminals := probe.dispatches(); terminals != 1 {
+		t.Errorf("terminal dispatches = %d, want exactly 1", terminals)
+	}
+}

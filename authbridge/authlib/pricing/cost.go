@@ -129,6 +129,13 @@ const MaxPlausibleRequestCostMicros int64 = maxPlausibleTokens * maxPlausibleMic
 // a forged response that cannot move the dollar total past $10,000 could still move the
 // token total by 9.2e18, and a client renders the two side by side.
 //
+// NO IMPORTER ON THIS BRANCH, and the sentence above is written in the present tense about
+// code that lands two PRs later — worth saying plainly rather than leaving a reader to grep for
+// it. The consumers are usage.maxPlausibleRequestTokens (#1013 of this stack) and the ledger
+// writer's token admission guard (#1014); a tree-wide grep at THIS commit finds only the
+// declaration. Exported here anyway because the split put the bound's derivation in this PR and
+// its readers in the next two, and unexporting it now would mean changing it back with them.
+//
 // ONE DEFINITION, ONE IMPORTER, deliberately. usage restated this as a second literal with a
 // comment recording the duplication as debt — and it was right to: two literals that must
 // agree is precisely the shape that let config's retention floor drift from the window span

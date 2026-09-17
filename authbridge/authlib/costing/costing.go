@@ -71,8 +71,9 @@ const (
 	// headerAbsent: no cost header at all. Price from token usage.
 	headerAbsent headerCostState = iota
 	// headerUnusable: a header was present but could not be believed — unparseable,
-	// negative, NaN or Inf. NOT a declaration of anything, so it must not suppress
-	// the usage fallback and must never publish a settled zero.
+	// negative, NaN, Inf, or past the micros unit every consumer accumulates in. NOT a
+	// declaration of anything, so it must not suppress the usage fallback and must never
+	// publish a settled zero.
 	headerUnusable
 	// headerZero: present, parsed, finite and exactly zero. On a NON-streamed
 	// response this is the gateway saying the call was free — a cache hit, or an
@@ -95,7 +96,19 @@ const (
 func headerCost(pctx *pipeline.Context) (cost float64, state headerCostState) {
 	costStr := pctx.ResponseHeaders.Get(ResponseCostHeader)
 	if costStr == "" {
-		// Anthropic /v1/messages (and newer LiteLLM) omit the bare header.
+		// Anthropic /v1/messages (and newer LiteLLM) omit the bare header, so the fallback is
+		// what keeps Claude Code's shape from recording $0 for every request.
+		//
+		// PRE-DISCOUNT ON A GATEWAY THAT RUNS THAT LAYER, which the package doc measures and
+		// this line does not qualify. "Original" means the figure BEFORE LiteLLM's own
+		// discount/margin layer: on the gateway measured here both are zero so the two headers
+		// agree, but where an operator configures them, /v1/messages — the Anthropic shape, with
+		// no bare header at all — bills the pre-discount figure while /v1/chat/completions bills
+		// the post-discount one. The two paths then disagree about the same model, and the drift
+		// check cannot see it because checkDrift compares this figure against the MODELLED one,
+		// not against the discount headers it reads. Pre-existing and not introduced here;
+		// closing it means subtracting DiscountAmountHeader and MarginAmountHeader when they are
+		// non-zero, which needs a gateway configured that way to verify against.
 		costStr = pctx.ResponseHeaders.Get(ResponseCostOriginalHeader)
 	}
 	if costStr == "" {
@@ -110,6 +123,29 @@ func headerCost(pctx *pipeline.Context) (cost float64, state headerCostState) {
 	}
 	if implausibleUnparsedCost(pctx, c) {
 		return 0, headerImplausible
+	}
+	// UNREPRESENTABLE IS THE LAST QUESTION ASKED, and the order is the whole substance of this
+	// check. pricing.MicrosFromUSD is the predicate costevent.Event.Priced() applies to this
+	// same figure downstream, so calling it here is what makes the producer and the consumer
+	// agree BY CONSTRUCTION: written as two independent checks they disagreed over ($9.007
+	// billion, +Inf), where this arm set Priced while the record it produced read as unpriced —
+	// a budget accumulating a charge the ledger and the aggregate both filed as uncovered, and
+	// two headers near the float ceiling summing to a +Inf the ledger's json.Marshal cannot
+	// write at all.
+	//
+	// ASKED AFTER THE PLAUSIBILITY BRANCH, because every figure past the micros unit is also
+	// past the plausibility cap, so asking first would swallow the hostile-host case as noise
+	// and make the disclosure unreachable for exactly the values most likely to be forged.
+	//
+	// AND UNUSABLE RATHER THAN IMPLAUSIBLE, which is forced rather than chosen. What reaches
+	// here is a PARSED endpoint — the plausibility branch above already claimed the unparsed
+	// ones — and a parsed endpoint has usage to model, so Settle prices this response from the
+	// rate table. RejectedReason reads as unpriced to every consumer (see Event.Priced), so
+	// disclosing the refusal here would refuse the modelled figure along with the header and
+	// leave a record whose two halves contradict each other. Unusable keeps the header out and
+	// lets the modelled charge stand, which is the outcome that loses no money.
+	if _, ok := pricing.MicrosFromUSD(c); !ok {
+		return 0, headerUnusable
 	}
 	return c, headerPositive
 }
@@ -138,6 +174,21 @@ func headerCost(pctx *pipeline.Context) (cost float64, state headerCostState) {
 // throw away the one signal that a rate table has gone stale against a gateway — the case the
 // drift measurement exists for — to bound a figure that is already visible as wrong.
 // TestSettle_ParsedEndpointIsUnaffectedByTheCap pins that.
+//
+// TWO LIMITS ON THAT ARGUMENT, both of which narrow it rather than restate it:
+//
+//   - DETECTABLE IS NOT PREVENTED. The drift check logs; it does not withhold. The figure still
+//     reaches Publish, the aggregate, the thirty-day ledger and litellm_budgettrack's 429
+//     lockout, so on the parsed path the disclosure buys an operator a log line after the
+//     damage, not instead of it.
+//   - A NON-NIL EXTENSION IS NOT A CORROBORATING FIGURE. The gate reads "the request parsed",
+//     and the extension is populated on the REQUEST pass carrying no counts, so it can be
+//     present with nothing to compare against: HasModelled is false whenever the resolver has
+//     no rates for the model or the usage block is empty. Those responses take this branch and
+//     get neither the cap nor the drift signal.
+//
+// Both are why cortex#1027 is an allowlist of hosts whose header is believed at all, rather
+// than a wider cap.
 //
 // THE RESIDUAL, stated because it is reachable and not closed here: a hostile host serving a
 // path the parser DOES recognise can settle a figure up to MaxCostMicros ($9.007 billion),
@@ -421,6 +472,22 @@ func Settle(pctx *pipeline.Context, rates pricing.Resolver) Settled {
 	outputOnly.Input, outputOnly.CacheWrite, outputOnly.CacheRead = 0, 0, 0
 	if micros, _, ok := modelledCost(rates, pctx.Host, model, outputOnly, promptTotal); ok {
 		out.OutputUSD, out.HasOutput = float64(micros)/1e6, true
+	}
+
+	// THE PAIR IS HELD TO THE PLAUSIBILITY CEILING ITS OWN HALVES ESCAPE. pricing.Cost applies
+	// that ceiling per call and this function makes three of them, so a request whose whole is
+	// refused as impossible can have both halves come back priced just under it: the record then
+	// reads unpriced, cost $0, prompt $10,000, output $10,000, and anything adding the request
+	// row to the response row — which is what these two fields are for — charges the total that
+	// was refused. Halving a forged figure does not produce two real ones.
+	//
+	// KEYED ON THE SUM, NOT ON "WAS THE WHOLE PRICED", because a single surviving half is
+	// deliberate: where the output tier carried tokens with no rate, Cost refuses the whole and
+	// the prompt half is the only figure anyone can attribute. Only the pair can smuggle a figure
+	// past a bound neither half broke.
+	if out.HasPrompt && out.HasOutput && !pricing.PlausibleRequestCostUSD(out.PromptUSD+out.OutputUSD) {
+		out.PromptUSD, out.HasPrompt = 0, false
+		out.OutputUSD, out.HasOutput = 0, false
 	}
 
 	streamedPlaceholder := state == headerZero && IsEventStream(pctx)

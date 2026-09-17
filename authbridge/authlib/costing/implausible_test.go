@@ -1,10 +1,9 @@
 package costing
 
 import (
-	"bytes"
+	"context"
 	"log/slog"
 	"net/http"
-	"strings"
 	"sync"
 	"testing"
 
@@ -263,50 +262,120 @@ func TestSettle_RefusedHeaderIsNotAnAnswer(t *testing.T) {
 // alternative — injecting a logger through headerCost — would widen a production signature
 // for a test's convenience.
 func TestWarnImplausibleCost_NamesTheHost(t *testing.T) {
-	var buf bytes.Buffer
+	capture := &captureHandler{}
 	prev := slog.Default()
-	slog.SetDefault(slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug})))
+	slog.SetDefault(slog.New(capture))
 	t.Cleanup(func() { slog.SetDefault(prev) })
 	implausibleWarnOnce = sync.Once{}
 	t.Cleanup(func() { implausibleWarnOnce = sync.Once{} })
 
 	Settle(unparsedCostCtx("1000000000"), rates(t))
 
-	// THE WARN LINE SPECIFICALLY, not the whole buffer. Asserting on the buffer passes
-	// when the detail is only on the debug line beside it — which is a real mutation that
-	// survived until this was tightened, and it would leave a default deployment (debug
-	// off) with a warning that names no host.
-	warn := warnLines(buf.String())
+	// THE WARN RECORD SPECIFICALLY, not every record. Asserting over all of them passes when
+	// the detail is only on the debug line beside it — a real mutation that survived until this
+	// was tightened, and one that would leave a default deployment (debug off) with a warning
+	// that names no host.
+	warn := capture.at(slog.LevelWarn)
 	if len(warn) != 1 {
-		t.Fatalf("want exactly one WARN line, got %d; a debug-only line is invisible in a default deployment.\nlog:\n%s", len(warn), buf.String())
+		t.Fatalf("want exactly one WARN record, got %d; a debug-only line is invisible in a default deployment", len(warn))
 	}
-	for _, want := range []string{"evil.example", "/v1/embeddings", "1e+09", "10000"} {
-		if !strings.Contains(warn[0], want) {
-			t.Errorf("the WARN line does not mention %q; an operator cannot find the host that sent this.\ngot: %s", want, warn[0])
+	got := attrs(warn[0])
+	for key, want := range map[string]any{
+		"host":              "evil.example",
+		"path":              "/v1/embeddings",
+		"reported_usd":      1e9,
+		"max_plausible_usd": 10000.0,
+	} {
+		if got[key] != want {
+			t.Errorf("WARN attr %q = %#v, want %#v; an operator cannot find the host that sent this. all attrs: %#v",
+				key, got[key], want, got)
 		}
 	}
 
 	// ONCE at warn level, so a hostile host cannot use this path as a log-flood
 	// amplifier. Every occurrence stays on the record as RejectedImplausible and at debug
 	// level for whoever is investigating.
-	buf.Reset()
+	capture.reset()
 	Settle(unparsedCostCtx("2000000000"), rates(t))
-	second := buf.String()
-	if n := len(warnLines(second)); n != 0 {
-		t.Errorf("a second refusal warned again (%d WARN lines); this fires on a path an attacker chooses, so it must be once per process.\ngot: %s", n, second)
+	if n := len(capture.at(slog.LevelWarn)); n != 0 {
+		t.Errorf("a second refusal warned again (%d WARN records); this fires on a path an attacker chooses, so it must be once per process", n)
 	}
-	if !strings.Contains(second, "2e+09") || !strings.Contains(second, "evil.example") {
-		t.Errorf("the second refusal left no usable debug trail; every occurrence must be recoverable by an operator who turns debug on.\ngot: %s", second)
+	debug := capture.at(slog.LevelDebug)
+	if len(debug) != 1 {
+		t.Fatalf("DEBUG records for the second refusal = %d, want 1: every occurrence must be recoverable by an operator who turns debug on", len(debug))
+	}
+	if d := attrs(debug[0]); d["reported_usd"] != 2e9 || d["host"] != "evil.example" {
+		t.Errorf("the second refusal's debug trail = %#v, want cost 2e9 on evil.example", d)
 	}
 }
 
-// warnLines returns the WARN records in a slog text-handler dump.
-func warnLines(log string) []string {
-	var out []string
-	for _, line := range strings.Split(log, "\n") {
-		if strings.Contains(line, "level=WARN") {
-			out = append(out, line)
+// captureHandler collects slog records as VALUES, which is what the assertions in this file
+// actually want to ask about.
+//
+// The earlier version of these tests matched substrings of a text-handler dump — "level=WARN",
+// "1e+09" — so they were asserting slog's OUTPUT FORMAT alongside the behaviour: a switch to a
+// JSON handler, or a change in how a float is rendered, breaks them while nothing about the
+// signal has changed. Worse for the float, which is the load-bearing detail here: "1e+09" is
+// Go's default float formatting, not a fact about the warning.
+//
+// Records are appended under a mutex because a slog.Handler may be called from any goroutine;
+// nothing in these tests does, and depending on that would be the kind of assumption that turns
+// into a flake once something else in the package logs asynchronously.
+type captureHandler struct {
+	mu      sync.Mutex
+	records []slog.Record
+}
+
+func (h *captureHandler) Enabled(context.Context, slog.Level) bool { return true }
+
+func (h *captureHandler) Handle(_ context.Context, r slog.Record) error {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.records = append(h.records, r.Clone())
+	return nil
+}
+
+func (h *captureHandler) WithAttrs([]slog.Attr) slog.Handler { return h }
+func (h *captureHandler) WithGroup(string) slog.Handler      { return h }
+
+// at returns the records at one level, most recent last.
+func (h *captureHandler) at(level slog.Level) []slog.Record {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	var out []slog.Record
+	for _, r := range h.records {
+		if r.Level == level {
+			out = append(out, r)
 		}
 	}
+	return out
+}
+
+func (h *captureHandler) reset() {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.records = nil
+}
+
+// attrs flattens a record's attributes into a map, so an assertion can name the KEY it depends
+// on — "host" — instead of hoping a value appears somewhere in a rendered line.
+//
+// Numbers are normalised to float64, deliberately. slog keeps the Go type it was handed, and
+// these attrs are compared through an `any`, so an expectation written as 10000 fails against a
+// value that IS 10000 the moment a call site passes an int instead of a float — a test failing on
+// a literal's type rather than on the signal. Every number here is a dollar figure.
+func attrs(r slog.Record) map[string]any {
+	out := map[string]any{}
+	r.Attrs(func(a slog.Attr) bool {
+		switch a.Value.Kind() {
+		case slog.KindInt64:
+			out[a.Key] = float64(a.Value.Int64())
+		case slog.KindUint64:
+			out[a.Key] = float64(a.Value.Uint64())
+		default:
+			out[a.Key] = a.Value.Any()
+		}
+		return true
+	})
 	return out
 }

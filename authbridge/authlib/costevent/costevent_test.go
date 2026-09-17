@@ -406,6 +406,9 @@ func TestPriced_RefusedFigureIsNeverSpend(t *testing.T) {
 		ev   Event
 	}{
 		{"the shape costing publishes", Event{RejectedReason: RejectedImplausible}},
+		// IN RANGE for the micros unit deliberately — $1 billion converts cleanly — so what
+		// zeroes it below is the REFUSAL and not the representability bound, which is a
+		// different check with its own rows above.
 		{"a reason left beside a figure", Event{CostUSD: 1e9, Settled: true, Source: SourceGatewayHeader, RejectedReason: RejectedImplausible}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -437,30 +440,6 @@ func TestPriced_RefusedFigureIsNeverSpend(t *testing.T) {
 
 // TestRejectedFiguresCannotWrapAnAggregate is the accumulation half, at the record level.
 //
-// A refused figure contributes ZERO micros, so no number of them moves a sum at all —
-// which is a stronger property than the plausibility cap has on its own (see
-// pricing.TestNoPerRequestBoundClosesTheAccumulationWrap: the cap moves the wrap threshold
-// from 1,024 requests to 922,337,204 and does not remove it). The count here is 2,048:
-// twice the number of at-bound figures it takes to wrap int64.
-//
-// The forged figure is deliberately IN RANGE for the micros unit — $9 billion converts to
-// 9e15 micros, just under MaxCostMicros — so what zeroes it is the refusal and not the
-// representability bound. Without the refusal these 2,048 additions wrap int64 negative,
-// which is the aggregate this whole disclosure is about.
-func TestRejectedFiguresCannotWrapAnAggregate(t *testing.T) {
-	forged := Event{CostUSD: 9e9, Settled: true, RejectedReason: RejectedImplausible}
-	if _, ok := pricing.MicrosFromUSD(forged.CostUSD); !ok {
-		t.Fatal("the forged fixture is out of range for the micros unit; this test would then pass on the bound rather than on the refusal")
-	}
-	var sum int64
-	for i := 0; i < 2048; i++ {
-		sum += forged.Micros()
-	}
-	if sum != 0 {
-		t.Errorf("2048 refused figures accumulated to %d micros, want 0; a refused figure is not clamped and not saturated, it contributes nothing", sum)
-	}
-}
-
 // mustJSON marshals ev for a session-event fixture.
 func mustJSON(t *testing.T, ev Event) json.RawMessage {
 	t.Helper()

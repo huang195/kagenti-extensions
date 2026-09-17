@@ -34,6 +34,7 @@ func TestNoTestInThisPackageRunsInParallel(t *testing.T) {
 		t.Fatalf("read package dir: %v", err)
 	}
 	fset := token.NewFileSet()
+	inspected := 0
 	for _, e := range entries {
 		name := e.Name()
 		if !strings.HasSuffix(name, "_test.go") || name == "parallel_guard_test.go" {
@@ -45,6 +46,7 @@ func TestNoTestInThisPackageRunsInParallel(t *testing.T) {
 		if err != nil {
 			t.Fatalf("parse %s: %v", name, err)
 		}
+		inspected++
 		ast.Inspect(file, func(n ast.Node) bool {
 			call, ok := n.(*ast.CallExpr)
 			if !ok {
@@ -62,6 +64,13 @@ func TestNoTestInThisPackageRunsInParallel(t *testing.T) {
 				name, exprText(sel.X), fset.Position(call.Pos()))
 			return true
 		})
+	}
+	// A GUARD THAT INSPECTED NOTHING PASSES, which is the failure mode of every check that
+	// selects its own inputs. This one skips by FILENAME — its own file, and anything not
+	// ending in _test.go — so a rename, a move, or a package split that leaves this file alone
+	// would make it green over zero files and stay green forever.
+	if inspected == 0 {
+		t.Fatal("no test files inspected: this guard selects its inputs by filename, so it reports success on an empty set")
 	}
 }
 

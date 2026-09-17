@@ -443,7 +443,12 @@ func Settle(pctx *pipeline.Context, rates pricing.Resolver) Settled {
 	// An impossible count is the other case: the contract is that such a report is refused
 	// whole, because a believed figure beside a refused one in the same row is a breakdown
 	// nobody can reconcile.
-	if refusal == pricing.RefusalImpossibleCount {
+	//
+	// ASKED OF THE COUNTERS, NOT OF Cost's REFUSAL REASON, which is the same question one level too
+	// far away: Cost returns the FIRST problem it meets, so with a table missing an earlier tier's
+	// rate the report refused as "no-rate" and this branch never ran — leaving the output half,
+	// which zeroes the offending tier, priced at $0.0005 on a record disclosing nothing.
+	if !pricing.PlausibleUsage(usage) {
 		return withRefusal(out, cost, state, pctx, costevent.RejectedImplausibleUsage)
 	}
 

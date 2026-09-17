@@ -42,15 +42,14 @@ func (p *responseCounter) count() int {
 
 // TestExtProc_TornStreamRunsTheResponsePhaseOnce is suggestion 4 of review round 6.
 //
-// THE GUARD WAS SET IN ONE OF THE TWO PLACES THAT RUN THE PHASE. handleResponseHeaders marks
-// it; handleResponseBody ran RunResponse and marked nothing, so on the route where body
-// messages arrive but Envoy never says end-of-stream, the teardown flush asked "did the phase
-// run" and got the wrong answer. Every non-streaming plugin then ran its response phase a
-// SECOND time — opa, cpex, lineage, sparc in the shipped pipelines — and the extra Invocation
-// rows landed in the recorded snapshot.
+// THE FLUSH MUST NOT RUN A PHASE THAT ALREADY RAN. On the route where body messages arrive but
+// Envoy never says end-of-stream, the response phase and the teardown flush could each dispatch it,
+// and every non-streaming plugin then decided twice — opa, cpex, lineage, sparc in the shipped
+// pipelines — with the extra Invocation rows landing in the recorded snapshot.
 //
-// The comment at the flush asserted the opposite ("the phase never ran... there is nothing to
-// double"), which is the reason to pin it with a test rather than to re-read the comment.
+// What makes it once is that a dispatch site RECORDS the response and the flush skips a recorded
+// one. An explicit "phase ran" mark existed for a while and was unreachable: deleting both of its
+// call sites left this package green, because no path marks without recording.
 //
 // MONEY WAS NEVER AT RISK HERE, and saying so is part of the claim: the cost owner is a
 // StreamingResponder, and RunResponse skips those, so the settle latch was never the thing
@@ -92,7 +91,7 @@ func TestExtProc_TornStreamRunsTheResponsePhaseOnce(t *testing.T) {
 	}
 
 	if got := counter.count(); got != 1 {
-		t.Errorf("response phases = %d, want 1: a body message ran the phase without marking it, so the teardown flush ran every non-streaming plugin again", got)
+		t.Errorf("response phases = %d, want 1: the teardown flush ran every non-streaming plugin a second time", got)
 	}
 }
 
@@ -101,8 +100,7 @@ func TestExtProc_TornStreamRunsTheResponsePhaseOnce(t *testing.T) {
 // The phase is a per-RESPONSE dispatch and was written as a per-MESSAGE one. A statically
 // configured STREAMED body mode delivers N messages, and each ran RunResponse over a PARTIAL
 // body: N decisions on N prefixes of a document, all of their Invocation rows in the recorded
-// snapshot. It also contradicted responsePhaseKey's own description of the phase, and it is the
-// same "wait for the whole body" rule the frame dispatch and the session record already follow.
+// snapshot. It is also the same "wait for the whole body" rule the frame dispatch and the session record already follow.
 //
 // No double charge was reachable — both cost owners are StreamingResponders, which RunResponse
 // skips — so what this protects is the audit trail, and any plugin that reads pctx.ResponseBody

@@ -34,6 +34,13 @@ import (
 //	              request and bounded — httpx.TeardownContext — because the request's own context
 //	              is frequently already done at that point, and a plugin holding a detached
 //	              context with no deadline holds it forever.
+//	finalizationDelivered
+//	              The same, AND the response has already gone downstream, so a plugin rejecting
+//	              here cannot take effect. It must also call pipeline.Context.MarkResponseDelivered
+//	              — otherwise OutcomeFromContext reports OutcomeDeny beside a 200 and every
+//	              Finisher, audit row and dashboard reads a delivered response as a denial. This is
+//	              the distinction the classes exist to force: "finalizing" and "already answered"
+//	              are not the same moment, and the buffered arms are finalizing BEFORE the write.
 //	inFlight      The caller is still waiting for this response. A reject can still change what
 //	              they receive, and a cancelled context genuinely means stop. The live context is
 //	              correct, and the teardown flush is the backstop for anything left unsettled.
@@ -46,9 +53,10 @@ import (
 type dispatchClass string
 
 const (
-	finalization dispatchClass = "finalization"
-	inFlight     dispatchClass = "inFlight"
-	inherited    dispatchClass = "inherited"
+	finalization          dispatchClass = "finalization"
+	finalizationDelivered dispatchClass = "finalizationDelivered"
+	inFlight              dispatchClass = "inFlight"
+	inherited             dispatchClass = "inherited"
 )
 
 // dispatchSites is keyed by "<file>:<function>:<context argument>", which is stable under edits
@@ -60,7 +68,7 @@ var dispatchSites = map[string]dispatchClass{
 	"reverseproxy/server.go:modifyResponse:finalCtx": finalization,
 	// The streaming body's terminal dispatch, built lazily inside finalize() so the deadline
 	// starts when the work does. Round 6's must-fix was that it did not.
-	"reverseproxy/server.go:finalize:ctx": finalization,
+	"reverseproxy/server.go:finalize:ctx": finalizationDelivered,
 	// Mid-stream frames, while bytes are still going to a client who is there.
 	"reverseproxy/server.go:Read:b.ctx": inFlight,
 
@@ -69,7 +77,7 @@ var dispatchSites = map[string]dispatchClass{
 	// by building this table, which is the argument for having one.
 	"forwardproxy/server.go:serveOutbound:finalCtx": finalization,
 	// The real streaming path's finish defer — the first instance ever fixed.
-	"forwardproxy/server.go:handleStreamingResponse:finalCtx": finalization,
+	"forwardproxy/server.go:handleStreamingResponse:finalCtx": finalizationDelivered,
 	// Mid-stream frames on that same path.
 	"forwardproxy/server.go:handleStreamingResponse:r.Context()": inFlight,
 	// Passthrough runs the response phase BEFORE any byte is written, so a reject still reaches
@@ -83,7 +91,7 @@ var dispatchSites = map[string]dispatchClass{
 	"forwardproxy/server.go:streamFallbackBuffered:finalCtx": finalization,
 
 	// ext_proc's teardown flush. The stream is gone by definition here.
-	"extproc/server.go:Process:finalCtx": finalization,
+	"extproc/server.go:Process:finalCtx": finalizationDelivered,
 	// Envoy is holding the response and waiting for our reply on a live stream: a reject becomes
 	// an ImmediateResponse, so these are in-flight even though one of them is a terminal frame.
 	// Anything left unsettled when the stream dies is picked up by the flush above.
@@ -122,7 +130,7 @@ func TestEveryResponseDispatchSiteIsClassified(t *testing.T) {
 				t.Errorf(`unclassified response dispatch at %s (%s)
 
   add it to dispatchSites as:
-      %q: finalization,   // or inFlight, or inherited
+      %q: finalization,   // or finalizationDelivered, inFlight, inherited
 
   finalization  the response is complete or gone; settle, record, finish. MUST take a context
                 from httpx.TeardownContext — the request's own is usually already done, and
@@ -136,7 +144,17 @@ func TestEveryResponseDispatchSiteIsClassified(t *testing.T) {
 				continue
 			}
 			seen[key] = true
-			if class == finalization && !fromTeardownContext(site.fn, site.ctxArg) {
+			if class == finalizationDelivered && !marksDelivered(site.fn) {
+				t.Errorf(`%s at %s is classified %s but its function never calls MarkResponseDelivered
+
+  The response has already gone downstream at this dispatch, so a plugin rejecting here cannot
+  take effect — and OutcomeFromContext maps any deny to OutcomeDeny, so every Finisher would read
+  a request answered with a 200 as denied. Either call pctx.MarkResponseDelivered() before the
+  dispatch, or reclassify: a site finalizing BEFORE the write is plain finalization, because a
+  reject there still changes what the client receives.`,
+					key, fset.Position(site.pos), class)
+			}
+			if (class == finalization || class == finalizationDelivered) && !fromTeardownContext(site.fn, site.ctxArg) {
 				t.Errorf(`%s at %s is classified %s but its context is not from httpx.TeardownContext
 
   got: %s
@@ -203,6 +221,25 @@ func dispatchesIn(fset *token.FileSet, file *ast.File) []dispatchSite {
 		})
 	}
 	return out
+}
+
+// marksDelivered reports whether fn calls MarkResponseDelivered on anything.
+//
+// Any receiver, deliberately: the pctx reaches these functions as a field, a parameter or a local
+// depending on the listener, and what matters is that the statement is there before the dispatch.
+func marksDelivered(fn *ast.FuncDecl) bool {
+	found := false
+	ast.Inspect(fn, func(n ast.Node) bool {
+		call, ok := n.(*ast.CallExpr)
+		if !ok {
+			return true
+		}
+		if sel, ok := call.Fun.(*ast.SelectorExpr); ok && sel.Sel.Name == "MarkResponseDelivered" {
+			found = true
+		}
+		return true
+	})
+	return found
 }
 
 // fromTeardownContext reports whether name is assigned from httpx.TeardownContext anywhere in fn.

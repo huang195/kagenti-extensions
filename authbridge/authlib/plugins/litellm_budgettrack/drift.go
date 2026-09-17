@@ -6,6 +6,7 @@ import (
 	"strings"
 	"sync"
 
+	"github.com/rossoctl/cortex/authbridge/authlib/costevent"
 	"github.com/rossoctl/cortex/authbridge/authlib/costing"
 	"github.com/rossoctl/cortex/authbridge/authlib/pipeline"
 	"github.com/rossoctl/cortex/authbridge/authlib/pricing"
@@ -79,6 +80,14 @@ func (p *BudgetTrack) SetDriftLogger(l *slog.Logger) {
 // The ledger keeps using the authoritative figure regardless: drift is a diagnostic about the
 // rate TABLE, never a reason to distrust the gateway's own number.
 func (p *BudgetTrack) checkDrift(pctx *pipeline.Context, settled costing.Settled) {
+	// ONLY A GATEWAY FIGURE IS WORTH COMPARING AGAINST THE TABLE. Off that arm the charged figure
+	// IS the modelled one, so the ratio is 1.0 by construction and the comparison says nothing —
+	// and a future change that made it say something would be measuring the table against itself.
+	// Here rather than at the call site, so every precondition this check has is in one place and
+	// each one can be tested; the call-site half could not be.
+	if settled.Source != costevent.SourceGatewayHeader {
+		return
+	}
 	authoritative := settled.CostUSD
 	if authoritative <= 0 || !settled.HasModelled {
 		return // unpriced by the table is a coverage gap, already reported as one

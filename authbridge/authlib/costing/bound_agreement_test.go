@@ -1,6 +1,7 @@
 package costing
 
 import (
+	"net/http"
 	"testing"
 
 	"github.com/rossoctl/cortex/authbridge/authlib/costevent"
@@ -372,5 +373,75 @@ func TestSettle_AHeaderFigureSurvivesAnImpossibleTokenReport(t *testing.T) {
 	}
 	if record := NewRecord(got, nil); !record.Priced() {
 		t.Error("the record reads unpriced: the gateway's figure has to survive a bad token report")
+	}
+}
+
+// outputOnlyRates is a table with an OUTPUT rate and no input rate — the shape tool-prune ships.
+func outputOnlyRates(t *testing.T) pricing.Resolver {
+	t.Helper()
+	var r pricing.Rates
+	r.Base[pricing.TierOutput], r.Set[pricing.TierOutput] = 1e-5, true
+	tab, err := pricing.NewTable([]pricing.Entry{{Host: "*", Model: "*", Rates: r, Prov: pricing.ProvConfigured}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return pricing.NewRegistry(tab)
+}
+
+// TestSettle_AnImpossibleCountIsRefusedWhateverElseIsWrong is round 8's must-fix, and it is a
+// lesson about the instrument rather than about the bound.
+//
+// Round 7 refused an impossible token report by reading WHY pricing.Cost declined the whole
+// request. Cost returns the FIRST reason it meets, so any earlier problem masks the count: with a
+// table that has no INPUT rate, {Input: 1000, CacheRead: -1, Output: 50} refuses as "no-rate"
+// before the loop ever reaches the -1 — the refusal-reason gate never fires, and the output half,
+// which zeroes the cache tiers along with the offending counter, comes back PRICED. Measured:
+// OutputUSD 0.0005 on a record with RejectedReason "".
+//
+// That is precisely the "believed figure beside a refused one in the same row" the gate exists to
+// prevent, reached by a route the gate could not see. The counters are provider-controlled ints, so
+// the check has to be a question asked of THEM — pricing.PlausibleUsage, once, before any figure is
+// derived — and not an inference from an enum that answers a different question.
+func TestSettle_AnImpossibleCountIsRefusedWhateverElseIsWrong(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		inf   pipeline.InferenceExtension
+		rates func(*testing.T) pricing.Resolver
+	}{{
+		// The reviewer's fixture: the count that is impossible is in a tier the surviving half
+		// zeroes, and an earlier tier has no rate.
+		name:  "a negative cache count, masked by a missing input rate",
+		inf:   pipeline.InferenceExtension{Model: "claude-opus-5", InputTokens: 1000, CacheReadTokens: -1, OutputTokens: 50},
+		rates: outputOnlyRates,
+	}, {
+		name:  "a negative output count, masked by a missing input rate",
+		inf:   pipeline.InferenceExtension{Model: "claude-opus-5", InputTokens: 1000, OutputTokens: -5},
+		rates: outputOnlyRates,
+	}, {
+		// And still refused when nothing else is wrong, which round 7's gate did catch: the same
+		// claim must not depend on the table.
+		name:  "a negative cache count with a complete table",
+		inf:   pipeline.InferenceExtension{Model: "claude-opus-5", InputTokens: 1000, CacheReadTokens: -1, OutputTokens: 50},
+		rates: rates,
+	}} {
+		t.Run(tc.name, func(t *testing.T) {
+			inf := tc.inf
+			pctx := &pipeline.Context{Host: "gw.internal", ResponseHeaders: http.Header{},
+				Extensions: pipeline.Extensions{Inference: &inf}}
+
+			got := Settle(pctx, tc.rates(t))
+
+			if got.HasPrompt || got.HasOutput || got.HasModelled || got.Priced {
+				t.Errorf("figures survived an impossible count: Priced=%v Cost=%v Prompt=%v(%v) Output=%v(%v)",
+					got.Priced, got.CostUSD, got.PromptUSD, got.HasPrompt, got.OutputUSD, got.HasOutput)
+			}
+			if got.RejectedReason != costevent.RejectedImplausibleUsage {
+				t.Errorf("RejectedReason = %q, want %q: the report was impossible whatever else the table could not price",
+					got.RejectedReason, costevent.RejectedImplausibleUsage)
+			}
+			if rec := NewRecord(got, nil); rec.PromptUSD+rec.OutputUSD != 0 {
+				t.Errorf("the record carries %v across its halves, which is what a request row renders", rec.PromptUSD+rec.OutputUSD)
+			}
+		})
 	}
 }

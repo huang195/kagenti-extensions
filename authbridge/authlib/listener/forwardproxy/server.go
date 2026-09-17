@@ -972,6 +972,10 @@ func (s *Server) handleStreamingResponse(w http.ResponseWriter, r *http.Request,
 		// dispatch with nothing that could ever stop it. See httpx.TeardownContext.
 		finalCtx, cancelFinal := httpx.TeardownContext(r.Context())
 		defer cancelFinal()
+		// DELIVERED: the headers and every frame are on the wire by now, which the Warn below
+		// already says. Marking it keeps a late refusal from becoming this request's OUTCOME as
+		// well — the same statement ext_proc's flush and the reverse proxy's finalize make.
+		pctx.MarkResponseDelivered()
 		finalAction := s.OutboundPipeline.RunResponseFrame(finalCtx, pctx, nil, true)
 		if finalAction.Type == pipeline.Reject {
 			// Headers already sent; we can't promote to 502, but

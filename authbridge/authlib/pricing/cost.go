@@ -231,6 +231,28 @@ const (
 	RefusalImplausibleTotal Refusal = "implausible-total"
 )
 
+// PlausibleUsage reports whether every counter in u could be a real report: non-negative, and no
+// larger than one request could bill for.
+//
+// EXPORTED BECAUSE THE QUESTION IS ASKED IN TWO PLACES AND MUST HAVE ONE ANSWER. Cost asks it while
+// pricing; costing.Settle asks it BEFORE deriving anything, because a figure derived from an
+// impossible count has to be refused whole — and inferring that from Cost's refusal reason does not
+// work: Cost returns the FIRST problem it meets, so a missing rate on an earlier tier masks the
+// count entirely. Measured with a table that has no input rate: {Input: 1000, CacheRead: -1,
+// Output: 50} refused as "no-rate", and the output half — which zeroes the offending tier along
+// with the prompt — came back priced at $0.0005 on a record disclosing nothing.
+//
+// These counters are provider-controlled integers on the wire, which is why the bound exists at
+// all; see maxPlausibleTokens for where the ceiling comes from.
+func PlausibleUsage(u Usage) bool {
+	for _, n := range u.tokens() {
+		if n < 0 || n > maxPlausibleTokens {
+			return false
+		}
+	}
+	return true
+}
+
 // CostWithReason is Cost, and says why when it refuses.
 //
 // Split out rather than folded into Cost's signature because three call sites want the figure
@@ -242,14 +264,16 @@ func CostWithReason(r Rates, u Usage) (int64, bool, Refusal) {
 	if u == (Usage{}) {
 		return 0, false, RefusalNoTokens
 	}
+	// FIRST, so the reason is stable. Asked before the per-tier loop below because the loop
+	// returns on the first problem it meets, and an impossible COUNT is the one refusal a caller
+	// acts on differently — costing refuses every figure derived from the report. Checked here, a
+	// missing rate can no longer mask it.
+	if !PlausibleUsage(u) {
+		return 0, false, RefusalImpossibleCount
+	}
 	eff := r.At(u.PromptTotal())
 	var usd float64
 	for i, n := range u.tokens() {
-		// Both directions of the same bound, and both are about the same input: these
-		// counts are a provider-controlled integer on the wire. See the list above.
-		if n < 0 || n > maxPlausibleTokens {
-			return 0, false, RefusalImpossibleCount
-		}
 		if n == 0 {
 			continue
 		}

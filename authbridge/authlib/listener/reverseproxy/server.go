@@ -795,6 +795,12 @@ type streamingResponseBody struct {
 func (b *streamingResponseBody) finalize() {
 	ctx, cancel := httpx.TeardownContext(b.ctx)
 	defer cancel()
+	// DELIVERED, so a refusal from here cannot rename the request. Every frame this body emitted
+	// went to the client as it was read, so a plugin rejecting on the terminal dispatch is a
+	// decision that cannot take effect — and without this, OutcomeFromContext would report
+	// OutcomeDeny beside a 200. ext_proc's teardown flush says the same thing for the same reason;
+	// the three listeners have to agree about it. See pipeline.Context.MarkResponseDelivered.
+	b.pctx.MarkResponseDelivered()
 	b.pipeline.RunResponseFrame(ctx, b.pctx, nil, true)
 }
 

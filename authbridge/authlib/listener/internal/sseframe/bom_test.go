@@ -59,12 +59,17 @@ func TestReadFrame_LeadingBOM(t *testing.T) {
 // deleting those three bytes from any payload that legitimately contains them — a real risk here,
 // since these frames carry arbitrary JSON, including whatever text a model generated.
 func TestReadFrame_BOMIsNotStrippedMidStream(t *testing.T) {
-	got := readAll(t, "data: first\n\ndata: "+bom+"second\n\n")
-	if len(got) != 2 {
-		t.Fatalf("got %d events, want 2: %q", len(got), got)
+	// AT A LINE START, not mid-value, which is the only position that discriminates. With the BOM
+	// inside the payload ("data: <bom>second") the check at the top of ReadFrame never looks there,
+	// so `if !r.bomChecked` → `if true` stayed green and this test proved nothing about the flag it
+	// documents. Here the BOM begins the second event's line, exactly where a per-frame check would
+	// strip it — and stripping it would make that line parse as a data field.
+	got := readAll(t, "data: first\n\n"+bom+"data: second\n\n")
+	if len(got) != 1 {
+		t.Fatalf("got %d events, want 1 — the second event's field name carries the BOM, so it is not \"data\" and the event is skipped: %q", len(got), got)
 	}
-	if got[1] != bom+"second" {
-		t.Errorf("second event = %q, want the bytes untouched: a BOM inside a payload is data, not framing", got[1])
+	if got[0] != "first" {
+		t.Errorf("first event = %q, want %q", got[0], "first")
 	}
 }
 

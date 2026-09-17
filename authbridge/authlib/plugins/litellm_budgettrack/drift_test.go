@@ -9,6 +9,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/rossoctl/cortex/authbridge/authlib/costevent"
 	"github.com/rossoctl/cortex/authbridge/authlib/costing"
 	"github.com/rossoctl/cortex/authbridge/authlib/pipeline"
 	"github.com/rossoctl/cortex/authbridge/authlib/pricing"
@@ -329,5 +330,75 @@ func TestDrift_NotMeasuredWhenTheModelledFigureIsAFloor(t *testing.T) {
 	// diagnostic must not suppress a charge.
 	if p.ledger.TotalSpend != 0.002 {
 		t.Errorf("TotalSpend = %v, want the gateway's 0.002", p.ledger.TotalSpend)
+	}
+}
+
+// TestDrift_PreconditionsAreEachTestable is item 4 of review round 8.
+//
+// The source check used to live at the call site, where nothing could catch its removal:
+// dispatching unconditionally left the whole package green, because on the usage-fallback arm the
+// charged figure IS the modelled one and the ratio is 1.0 whatever the gate does. A guard that can
+// be deleted without a failure is a guard nobody knows the shape of.
+//
+// Moved beside the other preconditions, it becomes checkable — by handing checkDrift a Settled that
+// no listener produces: a usage-fallback figure DIVERGING from the modelled one. That cannot arise
+// today (Settle assigns one to the other), and that is the point. It is the state a future change
+// would create, and the assertion says what must happen then: silence, because measuring the table
+// against a figure derived FROM the table is measuring it against itself.
+func TestDrift_PreconditionsAreEachTestable(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		settled costing.Settled
+		wantLog bool
+	}{{
+		name: "a gateway figure diverging from the table warns",
+		settled: costing.Settled{
+			CostUSD: 0.001, Source: costevent.SourceGatewayHeader, Priced: true,
+			ModelledUSD: 0.002, HasModelled: true, ModelledProv: pricing.ProvConfigured,
+		},
+		wantLog: true,
+	}, {
+		// THE ROW THE GATE EXISTS FOR.
+		name: "the same divergence on the usage-fallback arm says nothing",
+		settled: costing.Settled{
+			CostUSD: 0.001, Source: costevent.SourceUsageFallback, Priced: true,
+			ModelledUSD: 0.002, HasModelled: true, ModelledProv: pricing.ProvConfigured,
+		},
+	}, {
+		name: "a declared-free zero has nothing to divide by",
+		settled: costing.Settled{
+			CostUSD: 0, Source: costevent.SourceGatewayHeader, Priced: true, DeclaredFree: true,
+			ModelledUSD: 0.002, HasModelled: true, ModelledProv: pricing.ProvConfigured,
+		},
+	}, {
+		name: "no modelled figure means no comparison",
+		settled: costing.Settled{
+			CostUSD: 0.001, Source: costevent.SourceGatewayHeader, Priced: true,
+		},
+	}, {
+		name: "a modelled floor is not a measurement of the table",
+		settled: costing.Settled{
+			CostUSD: 0.002, Source: costevent.SourceGatewayHeader, Priced: true,
+			ModelledUSD: 0.001, HasModelled: true, ModelledProv: pricing.ProvConfigured,
+			ModelledIncomplete: true, ModelledIncompleteReason: pricing.ReasonOutputUncounted,
+		},
+	}} {
+		t.Run(tc.name, func(t *testing.T) {
+			p := configurePriced(t, 100, map[pricing.Tier]float64{pricing.TierInput: 1e-6})
+			var buf bytes.Buffer
+			p.SetDriftLogger(slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelWarn})))
+
+			h := http.Header{}
+			h.Set("Content-Type", "application/json")
+			h.Set(costing.ResponseCostHeader, "0.001")
+			pctx := &pipeline.Context{Host: "gw.internal", ResponseHeaders: h}
+			pricedInference(pctx, 1000, 0, 0, 1000)
+
+			p.checkDrift(pctx, tc.settled)
+
+			if warned := buf.Len() > 0; warned != tc.wantLog {
+				t.Errorf("warned = %v, want %v: %s", warned, tc.wantLog, buf.String())
+			}
+		})
 	}
 }

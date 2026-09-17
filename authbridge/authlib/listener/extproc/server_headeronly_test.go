@@ -144,6 +144,22 @@ func TestExtProc_HeaderOnlyResponse_SettlesCostAndRecordsResponseRow(t *testing.
 		t.Fatalf("consumed %d of %d messages; the listener bailed", stream.recvIdx, len(reqs))
 	}
 
+	// THE ROW ALONE DOES NOT SAY WHICH PATH MADE IT, which is how this test stopped discriminating:
+	// reverting the !endOfStream guard leaves it green, because the teardown flush added by this PR
+	// produces a row too. What distinguishes them is the RESPONSE this listener sent Envoy — asking
+	// for a body it will never get, which is what the reverted guard does.
+	//
+	// responses[1] is the answer to the response-header phase (responses[0] answered the request
+	// headers): no ModeOverride means "this phase finished the response", a ModeOverride means "send
+	// me the body", and Envoy sends no body for a response that has none.
+	if len(stream.responses) < 2 {
+		t.Fatalf("listener sent %d responses, want at least 2 (request headers, response headers)", len(stream.responses))
+	}
+	if mo := stream.responses[1].GetModeOverride(); mo != nil {
+		t.Errorf("the response-header phase asked Envoy for a body (%v) on a response that has none: Envoy sends none, so nothing would settle the cost — the row this test then finds comes from the teardown flush instead, which is not the path under test",
+			mo.GetResponseBodyMode())
+	}
+
 	ev := responseEvent(t, store)
 	if ev == nil {
 		t.Fatal("no outbound response row recorded for a header-only response; the response phase reached neither the pipeline nor the recorder")

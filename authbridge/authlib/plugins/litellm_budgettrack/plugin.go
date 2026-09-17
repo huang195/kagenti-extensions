@@ -247,11 +247,11 @@ func (p *BudgetTrack) bill(pctx *pipeline.Context) {
 	}
 	st.settled = true
 
-	// Only a gateway figure is worth comparing against the table. Comparing a modelled
-	// figure with itself would always agree and say nothing.
-	if settled.Source == costevent.SourceGatewayHeader && settled.CostUSD > 0 {
-		p.checkDrift(pctx, settled)
-	}
+	// Unconditional, because checkDrift owns its own preconditions — see the guards at the top
+	// of it. Split across the call site and the callee, the call-site half could not be tested:
+	// removing it changed nothing observable, since on the usage-fallback arm the modelled figure
+	// IS the charged one and the ratio is 1.0 either way.
+	p.checkDrift(pctx, settled)
 
 	total, added := p.accumulate(settled.CostUSD)
 	if !added {

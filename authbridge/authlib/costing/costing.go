@@ -304,6 +304,11 @@ type Settled struct {
 	Provenance pricing.Provenance
 	// Priced reports that a figure exists — INCLUDING a settled zero, which is the
 	// gateway saying the call was free. Not the same as CostUSD > 0.
+	//
+	// The in-process twin of costevent.Event.Priced, which is now defined as
+	// Trust().Spendable(); a consumer holding a published RECORD rather than this struct should
+	// ask there, and read Trust() when it needs to know how approximate a spendable figure is.
+	// NewRecord carries this field across as Settled, and a test asserts the two agree.
 	Priced bool
 	// DeclaredFree marks a gateway-reported, non-streamed, exactly-zero cost: a genuine
 	// free call. Distinguished from an unusable header and from a stream's placeholder

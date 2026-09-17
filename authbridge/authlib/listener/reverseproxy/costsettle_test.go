@@ -14,6 +14,7 @@ import (
 
 	"github.com/rossoctl/cortex/authbridge/authlib/costevent"
 	"github.com/rossoctl/cortex/authbridge/authlib/costing"
+	"github.com/rossoctl/cortex/authbridge/authlib/listener/httpx"
 	"github.com/rossoctl/cortex/authbridge/authlib/pipeline"
 	"github.com/rossoctl/cortex/authbridge/authlib/plugins/inferenceparser"
 	"github.com/rossoctl/cortex/authbridge/authlib/pricing"
@@ -52,8 +53,17 @@ type costProbe struct {
 	completion string
 	skips      int
 	record     bool
-	frames     int
-	lastSeen   bool
+
+	// frames counts every dispatch, terminals only the last=true ones. Both are ASSERTED,
+	// not merely collected: exactly-once on this listener was pinned nowhere, so a second
+	// terminal dispatch — a double charge — passed every test in this package.
+	frames    int
+	terminals int
+	// terminalBudget is how much of httpx.TeardownTimeout was still left when the terminal
+	// dispatch reached the plugins, and terminalDeadline whether that context carried one at
+	// all. See TestReverseProxy_LongStreamGetsAFullTeardownBudget.
+	terminalBudget   time.Duration
+	terminalDeadline bool
 
 	// terminal is signalled once when the terminal frame reaches the plugins. Buffered so
 	// the server goroutine never blocks on a test that has stopped listening.
@@ -70,14 +80,17 @@ func (p *costProbe) OnRequest(_ context.Context, _ *pipeline.Context) pipeline.A
 func (p *costProbe) OnResponse(_ context.Context, _ *pipeline.Context) pipeline.Action {
 	return pipeline.Action{Type: pipeline.Continue}
 }
-func (p *costProbe) OnResponseFrame(_ context.Context, pctx *pipeline.Context, _ []byte, last bool) pipeline.Action {
+func (p *costProbe) OnResponseFrame(ctx context.Context, pctx *pipeline.Context, _ []byte, last bool) pipeline.Action {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	p.frames++
 	if !last {
 		return pipeline.Action{Type: pipeline.Continue}
 	}
-	p.lastSeen = true
+	p.terminals++
+	if dl, ok := ctx.Deadline(); ok {
+		p.terminalDeadline, p.terminalBudget = true, time.Until(dl)
+	}
 	p.settled, p.loaded = costing.Load(pctx)
 	if ext := pctx.Extensions.Inference; ext != nil {
 		p.prompt, p.output, p.total = ext.PromptTokens, ext.CompletionTokens, ext.TotalTokens
@@ -106,6 +119,22 @@ func (p *costProbe) snapshotCost() (costing.Settled, bool, int, int, int) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	return p.settled, p.loaded, p.prompt, p.output, p.total
+}
+
+// dispatches returns the frame counts, so a test can pin how many times the parsers were
+// finalized rather than only what the last one produced.
+func (p *costProbe) dispatches() (frames, terminals int) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.frames, p.terminals
+}
+
+// teardownBudget returns what was left of the finalization deadline when the terminal frame
+// arrived, and whether there was a deadline at all.
+func (p *costProbe) teardownBudget() (time.Duration, bool) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.terminalBudget, p.terminalDeadline
 }
 
 func (p *costProbe) snapshotBody() (string, int) {
@@ -582,5 +611,86 @@ func TestReverseProxy_ClientDisconnectMidStreamStillSettles(t *testing.T) {
 	}
 	if !settled.Incomplete {
 		t.Error("Incomplete = false; a stream that died before its output count must say the figure is a floor")
+	}
+}
+
+// TestReverseProxy_LongStreamGetsAFullTeardownBudget is the must-fix from review round 6.
+//
+// The finalization context is DETACHED so a client hangup cannot cancel it, and BOUNDED so a
+// wedged plugin cannot pin a goroutine forever. Those two properties fight each other on one
+// axis — WHEN the bound starts — and a context built where the earlier fix built it, at
+// installStreamingResponseBody, starts its clock when the RESPONSE HEADERS arrive. Every
+// consumer of it fires at end-of-stream. A turn that streams for longer than
+// httpx.TeardownTimeout therefore reaches its terminal frame holding an already-expired
+// context, RunResponseFrame refuses an expired context exactly as it refuses a cancelled one,
+// and nothing settles: the same defect the disconnect test above pins, with a different cause
+// and a worse blast radius, because it drops the LONG turns — the expensive ones. Agent turns
+// past ten seconds are ordinary.
+//
+// WHAT IS ASSERTED IS THE BUDGET, NOT A REAL OVERRUN. Waiting out a ten-second stream would
+// put ten seconds into every run of this package, and TeardownTimeout is a const because
+// nothing should be tuning it at runtime — including a test. The discriminating question is
+// cheaper than the wait anyway: how much of the budget is LEFT when the terminal frame
+// arrives. Built at finalization it is the whole of it; built at header time it is short by
+// however long the stream ran, so a stream held well past the slack below fails.
+func TestReverseProxy_LongStreamGetsAFullTeardownBudget(t *testing.T) {
+	// hold is how long the response stays open after its first event, and slack is what the
+	// assertion allows for scheduling. hold must exceed slack by enough that the failure is
+	// unambiguous rather than flaky in either direction.
+	const hold = 400 * time.Millisecond
+	const slack = 150 * time.Millisecond
+
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		flusher := w.(http.Flusher)
+		fmt.Fprint(w, "data: {\"type\":\"message_start\",\"message\":{\"usage\":"+
+			"{\"input_tokens\":1000,\"cache_read_input_tokens\":30000,\"output_tokens\":1}}}\n\n")
+		flusher.Flush()
+		// The turn keeps generating. This is the whole point: on the shipped path the gap
+		// between the first event and the last is the model's thinking time, which for a long
+		// agent turn is minutes, not milliseconds.
+		time.Sleep(hold)
+		fmt.Fprint(w, "data: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":500}}\n\n")
+		fmt.Fprint(w, "data: {\"type\":\"message_stop\"}\n\n")
+		flusher.Flush()
+	}))
+	defer backend.Close()
+
+	probe := &costProbe{}
+	srv, err := NewServer(costPipeline(t, probe), nil, backend.URL, nil)
+	if err != nil {
+		t.Fatalf("NewServer: %v", err)
+	}
+	proxy := httptest.NewServer(srv.Handler())
+	defer proxy.Close()
+
+	postThrough(t, proxy.URL, "/v1/messages",
+		`{"model":"claude-opus-5","stream":true,"messages":[{"role":"user","content":"hi"}]}`)
+
+	budget, hasDeadline := probe.teardownBudget()
+	if !hasDeadline {
+		t.Fatal("the terminal dispatch ran on a context with no deadline: detached is only half of it — a wedged plugin would pin this goroutine for the life of the process")
+	}
+	if want := httpx.TeardownTimeout - slack; budget < want {
+		t.Errorf("teardown budget left at the terminal frame = %v, want >= %v (of %v): the deadline started when the response headers arrived, not at finalization, so a stream longer than %v settles nothing",
+			budget, want, httpx.TeardownTimeout, httpx.TeardownTimeout)
+	}
+
+	// AND STILL EXACTLY ONCE. The lazy context is per-finalization, so the guard that used to
+	// come from "one context, one cancel" is gone; what stops a second charge is b.finished.
+	if frames, terminals := probe.dispatches(); terminals != 1 {
+		t.Errorf("terminal dispatches = %d (of %d frames), want exactly 1: a second one settles the same turn twice", terminals, frames)
+	}
+
+	settled, loaded, prompt, output, _ := probe.snapshotCost()
+	if !loaded {
+		t.Fatal("no Settled stored: the parser's terminal pass never ran")
+	}
+	if prompt != 31000 || output != 500 {
+		t.Errorf("usage = (%d,%d), want (31000,500)", prompt, output)
+	}
+	if !settled.Priced {
+		t.Errorf("settled = %+v; want Priced: a long turn is exactly the one that must be charged", settled)
 	}
 }

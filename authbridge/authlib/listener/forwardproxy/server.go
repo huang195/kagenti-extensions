@@ -1137,6 +1137,18 @@ func (s *Server) streamFallbackBuffered(w http.ResponseWriter, r *http.Request, 
 		// Re-parse the buffered SSE body frame-by-frame so plugins see the
 		// same per-event shape as the real streaming path. A Reject is
 		// honored here — headers are not yet on the wire.
+		//
+		// ON A DETACHED, BOUNDED CONTEXT, exactly as the streaming path's finish defer is, and
+		// for a reason that is easy to miss here: the whole body is already in hand by this
+		// point (io.ReadAll above), so a client that hung up while it was being read leaves a
+		// cancelled r.Context() — and RunResponseFrame refuses a cancelled context before
+		// calling any plugin, returning a Deny this loop cannot tell apart from a policy
+		// reject. It would then write a rejection and RETURN, skipping
+		// recordOutboundResponseEvent below: no settled cost and no response row for a
+		// response that arrived complete. Detaching also restores the meaning of a Reject
+		// here — with the cancellation case gone, one can only come from a plugin.
+		finalCtx, cancelFinal := httpx.TeardownContext(r.Context())
+		defer cancelFinal()
 		reader := sseframe.NewReader(bytes.NewReader(respBody), maxBodySize)
 		for {
 			frame, ferr := reader.ReadFrame()
@@ -1147,13 +1159,13 @@ func (s *Server) streamFallbackBuffered(w http.ResponseWriter, r *http.Request, 
 				slog.Warn("forward-proxy: streaming response read error in fallback", "host", r.Host, "error", ferr)
 				break
 			}
-			frameAction := s.OutboundPipeline.RunResponseFrame(r.Context(), pctx, frame, false)
+			frameAction := s.OutboundPipeline.RunResponseFrame(finalCtx, pctx, frame, false)
 			if frameAction.Type == pipeline.Reject {
 				httpx.WriteRejection(w, frameAction)
 				return
 			}
 		}
-		finalAction := s.OutboundPipeline.RunResponseFrame(r.Context(), pctx, nil, true)
+		finalAction := s.OutboundPipeline.RunResponseFrame(finalCtx, pctx, nil, true)
 		if finalAction.Type == pipeline.Reject {
 			httpx.WriteRejection(w, finalAction)
 			return

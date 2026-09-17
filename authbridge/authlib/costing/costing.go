@@ -362,6 +362,18 @@ type Settled struct {
 	HasModelled bool
 	// ModelledProv is the provenance behind ModelledUSD.
 	ModelledProv pricing.Provenance
+	// ModelledIncomplete says the MODELLED figure is not an exact total, whichever figure
+	// won, and ModelledIncompleteReason is pricing.IncompleteReason's answer for it.
+	//
+	// SEPARATE FROM Incomplete, which is a claim about the figure that was CHARGED. The two
+	// coincide on the usage-fallback arm and diverge whenever a gateway's header wins: the
+	// header is exact by assertion, so Incomplete is correctly false, and the knowledge that
+	// the modelled figure beside it is a FLOOR was simply dropped. The drift check then
+	// divided a known-low modelled figure by an authoritative one and reported the RATE TABLE
+	// as stale — for a response whose counters were short. Carried here so the one consumer
+	// that compares the pair can tell "the table is wrong" from "the counters were".
+	ModelledIncomplete       bool
+	ModelledIncompleteReason string
 
 	// PromptUSD is the PROMPT half of the modelled figure — output excluded, tiers
 	// weighted. It exists because a request row can show what it cost while the
@@ -453,8 +465,32 @@ func Settle(pctx *pipeline.Context, rates pricing.Resolver) Settled {
 	// threshold flattens the same way for all three, so no premium can land on one and
 	// miss another.
 	promptTotal := usage.PromptTotal()
-	if micros, prov, ok := modelledCost(rates, pctx.Host, model, usage, promptTotal); ok {
+	micros, prov, ok, refusal := modelledCost(rates, pctx.Host, model, usage, promptTotal)
+	if ok {
 		out.ModelledUSD, out.HasModelled, out.ModelledProv = float64(micros)/1e6, true, prov
+	}
+
+	// AN IMPOSSIBLE COUNT REFUSES ALL THREE FIGURES, HERE, BEFORE THE HALVES ARE COMPUTED.
+	//
+	// The halves are not a partition of the counts — each is another pass over the same usage
+	// with some tiers ZEROED — so zeroing is exactly what erases the counter that caused the
+	// refusal. A negative Output, or one past what any request could report, makes Cost refuse
+	// the whole request and the output half, while promptOnly drops Output to zero and comes
+	// back PRICED. Measured at 3.8 micros/token: whole refused, promptOnly $0.0038.
+	//
+	// And a lone prompt half is enough to publish: settleCost skips only when
+	// `!Priced && !HasPrompt && RejectedReason == ""`, and abctl's renderer tests PromptUSD > 0
+	// rather than Priced(). So this shipped a figure derived from a count this package had just
+	// declared impossible, on a record that said unpriced. Reachable from the wire, where these
+	// counters are provider-controlled ints with no floor.
+	//
+	// SEPARATE FROM THE SUM GUARD BELOW, which keys on both halves existing because a lone
+	// survivor is legitimate when a tier has no RATE (see TestSettle_OnePricedHalfSurvivesAlone).
+	// An impossible count is the other case: the contract is that such a report is refused
+	// whole, because a believed figure beside a refused one in the same row is a breakdown
+	// nobody can reconcile.
+	if refusal == pricing.RefusalImpossibleCount {
+		return withRefusal(out, cost, state, pctx, costevent.RejectedImplausibleUsage)
 	}
 
 	// The prompt half, for a request row. Output zeroed rather than subtracted, because
@@ -462,7 +498,7 @@ func Settle(pctx *pipeline.Context, rates pricing.Resolver) Settled {
 	// presented as a whole one is worse than none.
 	promptOnly := usage
 	promptOnly.Output = 0
-	if micros, _, ok := modelledCost(rates, pctx.Host, model, promptOnly, promptTotal); ok {
+	if micros, _, ok, _ := modelledCost(rates, pctx.Host, model, promptOnly, promptTotal); ok {
 		out.PromptUSD, out.HasPrompt = float64(micros)/1e6, true
 	}
 
@@ -470,7 +506,7 @@ func Settle(pctx *pipeline.Context, rates pricing.Resolver) Settled {
 	// tiers instead of subtracting the prompt figure from the total.
 	outputOnly := usage
 	outputOnly.Input, outputOnly.CacheWrite, outputOnly.CacheRead = 0, 0, 0
-	if micros, _, ok := modelledCost(rates, pctx.Host, model, outputOnly, promptTotal); ok {
+	if micros, _, ok, _ := modelledCost(rates, pctx.Host, model, outputOnly, promptTotal); ok {
 		out.OutputUSD, out.HasOutput = float64(micros)/1e6, true
 	}
 
@@ -517,10 +553,55 @@ func Settle(pctx *pipeline.Context, rates pricing.Resolver) Settled {
 	// source rather than on "the header was not positive" because DeclaredFree reaches
 	// here as SourceGatewayHeader too: the gateway stating it charged nothing is an
 	// exact total, and publishing a floor of zero would be a lower bound on nothing.
-	if out.Priced && out.Source == costevent.SourceUsageFallback {
+	if out.HasModelled {
 		if reason := pricing.IncompleteReason(pctx.Extensions.Inference); reason != "" {
-			out.Incomplete, out.IncompleteReason = true, reason
+			out.ModelledIncomplete, out.ModelledIncompleteReason = true, reason
+			// The charged figure is qualified only when the modelled one IS the charged one.
+			// Gated on the source rather than on "the header was not positive" because
+			// DeclaredFree reaches here as SourceGatewayHeader too: a gateway stating it
+			// charged nothing is an exact total, and publishing a floor of zero would be a
+			// lower bound on nothing.
+			if out.Priced && out.Source == costevent.SourceUsageFallback {
+				out.Incomplete, out.IncompleteReason = true, reason
+			}
 		}
+	}
+
+	// A MODELLED FIGURE PAST THE CEILING IS DISCLOSED TOO, on the same rule as a header's.
+	// Both say no one inference call could have cost this; the difference is only which
+	// number was wrong, and this one's cause is ours — an operator's typo in a rate, or a
+	// rate discovered from a gateway — so it unprices every request that rate touches while
+	// looking exactly like traffic nobody had rates for.
+	//
+	// GATED ON NOTHING ELSE HAVING SETTLED, which is not hygiene. RejectedReason reads as
+	// unpriced to every consumer, so disclosing a derived figure's refusal on a response the
+	// GATEWAY priced would discard an authoritative charge in order to complain about a
+	// number that lost anyway. See TestSettle_AHeaderFigureSurvivesAnImpossibleTokenReport.
+	if !out.Priced && out.RejectedReason == "" && refusal == pricing.RefusalImplausibleTotal {
+		out.RejectedReason = costevent.RejectedImplausible
+	}
+	return out
+}
+
+// withRefusal finishes a Settled whose MODELLED figures were all refused, keeping whatever the
+// gateway's header already established.
+//
+// The header arm still runs, and that ordering is the point: a bad token report says nothing
+// about what the call actually charged, so a gateway figure — or a declared-free zero — must
+// survive it. The disclosure is attached only when nothing else settled, because a set
+// RejectedReason reads as unpriced everywhere.
+func withRefusal(out Settled, cost float64, state headerCostState, pctx *pipeline.Context, reason string) Settled {
+	switch {
+	case state == headerPositive:
+		out.CostUSD, out.Source, out.Provenance, out.Priced =
+			cost, costevent.SourceGatewayHeader, pricing.ProvAuthoritative, true
+	case state == headerZero && !IsEventStream(pctx):
+		out.DeclaredFree = true
+		out.CostUSD, out.Source, out.Provenance, out.Priced =
+			0, costevent.SourceGatewayHeader, pricing.ProvAuthoritative, true
+	}
+	if !out.Priced && out.RejectedReason == "" {
+		out.RejectedReason = reason
 	}
 	return out
 }
@@ -540,19 +621,21 @@ func Settle(pctx *pipeline.Context, rates pricing.Resolver) Settled {
 // nil interface and calling a method on it panics, where a nil *pricing.Registry would
 // have been safe. tool-prune hit exactly this and its fail-open masked the panic, so
 // pruning silently stopped.
-func modelledCost(rates pricing.Resolver, host, model string, u pricing.Usage, promptTotal int) (int64, pricing.Provenance, bool) {
+func modelledCost(rates pricing.Resolver, host, model string, u pricing.Usage, promptTotal int) (int64, pricing.Provenance, bool, pricing.Refusal) {
 	if rates == nil || u == (pricing.Usage{}) {
-		return 0, pricing.ProvNone, false
+		// No resolver is a deployment with no rate table at all, and no counters is unknown
+		// usage. Neither is a refusal of anything: nothing was on the wire to refuse.
+		return 0, pricing.ProvNone, false, pricing.RefusalNoTokens
 	}
 	r, prov := rates.Resolve(host, model, promptTotal)
 	if prov == pricing.ProvNone {
-		return 0, pricing.ProvNone, false
+		return 0, pricing.ProvNone, false, pricing.RefusalNoRate
 	}
-	micros, ok := pricing.Cost(r, u)
+	micros, ok, refusal := pricing.CostWithReason(r, u)
 	if !ok {
-		return 0, pricing.ProvNone, false
+		return 0, pricing.ProvNone, false, refusal
 	}
-	return micros, prov, true
+	return micros, prov, true, pricing.RefusalNone
 }
 
 // StateKey is where the full Settled outcome is stashed for the rest of the request.

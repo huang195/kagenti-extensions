@@ -239,8 +239,55 @@ func MicrosFromUSD(usd float64) (int64, bool) {
 // A tier with no rate but no tokens is fine: toolprune's table has no output rate
 // at all, and refusing there would unprice every request it measures.
 func Cost(r Rates, u Usage) (int64, bool) {
+	micros, ok, _ := CostWithReason(r, u)
+	return micros, ok
+}
+
+// Refusal names WHY Cost declined to price a request, for the one caller that has to tell the
+// causes apart.
+//
+// A wire-shaped string like IncompleteReason, but this one is NOT a wire value: it exists so
+// costing.Settle can decide whether a refusal is worth DISCLOSING on the published record.
+// Two of these are claims about impossible input and belong in front of an operator; the rest
+// are ordinary coverage gaps — no rates configured for a model, no counters in the response —
+// which a client already renders as unpriced and which would be noise as a disclosure.
+type Refusal string
+
+const (
+	// RefusalNone: nothing was refused.
+	RefusalNone Refusal = ""
+	// RefusalNoTokens: the response reported no counters at all, so there is nothing to
+	// price. Unknown usage, not a free request.
+	RefusalNoTokens Refusal = "no-tokens"
+	// RefusalImpossibleCount: a count no request could have reported — negative, or past
+	// maxPlausibleTokens. DISCLOSED, because it is a statement about the response's own
+	// numbers rather than about our configuration.
+	RefusalImpossibleCount Refusal = "impossible-count"
+	// RefusalNoRate: a tier that carried tokens had no rate, or the rate was negative or
+	// non-finite. A configuration gap, and the reason a partial total is never presented as
+	// a whole one.
+	RefusalNoRate Refusal = "no-rate"
+	// RefusalUnrepresentable: the arithmetic left the micros unit, which MicrosFromUSD
+	// refuses rather than return a garbage ledger figure.
+	RefusalUnrepresentable Refusal = "unrepresentable"
+	// RefusalImplausibleTotal: a figure past MaxPlausibleRequestCostMicros ($10,000), the
+	// same ceiling a gateway's own header is held to. DISCLOSED, because the cause is on our
+	// side — an operator's typo in a rate, or a rate discovered from a gateway — and it
+	// unprices every request that rate touches while looking like traffic nobody had rates
+	// for.
+	RefusalImplausibleTotal Refusal = "implausible-total"
+)
+
+// CostWithReason is Cost, and says why when it refuses.
+//
+// Split out rather than folded into Cost's signature because three call sites want the figure
+// and one wants the cause: costing.Settle publishes a refusal an operator can act on, and
+// telling "this rate table is wrong" from "this model has no rates" is the whole difference
+// between a signal and a shrug. Every refusal below is one of Cost's documented four-plus ways
+// to be unpriced, named rather than collapsed into a bare false.
+func CostWithReason(r Rates, u Usage) (int64, bool, Refusal) {
 	if u == (Usage{}) {
-		return 0, false
+		return 0, false, RefusalNoTokens
 	}
 	eff := r.At(u.PromptTotal())
 	var usd float64
@@ -248,13 +295,13 @@ func Cost(r Rates, u Usage) (int64, bool) {
 		// Both directions of the same bound, and both are about the same input: these
 		// counts are a provider-controlled integer on the wire. See the list above.
 		if n < 0 || n > maxPlausibleTokens {
-			return 0, false
+			return 0, false, RefusalImpossibleCount
 		}
 		if n == 0 {
 			continue
 		}
 		if !eff.Set[i] {
-			return 0, false
+			return 0, false, RefusalNoRate
 		}
 		// The RATE is validated here, not only at config time. Checking the token
 		// count and trusting the rate is not enough: a negative rate yields ok=true
@@ -263,7 +310,7 @@ func Cost(r Rates, u Usage) (int64, bool) {
 		// every other producer unguarded — including the ProvDiscovered /model/info
 		// path, where the numbers come from a remote gateway.
 		if r := eff.Base[i]; r < 0 || math.IsNaN(r) || math.IsInf(r, 0) {
-			return 0, false
+			return 0, false, RefusalNoRate
 		}
 		usd += float64(n) * eff.Base[i]
 	}
@@ -273,7 +320,7 @@ func Cost(r Rates, u Usage) (int64, bool) {
 	// figure, which is worse than reporting the request unpriced.
 	micros, ok := MicrosFromUSD(usd)
 	if !ok {
-		return 0, false
+		return 0, false, RefusalUnrepresentable
 	}
 	// AND HELD TO THE SAME PER-REQUEST CEILING AS A GATEWAY'S OWN FIGURE. MicrosFromUSD
 	// alone bounds this at MaxCostMicros — $9 billion, the figure this file calls a garbage
@@ -288,7 +335,7 @@ func Cost(r Rates, u Usage) (int64, bool) {
 	// Refused rather than clamped, like every other implausible input here: the request
 	// stays priceable-and-unpriced, which is a coverage gap a client already renders.
 	if micros > MaxPlausibleRequestCostMicros {
-		return 0, false
+		return 0, false, RefusalImplausibleTotal
 	}
-	return micros, true
+	return micros, true, RefusalNone
 }

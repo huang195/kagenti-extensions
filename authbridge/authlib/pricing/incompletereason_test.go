@@ -409,3 +409,65 @@ func TestCost_RefusesAnImplausibleTokenCountOnTheModelledPath(t *testing.T) {
 		})
 	}
 }
+
+// TestIncompleteReason_CountersBelowTotal is item 4 of review round 7.
+//
+// A response reporting input 600, output 0, total 1000 with a stop reason of "stop" prices 600
+// tokens and called that figure EXACT. It fell between the two predicates: outputUncounted
+// returns false on any stop reason, and totalsOnly requires every counter to be empty. So 400
+// reported tokens went unpriced and unqualified — a floor published as a total, which is the one
+// outcome this file exists to prevent.
+//
+// The rows below are the discrimination, not decoration. The cross-check compares figures the
+// RESPONSE supplied, so a genuinely zero-output call agrees with itself and stays exact; that is
+// the false positive outputUncounted's comment warns about, and the reason this is a separate
+// branch rather than a loosening of that predicate.
+func TestIncompleteReason_CountersBelowTotal(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		inf  *pipeline.InferenceExtension
+		want string
+	}{{
+		name: "a stated total larger than the counters",
+		inf:  &pipeline.InferenceExtension{InputTokens: 600, OutputTokens: 0, TotalTokens: 1000, FinishReason: "stop"},
+		want: ReasonCountersBelowTotal,
+	}, {
+		// THE CONTROL THAT MATTERS. Genuinely zero output — a refusal, or max_tokens of zero —
+		// reports a total equal to the prompt. Flagging this would put a permanent caveat on
+		// ordinary traffic, which is how an operator learns to ignore the real one.
+		name: "a genuine zero-output call is exact",
+		inf:  &pipeline.InferenceExtension{InputTokens: 600, OutputTokens: 0, TotalTokens: 600, FinishReason: "stop"},
+		want: "",
+	}, {
+		name: "counters that add up to the total are exact",
+		inf:  &pipeline.InferenceExtension{InputTokens: 600, OutputTokens: 400, TotalTokens: 1000, FinishReason: "stop"},
+		want: "",
+	}, {
+		// The legacy aggregates land in the same two tiers, so the cross-check covers them
+		// without knowing which field carried the count.
+		name: "the legacy aggregates are cross-checked too",
+		inf:  &pipeline.InferenceExtension{PromptTokens: 600, CompletionTokens: 0, TotalTokens: 1000, FinishReason: "stop"},
+		want: ReasonCountersBelowTotal,
+	}, {
+		// A total SMALLER than the parts is a gateway contradicting itself, and nothing here
+		// knows which side to believe — so it is not a claim that the figure is low.
+		name: "a total smaller than the counters is not a floor",
+		inf:  &pipeline.InferenceExtension{InputTokens: 600, OutputTokens: 400, TotalTokens: 700, FinishReason: "stop"},
+		want: "",
+	}, {
+		// Still the stronger claim when both could apply: no stop reason at all.
+		name: "no stop reason still reports the floor it already did",
+		inf:  &pipeline.InferenceExtension{InputTokens: 600, OutputTokens: 0, TotalTokens: 1000},
+		want: ReasonOutputUncounted,
+	}, {
+		name: "a totals-only gateway keeps its own reason",
+		inf:  &pipeline.InferenceExtension{TotalTokens: 1700},
+		want: ReasonSplitUnreported,
+	}} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := IncompleteReason(tc.inf); got != tc.want {
+				t.Errorf("IncompleteReason = %q, want %q", got, tc.want)
+			}
+		})
+	}
+}

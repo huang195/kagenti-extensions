@@ -109,6 +109,18 @@ const (
 	// that gateway answers. A consumer should present it as a standing caveat on the
 	// total's precision, never as an incident.
 	ReasonSplitUnreported = "split-unreported"
+
+	// ReasonCountersBelowTotal: the response's OWN total exceeds the counters that were
+	// priced, so tokens were reported and not attributed to any tier. The figure is a floor,
+	// like ReasonOutputUncounted, but the evidence is different and so is the honest label:
+	// there, a stop reason is missing and the output tally cannot be shown to be final; here,
+	// the gateway states a total and the parts do not add up to it.
+	//
+	// NAMED FOR THE EVIDENCE, not for the tier, because the tier is exactly what is unknown.
+	// Calling it output-uncounted would be the likeliest guess and still a guess — a
+	// short-reported prompt produces the identical arithmetic — and a wrong tier in the label
+	// sends an operator to the wrong side of the request.
+	ReasonCountersBelowTotal = "counters-below-total"
 )
 
 // NO PREDICATE IN THIS FILE READS pipeline.InferenceExtension.PresentKinds, and none should:
@@ -172,7 +184,42 @@ func IncompleteReason(inf *pipeline.InferenceExtension) string {
 	if totalsOnly(inf) {
 		return ReasonSplitUnreported
 	}
+	// THE GATEWAY'S OWN TOTAL, AGAINST THE COUNTERS THAT WERE PRICED. A response reporting
+	// input 600, output 0, total 1000 and a stop reason of "stop" prices 600 tokens and, before
+	// this check, called that figure EXACT: outputUncounted returns false on any stop reason,
+	// and totalsOnly needs every counter empty, so 400 reported tokens fell between the two
+	// predicates and the floor was published as a total.
+	//
+	// A CROSS-CHECK RATHER THAN A THIRD GUESS AT THE WIRE, which is what makes it safe here.
+	// The comparison uses figures the response itself supplied, so it cannot false-positive on
+	// a genuinely zero-output call — a refusal, a max_tokens of zero — where the total equals
+	// the prompt and the two sides agree. That is the failure mode outputUncounted's comment
+	// warns against, and the reason this is a separate branch rather than a weakening of it.
+	//
+	// Only ONE DIRECTION is a claim. A total SMALLER than the counters is a gateway
+	// contradicting itself, not a figure we can call low, and nothing here would know which
+	// side to believe.
+	if counted := countersBelowTotal(inf); counted {
+		return ReasonCountersBelowTotal
+	}
 	return ""
+}
+
+// countersBelowTotal reports a response whose stated total exceeds what UsageFromInference
+// could attribute to tiers.
+//
+// Reads the same fields UsageFromInference does, and in the same shape, so the label cannot
+// drift from the arithmetic: PromptTotal() is the prompt side it priced, Output the completion
+// side. The legacy aggregates are covered because UsageFromInference folds them into those two.
+func countersBelowTotal(inf *pipeline.InferenceExtension) bool {
+	if inf.TotalTokens <= 0 {
+		return false
+	}
+	u := UsageFromInference(inf)
+	// Guarded against the totals-only attribution, which is the one case where the total was
+	// itself turned INTO a counter: UsageFromInference puts the whole total in uncached input,
+	// so the two sides agree by construction and the branch above already named it.
+	return u.PromptTotal()+u.Output < inf.TotalTokens
 }
 
 // totalsOnly reports the shape ReasonSplitUnreported names: every per-tier counter and both

@@ -75,12 +75,23 @@ const (
 //
 // A wire string, spelled like Source and IncompleteReason: hyphenated lowercase.
 const (
-	// RejectedImplausible: a response reported a cost larger than one inference call
-	// could plausibly be (pricing.MaxPlausibleRequestCostMicros) on an endpoint this
-	// pipeline could not parse, so nothing corroborated the figure and it was not
-	// believed. See costing.headerCost for the rule and what it does and does not
-	// protect against.
+	// RejectedImplausible: a COST FIGURE larger than one inference call could plausibly be
+	// (pricing.MaxPlausibleRequestCostMicros). Two producers of it, and the reason is the
+	// same claim in both: a gateway's own header on an endpoint this pipeline could not
+	// parse, so nothing corroborated it (see costing.headerCost), or a figure MODELLED from
+	// plausible counts at an implausible rate — an operator's typo, or a rate discovered
+	// from a gateway's /model/info. The second one matters because its cause is ours: it
+	// unprices every request the rate touches while looking exactly like traffic nobody had
+	// rates for.
 	RejectedImplausible = "cost-implausible"
+
+	// RejectedImplausibleUsage: a TOKEN COUNT no request could have reported — negative, or
+	// past pricing.MaxPlausibleTokens — so every figure derived from it was refused,
+	// including the halves. Distinct from RejectedImplausible because the two say different
+	// things about where the impossibility is: there, a dollar figure nobody could have
+	// charged; here, a counter nobody could have counted, which also makes the token totals
+	// rendered beside the money untrustworthy. See costing.Settle.
+	RejectedImplausibleUsage = "usage-implausible"
 )
 
 // Event is one request's settled cost. Unlike tool-prune's event, which carries

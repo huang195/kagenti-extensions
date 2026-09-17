@@ -247,3 +247,130 @@ func TestSettle_SplitUnreportedReachesTheRecord(t *testing.T) {
 			record.Incomplete, record.IncompleteReason, pricing.ReasonSplitUnreported)
 	}
 }
+
+// TestSettle_AnImpossibleTokenReportIsRefusedWhole is must-fix 1 of review round 7.
+//
+// THE HALVES ARE NOT A PARTITION OF THE COUNTS, they are two passes over the same usage with
+// different tiers zeroed — and zeroing is exactly what erases the offending counter. A report
+// whose Output is negative, or larger than any request could produce, makes pricing.Cost refuse
+// the whole request and the output half; promptOnly zeroes Output, so the count that caused the
+// refusal is gone and that call SUCCEEDS. Measured, at 3.8 micros/token for both -5 and
+// MaxPlausibleTokens+1: whole ok=false, promptOnly ok=true micros=3800, outputOnly ok=false.
+//
+// AND A LONE PROMPT HALF IS ENOUGH TO PUBLISH. settleCost's skip gate is
+// `!Priced && !HasPrompt && RejectedReason == ""`, so HasPrompt alone carries a record onto the
+// wire; abctl's renderer then tests PromptUSD > 0 rather than Priced(). So a report this package
+// declared impossible shipped as Priced=false, RejectedReason="", PromptUSD=$0.0038 — and
+// rendered. Reachable from the wire: parsercommon assigns these provider ints with no floor.
+//
+// The sum guard added last round cannot catch it. That one keys on HasPrompt && HasOutput,
+// because a lone surviving half is legitimate when a tier has no RATE — a different claim, and
+// TestSettle_OnePricedHalfSurvivesAlone is its control. An impossible COUNT is not that case: the
+// contract says such a report is refused whole, because mixing a believed figure with a refused
+// one in the same row produces a breakdown nobody can reconcile.
+func TestSettle_AnImpossibleTokenReportIsRefusedWhole(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		input  int
+		output int
+	}{
+		{"a negative output count", 1000, -5},
+		{"an output count past what a request could report", 1000, pricing.MaxPlausibleTokens + 1},
+		{"a negative input count", -1, 500},
+		{"an input count past what a request could report", pricing.MaxPlausibleTokens + 1, 500},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			pctx := ctx(map[string]string{"Content-Type": "application/json"}, tc.input, tc.output)
+
+			got := Settle(pctx, rates(t))
+
+			if got.HasModelled || got.Priced {
+				t.Errorf("HasModelled = %v / Priced = %v at %v, want false: no figure derived from an impossible count is a price",
+					got.HasModelled, got.Priced, got.CostUSD)
+			}
+			if got.HasPrompt || got.PromptUSD != 0 {
+				t.Errorf("PromptUSD = %v (HasPrompt %v), want 0 / false: zeroing the offending tier is what let this through, and a lone prompt half is enough to publish a record",
+					got.PromptUSD, got.HasPrompt)
+			}
+			if got.HasOutput || got.OutputUSD != 0 {
+				t.Errorf("OutputUSD = %v (HasOutput %v), want 0 / false", got.OutputUSD, got.HasOutput)
+			}
+			// AND SAID OUT LOUD. A refusal that reaches no record is indistinguishable from
+			// traffic nobody could price — the same argument that put RejectedImplausible on a
+			// refused header. Without it, an impossible token report is silent.
+			if got.RejectedReason != costevent.RejectedImplausibleUsage {
+				t.Errorf("RejectedReason = %q, want %q: a refused report that discloses nothing looks exactly like unpriced traffic",
+					got.RejectedReason, costevent.RejectedImplausibleUsage)
+			}
+			record := NewRecord(got, nil)
+			if record.Priced() {
+				t.Error("the record reads Priced(): a refused report must not read as spend anywhere")
+			}
+			if sum := record.PromptUSD + record.OutputUSD; sum != 0 {
+				t.Errorf("the record's halves sum to %v: that is the figure a request row renders", sum)
+			}
+		})
+	}
+}
+
+// TestSettle_AModelledFigurePastTheCeilingIsDisclosed is item 9 of review round 7.
+//
+// A gateway's refused header is disclosed; a refused MODELLED figure was silent, and the two are
+// the same claim about a number — that no one inference call could have cost it. Silence there is
+// worse than for the header case, because the causes are ours: an operator's typo in a rate, or a
+// figure discovered from a gateway's /model/info, either of which unprices every request it
+// touches while looking exactly like traffic nobody had rates for.
+//
+// The counts here are entirely plausible — this is the RATE that is wrong, which is why the
+// impossible-count refusal above cannot cover it.
+func TestSettle_AModelledFigurePastTheCeilingIsDisclosed(t *testing.T) {
+	var r pricing.Rates
+	// $1 per token: a typo of six orders of magnitude, and 20,000 tokens then model $20,000.
+	r.Base[pricing.TierInput], r.Set[pricing.TierInput] = 1.0, true
+	r.Base[pricing.TierOutput], r.Set[pricing.TierOutput] = 1.0, true
+	tab, err := pricing.NewTable([]pricing.Entry{{Host: "*", Model: "*", Rates: r, Prov: pricing.ProvConfigured}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	pctx := ctx(map[string]string{"Content-Type": "application/json"}, 15000, 5000)
+
+	got := Settle(pctx, pricing.NewRegistry(tab))
+
+	if got.Priced || got.HasModelled {
+		t.Errorf("Priced = %v / HasModelled = %v at %v: a figure past the per-request ceiling is refused, not charged",
+			got.Priced, got.HasModelled, got.CostUSD)
+	}
+	if got.RejectedReason != costevent.RejectedImplausible {
+		t.Errorf("RejectedReason = %q, want %q: the refusal is the whole signal that a rate table has gone wrong",
+			got.RejectedReason, costevent.RejectedImplausible)
+	}
+	if record := NewRecord(got, nil); record.RejectedReason != costevent.RejectedImplausible {
+		t.Errorf("record RejectedReason = %q: a disclosure that reaches no record reaches no operator", record.RejectedReason)
+	}
+}
+
+// TestSettle_AHeaderFigureSurvivesAnImpossibleTokenReport is the guard on both disclosures above.
+//
+// RejectedReason means UNPRICED to every consumer — costevent.Priced() returns false on any
+// non-empty reason. So disclosing a modelled refusal on a response the GATEWAY priced would
+// throw away an authoritative figure to complain about a derived one, which is a bigger error
+// than the silence it fixes. The disclosure is therefore gated on nothing else having settled.
+func TestSettle_AHeaderFigureSurvivesAnImpossibleTokenReport(t *testing.T) {
+	pctx := ctx(map[string]string{
+		ResponseCostHeader: "0.25",
+		"Content-Type":     "application/json",
+	}, 1000, -5)
+
+	got := Settle(pctx, rates(t))
+
+	if !got.Priced || got.CostUSD != 0.25 {
+		t.Errorf("Priced = %v / CostUSD = %v, want true / 0.25: the gateway's own figure is what the call charged, whatever the token counters claimed",
+			got.Priced, got.CostUSD)
+	}
+	if got.RejectedReason != "" {
+		t.Errorf("RejectedReason = %q on a header-priced response: Event.Priced() reads that as unpriced, so this would discard a real charge", got.RejectedReason)
+	}
+	if record := NewRecord(got, nil); !record.Priced() {
+		t.Error("the record reads unpriced: the gateway's figure has to survive a bad token report")
+	}
+}

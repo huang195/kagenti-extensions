@@ -116,19 +116,23 @@ func (s *Server) Process(stream extprocv3.ExternalProcessor_ProcessServer) error
 		if (sawResponseHeaders || sawResponseBody) && !responseWasRecorded(pctx) {
 			finalCtx, cancelFinal := httpx.TeardownContext(ctx)
 			defer cancelFinal()
-			// THE OUTCOME AS IT STOOD BEFORE THE FLUSH RAN ANYTHING, captured here and passed
-			// to RunFinish below.
+			// THE RESPONSE HAS ALREADY GONE DOWNSTREAM, and saying so is what keeps a refusal
+			// recorded here from becoming this request's outcome.
 			//
 			// The flush dispatches plugins, and a plugin can reject in a response phase. The
-			// action is dropped — the response has already gone downstream, so there is nothing
-			// left to refuse — but the REJECTION is still recorded on the context, and
-			// OutcomeFromContext maps any deny to OutcomeDeny. Derived after the flush, every
-			// Finisher then reads "this request was denied" for a response Envoy delivered with
-			// a 200, which inverts the rule this defer states two blocks up: a rejected response
-			// is left alone precisely so a denial and an ordinary response are not confused. A
-			// late refusal cannot change what happened.
-			delivered := pipeline.OutcomeFromContext(pctx)
-			defer func() { p.RunFinish(ctx, pctx, delivered) }()
+			// action is dropped — there is nothing left to refuse — but the REJECTION is still
+			// recorded on the context, and OutcomeFromContext maps any deny to OutcomeDeny.
+			// Every Finisher then reads "this request was denied" for a response Envoy delivered
+			// with a 200, which inverts the rule this defer states two blocks up: a rejected
+			// response is left alone precisely so a denial and an ordinary response are not
+			// confused.
+			//
+			// MarkResponseDelivered is the pipeline-side half, so the fix holds for anything
+			// that re-derives the outcome from the context rather than reading the one passed to
+			// RunFinish — which is what a plugin does. The refusal stays on the record, marked
+			// Late; what it no longer does is rename the request.
+			pctx.MarkResponseDelivered()
+			defer func() { p.RunFinish(ctx, pctx, pipeline.OutcomeFromContext(pctx)) }()
 			if !responsePhaseWasRun(pctx) {
 				markResponsePhaseRun(pctx)
 				// THE PHASE HAS NOT RUN YET, which on this path means handleResponseHeaders

@@ -217,6 +217,12 @@ type Context struct {
 
 	Extensions Extensions
 
+	// responseDelivered says the response has already reached the client, so a refusal
+	// recorded after it cannot be in effect; rejectedAfterDelivery remembers that the
+	// rejection on record is one of those. See MarkResponseDelivered.
+	responseDelivered     bool
+	rejectedAfterDelivery bool
+
 	// currentPlugin, currentPhase, and currentPolicy are framework-owned
 	// fields set by Pipeline.Run / RunResponse around each plugin
 	// dispatch. They feed the Record / Allow / Skip / Observe / Modify /
@@ -478,8 +484,31 @@ func (c *Context) CurrentPhase() InvocationPhase { return c.currentPhase }
 func (c *Context) setRejectingPlugin(name string) {
 	if c.rejectingPlugin == "" {
 		c.rejectingPlugin = name
+		// Remember that this refusal arrived too late to take effect, so the outcome can say
+		// what happened rather than what a plugin wanted. See MarkResponseDelivered.
+		c.rejectedAfterDelivery = c.responseDelivered
 	}
 }
+
+// MarkResponseDelivered records that the response has already gone downstream, so any refusal
+// from here on cannot take effect.
+//
+// A LISTENER'S STATEMENT OF FACT, and only a listener can make it: the pipeline has no idea
+// whether bytes reached a client. ext_proc calls it before its teardown flush — Envoy has
+// finished with the stream by then — and the proxies' finalization paths are the same shape.
+//
+// WHAT IT CHANGES IS THE OUTCOME, NOT THE RECORD. Invocations appended afterwards are still
+// recorded, and still say deny; they are marked Late so a reader can tell "a plugin refused
+// this" from "this request was refused". What stops being true is the outcome:
+// OutcomeFromContext no longer reports OutcomeDeny on the strength of a refusal that arrived
+// after the response, because a request answered with a 200 was not denied — and every Finisher,
+// every audit row and every dashboard that reads the outcome would otherwise say it was.
+//
+// Idempotent, and one-way: a response cannot become undelivered.
+func (c *Context) MarkResponseDelivered() { c.responseDelivered = true }
+
+// ResponseDelivered reports whether the response has already gone downstream.
+func (c *Context) ResponseDelivered() bool { return c.responseDelivered }
 
 // Record appends an Invocation to pctx under the current pipeline
 // direction and framework-stamped plugin + phase. The author supplies
@@ -510,6 +539,13 @@ func (c *Context) Record(inv Invocation) {
 	}
 	if inv.Path == "" {
 		inv.Path = c.Path
+	}
+	// Stamped by the framework, like Shadow, and for the same reason: plugin code is identical
+	// before and after delivery, so the plugin cannot know. Recorded rather than dropped —
+	// "a plugin refused this after it shipped" is a real fact about a rollout — and read by
+	// OutcomeFromContext, which must not turn it into a denial.
+	if c.responseDelivered {
+		inv.Late = true
 	}
 	c.appendInvocation(inv)
 }

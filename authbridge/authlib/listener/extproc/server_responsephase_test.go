@@ -151,13 +151,20 @@ func (lateRejecter) Capabilities() pipeline.PluginCapabilities {
 func (lateRejecter) OnRequest(_ context.Context, _ *pipeline.Context) pipeline.Action {
 	return pipeline.Action{Type: pipeline.Continue}
 }
-func (lateRejecter) OnResponse(_ context.Context, _ *pipeline.Context) pipeline.Action {
-	return pipeline.Deny("late.reject", "refused after the response was delivered")
+func (lateRejecter) OnResponse(_ context.Context, pctx *pipeline.Context) pipeline.Action {
+	// DenyAndRecord, because that is what a real gate does: the Invocation is the audit trail and
+	// the Action is the decision. Returning a bare Deny would leave only the framework's
+	// rejecting-plugin state, and this test is about both.
+	return pctx.DenyAndRecord("late.reject", "late.reject", "refused after the response was delivered")
 }
 
 // finishWatcher records the outcome the listener HANDED to RunFinish, which is what
 // pctx.Outcome() returns to a plugin during its finish pass.
-type finishWatcher struct{ outcomes []pipeline.Outcome }
+type finishWatcher struct {
+	outcomes  []pipeline.Outcome
+	derived   []pipeline.Outcome
+	rejecting []string
+}
 
 func (f *finishWatcher) Name() string { return "finish-watcher" }
 func (f *finishWatcher) Capabilities() pipeline.PluginCapabilities {
@@ -170,9 +177,14 @@ func (f *finishWatcher) OnResponse(_ context.Context, _ *pipeline.Context) pipel
 	return pipeline.Action{Type: pipeline.Continue}
 }
 func (f *finishWatcher) OnFinish(_ context.Context, pctx *pipeline.Context) {
+	f.rejecting = append(f.rejecting, pctx.RejectingPlugin())
 	if out := pctx.Outcome(); out != nil {
 		f.outcomes = append(f.outcomes, *out)
 	}
+	// AND THE ONE A PLUGIN DERIVES ITSELF, which is the harder claim: passing a corrected
+	// outcome to RunFinish fixes only what the listener asserts, while any plugin is free to ask
+	// the context directly. Both are recorded so the test can tell them apart.
+	f.derived = append(f.derived, pipeline.OutcomeFromContext(pctx))
 }
 
 // TestExtProc_ALateRejectDoesNotInvertTheOutcome is item 8 of review round 7.
@@ -235,9 +247,35 @@ func TestExtProc_ALateRejectDoesNotInvertTheOutcome(t *testing.T) {
 	if got.StatusCode != 200 {
 		t.Errorf("StatusCode = %d, want 200", got.StatusCode)
 	}
-	// AND THE ROW IS STILL THERE. Dropping it instead would trade one wrong answer for
-	// another: the response WAS delivered, so its telemetry belongs in the session.
-	if ev := responseEvent(t, store); ev == nil {
-		t.Error("no response row recorded for a delivered response")
+	if len(watcher.derived) != 1 {
+		t.Fatalf("derived outcomes = %d, want exactly 1: %+v", len(watcher.derived), watcher.derived)
 	}
+	if d := watcher.derived[0]; d.FinalAction == pipeline.OutcomeDeny {
+		t.Errorf("a plugin deriving the outcome from the context sees %+v: the listener passing a corrected outcome to RunFinish is not enough, because nothing stops a plugin asking the context — see Context.MarkResponseDelivered",
+			d)
+	}
+	// AND THE REFUSAL IS STILL ON THE RECORD, marked rather than erased: a plugin that would
+	// have refused a response after it shipped is exactly what a rollout wants to see.
+	ev := responseEvent(t, store)
+	if ev == nil {
+		t.Fatal("no response row recorded for a delivered response")
+	}
+	var lateDeny bool
+	if ev.Invocations != nil {
+		for _, inv := range ev.Invocations.Outbound {
+			if inv.Action == pipeline.ActionDeny && inv.Late {
+				lateDeny = true
+			}
+		}
+	}
+	// THE EVIDENCE IS NOT ERASED EITHER. RejectingPlugin still names the plugin: what changed is
+	// that the OUTCOME no longer reads that as a denial. Erasing it would hide a real event.
+	if len(watcher.rejecting) != 1 || watcher.rejecting[0] != "late-rejecter" {
+		t.Errorf("RejectingPlugin during finish = %v, want [late-rejecter]: the refusal is marked as too late, not forgotten", watcher.rejecting)
+	}
+	if !lateDeny {
+		t.Errorf("no late deny invocation on the recorded row (%+v): the fix has to MARK the refusal, not drop it — the audit trail is the half worth keeping",
+			ev.Invocations)
+	}
+
 }

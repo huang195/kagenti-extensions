@@ -129,11 +129,23 @@ func headerCost(pctx *pipeline.Context) (cost float64, state headerCostState) {
 // configuration.
 //
 // GATED ON A NIL EXTENSION, which is exactly the set of responses whose spend was newly
-// admitted — an endpoint off the parser's dialect list, or a body it could not read. Where
-// the extension is present the request WAS parsed: we sent an inference-shaped body to an
-// inference-shaped path and read a model out of it, and today's behaviour is kept unchanged
-// there. That narrower hole — a hostile host serving /v1/chat/completions — predates this
-// and is a host-allowlist problem, which this is not pretending to be.
+// admitted — an endpoint off the parser's dialect list, or a body it could not read.
+//
+// WHY THE PARSED PATH IS LEFT ALONE, which is not merely a scope decision. Where the extension
+// is present there is a MODELLED figure from the token counters to compare the header against,
+// so an implausible header is DETECTABLE there: Settle publishes both and the drift check
+// notices them disagreeing (see Settled.HasReported and ModelledUSD). Refusing it instead would
+// throw away the one signal that a rate table has gone stale against a gateway — the case the
+// drift measurement exists for — to bound a figure that is already visible as wrong.
+// TestSettle_ParsedEndpointIsUnaffectedByTheCap pins that.
+//
+// THE RESIDUAL, stated because it is reachable and not closed here: a hostile host serving a
+// path the parser DOES recognise can settle a figure up to MaxCostMicros ($9.007 billion),
+// which is published, aggregated and written to the ledger while the drift check merely notes
+// the disagreement. Bounding it is not the fix — the fix is not believing that host's header at
+// all, which is the allowlist tracked in rossoctl/cortex#1027. It also feeds the accumulation
+// wrap pricing.MaxCostMicros documents, which the checked accumulate in this series' aggregate
+// PR closes.
 //
 // WHAT IT IS NOT. It is a blast-radius cap, NOT AUTHENTICATION. A forged figure UNDER the
 // cap still settles, because a plausible number from an unparsed endpoint is exactly what a
@@ -164,10 +176,20 @@ func implausibleUnparsedCost(pctx *pipeline.Context, usd float64) bool {
 // Not once per host, which is the shape a reader will expect and which cannot be safely
 // built here: pctx.Host is caller-controlled, so a map keyed on it is an unbounded
 // allocation driven by hostile input. Not unconditional either — the warning fires on a
-// path an attacker chooses and would be a log-flood amplifier. One warning names the
-// mechanism and the first host; every occurrence is on the record as
-// costevent.RejectedImplausible, and the Debug line below carries the full trail for
-// whoever is already investigating.
+// path an attacker chooses and would be a log-flood amplifier.
+//
+// THE ARGUMENT IS ABOUT THE ALWAYS-ON LEVEL, and the split is deliberate rather than
+// inconsistent: Warn fires once per process, Debug fires per occurrence. An operator turning
+// debug on has asked for one line per event and needs every occurrence to be recoverable —
+// TestWarnImplausibleCost_NamesTheHost pins that — whereas a Warn per hostile request would
+// flood a log nobody opted into. The residual is real and worth naming: with debug enabled this
+// path emits a line per attacker-chosen request. The bounded trail that needs no logger at all
+// is the per-request record, costevent.RejectedImplausible, which the per-minute accumulator
+// caps.
+// SWAPPED BY A TEST, WHICH MAKES IT A PACKAGE-WIDE CONSTRAINT. implausible_test.go resets this
+// and replaces slog.Default() to observe the one warning, so no test in this package may run in
+// parallel with another while that is true. TestNoTestInThisPackageRunsInParallel enforces it,
+// because a comment would not survive the first t.Parallel someone adds.
 var implausibleWarnOnce sync.Once
 
 // warnImplausibleCost tells an operator enough to FIND THE HOST: host, path, the figure

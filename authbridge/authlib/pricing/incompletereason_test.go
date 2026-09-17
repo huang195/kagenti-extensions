@@ -6,6 +6,19 @@ import (
 	"github.com/rossoctl/cortex/authbridge/authlib/pipeline"
 )
 
+// Presence bits, mirrored from parsercommon.Kind so a fixture can say which kinds it means
+// rather than carrying bare shifts.
+//
+// Mirrored rather than imported because parsercommon lives under plugins/internal and is
+// unreachable from here — the same constraint that made pipeline.InferenceExtension.PresentKinds
+// a plain uint8 with its layout written into the doc comment. They live in this file because the
+// only readers are the assertions below, which pin what the mask CANNOT discriminate: nothing in
+// the package reads it.
+const (
+	presentInput  uint8 = 1 << 0 // parsercommon.KindInput
+	presentOutput uint8 = 1 << 3 // parsercommon.KindOutput
+)
+
 // IncompleteReason decides whether a modelled figure may be presented as an exact
 // total, so the cases below are the boundary of what the system claims to know about
 // its own spend. Both directions matter: a missed floor understates the bill silently,

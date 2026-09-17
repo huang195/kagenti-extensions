@@ -48,6 +48,9 @@ func TestExtProc_HeadersThenTeardownStillSettlesTheHeaderCost(t *testing.T) {
 	defer cancel()
 	stream := &cancelOnEndStream{mockStream: &mockStream{ctx: ctx, requests: kept}, cancel: cancel}
 	_ = srv.Process(stream)
+	if stream.recvIdx != len(kept) {
+		t.Fatalf("consumed %d of %d messages; the listener bailed mid-script", stream.recvIdx, len(kept))
+	}
 
 	ev := responseEvent(t, store)
 	if ev == nil {
@@ -123,6 +126,9 @@ func TestExtProc_SplitJSONResponseBodyIsParsedAsOneResponse(t *testing.T) {
 
 	stream := &mockStream{ctx: context.Background(), requests: reqs}
 	_ = srv.Process(stream)
+	if stream.recvIdx != len(reqs) {
+		t.Fatalf("consumed %d of %d messages; the listener bailed mid-script", stream.recvIdx, len(reqs))
+	}
 
 	ev := responseEvent(t, store)
 	if ev == nil {

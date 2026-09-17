@@ -29,10 +29,13 @@ import "math"
 // ACCUMULATE where the sum is kept, which is a different package's invariant and not this
 // constant's to hold. TestNoPerRequestBoundClosesTheAccumulationWrap pins that reasoning.
 //
-// AND IT IS CLOSED THERE BY THE AGGREGATE WORK LATER IN THIS SERIES, not here and not yet:
-// usage.Counts.Add will route every field through a checked accumulate that saturates
-// instead of wrapping, and disclose on the totals that the figure has become a floor. None
-// of that exists at this commit — read the paragraph above as an open defect until it lands.
+// IT IS CLOSED BY THE AGGREGATE PR IN THIS SERIES — usage.Counts.Add routes every field
+// through a checked accumulate that saturates instead of wrapping, and discloses on the totals
+// that the figure has become a floor. None of that exists at THIS commit, so until that PR
+// lands the paragraph above is an open defect and not history. It is reachable meanwhile: a
+// header figure on a PARSED path is bounded only by this constant (see
+// costing.implausibleUnparsedCost for why that gate is narrow and what tracks the residual), so
+// 1,024 such requests wrap the aggregate.
 // What is settled either way is the part this constant is responsible for: a per-request
 // bound cannot close an accumulation wrap, and pushing MaxCostMicros lower would not have.
 //
@@ -209,9 +212,10 @@ func MicrosFromUSD(usd float64) (int64, bool) {
 //   - A count above maxPlausibleTokens, on the same reasoning and from the same
 //     wire. THE MODELLED FIGURE WAS THE UNBOUNDED ONE: headerCost refuses a
 //     gateway's figure past MaxPlausibleRequestCostMicros ($10,000), and
-//     usage.plausibleTokenReport refuses an implausible token REPORT and counts it
-//     in Counts.RefusedTokenRequests — while the money derived from those same
-//     counts arrived here and was believed, bounded only by MaxCostMicros, which is
+//     the aggregate PR in this series WILL refuse an implausible token report and
+//     count it (usage.plausibleTokenReport, Counts.RefusedTokenRequests — neither
+//     exists at this commit) — while the money derived from those same counts
+//     arrived here and was believed, bounded only by MaxCostMicros, which is
 //     $9 billion. So one response could have its tokens called impossible and its
 //     dollars kept, in the same aggregate, side by side in the same client.
 //   - A modelled figure past MaxPlausibleRequestCostMicros ($10,000), which is the

@@ -672,6 +672,7 @@ func requestScheme(r *http.Request) string {
 // modifyResponse returned early).
 func (s *Server) installStreamingResponseBody(resp *http.Response, pctx *pipeline.Context) {
 	upstream := resp.Body
+	finalCtx, cancelFinal := httpx.TeardownContext(resp.Request.Context())
 	resp.Body = &streamingResponseBody{
 		upstream: upstream,
 		reader:   sseframe.NewReader(upstream, maxBodySize),
@@ -690,9 +691,15 @@ func (s *Server) installStreamingResponseBody(resp *http.Response, pctx *pipelin
 		// Mid-stream frames keep the live request context deliberately: those dispatches
 		// happen only while bytes are being copied to a client that is still there, and a
 		// cancelled context there is a real signal to stop.
-		finalCtx: context.WithoutCancel(resp.Request.Context()),
-		pipeline: s.InboundPipeline,
-		pctx:     pctx,
+		//
+		// BOUNDED as well as detached — detaching removes the only thing that would ever stop
+		// the terminal dispatch, so without a deadline a blocked plugin pins this body, its
+		// pctx and its goroutine for the life of the process. finalCancel is called when the
+		// body finishes, whichever way it finishes. See httpx.TeardownContext.
+		finalCtx:    finalCtx,
+		finalCancel: cancelFinal,
+		pipeline:    s.InboundPipeline,
+		pctx:        pctx,
 		onClose: func(statusCode int) {
 			s.recordInboundResponseEvent(pctx, statusCode)
 		},
@@ -756,16 +763,28 @@ type streamingResponseBody struct {
 	reader   *sseframe.Reader
 	// ctx is the request context, used for mid-stream frames; finalCtx is its detached
 	// twin, used for every terminal dispatch. See installStreamingResponseBody.
-	ctx        context.Context
-	finalCtx   context.Context
-	pipeline   *pipeline.Holder
-	pctx       *pipeline.Context
-	onClose    func(statusCode int)
-	statusCode int
+	ctx      context.Context
+	finalCtx context.Context
+	// finalCancel releases finalCtx's deadline. Called on every path that finalizes, so a
+	// short stream does not leave a timer parked until it fires.
+	finalCancel context.CancelFunc
+	pipeline    *pipeline.Holder
+	pctx        *pipeline.Context
+	onClose     func(statusCode int)
+	statusCode  int
 
 	pending  []byte
 	finished bool
 	closed   bool
+}
+
+// releaseFinal stops finalCtx's timer once the terminal dispatch has run. Idempotent: several
+// paths finish this body, and a second call on a nil-checked cancel is free.
+func (b *streamingResponseBody) releaseFinal() {
+	if b.finalCancel != nil {
+		b.finalCancel()
+		b.finalCancel = nil
+	}
 }
 
 func (b *streamingResponseBody) Read(p []byte) (int, error) {
@@ -782,6 +801,7 @@ func (b *streamingResponseBody) Read(p []byte) (int, error) {
 	if err == io.EOF {
 		// End of upstream. Finalize aggregating plugins.
 		b.pipeline.RunResponseFrame(b.finalCtx, b.pctx, nil, true)
+		b.releaseFinal()
 		b.finished = true
 		return 0, io.EOF
 	}
@@ -790,6 +810,7 @@ func (b *streamingResponseBody) Read(p []byte) (int, error) {
 		// what they have, then propagate the error so net/http closes
 		// the downstream connection.
 		b.pipeline.RunResponseFrame(b.finalCtx, b.pctx, nil, true)
+		b.releaseFinal()
 		b.finished = true
 		return 0, err
 	}

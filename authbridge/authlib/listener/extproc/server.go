@@ -114,7 +114,8 @@ func (s *Server) Process(stream extprocv3.ExternalProcessor_ProcessServer) error
 			return
 		}
 		if (sawResponseHeaders || sawResponseBody) && !responseWasRecorded(pctx) {
-			finalCtx := context.WithoutCancel(ctx)
+			finalCtx, cancelFinal := httpx.TeardownContext(ctx)
+			defer cancelFinal()
 			if !responsePhaseWasRun(pctx) {
 				// THE PHASE NEVER RAN. handleResponseHeaders deferred it to a body message
 				// that never arrived, so unlike the body case there is nothing to double.
@@ -1196,13 +1197,14 @@ func immediateResponse(httpStatus int, reason string) *extprocv3.ProcessingRespo
 // prefix a parser may still be able to read — and says so, because a JSON body cut short parses
 // as nothing and the silence would otherwise look like a response that carried no usage.
 func appendBoundedBody(dst, src []byte) []byte {
-	// The first message is returned as it came: nothing to append to, so nothing to copy.
-	// Only when it is within the bound — an oversized first message falls through to the
-	// warning path below rather than being truncated silently, which is what the special case
-	// used to do. Process rejects a single message past maxBodySize before this is reached, so
-	// that path is defence in depth.
+	// COPIED, NOT ALIASED, even for the first message. Returning src hands back the protobuf
+	// message's own slice, so a later append into its spare capacity would write into memory
+	// Envoy's decoder owns — harmless today, because that message is discarded after this
+	// call, and not a property worth resting on. An oversized first message falls through to
+	// the warning path below rather than being truncated silently; Process rejects a single
+	// message past maxBodySize before this is reached, so that path is defence in depth.
 	if len(dst) == 0 && len(src) <= maxBodySize {
-		return src
+		return append([]byte(nil), src...)
 	}
 	room := maxBodySize - len(dst)
 	if room <= 0 {

@@ -111,22 +111,11 @@ const (
 	ReasonSplitUnreported = "split-unreported"
 )
 
-// Presence bits, mirrored from parsercommon.Kind.
-//
-// Mirrored rather than imported because parsercommon lives under plugins/internal and
-// is unreachable from here — the same constraint that made
-// pipeline.InferenceExtension.PresentKinds a plain uint8 with the layout written into
-// its doc comment.
-//
-// NO PREDICATE IN THIS FILE READS THE MASK, and none should: it is dialect-unreliable for
-// both questions asked here — see outputUncounted's block comment and the call site of
-// totalsOnly. The two bits stay declared because the tests that assert what the mask CANNOT
-// discriminate need names for them, and a fixture built from bare shifts would stop saying
-// which kinds it means.
-const (
-	presentInput  uint8 = 1 << 0 // parsercommon.KindInput
-	presentOutput uint8 = 1 << 3 // parsercommon.KindOutput
-)
+// NO PREDICATE IN THIS FILE READS pipeline.InferenceExtension.PresentKinds, and none should:
+// it is dialect-unreliable for both questions asked here — see outputUncounted's block comment
+// and the call site of totalsOnly. The bit names the tests need to say which kinds a fixture
+// means live in incompletereason_test.go, beside the assertions that use them, rather than as
+// production constants nothing in production reads.
 
 // IncompleteReason names why a figure modelled from inf's counters is not an exact
 // total, or "" when the counters support one.

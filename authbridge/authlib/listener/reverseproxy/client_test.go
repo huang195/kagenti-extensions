@@ -83,19 +83,26 @@ func getWithUA(t *testing.T, proxyURL, ua string) {
 	_ = resp.Body.Close()
 }
 
-func inboundEvents(t *testing.T, store *session.Store) []pipeline.SessionEvent {
+// inboundEvents waits for the request and response events of one turn.
+//
+// SUBSCRIBED, NOT POLLED. store.Subscribe delivers each event as it is appended, so this waits
+// exactly as long as the listener takes and no longer — where a 100 x 20ms poll both sleeps on
+// a fast machine and reports "got <nil>" on a slow one, with no way to tell a listener that was
+// slow from a listener that recorded nothing. The subscription has to be taken BEFORE the
+// request, which is why it is a parameter here rather than something this helper opens.
+func inboundEvents(t *testing.T, sub *session.Subscription, want int) []pipeline.SessionEvent {
 	t.Helper()
-	var v *pipeline.SessionView
-	for i := 0; i < 100; i++ {
-		if v = store.View(session.DefaultSessionID); v != nil && len(v.Events) >= 2 {
-			break
+	var out []pipeline.SessionEvent
+	deadline := time.After(5 * time.Second)
+	for len(out) < want {
+		select {
+		case ev := <-sub.Events():
+			out = append(out, ev)
+		case <-deadline:
+			t.Fatalf("waited 5s for %d inbound events, got %d: %+v", want, len(out), out)
 		}
-		time.Sleep(20 * time.Millisecond)
 	}
-	if v == nil || len(v.Events) < 2 {
-		t.Fatalf("expected an inbound request and response event, got %+v", v)
-	}
-	return v.Events
+	return out
 }
 
 // TestReverseProxy_ClientIsResolvedBeforeThePipelineRuns is the inbound half of the ordering
@@ -113,10 +120,12 @@ func inboundEvents(t *testing.T, store *session.Store) []pipeline.SessionEvent {
 func TestReverseProxy_ClientIsResolvedBeforeThePipelineRuns(t *testing.T) {
 	const sent = "claude-cli/2.1.14 (external, cli)"
 	proxyURL, store := serveWithUAPlugin(t, &uaMutatingPlugin{set: "impostor/9.9"})
+	sub, unsubscribe := store.Subscribe()
+	defer unsubscribe()
 
 	getWithUA(t, proxyURL, sent)
 
-	for _, ev := range inboundEvents(t, store) {
+	for _, ev := range inboundEvents(t, sub, 2) {
 		if ev.Client == nil {
 			t.Fatalf("phase %s: Client is nil", ev.Phase)
 		}
@@ -139,10 +148,12 @@ func TestReverseProxy_ClientIsResolvedBeforeThePipelineRuns(t *testing.T) {
 // no User-Agent at all.
 func TestReverseProxy_APluginCannotEraseTheClient(t *testing.T) {
 	proxyURL, store := serveWithUAPlugin(t, &uaMutatingPlugin{set: ""})
+	sub, unsubscribe := store.Subscribe()
+	defer unsubscribe()
 
 	getWithUA(t, proxyURL, "claude-cli/2.1.14 (external, cli)")
 
-	for _, ev := range inboundEvents(t, store) {
+	for _, ev := range inboundEvents(t, sub, 2) {
 		if ev.Client == nil {
 			t.Fatalf("phase %s: Client is nil — a plugin deleted the header and the caller that "+
 				"actually made this request became untagged traffic", ev.Phase)
@@ -160,10 +171,12 @@ func TestReverseProxy_APluginCannotEraseTheClient(t *testing.T) {
 // means the caller sent nothing, not that the listener was never wired.
 func TestReverseProxy_APluginCannotInventAClient(t *testing.T) {
 	proxyURL, store := serveWithUAPlugin(t, &uaMutatingPlugin{set: "impostor/9.9"})
+	sub, unsubscribe := store.Subscribe()
+	defer unsubscribe()
 
 	getWithUA(t, proxyURL, "")
 
-	for _, ev := range inboundEvents(t, store) {
+	for _, ev := range inboundEvents(t, sub, 2) {
 		if ev.Client != nil {
 			t.Errorf("phase %s: Client = %+v, want nil: the caller sent no User-Agent and a "+
 				"plugin's write became the recorded agent", ev.Phase, ev.Client)

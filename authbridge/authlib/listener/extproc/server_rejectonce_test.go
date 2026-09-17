@@ -88,6 +88,9 @@ func TestExtProc_AResponseRejectRunsTheResponsePhaseOnce(t *testing.T) {
 
 	stream := &mockStream{ctx: context.Background(), requests: reqs}
 	_ = srv.Process(stream)
+	if stream.recvIdx != len(reqs) {
+		t.Fatalf("consumed %d of %d messages; the listener bailed mid-script", stream.recvIdx, len(reqs))
+	}
 
 	if plug.responses != 1 {
 		t.Errorf("OnResponse ran %d times, want 1: the teardown flush inferred that the phase "+

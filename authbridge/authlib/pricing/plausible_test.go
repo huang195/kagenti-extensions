@@ -70,11 +70,25 @@ func TestMicrosFromUSD_TheEdgeIsAmbiguousInFloat64(t *testing.T) {
 	if edge-1 == edge {
 		t.Fatal("2^53-1 is NOT distinct from 2^53 here; the test below asserts a figure the unit cannot hold")
 	}
-	// The consequence the boundary test relies on: the edge is what you get back from a
-	// figure one micro BELOW it, so accepting the edge accepts a figure that may have
-	// come from either side of the bound.
+	// AND THE BEHAVIOUR THAT PREMISE JUSTIFIES, asserted through the function rather than
+	// left as arithmetic: a figure one micro below the bound rounds ONTO the bound, so both
+	// are refused. That is what "the edge is ambiguous" means operationally — accepting it
+	// would accept a figure that may have come from either side.
 	if got := math.Round((edge - 1) / 1e6 * 1e6); got != edge {
 		t.Errorf("(2^53-1) micros round-tripped through USD to %.0f, want the edge %.0f — the ambiguity the exclusive bound is chosen for is gone", got, edge)
+	}
+	if micros, ok := MicrosFromUSD(edge / 1e6); ok {
+		t.Errorf("MicrosFromUSD refused nothing at the bound: got %d, ok=true", micros)
+	}
+	if micros, ok := MicrosFromUSD((edge - 1) / 1e6); ok {
+		t.Errorf("MicrosFromUSD accepted %d micros for a figure one micro under the bound; it "+
+			"rounds onto the bound, which is the ambiguity the exclusive comparison exists for", micros)
+	}
+	// One micro under, expressed so it does NOT round onto the edge, is accepted — otherwise
+	// the two refusals above would also be satisfied by a function that refuses everything.
+	if _, ok := MicrosFromUSD((edge - 1024) / 1e6); !ok {
+		t.Error("MicrosFromUSD refused a figure comfortably inside the bound; the assertions " +
+			"above would then prove nothing")
 	}
 }
 
@@ -224,45 +238,29 @@ func TestPlausibleRequestCostUSD(t *testing.T) {
 // claim. The real fix is a checked accumulate where the sum is kept — usage.Counts.Add and
 // the ledger's totals — which is another package's invariant.
 func TestNoPerRequestBoundClosesTheAccumulationWrap(t *testing.T) {
-	// The wrap, at MaxCostMicros. This is the measured -9214364837600034816 from the
-	// disclosure, reproduced from the constant rather than pasted as a literal.
-	var sum int64
-	const atBound = int64(MaxCostMicros) - 1 // the largest figure MicrosFromUSD admits
-	n := 0
-	for ; n < 2048; n++ {
-		next := sum + atBound
-		if next < sum {
-			break // wrapped
-		}
-		sum = next
+	// THE FIGURES MaxCostMicros' DISCLOSURE QUOTES, read off the constants rather than
+	// simulated with a loop: a loop that adds int64s until they wrap asserts that Go wraps
+	// int64s, which is not a property of this package.
+	//
+	// If either number moves, the paragraph in cost.go quoting it is wrong and this fails.
+	if got := math.MaxInt64 / int64(MaxCostMicros); got != 1023 {
+		t.Errorf("math.MaxInt64/MaxCostMicros = %d, want 1023 — MaxCostMicros' disclosure says "+
+			"1,024 at-bound requests wrap the aggregate", got)
 	}
-	if n >= 2048 {
-		t.Fatalf("no wrap after 2048 at-bound figures (sum %d); the premise of this disclosure has changed", sum)
+	// Under the plausibility cap the same wrap is eight orders of magnitude further out. That
+	// is the blast-radius reduction the cap claims, and it is the reason the disclosure says
+	// the cap moves the wrap without closing it.
+	wrapAtCap := math.MaxInt64 / MaxPlausibleRequestCostMicros
+	if wrapAtCap < 9e8 {
+		t.Errorf("wrap at the cap after %d requests, want at least 9e8 — the cap is looser than "+
+			"the disclosure claims", wrapAtCap)
 	}
-	if n > 1024 {
-		t.Errorf("wrapped after %d at-bound requests, expected ~1024 — math.MaxInt64/MaxCostMicros is %d", n, math.MaxInt64/int64(MaxCostMicros))
+	// And still reachable, which is the honest half: a bound that made it unreachable would
+	// mean the disclosure needs rewriting rather than this test deleting.
+	if wrapAtCap <= 0 || wrapAtCap == math.MaxInt64 {
+		t.Fatal("the wrap is unreachable by arithmetic; MaxCostMicros' disclosure is now wrong " +
+			"in the other direction")
 	}
-
-	// The same 1,024 requests under the plausibility cap: nowhere near the wrap, with
-	// eight orders of magnitude to spare. That is the blast-radius reduction, stated as
-	// what it is.
-	capped := int64(1024) * MaxPlausibleRequestCostMicros
-	if capped <= 0 {
-		t.Fatalf("1024 capped figures already wrapped to %d; the cap is not bounding anything", capped)
-	}
-	if capped > math.MaxInt64/1000 {
-		t.Errorf("1024 capped figures reach %d, within 1000x of the wrap; the cap is looser than this test assumes", capped)
-	}
-
-	// And the honest half: the wrap is still REACHABLE under the cap, just far away. If
-	// this assertion ever fails it means someone bounded the accumulation, and the
-	// disclosure in MaxCostMicros should be rewritten rather than this test deleted.
-	wrapAt := math.MaxInt64/MaxPlausibleRequestCostMicros + 1
-	if wrapAt <= 0 {
-		t.Fatal("the cap makes the wrap unreachable by arithmetic; MaxCostMicros' disclosure is now wrong in the other direction")
-	}
-	t.Logf("wrap threshold: %d requests at MaxCostMicros, %d at MaxPlausibleRequestCostMicros (%.0fx further)",
-		math.MaxInt64/int64(MaxCostMicros)+1, wrapAt, float64(MaxCostMicros)/float64(MaxPlausibleRequestCostMicros))
 }
 
 // A MODELLED FIGURE IS HELD TO THE SAME PER-REQUEST CEILING AS A GATEWAY'S OWN.

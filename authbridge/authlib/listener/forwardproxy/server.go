@@ -951,11 +951,13 @@ func (s *Server) handleStreamingResponse(w http.ResponseWriter, r *http.Request,
 	// leaves inference/a2a stuck in an unfinalized state and emits no
 	// SessionResponse row to abctl.
 	defer func() {
-		// Use a detached context for finalization: the client may have
-		// cancelled the request context after reading the full stream,
-		// but aggregating plugins (inference-parser, session-budget) still
-		// need their last=true dispatch to finalize state.
-		finalCtx := context.WithoutCancel(r.Context())
+		// Use a detached, BOUNDED context for finalization: the client may have
+		// cancelled the request context after reading the full stream, but
+		// aggregating plugins (inference-parser, session-budget) still need their
+		// last=true dispatch to finalize state — and detaching alone would leave that
+		// dispatch with nothing that could ever stop it. See httpx.TeardownContext.
+		finalCtx, cancelFinal := httpx.TeardownContext(r.Context())
+		defer cancelFinal()
 		finalAction := s.OutboundPipeline.RunResponseFrame(finalCtx, pctx, nil, true)
 		if finalAction.Type == pipeline.Reject {
 			// Headers already sent; we can't promote to 502, but

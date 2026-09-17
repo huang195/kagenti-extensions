@@ -571,7 +571,21 @@ func (s *Server) serveOutbound(w http.ResponseWriter, r *http.Request, isBridge 
 			resp.Body = io.NopCloser(bytes.NewReader(respBody))
 		}
 
-		respAction := s.OutboundPipeline.RunResponse(r.Context(), pctx)
+		// DETACHED AND BOUNDED, because the body above is already whole. Everything from here on
+		// is finalization: a client that hung up during that read leaves a done context, and
+		// RunResponse refuses a done context before calling any plugin — returning a Deny this
+		// call site cannot tell from a policy reject, since it only tests action.Type. It would
+		// then write a rejection and RETURN, skipping the settle and the response row for a
+		// response that arrived complete. This is the BUFFERED OUTBOUND PATH, which is where
+		// most non-streamed inference responses go.
+		//
+		// One context for both dispatches: they are two halves of one finalization, and the
+		// terminal frame is what turns folded state into a charge. See httpx.TeardownContext,
+		// and the dispatch-site table in listener/parity for every site classified this way.
+		finalCtx, cancelFinal := httpx.TeardownContext(r.Context())
+		defer cancelFinal()
+
+		respAction := s.OutboundPipeline.RunResponse(finalCtx, pctx)
 		if respAction.Type == pipeline.Reject {
 			httpx.WriteRejection(w, respAction)
 			return
@@ -583,7 +597,7 @@ func (s *Server) serveOutbound(w http.ResponseWriter, r *http.Request, isBridge 
 		// Plugins that didn't migrate — i.e. don't implement
 		// StreamingResponder — are unaffected (RunResponseFrame skips them).
 		if s.OutboundPipeline.HasStreamingResponders() && resp.Body != nil {
-			respFrameAction := s.OutboundPipeline.RunResponseFrame(r.Context(), pctx, pctx.ResponseBody, true)
+			respFrameAction := s.OutboundPipeline.RunResponseFrame(finalCtx, pctx, pctx.ResponseBody, true)
 			if respFrameAction.Type == pipeline.Reject {
 				httpx.WriteRejection(w, respFrameAction)
 				return
@@ -1128,7 +1142,12 @@ func (s *Server) streamFallbackBuffered(w http.ResponseWriter, r *http.Request, 
 	pctx.ResponseBody = respBody
 	resp.Body = io.NopCloser(bytes.NewReader(respBody))
 
-	respAction := s.OutboundPipeline.RunResponse(r.Context(), pctx)
+	// The same detach as the fold and the settle below, on the site the earlier fix walked
+	// past: this runs after io.ReadAll too, so a hangup during the read denies the response
+	// phase and returns before anything is recorded.
+	phaseCtx, cancelPhase := httpx.TeardownContext(r.Context())
+	defer cancelPhase()
+	respAction := s.OutboundPipeline.RunResponse(phaseCtx, pctx)
 	if respAction.Type == pipeline.Reject {
 		httpx.WriteRejection(w, respAction)
 		return

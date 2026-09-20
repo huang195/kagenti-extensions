@@ -2032,3 +2032,24 @@ Open the three PRs against `main`, each based on `main` so GitHub shows cumulati
 - **The plan's test bodies are the specification; the prose around them is context.** Where a step says `IMPLEMENTER:`, the surrounding fixture must come from this package's existing helpers — grep for the nearest similar test and follow it. Do not invent a fixture shape.
 - **Three mutation controls in this plan have already caught a real defect class on this surface**: a renderer pinned while its call site was not, a helper pinned while `paneView` was not, and a flag pinned while the pane was not. When a control passes unexpectedly, suspect the test is one layer away from the code, or that the test's own setup disabled the path — `m.filtering = true` once silently skipped an entire key handler and made two assertions unreachable.
 - **`usage.Counts` has two reflection guards that fail by design** when a field is added and not wired. Treat their red as the instruction it is.
+
+---
+
+## Corrections from executing this plan
+
+Recorded after the fact. Every one is a place the plan was wrong and the code was right.
+
+1. **Task 1's mutation control was invalid.** Replacing `perTier[i] = float64(n) * eff.Base[i]` with `float64(n)` also corrupts `usd`, so the request blows the plausibility ceiling and the test fails with `refusal=implausible-total` — a red that says nothing about the ordering claim. Mutate only the split: keep `usd += float64(n) * eff.Base[i]` on its own line.
+2. **`modelledCost` has FOUR call sites, not three.** The fourth is `costing/avoided.go:99`. Discard the split there: a saving is not spend, and splitting an estimate by a modelled ratio compounds two approximations.
+3. **`costevent` has a wire-parity guard the plan did not mention.** `TestEventWireCoversEveryField` counts `Event`'s fields against a pinned number and must be updated with the marshal in `TestEventJSONTagsArePinned_EveryField`.
+4. **Task 2's fixture split was backwards.** The costing test table charges cache-read 3 micros/token against output 23, so `cacheRead 100000, output 3000` makes cache-read the LARGER cost and inverts the assertion. Use `output 20000`.
+5. **`TestFoldInto_CarriesEveryCountsField`'s own fixture needs the new field.** It marshals a `costevent.Event` literal; give it a `Tiers` record with four DIFFERENT values, so a fold copying one field into all four still fails.
+6. **`costJSON.Totals` embeds `usage.Counts` verbatim**, so the raw tier micros reach `--json` for free. Only the apportioned object is new work.
+7. **`spendSummary` has no `HasWindow`.** The window figure is gated on `Priced`, matching `renderSpendStrip`.
+8. **Task 9's `seriesRows(...)` does not exist.** Rows come from `spendDrawerRows(snap, n) []drawerRow` rendered through `fitStripFigures(prefix, drawerFigures(r), width)`.
+9. **`fitStripFigures` prepends `label + "  "`.** Trim it when placing the result in a column, or the series text sits three columns right of the header naming it.
+10. **A zero apportioned tier must render `emptyCell`, not a figure.** `formatUSDCell(0)` prints `$0.0000`, which asserts the tier was free. The plan's fixture populated all four tiers and so could not see this.
+11. **`spendDrawerLines` becomes `numTierRows + 2`** and the height floor rises by one; the drawer's own reservation was otherwise unchanged.
+12. **A padding loop after a fixed-size iteration is dead code.** `out[:numTierRows]` re-extends a slice within its capacity. Prefer a fixed-size array so the height is the return type.
+13. **`padLeft` and `trunc` already exist** — Task 10 needs no new helpers.
+14. **One unrelated fixture needed headroom:** `table_cursor_test.go`'s plugin-detail case grew from height 60 to 80, its premise being "grown past its content".

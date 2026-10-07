@@ -59,11 +59,25 @@ lost for everything downstream of that pod.
 The shim supplies propagation with stock OpenTelemetry auto-instrumentation and
 **exports nothing**:
 
-- **server side** (`starlette` / `asgi` / `fastapi`) — extract the inbound
-  `traceparent`, make it the active context.
-- **client side** (`httpx` / `requests` / `aiohttp-client` / `urllib3`) — inject
-  `traceparent` on outbound calls. `urllib3` is what covers `boto3`/`botocore`:
-  an S3 read from a tool otherwise escapes into a trace of its own (seen live).
+- **server side** (Starlette / FastAPI / aiohttp / Flask / Django / Falcon /
+  Pyramid / Tornado / gRPC) — extract the inbound `traceparent`, make it the
+  active context.
+- **client side** (`httpx` / `requests` / `aiohttp` / `urllib3` / `urllib` /
+  gRPC) — inject `traceparent` on outbound calls. `urllib3` is what covers
+  `boto3`/`botocore`: an S3 read from a tool otherwise escapes into a trace of
+  its own (seen live). `urllib` is the standard-library client, seen by none
+  of the others. The list is every HTTP and gRPC instrumentor in the contrib
+  catalog, not the libraries the sample apps use: one whose library is not
+  installed is inert, one whose library is installed but unused patches entry
+  points nothing calls, a missing one is a fragmented trace. The stock agent
+  image carries `grpcio` and `flask` as dependencies, so those two activate on
+  every baked agent. `test/propagation/` proves each row against a real
+  exchange. One failure mode to know: stock auto-instrumentation loads the
+  instrumentors in one pass and stops at the first one that raises (an import
+  error only skips that one), so an instrumentor that fails at start, for
+  example Django settings that raise when imported, leaves every instrumentor
+  after it in the alphabet unloaded. The hook logs it; the trace fragments at
+  this pod, visibly.
 - **`threading`** — carry the active context across `Thread.start` /
   `ThreadPoolExecutor.submit`. **Load-bearing**: frameworks that run the LLM
   call in a worker thread (anything using `loop.run_in_executor`) otherwise
@@ -126,8 +140,10 @@ The shim is generic across the mainstream Python stack, not universal:
   `$VIRTUAL_ENV` or at the usual paths) or a plain pip/system python;
   `build-otel-shim.sh` probes the image for the interpreter the app runs and
   refuses when it finds none (an explicit argument overrides the probe).
-- Server is **ASGI / Starlette / FastAPI**; HTTP client is **httpx**,
-  **requests**, **aiohttp** or **urllib3** (which is how `boto3` talks).
+- Server and client are any of the HTTP and gRPC libraries above. Outside
+  them: a hand-built `http.client` connection, raw sockets, `websockets`, a
+  CLI `subprocess`, `multiprocessing` workers and non-Python runtimes carry
+  nothing.
 - A caller that sends no `traceparent` gets one minted by the entry sidecar
   (`parent.source=none` on that hop, contract v1.6); the shim itself seeds
   nothing.
@@ -147,9 +163,9 @@ stronger condition than it sounds.
 ### Half-instrumented apps: the case that looks fine and is not
 
 Propagation needs **two** halves: something that extracts the inbound
-`traceparent` into an active context (`starlette` / `asgi` / `fastapi`), and
-something that injects it on the way out (`httpx` / `requests` / `aiohttp` /
-`urllib3`). An app carrying only the client half can inject, but has nothing
+`traceparent` into an active context (any of the server instrumentors), and
+something that injects it on the way out (any of the client instrumentors).
+An app carrying only the client half can inject, but has nothing
 to inject *from*.
 
 That app is in a corner this kit cannot get you out of:
@@ -205,7 +221,7 @@ small self-contained binary and inert at runtime; noted here rather than hidden.
 ### Refuse rather than guess
 
 `build-otel-shim.sh` probes the image and stops if it finds no runnable Python,
-or if any of the eight instrumentors the shim installs is already present
+or if any of the instrumentors the shim installs is already present
 (wrapping would stack a second instrumentor on the same library), or if the
 image already carries the shim's own hook. It does **not** refuse on the mere
 presence of the `opentelemetry.instrumentation` namespace or of a dormant SDK

@@ -10,7 +10,7 @@ Inert unless ``LINEAGE_PROPAGATE=1``. When active: pin the propagate-only
 posture as env *defaults* (every exporter ``none``, ``tracecontext,baggage``
 propagators — ``setdefault``, so a deliberate override still wins), then run
 stock auto-instrumentation via ``initialize()``; which instrumentors activate
-depends on what the app imports.
+depends on which libraries the image carries.
 
 Failure policy: never take the app down. ``initialize()`` swallows its own
 exceptions, the guard below covers the rest, and ``site`` itself survives a

@@ -178,7 +178,7 @@ detect_user() {  # sets APP_UID and APP_GID (either may be given explicitly)
 }
 
 # The interlock asks exactly "would wrapping DOUBLE-instrument?": is any of the
-# eight instrumentors this shim installs already present? Not the
+# instrumentors this shim installs already present? Not the
 # `opentelemetry.instrumentation` namespace (a transitive dep of anything
 # OTel-adjacent, no library instrumentation in it) and not a dormant SDK
 # (a2a-sdk ships one on every stock agent) — neither is a refusal signal. An
@@ -195,7 +195,8 @@ import importlib.util as u
 def has(m):
     try: return u.find_spec(m) is not None
     except ModuleNotFoundError: return False
-mods = ["starlette", "asgi", "fastapi", "httpx", "requests", "aiohttp_client", "urllib3", "threading"]
+mods = ["asgi", "wsgi", "starlette", "fastapi", "aiohttp_server", "flask", "django", "falcon", "pyramid", "tornado", "grpc",
+        "httpx", "requests", "aiohttp_client", "urllib3", "urllib", "threading"]
 found = [m for m in mods if has("opentelemetry.instrumentation." + m)]
 if found: print("instrumented:" + ",".join(found))
 elif has("_lineage_propagate"): print("hook")

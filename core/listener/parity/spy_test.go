@@ -58,6 +58,15 @@ type spyConfig struct {
 	// SessionEvent.Plugins[<name>/req-body].
 	RecordRequestBody bool `json:"record_request_body"`
 
+	// RecordRequestBodyDigest is RecordRequestBody for a body too big to put in
+	// a fixture literal — same bytes, reported as length + SHA-256 at
+	// SessionEvent.Plugins[<name>/req-body-digest]. See
+	// RecordResponseBodyDigest for the reasoning; the request side needs it
+	// because the request caps diverge too (1 MiB vs 32 MiB), and a failure
+	// message is readable at this size while two megabytes of expected body is
+	// not.
+	RecordRequestBodyDigest bool `json:"record_request_body_digest"`
+
 	// MutateRequestBody, when non-nil, is the exact byte string the spy
 	// hands to pctx.SetBody at OnRequest — making it stand in for
 	// tool-prune, which is the in-tree plugin whose whole job is this and
@@ -79,6 +88,25 @@ type spyConfig struct {
 	// count at SessionEvent.Plugins[<name>/resp-body]. Only meaningful
 	// on the spyStreamingPlugin variant.
 	RecordResponseFrames bool `json:"record_response_frames"`
+
+	// RecordResponseBodyDigest publishes the length and SHA-256 of the
+	// BUFFERED response body at SessionEvent.Plugins[<name>/resp-body-digest].
+	//
+	// The gap it fills: RecordRequestBody covers the request and
+	// RecordResponseFrames covers the streamed response, so nothing reported
+	// what a plugin was handed on the buffered response path — which is where
+	// the listeners' response-body caps differ. extproc TRUNCATES an oversized
+	// response to its 1 MiB cap and runs the pipeline on the prefix
+	// (extproc/server.go:1248), so the divergence is visible ONLY in the
+	// plugin's view of the body: the client still gets the whole thing and
+	// neither the event's status nor its error says a byte went missing.
+	//
+	// A digest rather than the bytes for two reasons. A multi-megabyte
+	// expectation literal is unreadable, and the digest is what makes the
+	// assertion sharp: length alone would pass for any 1 MiB of the body,
+	// while the digest pins it to the PREFIX. Truncation that kept the tail
+	// would be just as wrong and just as silent.
+	RecordResponseBodyDigest bool `json:"record_response_body_digest"`
 
 	// RequestInvocation is recorded via pctx.Record at OnRequest when
 	// non-nil, which is the only way a spy that does NOT deny appears in
@@ -111,6 +139,14 @@ type bodyObservation struct {
 	TerminalFrames int    `json:"terminal_frames,omitempty"`
 }
 
+// bodyDigest is what the spy publishes about a buffered response body: its
+// length and the SHA-256 of exactly those bytes. See
+// spyConfig.RecordResponseBodyDigest for why it is a digest and not the body.
+type bodyDigest struct {
+	Len    int    `json:"len"`
+	SHA256 string `json:"sha256"`
+}
+
 // spyEvent is the payload emitted at OnResponse. Trivial and JSON-
 // stable so parity assertions compare raw JSON directly.
 type spyEvent struct {
@@ -138,6 +174,12 @@ func (s *spyPlugin) Configure(raw json.RawMessage) error {
 func (s *spyPlugin) OnRequest(_ context.Context, pctx *pipeline.Context) pipeline.Action {
 	if s.cfg.RecordRequestBody {
 		s.publish(pctx, bodyReqStrippedSuffix+pipeline.PluginEventSuffix, bodyObservation{Body: string(pctx.Body)})
+	}
+	if s.cfg.RecordRequestBodyDigest {
+		s.publish(pctx, bodyReqDigestStrippedSuffix+pipeline.PluginEventSuffix, bodyDigest{
+			Len:    len(pctx.Body),
+			SHA256: sha256Hex(pctx.Body),
+		})
 	}
 	// Rewrite AFTER recording, so a fixture can pin both halves of the
 	// mutation independently: /req-body is what the listener handed the
@@ -182,6 +224,16 @@ func (s *spyPlugin) OnRequest(_ context.Context, pctx *pipeline.Context) pipelin
 }
 
 func (s *spyPlugin) OnResponse(_ context.Context, pctx *pipeline.Context) pipeline.Action {
+	// Published unconditionally when the knob is set, zero length included, so
+	// a fixture can tell "OnResponse ran and was handed nothing" from
+	// "OnResponse never ran" — which is exactly the difference between
+	// extproc's truncate-and-continue and reverseproxy's 502 refusal.
+	if s.cfg.RecordResponseBodyDigest {
+		s.publish(pctx, bodyRespDigestStrippedSuffix+pipeline.PluginEventSuffix, bodyDigest{
+			Len:    len(pctx.ResponseBody),
+			SHA256: sha256Hex(pctx.ResponseBody),
+		})
+	}
 	if s.cfg.EmitOnResponse && s.cfg.ResponseEvent != nil {
 		s.publish(pctx, pipeline.PluginEventSuffix, *s.cfg.ResponseEvent)
 	}
@@ -268,8 +320,10 @@ const (
 // Body-observation event keys in stripped form — the shape
 // SessionEvent.Plugins uses after SnapshotPlugins removes PluginEventSuffix.
 const (
-	bodyReqStrippedSuffix  = "/req-body"
-	bodyRespStrippedSuffix = "/resp-body"
+	bodyReqStrippedSuffix        = "/req-body"
+	bodyReqDigestStrippedSuffix  = "/req-body-digest"
+	bodyRespStrippedSuffix       = "/resp-body"
+	bodyRespDigestStrippedSuffix = "/resp-body-digest"
 )
 
 func init() {

@@ -74,6 +74,23 @@ type fixture struct {
 	// record. Combine with expectedWireStatus to pin the wire code.
 	pipelineRefusedPreRun bool
 
+	// refusedPreRunBy says the same thing PER LISTENER, keyed by the name in
+	// listenerRun. Non-nil REPLACES pipelineRefusedPreRun; a missing key reads
+	// as false.
+	//
+	// It exists because the request-body caps are not the same number on every
+	// shape — 1 MiB on extproc and reverseproxy, 32 MiB on forwardproxy
+	// (forwardproxy/server.go:59) — so a body in between is refused pre-run on
+	// one leg of a fixture and runs the whole pipeline on the other. The
+	// fixture-level flag cannot say that: it errors on whichever leg disagrees
+	// with it, so the shape was unrepresentable and the gap untestable.
+	//
+	// This is a DRIVER-SHAPE hint, not a comparison weakener. assertParity
+	// still compares PipelineRan pairwise, so a fixture that set this and then
+	// asked for parity would fail on the very divergence it declared — which is
+	// why divergence_test.go exists and this does not loosen anything here.
+	refusedPreRunBy map[string]bool
+
 	// expectedWireStatus, when non-zero, is asserted against every
 	// listener's wire status. Meaningful whenever the listener produced a
 	// status of its own: a pre-pipeline refusal (pipelineRefusedPreRun) or
@@ -141,6 +158,16 @@ type fixture struct {
 	// where the fixture controls the request shape, so fixtures opt in
 	// rather than inheriting a comparison they were not written for.
 	expectedUpstream *upstreamSummary
+}
+
+// refusedPreRun reports whether the named listener is expected to refuse the
+// request before the pipeline runs. refusedPreRunBy wins when set, so a fixture
+// declares either one global answer or one per listener, never a mix.
+func (f fixture) refusedPreRun(listener string) bool {
+	if f.refusedPreRunBy != nil {
+		return f.refusedPreRunBy[listener]
+	}
+	return f.pipelineRefusedPreRun
 }
 
 // contentType returns the fixture's response content-type or a sensible
@@ -496,7 +523,14 @@ func runExtproc(t *testing.T, f fixture, wantPhase pipeline.SessionPhase) *obser
 			},
 		})
 	}
-	if f.upstreamStatus > 0 {
+	// The response phase is skipped when this leg is expected to refuse the
+	// request pre-run, and that is transport fidelity rather than test
+	// convenience: an ImmediateResponse terminates Envoy's filter chain, so
+	// Envoy never calls ext_proc again for that request. Sending response
+	// callbacks after one would hand the listener a shape production cannot
+	// produce. No fixture hit this before — a refusal meant upstreamStatus: 0 —
+	// but a cap that only ONE shape enforces needs an upstream for the other leg.
+	if f.upstreamStatus > 0 && !f.refusedPreRun("extproc") {
 		reqs = append(reqs, &extprocv3.ProcessingRequest{
 			Request: &extprocv3.ProcessingRequest_ResponseHeaders{
 				ResponseHeaders: &extprocv3.HttpHeaders{
@@ -555,7 +589,10 @@ func runExtproc(t *testing.T, f fixture, wantPhase pipeline.SessionPhase) *obser
 	if stream.recvIdx != len(reqs) {
 		t.Errorf("extproc: consumed %d of %d messages; listener bailed", stream.recvIdx, len(reqs))
 	}
-	if f.upstreamStatus == 0 {
+	// A pre-run refusal is checked here too, not only by the missing session
+	// event: "no event" is also what a listener that quietly forwarded the
+	// request and recorded nothing would produce, and those are opposite bugs.
+	if f.upstreamStatus == 0 || f.refusedPreRun("extproc") {
 		if n := len(stream.responses); n == 0 {
 			t.Errorf("extproc: fixture %q asked for deny but no response was sent", f.name)
 		} else if last := stream.responses[n-1]; last.GetImmediateResponse() == nil {
@@ -564,7 +601,7 @@ func runExtproc(t *testing.T, f fixture, wantPhase pipeline.SessionPhase) *obser
 	}
 
 	wireStatus := extprocWireStatus(stream)
-	obs := finalizeObservation(t, f, observe(t, store, f.direction, wantPhase), wireStatus)
+	obs := finalizeObservation(t, f, "extproc", observe(t, store, f.direction, wantPhase), wireStatus)
 	if obs != nil && f.expectedUpstream != nil {
 		obs.Upstream = extprocUpstream(f, stream, wireStatus)
 	}
@@ -649,21 +686,27 @@ func extprocWireStatus(stream *mockStream) int {
 }
 
 // finalizeObservation stamps PipelineRan + WireStatus onto an
-// observation. pipelineRefusedPreRun is a strict expectation: the
-// listener MUST refuse before the pipeline. A missing event when the
-// fixture didn't opt in is a bug; an event present when it did is
-// also a bug (the listener silently stopped enforcing the cap).
-func finalizeObservation(t *testing.T, f fixture, obs *observation, wireStatus int) *observation {
+// observation. The refusal expectation — pipelineRefusedPreRun, or
+// refusedPreRunBy[listener] where the caps differ per shape — is strict in
+// BOTH directions: a missing event where the fixture didn't opt in is a bug,
+// and an event present where it did is also a bug (the listener silently
+// stopped enforcing the cap).
+//
+// listener is the name from listenerRun, needed both to read refusedPreRunBy
+// and to say which leg failed — with three drivers calling this, "the listener"
+// in an error message named none of them.
+func finalizeObservation(t *testing.T, f fixture, listener string, obs *observation, wireStatus int) *observation {
 	t.Helper()
+	refused := f.refusedPreRun(listener)
 	if obs == nil {
-		if !f.pipelineRefusedPreRun {
-			t.Errorf("no session event recorded for fixture %q; set pipelineRefusedPreRun=true if expected", f.name)
+		if !refused {
+			t.Errorf("no session event recorded for fixture %q on %s; set pipelineRefusedPreRun (or refusedPreRunBy[%q]) if expected", f.name, listener, listener)
 			return nil
 		}
 		return &observation{PipelineRan: false, WireStatus: wireStatus}
 	}
-	if f.pipelineRefusedPreRun {
-		t.Errorf("fixture %q expected the listener to refuse before the pipeline, but an event was recorded (wireStatus=%d)", f.name, wireStatus)
+	if refused {
+		t.Errorf("fixture %q expected %s to refuse before the pipeline, but an event was recorded (wireStatus=%d)", f.name, listener, wireStatus)
 	}
 	obs.PipelineRan = true
 	obs.WireStatus = wireStatus
@@ -744,7 +787,7 @@ func runReverseProxy(t *testing.T, f fixture, wantPhase pipeline.SessionPhase) *
 		t.Errorf("reverseproxy: fixture %q asked for deny but upstream was reached", f.name)
 	}
 
-	obs := finalizeObservation(t, f, observe(t, store, pipeline.Inbound, wantPhase), resp.StatusCode)
+	obs := finalizeObservation(t, f, "reverseproxy", observe(t, store, pipeline.Inbound, wantPhase), resp.StatusCode)
 	if obs != nil {
 		obs.Upstream = upstreamSeen
 	}
@@ -830,7 +873,7 @@ func runForwardProxy(t *testing.T, f fixture, wantPhase pipeline.SessionPhase) *
 		t.Errorf("forwardproxy: fixture %q asked for deny but upstream was reached", f.name)
 	}
 
-	obs := finalizeObservation(t, f, observe(t, store, pipeline.Outbound, wantPhase), resp.StatusCode)
+	obs := finalizeObservation(t, f, "forwardproxy", observe(t, store, pipeline.Outbound, wantPhase), resp.StatusCode)
 	if obs != nil {
 		obs.Upstream = upstreamSeen
 	}

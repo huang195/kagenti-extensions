@@ -7,6 +7,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -17,9 +18,14 @@ import (
 
 	"github.com/rossoctl/cortex/cmd/agentop/apiclient"
 	"github.com/rossoctl/cortex/cmd/agentop/edit"
+	"github.com/rossoctl/cortex/cmd/agentop/servers"
 	"github.com/rossoctl/cortex/core/config"
 	"github.com/rossoctl/cortex/core/cost/usage"
+	"github.com/rossoctl/cortex/core/pipeline"
+	"github.com/rossoctl/cortex/core/plugins/inferencerouter/routerconfig"
 	"github.com/rossoctl/cortex/core/redact"
+	"github.com/rossoctl/cortex/core/session"
+	"github.com/rossoctl/cortex/core/sessionapi"
 )
 
 // routerYAML is a local config with the router's two servers and claude-code routed to ete.
@@ -224,5 +230,203 @@ func TestAgentsPane_ARowsRefreshAlsoRefetchesThePipeline(t *testing.T) {
 	m.Update(cmd())
 	if got, _ := agentsCell(t, m, "opencode/1.0.3", "SERVER"); got != "glm" {
 		t.Errorf("SERVER = %q after the refresh, want glm", got)
+	}
+}
+
+// routerPlugin stands in for the inference-router in a real pipeline: the session API serves its
+// name, and its config through pipeline.WrapConfigured, as it serves the real plugin's.
+type routerPlugin struct{}
+
+func (routerPlugin) Name() string                              { return servers.PluginName }
+func (routerPlugin) Capabilities() pipeline.PluginCapabilities { return pipeline.PluginCapabilities{} }
+func (routerPlugin) OnRequest(context.Context, *pipeline.Context) pipeline.Action {
+	return pipeline.Action{Type: pipeline.Continue}
+}
+func (routerPlugin) OnResponse(context.Context, *pipeline.Context) pipeline.Action {
+	return pipeline.Action{Type: pipeline.Continue}
+}
+
+// servePipeline is the URL of a real sessionapi server whose outbound pipeline runs the router,
+// configured as routerRaw, under policy: the wire the TUI reads, not a hand-built view of it.
+func servePipeline(t *testing.T, policy pipeline.ErrorPolicy) string {
+	t.Helper()
+	p, err := pipeline.New([]pipeline.Plugin{pipeline.WrapConfigured(routerPlugin{}, json.RawMessage(routerRaw))},
+		pipeline.WithPolicies(policy))
+	if err != nil {
+		t.Fatal(err)
+	}
+	store := session.New(time.Minute, 10, 0)
+	t.Cleanup(store.Close)
+	ts := httptest.NewServer(sessionapi.New(":0", store, sessionapi.WithPipelines(nil, pipeline.NewHolder(p))).Server().Handler)
+	t.Cleanup(ts.Close)
+	return ts.URL
+}
+
+// attachTo points m at the session API at url as this machine's Cortex — its config file and
+// stats server stay f's — and loads the pipeline the way the TUI does. The view m holds is kept
+// until the reply replaces it, as a refetch keeps it: pipelineLoadedMsg repaints against it.
+func attachTo(t *testing.T, m *model, url string) {
+	t.Helper()
+	m.client, m.localEndpoint = apiclient.New(url), url
+	prev := m.pipeline
+	m.Update(m.loadPipelineCmd()())
+	if m.pipeline == prev {
+		t.Fatalf("no pipeline loaded from %s", url)
+	}
+}
+
+// observing is v with the router's entry under on_error: observe, as /v1/pipeline serves it.
+func observing(v *apiclient.PipelineView) *apiclient.PipelineView {
+	for i := range v.Outbound {
+		if v.Outbound[i].Name == servers.PluginName {
+			v.Outbound[i].OnError = pipeline.ErrorPolicyObserve
+		}
+	}
+	return v
+}
+
+// A router under on_error: observe stays in the running pipeline, but moves nothing: it only
+// records observe/would_route. So it is no router to the SERVER column or to S, which says why in
+// the words `agentop server` uses — and writes nothing. Through a real session API, because the
+// policy reaches the TUI only on the wire.
+func TestAgentsPane_AnObservingRouterRoutesNothing(t *testing.T) {
+	f := newFakeProxy(t, false)
+	m := serverModel(t, f)
+	attachTo(t, m, servePipeline(t, pipeline.ErrorPolicyEnforce))
+	if got, _ := agentsCell(t, m, "claude-code/2.1.270", "SERVER"); got != "ete" {
+		t.Fatalf("under enforce, SERVER = %q, want ete", got)
+	}
+
+	attachTo(t, m, servePipeline(t, pipeline.ErrorPolicyObserve))
+	if got, ok := agentsCell(t, m, "claude-code/2.1.270", "SERVER"); ok {
+		t.Errorf("SERVER = %q for a router under on_error: observe, which routes nothing", got)
+	}
+	if m.serverKeyOffered() {
+		t.Error("the footer offers S for a router that routes nothing")
+	}
+	before := f.config(t)
+	onRow(t, m, "opencode/1.0.3")
+	if cmd := m.handleKey(keyRune('S')); cmd != nil || m.serverPicker != nil {
+		t.Fatalf("S opened something: cmd %v, picker %+v", cmd, m.serverPicker)
+	}
+	if want := servers.Inactive(pipeline.ErrorPolicyObserve, f.path); m.flash != want {
+		t.Errorf("flash %q\nwant  %q", m.flash, want)
+	}
+	if f.config(t) != before {
+		t.Error("the config was written")
+	}
+}
+
+// ↵ asks again rather than trusting the picker's opening: the pane's rows refresh the pipeline
+// while the picker is up, and a router that has since stopped routing must not be written to, nor
+// a "New … sessions →" flash claim a route that will not happen.
+func TestServerPicker_EnterRefusesARouterThatStoppedRoutingWhileItWasOpen(t *testing.T) {
+	f := newFakeProxy(t, false)
+	m := serverModel(t, f)
+	before := f.config(t)
+	onRow(t, m, "opencode/1.0.3")
+	m.handleKey(keyRune('S'))
+	if m.serverPicker == nil {
+		t.Fatalf("S opened no picker; flash %q", m.flash)
+	}
+	m.handleKey(keyDown)
+	m.Update(pipelineLoadedMsg(observing(routerPipeline(routerRaw))))
+	if cmd := m.handleKey(keyEnter); cmd != nil {
+		t.Fatal("↵ started a write to a router under on_error: observe")
+	}
+	if want := servers.Inactive(pipeline.ErrorPolicyObserve, f.path); m.flash != want {
+		t.Errorf("flash %q\nwant  %q", m.flash, want)
+	}
+	if m.serverSwitch != nil || f.config(t) != before {
+		t.Errorf("a switch began (%+v) or the config was written", m.serverSwitch)
+	}
+}
+
+// With no router on /v1/pipeline, S cannot tell a config with none from one whose router is under
+// on_error: off — the proxy does not build an off plugin, so it does not list it — and says both.
+func TestServerPicker_NoRouterNamesBothReasonsItMayBeMissing(t *testing.T) {
+	f := newFakeProxy(t, false)
+	m := serverModel(t, f)
+	m.pipeline = &apiclient.PipelineView{Outbound: []apiclient.PipelinePlugin{{Name: "inference-parser"}}}
+	m.rebuildAgentsTable()
+	onRow(t, m, "opencode/1.0.3")
+	m.handleKey(keyRune('S'))
+	for _, want := range []string{"runs no inference-router", "agentop server add", "on_error: off", f.path} {
+		if !strings.Contains(m.flash, want) {
+			t.Errorf("flash %q, want it to contain %q", m.flash, want)
+		}
+	}
+}
+
+// A router config this side cannot decode is no router to show: a SERVER column read off a
+// half-decoded config would name servers it never decoded, and S would write against it.
+func TestActiveRouter_AConfigItCannotReadIsNotOn(t *testing.T) {
+	m := serverModel(t, newFakeProxy(t, false))
+	m.pipeline = routerPipeline(`{"servers":5}`)
+	m.rebuildAgentsTable()
+	if _, on := m.activeRouter(); on {
+		t.Error("activeRouter is on for a config it could not decode")
+	}
+	if _, ok := agentsCell(t, m, "claude-code/2.1.270", "SERVER"); ok {
+		t.Error("SERVER is shown for a router config agentop could not read")
+	}
+	onRow(t, m, "opencode/1.0.3")
+	m.handleKey(keyRune('S'))
+	if m.serverPicker != nil || !strings.Contains(m.flash, "cannot read the inference-router's running config") {
+		t.Errorf("S: picker %+v, flash %q", m.serverPicker, m.flash)
+	}
+}
+
+// A rows reply while a pipeline fetch is out starts no second one: the guard that keeps the 2s
+// tick from stacking fetches against a slow endpoint holds here too.
+func TestAgentsPane_ARowsReplyDoesNotStackAPipelineFetch(t *testing.T) {
+	m := serverModel(t, newFakeProxy(t, false))
+	m.pipelineFetching = true
+	if _, cmd := m.Update(agentRowsLoadedMsg{rows: m.agents, open: agentsOpenNever}); cmd != nil {
+		t.Error("a rows reply started a pipeline fetch while one was in flight")
+	}
+	if !m.pipelineFetching {
+		t.Error("the in-flight flag was cleared by a reply that was not the pipeline's")
+	}
+}
+
+// A pipeline reply repaints the agents table only when the router in it changed — its routing or
+// whether it routes — since one lands every 2s on the pipeline panes.
+func TestPipelineLoaded_RepaintsTheAgentsOnlyWhenTheRouterChanged(t *testing.T) {
+	m := serverModel(t, newFakeProxy(t, false))
+	// Rows that are not drawn yet: they appear only when something repaints.
+	m.agents = append(m.agents, agentRow{label: "bob-shell/1.0", Counts: usage.Counts{Requests: 2}})
+	m.Update(pipelineLoadedMsg(routerPipeline(routerRaw)))
+	if slices.Contains(m.agentRowLabels, "bob-shell/1.0") {
+		t.Error("an unchanged router repainted the agents table")
+	}
+	m.Update(pipelineLoadedMsg(routerPipeline(strings.Replace(routerRaw, `"claude-code":"ete"`, `"claude-code":"glm"`, 1))))
+	if !slices.Contains(m.agentRowLabels, "bob-shell/1.0") {
+		t.Error("a changed route did not repaint the agents table")
+	}
+	if got, _ := agentsCell(t, m, "claude-code/2.1.270", "SERVER"); got != "glm" {
+		t.Errorf("SERVER = %q after the route changed, want glm", got)
+	}
+	m.Update(pipelineLoadedMsg(observing(routerPipeline(routerRaw))))
+	if _, ok := agentsCell(t, m, "claude-code/2.1.270", "SERVER"); ok {
+		t.Error("a router that stopped routing left the SERVER column up")
+	}
+}
+
+// A SERVER cell names a server only where one can be chosen. Other pools many agents, and the
+// no-User-Agent row is one the router refuses to route, so both show nothing rather than an
+// "own choice" S would then refuse. A server name is sanitised like every other served label.
+func TestAgentServerCell_NamesNoServerWhereNoneCanBeChosen(t *testing.T) {
+	router := routerconfig.Config{Agents: map[string]string{"claude-code": "ete", "opencode": "\x1b[31mglm"}}
+	for label, want := range map[string]string{
+		"claude-code/2.1.270": "ete",
+		"bob-shell/1.0":       agentOwnChoice,
+		otherAgents:           "",
+		routerconfig.NoAgent:  "",
+		"opencode/1.0.3":      "�[31mglm",
+	} {
+		if got := agentServerCell(router, label); got != want {
+			t.Errorf("agentServerCell(%q) = %q, want %q", label, got, want)
+		}
 	}
 }

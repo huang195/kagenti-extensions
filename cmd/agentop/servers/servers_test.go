@@ -6,6 +6,7 @@ import (
 	"testing"
 
 	"github.com/rossoctl/cortex/core/config"
+	"github.com/rossoctl/cortex/core/pipeline"
 	"github.com/rossoctl/cortex/core/plugins/inferencerouter/routerconfig"
 )
 
@@ -111,5 +112,27 @@ func TestVerify(t *testing.T) {
 	cfg.Pipeline.Outbound.Plugins[1].Config = []byte(`{"servers": {"ete": {"url": "https://ete.example.com", "key": "k"}}, "agents": {"claude-code": "ete"}}`)
 	if err := Verify(cfg); err != nil {
 		t.Errorf("Verify = %v on a valid router entry", err)
+	}
+}
+
+// Inactive is "" exactly when an entry under policy routes — the default, spelled or not — and
+// otherwise says why nothing is routed and how to fix it in file, which `agentop server` and the
+// TUI's S both show.
+func TestInactive(t *testing.T) {
+	const file = "~/.cortex/config.yaml"
+	for _, policy := range []pipeline.ErrorPolicy{"", pipeline.ErrorPolicyEnforce} {
+		if got := Inactive(policy, file); got != "" {
+			t.Errorf("Inactive(%q) = %q, want \"\"", policy, got)
+		}
+	}
+	for policy, want := range map[pipeline.ErrorPolicy]string{
+		pipeline.ErrorPolicyObserve: "The inference-router entry runs under on_error: observe, so nothing is routed: " +
+			"a request it would route is only recorded, as observe/would_route. ",
+		pipeline.ErrorPolicyOff: "The inference-router entry runs under on_error: off, so it does not run and nothing is routed. ",
+	} {
+		fix := "Remove on_error from the entry in " + file + ", or set it to enforce, to route."
+		if got := Inactive(policy, file); got != want+fix {
+			t.Errorf("Inactive(%q) =\n %q\nwant\n %q", policy, got, want+fix)
+		}
 	}
 }

@@ -171,8 +171,8 @@ func TestServerPicker_RefusesWhereItCannotApply(t *testing.T) {
 		{"no router", "claude-code/2.1.270", "runs no inference-router", func(m *model) {
 			m.pipeline = &apiclient.PipelineView{Outbound: []apiclient.PipelinePlugin{{Name: "inference-parser"}}}
 		}},
-		// The no-User-Agent row reads "own choice" like any unrouted agent, but the router refuses
-		// to route it: its requests belong to no one agent.
+		// The router refuses to route the no-User-Agent row: its requests belong to no one agent.
+		// Its SERVER cell is blank for the same reason.
 		{"the no-User-Agent row", "unknown", `"unknown" cannot be routed`, func(m *model) {
 			m.agents = append(m.agents, agentRow{label: "unknown", Counts: usage.Counts{Requests: 1}})
 		}},

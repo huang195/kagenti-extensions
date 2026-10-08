@@ -18,7 +18,6 @@ import (
 
 	"github.com/rossoctl/cortex/cmd/agentop/servers"
 	"github.com/rossoctl/cortex/core/config"
-	"github.com/rossoctl/cortex/core/pipeline"
 	"github.com/rossoctl/cortex/core/plugins/inferencerouter/routerconfig"
 )
 
@@ -153,25 +152,13 @@ func readRouter(cfg *config.Config) (c routerconfig.Config, present bool, err er
 }
 
 // routerInactive is why the router entry in cfg routes nothing although it is in
-// the chain, or "" when it routes: its on_error. Under observe the router redirects
-// nothing and records observe/would_route where it would have routed; under off it
-// does not run. Either way a server given to an agent changes no traffic, and a
-// command that said the agent's sessions now go there would be wrong. path is the
-// config file, for the fix.
+// the chain, or "" when it routes: its on_error, worded by servers.Inactive, which
+// the TUI's S shares. path is the config file, for the fix.
 func routerInactive(cfg *config.Config, path string) string {
 	for _, e := range cfg.Pipeline.Outbound.Plugins {
-		if e.Name != routerName {
-			continue
+		if e.Name == routerName {
+			return servers.Inactive(e.OnError, homeTilde(path))
 		}
-		fix := fmt.Sprintf("Remove on_error from the entry in %s, or set it to enforce, to route.", homeTilde(path))
-		switch e.OnError.Resolved() {
-		case pipeline.ErrorPolicyObserve:
-			return fmt.Sprintf("The %s entry runs under on_error: observe, so nothing is routed: a request it would "+
-				"route is only recorded, as observe/would_route. %s", routerName, fix)
-		case pipeline.ErrorPolicyOff:
-			return fmt.Sprintf("The %s entry runs under on_error: off, so it does not run and nothing is routed. %s", routerName, fix)
-		}
-		return ""
 	}
 	return ""
 }

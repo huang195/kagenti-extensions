@@ -53,8 +53,8 @@ func (m *model) serverKeyRefusal(label string) string {
 		return "Other pools every client Cortex does not recognise; route one by name with agentop server use <server> --agent <agent>"
 	}
 	// The router's own rule, so S cannot write an agent name the proxy would refuse to reload. It
-	// is what turns the no-User-Agent row away: that row reads "own choice" like any unrouted
-	// agent, but its requests belong to no one agent, so it cannot be routed.
+	// is what turns the no-User-Agent row away: its requests belong to no one agent, so it cannot
+	// be routed, and its SERVER cell is blank for the same reason (agentServerCell).
 	if err := routerconfig.CheckAgent(pipeline.AgentName(label)); err != nil {
 		return err.Error()
 	}
@@ -62,11 +62,11 @@ func (m *model) serverKeyRefusal(label string) string {
 		return "S changes this machine's Cortex, and agentop is not attached to it — or its stats server did not answer at startup"
 	}
 	// THE ONE PLACE A ROUTER THAT CANNOT TAKE A CHOICE IS REFUSED, and serverKeyOffered asks the
-	// same activeRouter, so the footer never offers S where this refuses it. A router the proxy
-	// runs but that routes nothing — on_error: observe, which /v1/pipeline does not yet report —
-	// belongs here beside the absent one, with the reason `agentop server` gives.
-	if _, on := m.activeRouter(); !on {
-		return "this Cortex runs no inference-router; add a server with agentop server add <name> <url>"
+	// same routerStatus, through activeRouter, so the footer never offers S where this refuses it.
+	// Absent (or off, which /v1/pipeline cannot tell from absent), under on_error: observe — in the
+	// words `agentop server` uses — or a config agentop cannot read.
+	if _, why := m.routerStatus(); why != "" {
+		return why
 	}
 	if m.serverSwitch != nil {
 		return "a server switch for " + m.serverSwitch.agent + " is still in progress"
@@ -75,8 +75,9 @@ func (m *model) serverKeyRefusal(label string) string {
 }
 
 // serverKeyOffered reports whether the footer advertises S: attached to this machine's Cortex,
-// with the router in its pipeline, and no switch in flight — the status line shows that one, and
-// S would only say it is still going. Per pane, not per row — the row reasons are S's to explain.
+// with a router in its pipeline that routes, and no switch in flight — the status line shows
+// that one, and S would only say it is still going. Per pane, not per row — the row reasons are
+// S's to explain.
 func (m *model) serverKeyOffered() bool {
 	_, _, local := m.localCortexTarget()
 	_, on := m.activeRouter()
@@ -143,15 +144,18 @@ func (m *model) applyServerChoice() tea.Cmd {
 	p := m.serverPicker
 	m.serverPicker = nil
 	choice := p.entries[p.cursor]
+	// ASKED AGAIN, NOT CARRIED OVER FROM THE OPENING: the pane's rows refetch the pipeline while
+	// the picker is up, so the router may have stopped routing since — and then neither a write
+	// nor "already go to" below would be true. First, so no flash claims a route.
+	if why := m.serverKeyRefusal(p.agent); why != "" {
+		m.setFlash(why)
+		return nil
+	}
 	if p.cursor == p.current {
 		m.setFlash(alreadyRouted(p.agent, choice.name))
 		return nil
 	}
-	path, statsURL, ok := m.localCortexTarget()
-	if !ok {
-		m.setFlash(m.serverKeyRefusal(p.agent))
-		return nil
-	}
+	path, statsURL, _ := m.localCortexTarget()
 	m.serverSwitch = &serverSwitch{agent: p.agent, server: choice.name}
 	agent, server := p.agent, choice.name
 	return func() tea.Msg {

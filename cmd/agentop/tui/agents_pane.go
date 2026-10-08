@@ -282,8 +282,9 @@ func (m *model) rebuildAgentsTable() {
 	if withSessions {
 		cols = append(cols[:1:1], append([]table.Column{{Title: "SESSIONS", Width: 8}}, cols[1:]...)...)
 	}
-	// SERVER, last, only while the proxy runs the inference-router: without it no agent is
-	// routed, and a column reading "own choice" on every row would be noise.
+	// SERVER, last, only while the proxy runs an inference-router that routes — not one under
+	// on_error: observe, which keeps its config but moves nothing (see routerStatus). Without
+	// one no agent is routed, and a column reading "own choice" on every row would be noise.
 	router, routed := m.activeRouter()
 	if routed {
 		cols = append(cols, table.Column{Title: "SERVER", Width: agentsServerWidth})

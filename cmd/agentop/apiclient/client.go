@@ -257,7 +257,11 @@ type PipelinePlugin struct {
 	RequiresAny []string        `json:"requiresAny,omitempty"`
 	Description string          `json:"description,omitempty"`
 	Config      json.RawMessage `json:"config,omitempty"`
-	Metrics     []PluginMetric  `json:"metrics,omitempty"`
+	// OnError is the plugin's on_error policy, "" for the default (enforce): the proxy sends
+	// it only when it is not. A plugin under observe runs, but what it would change is
+	// dropped, so its Config says what it would do rather than what it does.
+	OnError pipeline.ErrorPolicy `json:"onError,omitempty"`
+	Metrics []PluginMetric       `json:"metrics,omitempty"`
 }
 
 // PluginMetric mirrors core/pipeline.Metric on the wire. Kept as a local

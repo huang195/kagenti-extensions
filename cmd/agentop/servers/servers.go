@@ -15,6 +15,7 @@ import (
 
 	"github.com/rossoctl/cortex/cmd/agentop/edit"
 	"github.com/rossoctl/cortex/core/config"
+	"github.com/rossoctl/cortex/core/pipeline"
 	"github.com/rossoctl/cortex/core/plugins/inferencerouter/routerconfig"
 )
 
@@ -34,6 +35,26 @@ func Verify(cfg *config.Config) error {
 		}
 	}
 	return nil
+}
+
+// Inactive is why a router entry under policy, its on_error, routes nothing, or "" when it
+// routes. Under observe the router redirects nothing and records observe/would_route where it
+// would have routed; under off it does not run. Either way a server given to an agent changes no
+// traffic, and whatever said the agent's sessions now go there would be wrong. file is the config
+// file as the caller shows it, for the fix; whether the result is "" does not depend on it.
+//
+// One wording for `agentop server`, which reads the policy off the file, and the TUI's S, which
+// reads it off /v1/pipeline, so the two say the same thing about the same router.
+func Inactive(policy pipeline.ErrorPolicy, file string) string {
+	fix := fmt.Sprintf("Remove on_error from the entry in %s, or set it to enforce, to route.", file)
+	switch policy.Resolved() {
+	case pipeline.ErrorPolicyObserve:
+		return fmt.Sprintf("The %s entry runs under on_error: observe, so nothing is routed: a request it would "+
+			"route is only recorded, as observe/would_route. %s", PluginName, fix)
+	case pipeline.ErrorPolicyOff:
+		return fmt.Sprintf("The %s entry runs under on_error: off, so it does not run and nothing is routed. %s", PluginName, fix)
+	}
+	return ""
 }
 
 // AgentChange routes agent's new sessions to server, or stops routing it when server is "": the

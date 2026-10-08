@@ -416,8 +416,8 @@ type model struct {
 	// write it started, until serverSwitchedMsg lands. See server_picker.go.
 	serverPicker *serverPicker
 	serverSwitch *serverSwitch
-	// serverNotice is why S opened nothing, drawn whole over the AGENTS pane and modal while
-	// non-empty. See renderServerNotice.
+	// serverNotice is why S opened nothing, or why a switch did not go through, drawn whole over
+	// the AGENTS pane and modal while non-empty. See renderServerNotice.
 	serverNotice string
 	// events was labelled a ring buffer and has never been one. Nothing trims an entry in
 	// place; every write is one of six, and the CTX(1M) gauge folds forward off this map,

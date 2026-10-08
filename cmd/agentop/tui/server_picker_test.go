@@ -128,7 +128,8 @@ func TestServerPicker_EnterOnOwnChoiceStopsRoutingTheAgent(t *testing.T) {
 }
 
 // esc, and ↵ on the value already in force, write nothing; S inside the picker does nothing,
-// since no picker key toggles.
+// since no picker key toggles. ↵ there still asks the file, which already holds the value, so the
+// write ends WriteUnchanged without writing or polling — and says it is already in force.
 func TestServerPicker_EscTheCurrentValueAndSWriteNothing(t *testing.T) {
 	f := newFakeProxy(t, false)
 	m := serverModel(t, f)
@@ -144,9 +145,11 @@ func TestServerPicker_EscTheCurrentValueAndSWriteNothing(t *testing.T) {
 	}
 
 	m.handleKey(keyRune('S'))
-	if cmd := m.handleKey(keyEnter); cmd != nil || m.serverPicker != nil {
+	cmd := m.handleKey(keyEnter)
+	if cmd == nil || m.serverPicker != nil {
 		t.Fatalf("↵ on the current value: cmd %v, picker %+v", cmd, m.serverPicker)
 	}
+	m.Update(cmd())
 	if m.flash != "New claude-code sessions already go to ete." {
 		t.Errorf("flash %q", m.flash)
 	}
@@ -237,18 +240,18 @@ func TestServerPicker_TheCountLeavesOutASessionNoPinHolds(t *testing.T) {
 	}
 }
 
-// A refused reload flashes the proxy's error, and the column stays on what the proxy still runs.
-func TestServerPicker_ARefusedReloadFlashesItsErrorAndKeepsTheColumn(t *testing.T) {
+// A refused reload shows the proxy's error, and the column stays on what the proxy still runs.
+func TestServerPicker_ARefusedReloadShowsItsErrorAndKeepsTheColumn(t *testing.T) {
 	f := newFakeProxy(t, true)
 	m := serverModel(t, f)
 	switchTo(t, m, "claude-code/2.1.270", "glm")
-	if !strings.Contains(m.flash, "claude-code stays where it was") || !strings.Contains(m.flash, `configure "inference-router": refused`) {
-		t.Errorf("flash %q", m.flash)
+	if !strings.Contains(m.serverNotice, "claude-code stays where it was") || !strings.Contains(m.serverNotice, `configure "inference-router": refused`) {
+		t.Errorf("notice %q", m.serverNotice)
 	}
-	// edit.WritePluginConfig put the file back, and the flash says so: a refusal that read as
+	// edit.WritePluginConfig put the file back, and the result says so: a refusal that read as
 	// "written" would send the reader looking for an edit that is not there.
-	if !strings.Contains(m.flash, "put back") || f.config(t) != routerYAML {
-		t.Errorf("flash %q; config:\n%s", m.flash, f.config(t))
+	if !strings.Contains(m.serverNotice, "put back") || f.config(t) != routerYAML {
+		t.Errorf("notice %q; config:\n%s", m.serverNotice, f.config(t))
 	}
 	if got, _ := agentsCell(t, m, "claude-code/2.1.270", "SERVER"); got != "ete" {
 		t.Errorf("SERVER = %q after a refused reload, want the old ete", got)
@@ -398,21 +401,24 @@ func squash(s string) string {
 	}, s)
 }
 
-// The result of a switch is the footer's whole line until the next key, cut from the LEFT where
-// it must be, so at 80 columns the part a reader acts on survives: the proxy's error after a
-// refusal, the URL to check after a timeout, the count after a success.
+// The result of a switch that went through is the footer's whole line until the next key, cut
+// from the LEFT where it must be, so at 80 columns the part a reader acts on survives: the URL to
+// check after a timeout, the count after a success. A refusal is the panel, whole.
 func TestServerSwitch_TheResultIsReadableAt80Columns(t *testing.T) {
 	refused := serverModel(t, newFakeProxy(t, true))
 	refused.width = 80
+	refused.rebuildAgentsTable()
 	switchTo(t, refused, "claude-code/2.1.270", "glm")
-	line := strings.SplitN(refused.footerView(), "\n", 2)[0]
-	for _, want := range []string{"put back", `configure "inference-router": refused`} {
-		if !strings.Contains(line, want) {
-			t.Errorf("after a refusal the footer at 80 lost %q: %q", want, line)
+	panel := squash(renderServerNotice(refused.serverNotice, 80))
+	for _, want := range []string{"refused", "put back", `configure "inference-router": refused`} {
+		if !strings.Contains(panel, squash(want)) {
+			t.Errorf("after a refusal the panel at 80 lost %q: %q", want, refused.serverNotice)
 		}
 	}
-	if w := lipgloss.Width(line); w > 80 {
-		t.Errorf("the footer's first line is %d columns", w)
+	for i, l := range strings.Split(refused.View(), "\n") {
+		if w := lipgloss.Width(l); w > 80 {
+			t.Errorf("view line %d is %d columns", i, w)
+		}
 	}
 
 	ok := serverModel(t, newFakeProxy(t, false))
@@ -570,5 +576,154 @@ func TestServerSwitch_ALaterConnectionNeitherCountsNorRefetches(t *testing.T) {
 	}
 	if want := "New claude-code sessions → glm. 2 running sessions stay where they are."; m.flash != want {
 		t.Errorf("flash %q, want %q", m.flash, want)
+	}
+}
+
+// A switch that does not go through is shown whole, in the panel S's refusals use. A real
+// reloader error runs past what an 80-column footer leaves, and a footer line cut from the left
+// lost "refused" and "put back" — what happened to the file — before the error itself did.
+// Success and a timeout stay one sticky line: each fits, with what the reader acts on last.
+func TestServerSwitch_AFailureIsShownWholeInThePanel(t *testing.T) {
+	const reloadErr = `build pipeline: outbound plugin 2 (inference-router): configure "inference-router": ` +
+		`agents: claude-code: names server "glm", which is not one of the servers configured`
+	for _, tc := range []struct {
+		name string
+		msg  serverSwitchedMsg
+	}{
+		{"refused", serverSwitchedMsg{agent: "claude-code", server: "glm",
+			res: edit.WriteResult{Outcome: edit.WriteReloadFailed, ReloadError: reloadErr, RolledBack: true}}},
+		{"unreachable", serverSwitchedMsg{agent: "claude-code", server: "glm",
+			res: edit.WriteResult{Outcome: edit.WriteStatusUnreachable, ReloadError: "reload status endpoint unreachable", RolledBack: true}}},
+		{"refused and not put back", serverSwitchedMsg{agent: "claude-code", server: "glm",
+			res: edit.WriteResult{Outcome: edit.WriteReloadFailed, ReloadError: reloadErr},
+			err: errors.New("the proxy refused the change (" + reloadErr + "), and config.yaml changed while the proxy was reloading it, so it was left as found")}},
+		{"before the write", serverSwitchedMsg{agent: "claude-code", server: "glm",
+			err: errors.New("not writing /Users/someone/.cortex/config.yaml: inference-router config: agents: claude-code: no server named glm")}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			m := serverModel(t, newFakeProxy(t, false))
+			m.width = 80
+			m.rebuildAgentsTable()
+			m.serverSwitch = &serverSwitch{agent: "claude-code", server: "glm"}
+			tc.msg.statsURL = m.localStatsURL
+			m.applyServerSwitched(tc.msg)
+			want := serverSwitchedText(tc.msg, 0)
+			if m.serverNotice != want {
+				t.Fatalf("notice %q, want the whole result %q", m.serverNotice, want)
+			}
+			if m.flash == want {
+				t.Errorf("the failure is a footer line too: %q", m.flash)
+			}
+			if panel := renderServerNotice(m.serverNotice, 80); !strings.Contains(squash(panel), squash(want)) {
+				t.Errorf("the panel does not carry the whole result:\n%s", panel)
+			}
+			view := m.View()
+			if !strings.Contains(view, "[esc] close") {
+				t.Errorf("no panel over the pane:\n%s", view)
+			}
+			for i, l := range strings.Split(view, "\n") {
+				if w := lipgloss.Width(l); w > 80 {
+					t.Errorf("view line %d is %d columns", i, w)
+				}
+			}
+		})
+	}
+
+	// Landing off the AGENTS pane, where the panel is not drawn, it is the sticky line instead:
+	// a result the reader never sees is worse than one cut short.
+	m := serverModel(t, newFakeProxy(t, true))
+	m.pane = paneSessions
+	m.applyServerSwitched(serverSwitchedMsg{agent: "claude-code", server: "glm", statsURL: m.localStatsURL,
+		res: edit.WriteResult{Outcome: edit.WriteReloadFailed, ReloadError: "refused", RolledBack: true}})
+	if m.serverNotice != "" || !m.flashSticky || !strings.Contains(m.flash, "put back") {
+		t.Errorf("off the pane: notice %q, flash %q (sticky %v)", m.serverNotice, m.flash, m.flashSticky)
+	}
+}
+
+// The result closes the panel S opened to say the switch was still in progress: left up, the key
+// that closed it would also have dismissed the sticky result under it.
+func TestServerSwitch_TheResultClosesTheInFlightNotice(t *testing.T) {
+	m := serverModel(t, newFakeProxy(t, false))
+	m.serverSwitch = &serverSwitch{agent: "claude-code", server: "glm"}
+	onRow(t, m, "claude-code/2.1.270")
+	m.handleKey(keyRune('S'))
+	if !strings.Contains(m.serverNotice, "still in progress") {
+		t.Fatalf("notice %q", m.serverNotice)
+	}
+	m.applyServerSwitched(serverSwitchedMsg{agent: "claude-code", server: "glm", statsURL: m.localStatsURL,
+		res: edit.WriteResult{Outcome: edit.WriteReloaded}})
+	if m.serverNotice != "" {
+		t.Errorf("the in-progress notice outlived the result: %q", m.serverNotice)
+	}
+	if line := strings.SplitN(m.footerView(), "\n", 2)[0]; !m.flashSticky || !strings.Contains(line, "New claude-code sessions → glm.") {
+		t.Errorf("footer %q (sticky %v)", line, m.flashSticky)
+	}
+}
+
+// The route can change while the picker is up — the pane's rows poll refetches /v1/pipeline, and
+// a shell's `agentop server use` lands first — so the entry the picker opened on is no measure of
+// what ↵ on it does. ↵ writes whatever the file lacks, and the result says what happened.
+func TestServerPicker_EnterOnTheEntryItOpenedOnWritesWhatChangedUnderneath(t *testing.T) {
+	f := newFakeProxy(t, false)
+	m := serverModel(t, f)
+	onRow(t, m, "claude-code/2.1.270")
+	m.handleKey(keyRune('S'))
+	if m.serverPicker == nil || m.serverPicker.entries[m.serverPicker.cursor].name != "ete" {
+		t.Fatalf("picker %+v, want it open on ete", m.serverPicker)
+	}
+	moved := strings.Replace(routerYAML, "claude-code: ete", "claude-code: glm", 1)
+	if err := os.WriteFile(f.path, []byte(moved), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	m.Update(m.loadPipelineCmd()())
+	if got, _ := agentsCell(t, m, "claude-code/2.1.270", "SERVER"); got != "glm" || m.serverPicker == nil {
+		t.Fatalf("SERVER %q, picker %+v: the refetch did not land under an open picker", got, m.serverPicker)
+	}
+	cmd := m.handleKey(keyEnter)
+	if cmd == nil {
+		t.Fatalf("↵ on ete wrote nothing while the proxy routes claude-code to glm; flash %q", m.flash)
+	}
+	if _, refetch := m.Update(cmd()); refetch != nil {
+		m.Update(refetch())
+	}
+	if !strings.Contains(f.config(t), "claude-code: ete") || m.flash != "New claude-code sessions → ete." {
+		t.Errorf("flash %q; config:\n%s", m.flash, f.config(t))
+	}
+}
+
+// A served server name reaches the screen in the picker's rows and in every line about a switch,
+// and the proxy only runs names its rule allows — but it arrives over an unauthenticated API, so
+// each is sanitised where it is drawn, as the SERVER cells are. The same for a mapping's model
+// names and for the errors a switch reports.
+func TestServerTexts_DrawNoControlFromWhatTheProxyServed(t *testing.T) {
+	const raw = `{"servers":{"ete":{"url":"https://ete.example.com","key":"sk-ete"},` +
+		`"g\u001b]0;pwned\u0007lm":{"url":"https://glm.example.com:8443","key":"sk-glm","opus":"m\u001b[2Jx","sonnet":"s","haiku":"h"}},` +
+		`"agents":{"claude-code":"ete"}}`
+	m := serverModel(t, newFakeProxy(t, false))
+	m.pipeline = routerPipeline(raw)
+	m.rebuildAgentsTable()
+	onRow(t, m, "claude-code/2.1.270")
+	m.handleKey(keyRune('S'))
+	if m.serverPicker == nil || len(m.serverPicker.entries) != 3 {
+		t.Fatalf("picker %+v; notice %q", m.serverPicker, m.serverNotice)
+	}
+	name := m.serverPicker.entries[2].name
+	m.serverSwitch = &serverSwitch{agent: "claude-code", server: name}
+	for what, got := range map[string]string{
+		"the picker":         renderServerPicker(m.serverPicker, 120),
+		"the in-flight mark": m.footerView(),
+		"a switch":           switchedText("claude-code", name, 2),
+		"already in force":   alreadyRouted("claude-code", name),
+		"already in the file": serverSwitchedText(serverSwitchedMsg{agent: "claude-code", server: name,
+			res: edit.WriteResult{Outcome: edit.WriteUnchanged}}, 0),
+		"a refusal": serverSwitchedText(serverSwitchedMsg{agent: "claude-code", server: name,
+			res: edit.WriteResult{Outcome: edit.WriteReloadFailed, ReloadError: "bad \x1b]0;x\x07", RolledBack: true}}, 0),
+		"an error": serverSwitchedText(serverSwitchedMsg{agent: "claude-code", server: name, err: errors.New("bad \x1b[2J")}, 0),
+	} {
+		for _, bad := range []string{"\x1b]", "\x07", "\x1b[2J"} {
+			if strings.Contains(got, bad) {
+				t.Errorf("%s draws %q: %q", what, bad, got)
+			}
+		}
 	}
 }

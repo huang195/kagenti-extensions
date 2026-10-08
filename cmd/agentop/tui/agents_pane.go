@@ -282,6 +282,12 @@ func (m *model) rebuildAgentsTable() {
 	if withSessions {
 		cols = append(cols[:1:1], append([]table.Column{{Title: "SESSIONS", Width: 8}}, cols[1:]...)...)
 	}
+	// SERVER, last, only while the proxy runs the inference-router: without it no agent is
+	// routed, and a column reading "own choice" on every row would be noise.
+	router, routed := m.activeRouter()
+	if routed {
+		cols = append(cols, table.Column{Title: "SERVER", Width: agentsServerWidth})
+	}
 	if want := fitTableColumns(cols, m.width); !sameColumns(m.agentsTbl.Columns(), want) {
 		m.agentsTbl.SetRows(nil)
 		m.agentsTbl.SetColumns(want)
@@ -292,6 +298,10 @@ func (m *model) rebuildAgentsTable() {
 	// across agents billing in different units it would only read as mixed.
 	all := table.Row{allAgentsLabel, "", "", ""}
 	if withSessions {
+		all = append(all, "")
+	}
+	// Nothing under SERVER either: routing is chosen per agent, and S on this row says so.
+	if routed {
 		all = append(all, "")
 	}
 	rows = append(rows, all)
@@ -318,6 +328,9 @@ func (m *model) rebuildAgentsTable() {
 		if withSessions {
 			r := rows[len(rows)-1]
 			rows[len(rows)-1] = append(r[:1:1], append(table.Row{m.agentSessionsCell(a.label)}, r[1:]...)...)
+		}
+		if routed {
+			rows[len(rows)-1] = append(rows[len(rows)-1], agentServerCell(router, a.label))
 		}
 	}
 	m.agentsTbl.SetRows(rows)

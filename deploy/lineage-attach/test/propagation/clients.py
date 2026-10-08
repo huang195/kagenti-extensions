@@ -58,7 +58,8 @@ def grpc_(target):
     ident = lambda b: b  # noqa: E731  raw bytes, no proto
     channel = grpc.insecure_channel(target)
     grpc.channel_ready_future(channel).result(timeout=30)  # the server may still be starting
-    return channel.unary_unary("/probe.Echo/Echo", request_serializer=ident, response_deserializer=ident)(b"").decode()
+    echo = channel.unary_unary("/probe.Echo/Echo", request_serializer=ident, response_deserializer=ident)
+    return echo(b"", timeout=5).decode()
 
 
 CLIENTS = {

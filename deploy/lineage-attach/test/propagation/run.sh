@@ -53,8 +53,10 @@ ORDER=(httpx requests aiohttp_client urllib3 urllib threading floor starlette fa
 run() { "$CONTAINER_TOOL" "$@"; }
 log()  { printf '>> %s\n' "$*" >&2; }
 
+ACTIVE_SRV=""  # the server container of the case in flight, for an early exit
+
 cleanup() {
-  run rm -f "${PREFIX}-sink" >/dev/null 2>&1 || true
+  run rm -f "${PREFIX}-sink" ${ACTIVE_SRV:+"$ACTIVE_SRV"} >/dev/null 2>&1 || true
   run network rm "$NET" >/dev/null 2>&1 || true
   [ "${KEEP:-0}" = 1 ] && return 0
   for row in "${ORDER[@]}"; do run rmi -f "${PREFIX}-${row}:latest" "${PREFIX}-${row}-otel:latest" >/dev/null 2>&1 || true; done
@@ -97,15 +99,17 @@ server_case() {  # image gate
   local img=$1 gate=$2 args=() name="${PREFIX}-${row}-srv"
   [ "$gate" = 1 ] && args+=(-e LINEAGE_PROPAGATE=1)
   [ "$row" = django ] && args+=(-e DJANGO_SETTINGS_MODULE=servers)
+  ACTIVE_SRV="$name"
   run run -d --rm --name "$name" --network "$NET" ${args[@]+"${args[@]}"} -e SINK="http://${PREFIX}-sink:8000/" "$img" \
     python /probe/servers.py "$row" >/dev/null
   run run --rm --network "$NET" "${PREFIX}-sink:latest" python /probe/driver.py "http://${name}:8000/" "$INBOUND" 2>/dev/null | seen
-  run rm -f "$name" >/dev/null 2>&1
+  run rm -f "$name" >/dev/null 2>&1; ACTIVE_SRV=""
 }
 
 rpc_case() {  # image gate inbound -> "metadata-seen sink-seen"
   local img=$1 gate=$2 inbound=$3 args=() name="${PREFIX}-${row}-srv"
   [ "$gate" = 1 ] && args+=(-e LINEAGE_PROPAGATE=1)
+  ACTIVE_SRV="$name"
   run run -d --rm --name "$name" --network "$NET" ${args[@]+"${args[@]}"} -e SINK="http://${PREFIX}-sink:8000/" "$img" \
     python /probe/servers.py grpc >/dev/null
   [ -n "$inbound" ] && args+=(-e INBOUND_TRACEPARENT="$inbound")
@@ -115,7 +119,7 @@ s=sys.stdin.read().strip()
 if not s: print("? ?")
 else:
     d=json.loads(s); print(d.get("inbound") or "-", (d.get("sink") or {}).get("traceparent") or "-")' 2>/dev/null || echo "? ?"
-  run rm -f "$name" >/dev/null 2>&1
+  run rm -f "$name" >/dev/null 2>&1; ACTIVE_SRV=""
 }
 
 main() {

@@ -285,6 +285,14 @@ func (m *model) rebuildAgentsTable() {
 	// SERVER, last, only while the proxy runs an inference-router that routes — not one under
 	// on_error: observe, which keeps its config but moves nothing (see routerStatus). Without
 	// one no agent is routed, and a column reading "own choice" on every row would be noise.
+	//
+	// SQUEEZING AGENT ON A NARROW TERMINAL, NOT DROPPED AS THE SESSIONS TABLE'S IS, and on
+	// purpose: this column is the one place the pane shows where each agent's new sessions go.
+	// AGENT is the widest, so the fitter takes the room from it — 30 to 16 at 80 columns with
+	// SESSIONS up, whole again from 98 — and what survives is the agent's name and minor version,
+	// "claude-code/2.1…". That name is what SERVER and S act on, so two patch versions' rows that
+	// read alike there are one agent with one server
+	// (TestAgentsPane_TheAgentsNameSurvivesTheServerColumnAt80).
 	router, routed := m.activeRouter()
 	if routed {
 		cols = append(cols, table.Column{Title: "SERVER", Width: agentsServerWidth})

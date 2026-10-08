@@ -249,3 +249,36 @@ func TestServerColumns_FromTheWire(t *testing.T) {
 		t.Errorf("SERVER = %q off the wire for a router under on_error: observe", got)
 	}
 }
+
+// Widening the terminal never takes AGENT or SERVER away, and never narrows TITLE, whichever of
+// the two are asked for. Both used to come and go: at 90 they fitted in the room COST and SAVED
+// leave while TITLE holds them out, at 93 those returned and took it back, and at 113 or so the
+// optional columns fitted again — present, absent, present as the window widened. TITLE then
+// grew into the room AGENT and SERVER would claim and shrank when they arrived, the money
+// columns' old harm by another door (TestSessionsTitle_WidthNeverShrinksAsTheTerminalGrows).
+func TestSessionsTable_WideningNeverDropsAColumnOrNarrowsTitle(t *testing.T) {
+	for _, flags := range []struct{ agent, server bool }{{true, false}, {false, true}, {true, true}} {
+		seen := map[string]int{}
+		prevTitle := 0
+		for w := 40; w < 250; w++ {
+			cols := fitTableColumns(sessionsColumnsWith(w, flags.agent, flags.server), w)
+			for _, title := range []string{"AGENT", "SERVER", "TITLE", "COST"} {
+				if sessionsColumnWidth(cols, title) > 0 {
+					seen[title] = w
+				} else if at, ok := seen[title]; ok && at == w-1 {
+					t.Errorf("agent=%v server=%v: widening %d to %d dropped %s", flags.agent, flags.server, w-1, w, title)
+				}
+			}
+			if got := sessionsColumnWidth(cols, "TITLE"); got > 0 {
+				if prevTitle > 0 && got < prevTitle {
+					t.Errorf("agent=%v server=%v: widening %d to %d shrank TITLE from %d to %d",
+						flags.agent, flags.server, w-1, w, prevTitle, got)
+				}
+				prevTitle = got
+			}
+		}
+		if seen["SERVER"] == 0 && flags.server || seen["AGENT"] == 0 && flags.agent {
+			t.Errorf("agent=%v server=%v: never shown below 250 columns: %v", flags.agent, flags.server, seen)
+		}
+	}
+}

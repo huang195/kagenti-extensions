@@ -458,3 +458,27 @@ func TestServerNotice_NamesTheConfigFileAsAgentopServerDoes(t *testing.T) {
 		t.Errorf("reason %q, want agentop server's words", why)
 	}
 }
+
+// At 80 columns, with SESSIONS up, the SERVER column costs AGENT fourteen columns, 30 to 16, and
+// that is deliberate (rebuildAgentsTable): SERVER is the one place the pane shows where each
+// agent's new sessions go, and what it and S act on is the agent's NAME, which survives with its
+// minor version — two patch versions' rows that then read alike are one agent, with one server.
+// Pinned so a later column cannot cut into the name as well.
+func TestAgentsPane_TheAgentsNameSurvivesTheServerColumnAt80(t *testing.T) {
+	m := serverModel(t, newFakeProxy(t, false))
+	m.width = 80
+	m.sessions = []session.SessionSummary{{ID: "a", Agent: "claude-code/2.1.270"}}
+	m.rebuildAgentsTable()
+	if _, ok := agentsCell(t, m, "claude-code/2.1.270", "SERVER"); !ok {
+		t.Fatal("no SERVER column at 80")
+	}
+	if _, ok := agentsCell(t, m, "claude-code/2.1.270", "SESSIONS"); !ok {
+		t.Fatal("no SESSIONS column: the fixture no longer measures the narrowest case")
+	}
+	if got, floor := sessionsColumnWidth(m.agentsTbl.Columns(), "AGENT"), len("claude-code/2.1")+1; got < floor {
+		t.Errorf("AGENT is %d columns at 80, under the %d that keeps an agent's name and minor version", got, floor)
+	}
+	if view := m.View(); !strings.Contains(view, "claude-code/2.1") {
+		t.Errorf("the row does not show the agent's name:\n%s", view)
+	}
+}

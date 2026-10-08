@@ -785,9 +785,11 @@ agentop is for, and the other three are surfaces you visit and leave.
   server each session's inference traffic last went to, which for a session that
   was running when its agent was switched is still the one it started on. A host no
   server has, such as an unrouted agent's own provider, is shown without its port in
-  parentheses, and a session with no inference traffic as an em dash. Read-only: no
-  key here moves a session, since that would move a running conversation. On a
-  terminal too narrow for it the column is left out, not squeezed.
+  parentheses, and a session with no inference traffic seen as an em dash. Read-only:
+  no key here moves a session, since that would move a running conversation. On a
+  terminal too narrow for it the column is left out, not squeezed, and so is
+  `AGENT`; neither shows until `COST` and `SAVED` do, so widening the window never
+  takes one away.
 
   A **`pending:` bucket**, where an agent's calls that name no session collect
   until one does, is listed after the real sessions. Its row shows the agent

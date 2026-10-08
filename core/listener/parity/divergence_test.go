@@ -13,20 +13,52 @@ package parity
 //
 // So a body between 1 MiB and 32 MiB is served on the laptop path and refused
 // on the Kubernetes path, and an Anthropic Claude Code session produces 5 MiB
-// request bodies (measured in #904) — the band is where real traffic lives, not
-// a corner. Until these fixtures existed nothing stated which way each shape
-// goes, so neither answer was a decision and either could change silently.
+// request bodies (the 5,250,133-byte request measured in #864) — the band is
+// where real traffic lives, not a corner. Until these fixtures existed nothing
+// stated which way each shape goes, so neither answer was a decision and
+// either could change silently.
+//
+// TWO ENVOY CONFIGS, AND EVERY extproc ROW BELOW SAYS WHICH ONE IT DESCRIBES.
+// The caps in that table are the LISTENER's, and on the shipped Kubernetes path
+// they are not the first limit a large body meets. ext_proc asks Envoy for
+// BUFFERED bodies in both directions, and neither the chart's envoy-config nor
+// the operator's envoy.yaml.tmpl raises per_connection_buffer_limit_bytes or
+// per_request_buffer_limit_bytes — so Envoy's own 1 MiB default fires first,
+// and the listener is handed no body to apply its cap to:
+//
+//	                   shipped (Envoy's 1 MiB default)     buffer limit raised past the body
+//	request over cap   413 from Envoy; ext_proc is never   413 from the listener's own check
+//	                   called and records NO row           (requestBodyResponse's size guard)
+//	response over cap  500 from Envoy; ext_proc sees       appendBoundedBody truncates to
+//	                   ResponseHeaders without             1 MiB, logs a WARN, and the
+//	                   end_of_stream then EOF, and         pipeline runs on the prefix
+//	                   records 200 with an EMPTY body
+//
+// The first three fixtures pin the RIGHT column — the only config in which the
+// listener's own cap is reachable at all, and therefore the only one that can
+// pin appendBoundedBody. The fourth pins the shipped response shape, via
+// envoyAbortsResponseBody. Both columns are worth having, and the left one is
+// the worse failure: the session event claims a clean 200 while the client got
+// a 500, so the event contradicts what the caller saw rather than merely
+// omitting something.
+//
+// One gap has no fixture, because only one shape can express it: on the shipped
+// Kubernetes path an over-cap REQUEST leaves no session row anywhere, Envoy
+// having refused before ext_proc was called, while the forward proxy records a
+// 413 proxy_error row of its own (recordUnbufferedRequest). An operator
+// comparing the shapes sees a vanished request on one and a logged refusal on
+// the other.
 //
 // Why a sibling of assertParity rather than a tolerance inside it. #987
 // suggested a fixture field that makes assertParity accept per-listener
 // answers. A field like that is an escape hatch: the next fixture that fails on
 // real drift can be made green by filling it in, in a harness whose own
-// comments (parity_test.go:706, :739) exist because it once passed having
-// compared nothing. assertDivergence instead never calls observationDiff, so
-// there is no pairwise check to weaken — each leg is pinned absolutely against
-// its own declared row — and three guards stop it being used for anything else:
-// every listener needs a row, the rows must actually disagree, and each row has
-// to say why.
+// comments exist because it once passed having compared nothing.
+// assertDivergence instead never calls observationDiff, so there is no pairwise
+// check to weaken — each leg is pinned absolutely against its own declared row
+// — and four guards stop it being used for anything else: every listener needs
+// a row, no row may name a listener outside the set being run, the rows must
+// actually disagree, and each row has to say why.
 
 import (
 	"fmt"
@@ -47,9 +79,10 @@ type divergentExpectation struct {
 	// may forget to update.
 	why string
 
-	// pipelineRan is false when the listener refused before the pipeline. Pair
-	// it with refusedPreRunBy on the fixture, which is what tells the driver to
-	// expect no session event from this leg.
+	// pipelineRan is false when the listener refused before the pipeline. It is
+	// also the SOLE declaration of that fact: assertDivergence derives the
+	// fixture's refusedPreRunBy from these rows, so the driver is told to expect
+	// no session event from this leg without a second place to keep in step.
 	pipelineRan bool
 
 	// wireStatus is the transport's code. Compared ALWAYS, including the 0 that
@@ -104,6 +137,14 @@ func assertDivergence(t *testing.T, f fixture, wantPhase pipeline.SessionPhase, 
 		if e.why == "" {
 			t.Fatalf("assertDivergence: fixture %q listener %q has an empty why; an unexplained divergence is the problem this file exists to fix", f.name, l.name)
 		}
+		// Guard: errorCode without errorKind checks NOTHING. The empty-kind arm
+		// below asserts only that the event carried no error at all, so a row
+		// saying {errorCode: "200"} reads like a claim about the upstream's
+		// status and is never compared against anything — the same silent-pass
+		// shape the guards here exist to close.
+		if e.errorKind == "" && e.errorCode != "" {
+			t.Fatalf("assertDivergence: fixture %q listener %q sets errorCode %q with an empty errorKind; nothing would compare it, because an empty kind asserts the event carried no error at all", f.name, l.name, e.errorCode)
+		}
 	}
 	// Guard: a row naming a listener that is not being run would look like
 	// coverage and check nothing. Typos in a map key are otherwise invisible.
@@ -118,6 +159,21 @@ func assertDivergence(t *testing.T, f fixture, wantPhase pipeline.SessionPhase, 
 	if !divergentRows(listeners, want) {
 		t.Fatalf("assertDivergence: fixture %q expects identical behaviour from every listener; that is parity — use assertParity, which also runs the pairwise diff", f.name)
 	}
+
+	// The driver needs to know which legs refuse pre-run, and the rows have
+	// already said so. Deriving it keeps ONE declaration: a fixture that also
+	// wrote refusedPreRunBy by hand could drift from its own rows, and while
+	// that disagreement does fail loudly (finalizeObservation's "no session
+	// event" check, then the PipelineRan comparison below), a reader would have
+	// two places to reconcile to learn what the fixture claims.
+	if f.refusedPreRunBy != nil {
+		t.Fatalf("assertDivergence: fixture %q sets refusedPreRunBy; assertDivergence derives it from the rows' pipelineRan, so declare it there only", f.name)
+	}
+	refused := make(map[string]bool, len(listeners))
+	for _, l := range listeners {
+		refused[l.name] = !want[l.name].pipelineRan
+	}
+	f.refusedPreRunBy = refused
 
 	type namedObs struct {
 		listener string
@@ -248,28 +304,39 @@ func divergenceBody(n int) []byte {
 	return b
 }
 
-// maxBufferedBody is the 1 MiB cap extproc and reverseproxy share
-// (extproc/server.go:33, reverseproxy/server.go:47). Spelled here so the
-// fixtures below read as "one over" / "the first cap's worth" rather than as
-// bit-shift arithmetic.
+// maxBufferedBody is the 1 MiB cap extproc and reverseproxy share — each
+// spells it maxBodySize in its own package. Written out here so the fixtures
+// below read as "one over" / "the first cap's worth" rather than as bit-shift
+// arithmetic.
+//
+// It coincides with Envoy's default buffer limit, which is where it came from
+// and is why the shipped Kubernetes path refuses at the same number by a
+// different mechanism. The two are independent settings, so a deployment that
+// raises one does not move this.
 const maxBufferedBody = 1 << 20
 
 // TestDivergence_OutboundRequestBodyCap: a 2 MiB outbound request is refused
 // before the pipeline by extproc (413) and carried in full by the forward
 // proxy, whose request cap is 32 MiB.
 //
-// This is the band #904 measured real Claude Code traffic in, so the
+// This is the band #864 measured real Claude Code traffic in, so the
 // consequence is concrete: the same agent that works on a laptop loses every
 // request over 1 MiB the moment it is deployed to Kubernetes — and loses it as
 // a 413 from the sidecar, which is not a status the upstream ever sent.
+//
+// The 413 holds on BOTH Envoy configs, which is why this is the one cap fixture
+// whose observables need no qualifying. On the shipped config it is Envoy's own
+// Payload Too Large, refused over the 1 MiB default buffer limit before
+// ext_proc is called; raise that limit and the listener's own size guard
+// answers the same 413 instead. What differs is invisible from here and is
+// recorded in the file comment: on the shipped path no session row is written
+// at all, whereas the forward proxy logs a 413 proxy_error row over its own
+// cap.
 func TestDivergence_OutboundRequestBodyCap(t *testing.T) {
 	big := divergenceBody(2 << 20)
 	f := fixture{
 		name:      "outbound-request-body-cap",
 		direction: pipeline.Outbound,
-		// Per listener, which is the whole shape of this fixture: one leg
-		// refuses pre-run while the other runs the pipeline on the same bytes.
-		refusedPreRunBy: map[string]bool{"extproc": true},
 		entries: []config.PluginEntry{spyEntry(spyPluginA, spyConfig{
 			ReadsBody:               true,
 			RecordRequestBodyDigest: true,
@@ -277,20 +344,21 @@ func TestDivergence_OutboundRequestBodyCap(t *testing.T) {
 		method: "POST",
 		path:   "/divergence/big-request",
 		// An upstream is needed for the leg that does NOT refuse. The extproc
-		// driver skips the response phase for a leg declared refusedPreRunBy,
-		// because Envoy stops calling ext_proc after an ImmediateResponse.
+		// driver skips the response phase for any leg whose row says
+		// pipelineRan: false, because Envoy stops calling ext_proc after an
+		// ImmediateResponse.
 		upstreamStatus: 200,
 		upstreamBody:   []byte(`{"ok":true}`),
 		reqBody:        big,
 	}
 	assertDivergence(t, f, pipeline.SessionRequest, outboundListeners, map[string]divergentExpectation{
 		"extproc": {
-			why:         "1 MiB request cap, refused at the body message before any plugin ran (extproc/server.go:220)",
+			why:         "1 MiB request cap, refused before any plugin ran: Envoy's own default buffer limit on the shipped config, and the listener's size guard as the backstop once that limit is raised",
 			pipelineRan: false,
 			wireStatus:  413,
 		},
 		"forwardproxy": {
-			why:             "32 MiB request cap, so 2 MiB is ordinary traffic and the plugin sees all of it",
+			why:             "32 MiB request cap (maxRequestBodySize) and no Envoy in front of it, so 2 MiB is ordinary traffic and the plugin sees all of it",
 			pipelineRan:     true,
 			wireStatus:      200,
 			eventStatusCode: 0, // request-phase event; no status has been chosen yet
@@ -302,15 +370,25 @@ func TestDivergence_OutboundRequestBodyCap(t *testing.T) {
 }
 
 // TestDivergence_InboundResponseBodyCap: a 2 MiB upstream response on the
-// inbound path. extproc TRUNCATES to 1 MiB and reports success; the reverse
-// proxy refuses with a 502 it generated itself.
+// inbound path, WITH ENVOY'S BUFFER LIMIT RAISED ABOVE THE BODY. extproc
+// TRUNCATES to 1 MiB and reports success; the reverse proxy refuses with a 502
+// it generated itself.
 //
 // Both halves contradict #987's prescription, which expected the two to agree
-// on 502. extproc's appendBoundedBody (extproc/server.go:1248) cuts the body,
-// logs a WARN and lets the pipeline run on the prefix — so the client gets its
-// whole response and only the plugin's view is short. The function's own
-// comment names the consequence: "a JSON body cut short parses as nothing and
-// the silence would otherwise look like a response that carried no usage."
+// on 502 — but only in this config, and that qualification is the whole reason
+// it is stated here. appendBoundedBody cuts the body, logs a WARN and lets the
+// pipeline run on the prefix, so the client gets its whole response and only
+// the plugin's view is short. The function's own comment names the
+// consequence: "a JSON body cut short parses as nothing and the silence would
+// otherwise look like a response that carried no usage."
+//
+// On the SHIPPED config the extproc row is not this. Envoy refuses the
+// response over its 1 MiB default, answers the client 500, and
+// appendBoundedBody is never reached — so the two shapes agree that the client
+// gets an error (500 against the reverse proxy's 502) and disagree about the
+// event, extproc's saying 200 with no error where the reverse proxy's says 502
+// proxy_error. TestDivergence_InboundResponseBodyCapOnShippedEnvoy pins that
+// pair; this one pins what the listener does when it is given the body.
 func TestDivergence_InboundResponseBodyCap(t *testing.T) {
 	big := divergenceBody(2 << 20)
 	f := fixture{
@@ -327,7 +405,7 @@ func TestDivergence_InboundResponseBodyCap(t *testing.T) {
 	}
 	assertDivergence(t, f, pipeline.SessionResponse, inboundListeners, map[string]divergentExpectation{
 		"extproc": {
-			why:             "1 MiB response cap enforced by truncation, so the pipeline runs on the first 1 MiB and nothing reports a problem",
+			why:             "1 MiB response cap enforced by truncation (appendBoundedBody), reachable only once Envoy's buffer limit is raised past the body: the pipeline runs on the first 1 MiB and the event reports no problem",
 			pipelineRan:     true,
 			wireStatus:      0, // no HTTP transport of its own; Envoy owns the connection
 			eventStatusCode: 200,
@@ -336,7 +414,7 @@ func TestDivergence_InboundResponseBodyCap(t *testing.T) {
 			},
 		},
 		"reverseproxy": {
-			why:             "same 1 MiB cap enforced by refusal: modifyResponse returns responseBufferError{overLimit} and the request ends 502 (reverseproxy/server.go:522)",
+			why:             "same 1 MiB cap enforced by refusal, and no Envoy in front to pre-empt it: modifyResponse returns responseBufferError{overLimit} and the request ends 502",
 			pipelineRan:     true,
 			wireStatus:      502,
 			eventStatusCode: 502,
@@ -354,15 +432,27 @@ func TestDivergence_InboundResponseBodyCap(t *testing.T) {
 	})
 }
 
-// TestDivergence_OutboundResponseBodyCap: the silent one, and the reason the
-// digest knob had to exist before this fixture could be written.
+// TestDivergence_OutboundResponseBodyCap: the quiet one, and the reason the
+// digest knob had to exist before this fixture could be written. AGAIN WITH
+// ENVOY'S BUFFER LIMIT RAISED ABOVE THE BODY — see the row's why.
 //
 // Both legs report 200 with no error. The ONLY observable difference is how
 // much of the response the plugin was handed — 1 MiB on extproc, all 2 MiB on
-// the forward proxy — so on the Kubernetes path an LLM response over 1 MiB
-// reaches the client intact while its token counts, and therefore its cost,
-// silently become zero. Nothing in the session event, the wire status or the
-// logs the operator reads says a byte went missing.
+// the forward proxy — so an LLM response over 1 MiB reaches the client intact
+// while its token counts, and therefore its cost, silently become zero.
+// Nothing in the session event or the wire status says a byte went missing.
+// The LOGS do: appendBoundedBody warns "extproc: response body reached the
+// buffer limit; truncating". That WARN is the only signal, which is why it is
+// worth naming — an operator reading the session API, /v1/usage or agentop
+// sees a healthy request and would have to already suspect this to go looking
+// for it.
+//
+// On the SHIPPED config nothing is truncated here either, for the reason the
+// file comment gives: Envoy refuses the response over its own 1 MiB default
+// and answers the client 500, so the cost is lost to an error rather than to a
+// short body. The outbound pair is worth keeping separate from the inbound one
+// above because the forward proxy, this leg's peer, is the shape that gets it
+// right in both configs: a 10 MiB cap and no Envoy ahead of it.
 func TestDivergence_OutboundResponseBodyCap(t *testing.T) {
 	big := divergenceBody(2 << 20)
 	f := fixture{
@@ -379,7 +469,7 @@ func TestDivergence_OutboundResponseBodyCap(t *testing.T) {
 	}
 	assertDivergence(t, f, pipeline.SessionResponse, outboundListeners, map[string]divergentExpectation{
 		"extproc": {
-			why:             "1 MiB response cap, truncated silently: the plugin sees the first 1 MiB and the event looks entirely healthy",
+			why:             "1 MiB response cap, truncated by appendBoundedBody once Envoy's buffer limit is raised past the body: the plugin sees the first 1 MiB and the event looks entirely healthy, the WARN in the log being the only sign",
 			pipelineRan:     true,
 			wireStatus:      0,
 			eventStatusCode: 200,
@@ -388,13 +478,76 @@ func TestDivergence_OutboundResponseBodyCap(t *testing.T) {
 			},
 		},
 		"forwardproxy": {
-			why:             "10 MiB response cap (forwardproxy/server.go:79), so the plugin is handed the whole 2 MiB and can count it",
+			why:             "10 MiB response cap (its own maxBodySize) and no Envoy in front of it, so the plugin is handed the whole 2 MiB and can count it",
 			pipelineRan:     true,
 			wireStatus:      200,
 			eventStatusCode: 200,
 			pluginEvents: map[string]string{
 				spyPluginA + bodyRespDigestStrippedSuffix: digestJSON(big),
 			},
+		},
+	})
+}
+
+// TestDivergence_InboundResponseBodyCapOnShippedEnvoy: the same 2 MiB inbound
+// response as TestDivergence_InboundResponseBodyCap, this time through the
+// SHIPPED Kubernetes config — Envoy's 1 MiB default buffer limit left where
+// the chart and the operator template leave it.
+//
+// This is the pair operators actually run, and the worse of the two. Envoy
+// refuses the over-limit response and answers the CLIENT 500, never delivering
+// the body to ext_proc: the listener is handed ResponseHeaders carrying the
+// upstream's own 200 without end_of_stream, and then the stream ends. Its
+// stream-end flush runs the response phase on an EMPTY buffer and records a
+// 200 with no error — so the session event, /v1/usage and agentop all show a
+// clean request that the caller watched fail. appendBoundedBody is never
+// reached, so there is not even the WARN that the raised-limit fixtures get.
+//
+// The empty digest is what makes that visible rather than merely absent: the
+// plugin RAN and was handed nothing. A row asserting no plugin event at all
+// would also pass if the response phase had been skipped, which is the
+// opposite bug — and the benign one, since a phase that never ran could not
+// have recorded a misleading 200.
+//
+// The client's 500 is Envoy's own and is deliberately absent from these rows;
+// see envoyAbortsResponseBody. What diverges here, and is pinned, is the half
+// the listeners own: extproc's event says 200 with no error where the reverse
+// proxy's says 502 proxy_error, even though both callers got an error.
+func TestDivergence_InboundResponseBodyCapOnShippedEnvoy(t *testing.T) {
+	big := divergenceBody(2 << 20)
+	f := fixture{
+		name:                    "inbound-response-body-cap-shipped-envoy",
+		direction:               pipeline.Inbound,
+		envoyAbortsResponseBody: true,
+		entries: []config.PluginEntry{spyEntry(spyPluginA, spyConfig{
+			ReadsBody:                true,
+			RecordResponseBodyDigest: true,
+		})},
+		method:         "GET",
+		path:           "/divergence/big-response",
+		upstreamStatus: 200,
+		upstreamBody:   big,
+	}
+	assertDivergence(t, f, pipeline.SessionResponse, inboundListeners, map[string]divergentExpectation{
+		"extproc": {
+			why:             "Envoy's own 1 MiB default buffer limit refuses the response before the listener sees a byte of it; the stream-end flush then runs the response phase on an empty buffer and records a healthy-looking 200",
+			pipelineRan:     true,
+			wireStatus:      0, // the 500 is Envoy's; this listener has no transport to report one
+			eventStatusCode: 200,
+			pluginEvents: map[string]string{
+				// Length zero, and the digest of empty: OnResponse ran and was
+				// handed nothing. Not the same claim as pluginEvents: nil.
+				spyPluginA + bodyRespDigestStrippedSuffix: digestJSON(nil),
+			},
+		},
+		"reverseproxy": {
+			why:             "no Envoy on this path to pre-empt anything, so the body arrives and the listener's own 1 MiB cap refuses it: responseBufferError{overLimit}, and the request ends 502",
+			pipelineRan:     true,
+			wireStatus:      502,
+			eventStatusCode: 502,
+			errorKind:       "proxy_error",
+			errorCode:       "200",
+			pluginEvents:    nil,
 		},
 	})
 }

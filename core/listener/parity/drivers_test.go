@@ -63,6 +63,30 @@ type fixture struct {
 	// review lived exactly there.
 	splitResponseBodyAt int
 
+	// envoyAbortsResponseBody makes the ext_proc driver send ResponseHeaders with
+	// end_of_stream FALSE and then no ResponseBody at all, ending the stream.
+	//
+	// That is not a malformed stream — it is what the SHIPPED Kubernetes config
+	// produces for a response over Envoy's buffer limit. ext_proc asks for
+	// ResponseBodyMode BUFFERED (requestBodyResponse's response-side twin), and
+	// neither the chart's envoy-config nor the operator's envoy.yaml.tmpl sets
+	// per_connection_buffer_limit_bytes or per_request_buffer_limit_bytes, so
+	// Envoy's 1 MiB default applies; its docs for BUFFERED say the downstream
+	// system receives an error when the body exceeds it. Envoy sends the headers
+	// it had already seen, fails the stream, and answers the client 500 itself.
+	//
+	// ext_proc ONLY, like splitResponseBodyAt, and for a stronger reason than
+	// that one: there is no Envoy on the laptop path at all, so this models a
+	// filter the other legs genuinely do not have. A fixture setting it is
+	// therefore comparing two SHIPPED DEPLOYMENTS of the same request, which is
+	// the divergence, not an asymmetry in the harness.
+	//
+	// The 500 itself is not representable here and must not be faked: Envoy
+	// generates it, the listener never sees it, and extproc's wire status stays 0
+	// for want of a transport of its own. What this knob pins is the half the
+	// listener DOES own — the session event it records with no body in hand.
+	envoyAbortsResponseBody bool
+
 	// deps are the dependencies the pipeline is built with — the same injection production
 	// uses (plugins.BuildWithDeps). Zero value for the spy fixtures, a pricing registry for
 	// the cost fixtures, which is what lets this suite run the REAL cost owner instead of a
@@ -80,7 +104,7 @@ type fixture struct {
 	//
 	// It exists because the request-body caps are not the same number on every
 	// shape — 1 MiB on extproc and reverseproxy, 32 MiB on forwardproxy
-	// (forwardproxy/server.go:59) — so a body in between is refused pre-run on
+	// (its maxRequestBodySize) — so a body in between is refused pre-run on
 	// one leg of a fixture and runs the whole pipeline on the other. The
 	// fixture-level flag cannot say that: it errors on whichever leg disagrees
 	// with it, so the shape was unrepresentable and the gap untestable.
@@ -515,7 +539,9 @@ func runExtproc(t *testing.T, f fixture, wantPhase pipeline.SessionPhase) *obser
 		},
 	}
 	// Send RequestBody only when the plugin declared ReadsBody, matching
-	// what Envoy does at the ext_proc filter (server.go:113).
+	// what Envoy does at the ext_proc filter — the server asks for the body
+	// from its RequestHeaders handler (NeedsBody() && requestHasBody) and
+	// Envoy sends one only in reply to that.
 	if len(f.reqBody) > 0 && spyPipe.NeedsBody() {
 		reqs = append(reqs, &extprocv3.ProcessingRequest{
 			Request: &extprocv3.ProcessingRequest_RequestBody{
@@ -559,7 +585,11 @@ func runExtproc(t *testing.T, f fixture, wantPhase pipeline.SessionPhase) *obser
 		// error-status-on-headers while a suite whose entire purpose is catching
 		// per-listener divergence stayed green. A harness that cannot express a
 		// shape cannot notice a listener mishandling it.
-		if spyPipe.NeedsBody() && len(f.upstreamBody) > 0 {
+		//
+		// And not at all when Envoy aborted over its own buffer limit: the
+		// headers above are the last message the listener gets, so what runs is
+		// the stream-end flush with an empty buffer. See envoyAbortsResponseBody.
+		if spyPipe.NeedsBody() && len(f.upstreamBody) > 0 && !f.envoyAbortsResponseBody {
 			if cut := f.splitResponseBodyAt; cut > 0 && cut < len(f.upstreamBody) {
 				reqs = append(reqs, &extprocv3.ProcessingRequest{
 					Request: &extprocv3.ProcessingRequest_ResponseBody{

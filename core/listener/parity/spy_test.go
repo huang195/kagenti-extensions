@@ -95,11 +95,20 @@ type spyConfig struct {
 	// The gap it fills: RecordRequestBody covers the request and
 	// RecordResponseFrames covers the streamed response, so nothing reported
 	// what a plugin was handed on the buffered response path — which is where
-	// the listeners' response-body caps differ. extproc TRUNCATES an oversized
-	// response to its 1 MiB cap and runs the pipeline on the prefix
-	// (extproc/server.go:1248), so the divergence is visible ONLY in the
+	// the listeners' response-body caps differ. Given the body, extproc
+	// TRUNCATES an oversized response to its 1 MiB cap and runs the pipeline on
+	// the prefix (appendBoundedBody), so the divergence is visible ONLY in the
 	// plugin's view of the body: the client still gets the whole thing and
 	// neither the event's status nor its error says a byte went missing.
+	//
+	// "Given the body" is load-bearing. On the shipped Kubernetes config Envoy's
+	// own 1 MiB default buffer limit refuses the response first and ext_proc
+	// receives no body message at all, so what this knob reports there is a
+	// length of ZERO — the stream-end flush having run the response phase on an
+	// empty buffer. That is why it publishes unconditionally: both the truncated
+	// prefix and the empty buffer are claims a fixture needs to make, and they
+	// are different claims from OnResponse not running. divergence_test.go's
+	// file comment lays out which config produces which.
 	//
 	// A digest rather than the bytes for two reasons. A multi-megabyte
 	// expectation literal is unreadable, and the digest is what makes the

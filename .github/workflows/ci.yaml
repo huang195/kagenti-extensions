@@ -300,6 +300,11 @@ jobs:
       - name: Install dependencies
         run: |
           pip install pytest==8.* python-keycloak==5.3.1 pyjwt==2.10.1 pyyaml==6.*
+          # tests/test_lineage_propagate_hook.py exercises the lineage kit's MCP
+          # context bridge against the SDK's real client transport. Keep mcp on
+          # the 1.x line: the bridge exists for 1.x and the module skips on 2.x,
+          # so a bump to mcp 2 would silently turn these tests into skips.
+          pip install mcp==1.28.1 httpx==0.28.1 anyio==4.15.1 opentelemetry-api==1.42.1
 
       - name: Run tests
         run: pytest tests/ -v -x --ignore=tests/e2e

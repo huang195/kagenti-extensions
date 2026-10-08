@@ -272,16 +272,21 @@ func serverSwitchedText(msg serverSwitchedMsg, staying int) string {
 // too, but it is where new sessions go, so naming it would say nothing; one with no inference
 // yet is not anywhere, and its first request goes to the new choice.
 //
-// RUNNING MEANS RESIDENT: a session the proxy holds in memory has had traffic since it started,
-// so the router has pinned it. A row only the archive holds has no pin, and is not counted.
-// SessionSummary.Active would not do — it marks the one most recently updated session.
+// RUNNING MEANS A REQUEST THIS PROXY SAW, because that is what the router pins a session by, in
+// memory. A row only the archive holds has no pin, and neither has a resident one whose host is
+// only its history's (InferenceHostFromHistory: resumed after a restart, no inference sent
+// since) — its next request is decided as a new one's and goes to the new choice, so it does not
+// stay. Neither is counted. After an eviction alone such a row's pin can survive, and leaving it
+// out errs low, the quiet side. SessionSummary.Active would not do — it marks the one most
+// recently updated session.
 //
 // Read with the router as it was: a switch changes agents, not servers, so the hosts are the same.
 func (m *model) sessionsStaying(agent, server string) int {
 	router, _ := m.activeRouter()
 	n := 0
 	for _, s := range m.sessions {
-		if pipeline.AgentName(s.Agent) != agent || (s.Resident != nil && !*s.Resident) || s.InferenceHost == "" {
+		if pipeline.AgentName(s.Agent) != agent || (s.Resident != nil && !*s.Resident) || s.InferenceHost == "" ||
+			s.InferenceHostFromHistory {
 			continue
 		}
 		on, ok := servers.ForHost(router, s.InferenceHost)

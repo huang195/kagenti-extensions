@@ -1482,8 +1482,10 @@ went somewhere other than the new choice (for a switch back to its own choice, t
 of the servers), and is left out when there are none. A switch moves none of them:
 the router keeps a running session on the server it started on until the proxy
 restarts, unless the proxy dropped the session from memory before the router pinned
-it (see [`agentop server`](#choosing-an-inference-server-agentop-server)). The
-sessions table's `SERVER` column shows where each one is.
+it (see [`agentop server`](#choosing-an-inference-server-agentop-server)). So a
+session resumed after a restart that has sent no inference since is not counted: no
+pin survived the restart, and its next request goes to the new choice. The sessions
+table's `SERVER` column shows where each one is.
 
 When the switch does not go through, the line says where it left the config file. A
 reload the proxy refused is the proxy's error, with the file put back and the agent

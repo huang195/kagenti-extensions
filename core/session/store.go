@@ -1000,6 +1000,20 @@ type SessionSummary struct {
 	// persists it, and a resumed session reports it until its own next inference request.
 	InferenceHost string `json:"inferenceHost,omitempty"`
 
+	// InferenceHostFromHistory is true when InferenceHost came from the session's history before
+	// this store entry — the archive's fold — because no request the entry holds has set it: a
+	// session resumed after a restart, or re-created after an eviction, that has sent no inference
+	// request since. Absent otherwise, and on a row only the archive holds (Resident false), all of
+	// whose figures are history.
+	//
+	// WHAT A CLIENT NEEDS TO COUNT WHERE RUNNING SESSIONS STAY. The inference-router pins a session
+	// in process memory by the first request it routes, so after a restart nothing holds such a
+	// session where its history says it was: its next request is decided as a new one's, and goes
+	// to its agent's current server. After an eviction alone the pin can survive, so a count that
+	// leaves these rows out errs low there, which is the quiet side. InferenceHost itself is
+	// unchanged by this: it still says where the session's inference last went.
+	InferenceHostFromHistory bool `json:"inferenceHostFromHistory,omitempty"`
+
 	// Resident is false on a row the session archive served because the store no longer holds
 	// the session (GET /v1/sessions?archived=true), and absent otherwise. A POINTER because
 	// omitempty on a bool drops exactly the false the wire needs; absent then means "resident",

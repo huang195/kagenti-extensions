@@ -250,8 +250,9 @@ func serverRemove(args []string, stdout, stderr io.Writer) int {
 // runningOn counts the sessions the proxy at sessionsURL holds in memory whose inference
 // traffic last went to server name — the ones a remove leaves asking for a new session.
 //
-// IN MEMORY, NOT IN THE ARCHIVE: a resident session has had traffic since this proxy started,
-// so the router has pinned it; a session only the archive holds has no pin left to break.
+// IN MEMORY, NOT IN THE ARCHIVE, AND BY A REQUEST THIS PROXY SAW: the router pins a session by
+// the first request it routes and keeps the pin in memory, so a session only the archive holds
+// has no pin left to break, and neither has a resident one whose host is only its history's.
 // SessionSummary.Active would not do — it marks the one most recently updated session.
 //
 // 0 when the proxy does not answer, which is the quiet side for a warning: the remove itself
@@ -268,6 +269,11 @@ func runningOn(sessionsURL string, c routerconfig.Config, name string) int {
 	}
 	n := 0
 	for _, s := range list {
+		// Its host only its history's: resumed after a restart, nothing sent since, so no pin
+		// survived to hold it to name (see SessionSummary.InferenceHostFromHistory).
+		if s.InferenceHostFromHistory {
+			continue
+		}
 		if on, ok := servers.ForHost(c, s.InferenceHost); ok && on == name {
 			n++
 		}

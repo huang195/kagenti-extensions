@@ -550,17 +550,51 @@ func sessionsAPI(t *testing.T, hosts ...string) string {
 	t.Helper()
 	store := session.New(0, 0, 0)
 	for i, h := range hosts {
-		store.Append(fmt.Sprintf("s%d", i), pipeline.SessionEvent{At: time.Now(), Phase: pipeline.SessionRequest,
-			Host: h, Inference: &pipeline.InferenceExtension{Model: "claude-opus-5-5"}})
+		store.Append(fmt.Sprintf("s%d", i), inferenceTo(h))
 	}
-	store.Append("tunnel-only", pipeline.SessionEvent{At: time.Now(), Phase: pipeline.SessionRequest, Tunnel: true,
-		HTTPMethod: "CONNECT", Host: "ete.example.com:443"})
+	store.Append("tunnel-only", tunnelTo("ete.example.com:443"))
+	return serveSessions(t, store)
+}
+
+// inferenceTo is one inference request sent to host; tunnelTo a CONNECT tunnel-open to it.
+func inferenceTo(host string) pipeline.SessionEvent {
+	return pipeline.SessionEvent{At: time.Now(), Phase: pipeline.SessionRequest, Host: host,
+		Inference: &pipeline.InferenceExtension{Model: "claude-opus-5-5"}}
+}
+
+func tunnelTo(host string) pipeline.SessionEvent {
+	return pipeline.SessionEvent{At: time.Now(), Phase: pipeline.SessionRequest, Tunnel: true, HTTPMethod: "CONNECT", Host: host}
+}
+
+// serveSessions is a real session API over store, closed with the test; it returns the address a
+// config names for it.
+func serveSessions(t *testing.T, store *session.Store) string {
+	t.Helper()
 	ts := httptest.NewServer(sessionapi.New(":0", store).Server().Handler)
 	t.Cleanup(func() {
 		ts.Close()
 		store.Close()
 	})
 	return strings.TrimPrefix(ts.URL, "http://")
+}
+
+// historyKeeper is a session archive reduced to what ListSessions asks of one: for each id it
+// holds, one event of history (seq 1) folded as the archive folds it. A store it is added to
+// numbers that id's entry after the history, and lists the two together.
+type historyKeeper map[string]*session.SummaryFold
+
+func (k historyKeeper) Record(string, *pipeline.SessionEvent) {}
+
+func (k historyKeeper) LastSeq(id string) uint64 {
+	if k[id] != nil {
+		return 1
+	}
+	return 0
+}
+
+func (k historyKeeper) Prior(id string, after uint64) (session.Prior, bool) {
+	f := k[id]
+	return session.Prior{Fold: f}, f != nil && after == 1
 }
 
 // Removing a server that running sessions still use goes ahead, and says how many will now be
@@ -594,6 +628,25 @@ func TestServerRemove_WithNoProxyRunningCountsNothing(t *testing.T) {
 	path := serverEnvWithSessions(t, closedAddr(t), sessions, routerBlock)
 	code, out, errOut := runServerCmd(t, "", "remove", "ete", "--config", path)
 	if code != 0 || strings.Contains(errOut, "warning") || !strings.Contains(out, "applies when the proxy next starts") {
+		t.Errorf("exit %d, stdout:\n%s\nstderr:\n%s", code, out, errOut)
+	}
+}
+
+// A session resumed after a restart that has sent no inference since lists its history's host,
+// but the router's pins did not survive the restart: nothing holds it to ete, so its next request
+// goes to its agent's current server and gets no error. It is left out of the count; the session
+// whose own request this proxy saw is not.
+func TestServerRemove_LeavesOutASessionNoPinHolds(t *testing.T) {
+	earlier := session.NewSummaryFold()
+	e := inferenceTo("ete.example.com")
+	earlier.Add("resumed", &e)
+	store := session.New(0, 0, 0)
+	store.AddRecorder(historyKeeper{"resumed": earlier})
+	store.Append("resumed", tunnelTo("ete.example.com:443"))
+	store.Append("seen", inferenceTo("ete.example.com"))
+	path := serverEnvWithSessions(t, newFakeStats(t, 0).addr(), serveSessions(t, store), routerBlock)
+	code, out, errOut := runServerCmd(t, "", "remove", "ete", "--config", path)
+	if code != 0 || !strings.Contains(errOut, "warning: 1 running session ") {
 		t.Errorf("exit %d, stdout:\n%s\nstderr:\n%s", code, out, errOut)
 	}
 }

@@ -143,3 +143,50 @@ func TestSummaryFold_AnOlderSessionJSONHasNoInferenceHost(t *testing.T) {
 		t.Fatalf("InferenceHost = %q, want ete.example.com", got)
 	}
 }
+
+// A session resumed from the archive reports the archive's inferenceHost until its own next
+// inference request, and says that is where the value came from: no request this store entry
+// holds set it. After a restart that is what tells a client the inference-router holds no pin
+// for the session, which it sets by a request it routes and keeps in memory only.
+func TestInferenceHost_SaysWhenOnlyTheHistorySetIt(t *testing.T) {
+	earlier := NewSummaryFold()
+	first := inferenceReq("ete.example.com")
+	earlier.Add("s1", &first)
+	st := New(0, 0, 0)
+	defer st.Close()
+	st.AddRecorder(&priorKeeper{last: map[string]uint64{"s1": 1}, prior: map[string]Prior{"s1": {Fold: earlier}}})
+	for _, e := range interleaved() {
+		st.Append("s1", e)
+	}
+	sum := summaryOf(t, st, "s1")
+	if sum.InferenceHost != "ete.example.com" || !sum.InferenceHostFromHistory {
+		t.Fatalf("resumed with no inference request since: InferenceHost %q, FromHistory %v; want the history's ete.example.com, from history",
+			sum.InferenceHost, sum.InferenceHostFromHistory)
+	}
+	if b, _ := json.Marshal(sum); !strings.Contains(string(b), `"inferenceHostFromHistory":true`) {
+		t.Errorf("the wire does not say it: %s", b)
+	}
+
+	st.Append("s1", inferenceReq("ete.example.com"))
+	sum = summaryOf(t, st, "s1")
+	if sum.InferenceHost != "ete.example.com" || sum.InferenceHostFromHistory {
+		t.Fatalf("after its own request to the same host: InferenceHost %q, FromHistory %v; want ete.example.com, not from history",
+			sum.InferenceHost, sum.InferenceHostFromHistory)
+	}
+	if b, _ := json.Marshal(sum); strings.Contains(string(b), "inferenceHostFromHistory") {
+		t.Errorf("the wire sends the flag for a host the entry set: %s", b)
+	}
+}
+
+// A session with no history before its entry never carries the flag, whatever it has sent.
+func TestInferenceHost_IsNeverFromHistoryWithoutOne(t *testing.T) {
+	st := New(0, 0, 0)
+	defer st.Close()
+	st.Append("s1", inferenceReq("ete.example.com"))
+	st.Append("s2", interleaved()[0])
+	for _, id := range []string{"s1", "s2"} {
+		if sum := summaryOf(t, st, id); sum.InferenceHostFromHistory {
+			t.Errorf("%s: InferenceHostFromHistory with no history: %+v", id, sum)
+		}
+	}
+}

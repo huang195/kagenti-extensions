@@ -108,3 +108,63 @@ func agentServerCell(router routerconfig.Config, label string) string {
 	}
 	return agentOwnChoice
 }
+
+// sessionsServerWidth is the sessions table's SERVER column: a server name, or a host shown in
+// parentheses and cut to fit.
+const sessionsServerWidth = 12
+
+// sessionsNotAHost is the SERVER cell for a session whose inference host is not one a hostname
+// can spell. Nothing of it is drawn: see sessionServerCell. The space is what keeps it from
+// reading as a host called that, as agentOwnChoice's does for a server.
+const sessionsNotAHost = "(not a host)"
+
+// sessionServerCell is the sessions table's SERVER cell for a session whose inference traffic
+// last went to host: the server on that host; a host no server has, in parentheses; or emptyCell
+// when the session has no inference traffic.
+//
+// PARENTHESES ARE THE DIMMING, for agentOwnChoice's reason. They are not in a server name's
+// alphabet, so "(api.anthropic.com)" cannot read as a server called that.
+//
+// ONLY A HOST IS EVER DRAWN, and only one that is one. inferenceHost is the host[:port] the
+// request carried — client-controlled, served over an unauthenticated API — so a value holding
+// anything a hostname cannot (an '@' with a key before it, a path or query, a control, or a
+// parenthesis that would draw one host as two) shows sessionsNotAHost instead, and nothing of
+// its text. Splitting off the port is not enough: routerconfig.Hostname splits at the last ':',
+// so "sk-…:x@evil.example" comes back as "sk-…", the key (servers.Host refuses a URL whole for
+// the same reason). The port is dropped, as the router matches without it. That alphabet is
+// stricter than sanitizeLabel, so what passes it needs no sanitising; a server name does.
+func sessionServerCell(router routerconfig.Config, host string, w int) string {
+	if host == "" {
+		return emptyCell
+	}
+	if name, ok := servers.ForHost(router, host); ok {
+		return trunc(sanitizeLabel(name), w)
+	}
+	h := routerconfig.Hostname(host)
+	if h == "" || !isHostPort(host) {
+		return trunc(sessionsNotAHost, w)
+	}
+	return trunc("("+h+")", w)
+}
+
+// isHostPort reports whether s is spelled only from a hostname's letters, digits, '.', '-' and
+// '_', plus the ':' and brackets of a port and an IPv6 literal.
+func isHostPort(s string) bool {
+	for _, r := range s {
+		switch {
+		case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z', r >= '0' && r <= '9':
+		case r == '.', r == '-', r == '_', r == ':', r == '[', r == ']':
+		default:
+			return false
+		}
+	}
+	return true
+}
+
+// sessionsShowServer reports whether the sessions table carries SERVER: when the router the
+// proxy runs routes — activeRouter's rule, so an observing router hides it here as on the agents
+// pane — and has more than one server. With one there is nothing for the column to tell apart.
+func (m *model) sessionsShowServer() (routerconfig.Config, bool) {
+	router, on := m.activeRouter()
+	return router, on && len(router.Servers) > 1
+}

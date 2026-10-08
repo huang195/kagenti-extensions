@@ -248,8 +248,11 @@ func (m *model) rebuildSessionsTable() {
 	// fitter settled on, so padding first would pad to a width the column no longer has. Every
 	// lookup below still finds its column, because they go through headerTitle.
 	scope := m.sessionsScope()
-	want := alignSessionsHeaders(fitTableColumns(sessionsColumnsWithAgent(m.width, m.sessionsListTwoAgents(scope)), m.width))
+	router, showServer := m.sessionsShowServer()
+	want := alignSessionsHeaders(fitTableColumns(
+		sessionsColumnsWith(m.width, m.sessionsListTwoAgents(scope), showServer), m.width))
 	agentW := sessionsColumnWidth(want, "AGENT")
+	serverW := sessionsColumnWidth(want, "SERVER")
 	costW := sessionsColumnWidth(want, "COST")
 	savedW := sessionsColumnWidth(want, "SAVED")
 	// The other cells are fitted too: padLeft right-aligns into the FITTED width, so digits
@@ -296,6 +299,11 @@ func (m *model) rebuildSessionsTable() {
 		}
 		if agentW > 0 {
 			row = append(row, sessionAgentCell(s, agentW))
+		}
+		// Read-only: where the session's inference went. No key here changes it — that would
+		// move a running conversation, which the router exists not to do.
+		if serverW > 0 {
+			row = append(row, sessionServerCell(router, s.InferenceHost, serverW))
 		}
 		row = append(row,
 			relTime(now, s.UpdatedAt),
@@ -346,6 +354,10 @@ func (m *model) rebuildSessionsTable() {
 		}
 		if agentW > 0 {
 			row = append(row, sessionAgentCell(session.SessionSummary{ID: id}, agentW))
+		}
+		// No summary, so no inference host to name a server from.
+		if serverW > 0 {
+			row = append(row, emptyCell)
 		}
 		row = append(row,
 			// "cached" sits in UPDATED now, where an em dash used to, because ACTIVE is gone
@@ -1521,33 +1533,55 @@ func sessionsShowMoney(termWidth int) bool {
 // sessionsColumnsFor is the column set this terminal actually gets. Paired with
 // sessionsShowMoney in rebuildSessionsTable so the row arity always matches the header.
 func sessionsColumnsFor(termWidth int) []table.Column {
-	return sessionsColumnsWithAgent(termWidth, false)
+	return sessionsColumnsWith(termWidth, false, false)
 }
 
 // sessionsAgentWidth fits "claude-code", an agent label (versionless; see pipeline.AgentName).
 const sessionsAgentWidth = 11
 
-// sessionsColumnsWithAgent is sessionsColumnsFor plus an AGENT column after TITLE when agent is set
-// and the column fits without narrowing any other; see rebuildSessionsTable for when it is asked.
-func sessionsColumnsWithAgent(termWidth int, agent bool) []table.Column {
+// sessionsColumnsWith is sessionsColumnsFor plus an AGENT column after TITLE when agent is set,
+// and a SERVER column after that when server is set, each only when it fits without narrowing any
+// other; see rebuildSessionsTable for when each is asked.
+//
+// DROPPED WHOLE ON A NARROW TERMINAL, never squeezed, the rule the money columns follow: AGENT
+// first, since it is offered first, then SERVER against what is left. Squeezing either would cut
+// it to a fragment and narrow the columns every width test here pins.
+func sessionsColumnsWith(termWidth int, agent, server bool) []table.Column {
 	cols := sessionsBaseColumns(termWidth)
 	if agent {
-		with := make([]table.Column, 0, len(cols)+1)
-		for _, c := range cols {
-			with = append(with, c)
-			if t := headerTitle(c); t == "TITLE" || (t == "SESSION" && !sessionsShowTitle(termWidth)) {
-				with = append(with, table.Column{Title: "AGENT", Width: sessionsAgentWidth})
-			}
-		}
-		fitted, fits := fitTableColumns(with, termWidth), true
-		for i := range with {
-			fits = fits && fitted[i].Width >= with[i].Width
-		}
-		if fits {
-			cols = with
-		}
+		cols = withColumnIfItFits(cols, table.Column{Title: "AGENT", Width: sessionsAgentWidth}, termWidth)
+	}
+	if server {
+		cols = withColumnIfItFits(cols, table.Column{Title: "SERVER", Width: sessionsServerWidth}, termWidth)
 	}
 	return growSessionsTitle(cols, termWidth)
+}
+
+// withColumnIfItFits is cols with col inserted after the identifying columns — SESSION, then
+// TITLE and AGENT where present — or cols unchanged when the fitter would have to narrow any
+// column to make room.
+//
+// After them, in the order they are offered, so a row reads which session, then whose, then
+// where — and SESSION, always present, stays first, where a reader looks for the id.
+func withColumnIfItFits(cols []table.Column, col table.Column, termWidth int) []table.Column {
+	at := 0
+	for i, c := range cols {
+		switch headerTitle(c) {
+		case "SESSION", "TITLE", "AGENT":
+			at = i + 1
+		}
+	}
+	with := make([]table.Column, 0, len(cols)+1)
+	with = append(with, cols[:at]...)
+	with = append(with, col)
+	with = append(with, cols[at:]...)
+	fitted := fitTableColumns(with, termWidth)
+	for i := range with {
+		if fitted[i].Width < with[i].Width {
+			return cols
+		}
+	}
+	return with
 }
 
 func sessionsBaseColumns(termWidth int) []table.Column {

@@ -396,7 +396,7 @@ func TestDivergence_OutboundRequestBodyCap(t *testing.T) {
 	}
 	assertDivergence(t, f, pipeline.SessionRequest, outboundListeners, map[string]divergentExpectation{
 		"extproc": {
-			why:         "1 MiB request cap, refused before any plugin ran: Envoy's own default buffer limit on the shipped config, and the listener's size guard as the backstop once that limit is raised",
+			why:         "1 MiB request cap, refused before any plugin ran: Envoy's own default buffer limit on the shipped config, and the listener's own check in Process's RequestBody case as the backstop once that limit is raised",
 			pipelineRan: false,
 			wireStatus:  413,
 		},

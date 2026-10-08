@@ -19,14 +19,21 @@ func inferenceReq(host string) pipeline.SessionEvent {
 }
 
 // interleaved is what live traffic puts between two inference requests: a bridged CONNECT's
-// tunnel-open, an MCP call and its response, and the inference response itself. None of them
-// may move InferenceHost — each carries a host, and two of them an extension.
+// tunnel-open, an MCP call and its response, the inference response itself, and a denial. None
+// of them may move InferenceHost — each carries a host, and three of them an extension.
+//
+// THE DENIAL CARRIES AN INFERENCE PARSE, as a live one does: the parser runs before the plugin
+// that turns the request away (the router's pinned_server_removed, for one). It went nowhere, so
+// its host says nothing about where the session's inference goes; the inference-router's own
+// history rule (wentTo) skips a denied row for the same reason. Last, so that interleaved()[:3]
+// stays a run with no inference parse at all.
 func interleaved() []pipeline.SessionEvent {
 	return []pipeline.SessionEvent{
 		{Phase: pipeline.SessionRequest, Tunnel: true, HTTPMethod: "CONNECT", Host: "api.anthropic.com:443"},
 		{Phase: pipeline.SessionRequest, Host: "tools.local:8080", MCP: &pipeline.MCPExtension{Method: "tools/call"}},
 		{Phase: pipeline.SessionResponse, Host: "tools.local:8080", MCP: &pipeline.MCPExtension{Method: "tools/call"}},
 		{Phase: pipeline.SessionResponse, Host: "elsewhere.example.com", Inference: &pipeline.InferenceExtension{TotalTokens: 10}},
+		{Phase: pipeline.SessionDenied, Host: "denied.example.com", Inference: &pipeline.InferenceExtension{Model: "claude-opus-5-5"}},
 	}
 }
 
@@ -38,7 +45,7 @@ func TestInferenceHost_TheLatestInferenceRequestWins(t *testing.T) {
 		s.Append("s1", e)
 	}
 	if got := summaryOf(t, s, "s1").InferenceHost; got != "ete.example.com" {
-		t.Fatalf("InferenceHost = %q after a tunnel row, an MCP call and a response; want the inference request's ete.example.com", got)
+		t.Fatalf("InferenceHost = %q after a tunnel row, an MCP call, a response and a denial; want the inference request's ete.example.com", got)
 	}
 	s.Append("s1", inferenceReq("glm.example.com:8443"))
 	if got := summaryOf(t, s, "s1").InferenceHost; got != "glm.example.com:8443" {

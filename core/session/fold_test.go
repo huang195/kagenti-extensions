@@ -32,7 +32,10 @@ func foldFixture(t *testing.T) []pipeline.SessionEvent {
 	turn := func(content string, tokens int, rec event.Event, c *pipeline.EventClient) []pipeline.SessionEvent {
 		req := titleEvent(content)
 		req.Phase, req.Client = pipeline.SessionRequest, c
-		// One host per agent, so the latest inference request is a different host from the first.
+		// One host per agent, so the session's inference host moves between turns and the fold
+		// and the store must agree on where it ends. Not a latest-wins check: the first and the
+		// latest turns are both claude-code's, so a first-wins fold would pass here too. That
+		// rule is pinned in inference_host_test.go.
 		req.Host = c.Name + ".example.com"
 		tunnel := pipeline.SessionEvent{Phase: pipeline.SessionRequest, Tunnel: true, HTTPMethod: "CONNECT"}
 		resp := pipeline.SessionEvent{

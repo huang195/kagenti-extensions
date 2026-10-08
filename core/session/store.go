@@ -980,12 +980,16 @@ type SessionSummary struct {
 
 	// InferenceHost is where this session's inference traffic goes: the host of its most recent
 	// request that carried an inference parse, as the event recorded it. After a redirect that is
-	// the server that answered, not the host the client named (see SessionEvent.RequestedHost).
-	// Absent for a session with no inference traffic.
+	// the server it was sent to, whether or not that server answered, and not the host the client
+	// named (see SessionEvent.RequestedHost).
+	// Absent for a session with no inference traffic — and for one resumed from an archive written
+	// before this field existed, until its next inference request, where absent means unknown:
+	// that history was folded without it (see foldJSON.InferenceHost).
 	//
-	// LATEST WINS, AND ONLY AN INFERENCE REQUEST MOVES IT. A CONNECT tunnel row, an MCP call or
-	// any response leaves it where it was: live traffic interleaves those between turns, and a
-	// field they cleared would read "no inference traffic" on a session that has plenty.
+	// LATEST WINS, AND ONLY AN INFERENCE REQUEST MOVES IT. A CONNECT tunnel row, an MCP call, any
+	// response or a denial leaves it where it was: live traffic interleaves those between turns,
+	// and a field they cleared would read "no inference traffic" on a session that has plenty. A
+	// denial carries its request's parse but went nowhere, so its host is not where anything goes.
 	//
 	// GENERIC, NOT THE ROUTER'S: it says where a session's inference goes with or without the
 	// inference-router. agentop names a session's server from it, which is why the router refuses

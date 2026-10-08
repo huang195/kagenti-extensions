@@ -202,8 +202,9 @@ type foldJSON struct {
 	AvoidedSaturated bool                    `json:"avoidedSaturated,omitempty"`
 	Units            map[string]int          `json:"units,omitempty"`
 	PromptContext    *pipeline.PromptContext `json:"promptContext,omitempty"`
-	// InferenceHost is absent from a session.json written before it existed, which decodes to ""
-	// — "no inference traffic seen" — until the session's next inference request sets it.
+	// InferenceHost is absent from a session.json written before it existed, which decodes to "".
+	// THERE "" MEANS UNKNOWN, NOT "NO INFERENCE TRAFFIC": that history may hold plenty, folded by
+	// a Cortex that did not record where it went. The session's next inference request sets it.
 	InferenceHost string `json:"inferenceHost,omitempty"`
 }
 

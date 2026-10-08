@@ -14,18 +14,31 @@ package parity
 // WHAT THE LIMIT IS. cmd/cortex-envoy's startGRPCExtProc builds its ext_proc
 // server with a bare grpc.NewServer() and passes no options, so grpc-go's
 // default MaxRecvMsgSize — 4 MiB — applies to every ProcessingRequest Envoy
-// sends it. newExtprocGRPCServer below reconstructs that call site exactly:
-// grpc.NewServer() with no options, the real extproc.Server registered on it, a
-// real stream over bufconn. Passing grpc.MaxRecvMsgSize here in either
-// direction would make this file measure itself.
+// sends it. newExtprocGRPCServer below reconstructs that call site: a bare
+// grpc.NewServer(), the real extproc.Server registered on it, a real stream
+// over bufconn. Passing grpc.MaxRecvMsgSize here in either direction would make
+// this file measure itself.
 //
-// WHY IT MATTERS. The band these fixtures are about is 1-32 MiB, and #864
-// measured real Claude Code requests at 5,250,133 bytes — past 4 MiB. So in
-// envoy-sidecar mode that request never meets the listener's own 1 MiB check and
-// never produces the 413 TestDivergence_OutboundRequestBodyCap pins, even with
-// Envoy's buffer limit raised: the gRPC stream fails first. An operator reading
-// the cap table without this would raise per_connection_buffer_limit_bytes,
-// expect the 413, and get a dead stream instead.
+// Reconstructs, not reaches — and the difference is load-bearing. core cannot
+// import package main, so nothing here would notice startGRPCExtProc gaining a
+// grpc.MaxRecvMsgSize option: every assertion below would stay green while the
+// real ceiling moved. What this file pins is grpc-go's DEFAULT and what the
+// listener does under it. The call site is pinned where it lives, by
+// cmd/cortex-envoy's TestStartGRPCExtProcKeepsDefaultRecvLimit; both halves are
+// needed, and neither substitutes for the other.
+//
+// WHY IT MATTERS, AND IN WHICH ENVOY CONFIG. This ceiling sits BEHIND Envoy's
+// buffer limit. On the shipped config nothing reaches it: Envoy buffers at most
+// 1 MiB, so the ProcessingRequest cannot approach 4 MiB, and #864's 5,250,133-byte
+// request gets Envoy's own 413 — the left column of divergence_test.go's cap
+// table, unchanged. The band these fixtures are about is 1-32 MiB, so the
+// operator whose traffic lives there raises per_connection_buffer_limit_bytes to
+// get past that, and THAT is where this limit decides the outcome: the wall
+// moves from 1 MiB to 4 MiB rather than away, so a 5 MiB body still never meets
+// the listener's own check and still never produces the 413
+// TestDivergence_OutboundRequestBodyCap pins. What the operator gets instead is
+// an empty 500 from Envoy; ResourceExhausted is visible only to ext_proc, in the
+// sidecar's own logs.
 //
 // AND THE TWO DIRECTIONS FAIL DIFFERENTLY, which is the part worth having in a
 // test rather than a comment — it was measured here, not assumed:
@@ -34,15 +47,18 @@ package parity
 //     a pipeline.Context, so the teardown flush has nothing to record and no
 //     session row exists in either direction. Same observable shape as the 413
 //     one message earlier, and for the same reason (both leave pctx nil), which
-//     is why the request cases below assert zero rows for both.
-//   - An over-limit RESPONSE books a 200. By then the request phase has run and
-//     ResponseHeaders have been seen, so Process's deferred flush fires its
-//     (sawResponseHeaders || sawResponseBody) gate and records an ordinary
-//     response row: status 200, no error, and the response body reported as
-//     ZERO bytes. That is a third mechanism producing the misleading 200 the
-//     last two divergence fixtures pin for Envoy's own refusal — reached one
-//     layer further in, and on the outbound leg it is a request whose spend
-//     silently becomes nothing.
+//     is why the request cases below assert zero rows for both. What differs is
+//     what the caller is told: the 413 is a real status with the listener's own
+//     body, whereas here Envoy has no answer to give and sends an empty 500.
+//   - An over-limit RESPONSE books a 200 — while the client gets that same empty
+//     500. By then the request phase has run and ResponseHeaders have been seen,
+//     so Process's deferred flush fires its (sawResponseHeaders ||
+//     sawResponseBody) gate and records an ordinary response row: status 200, no
+//     error, and the response body reported as ZERO bytes. So this is not a row
+//     that merely lost a body. It is the same contradiction the last two
+//     divergence fixtures pin for Envoy's own refusal — the event claims a clean
+//     200 the caller never saw — reached one layer further in, and on the
+//     outbound leg it is also a request whose spend silently becomes nothing.
 //
 // Not covered here, deliberately: a 2 MiB response, which is over the
 // listener's cap and under gRPC's. That is extproc's appendBoundedBody
@@ -70,14 +86,17 @@ import (
 	"github.com/rossoctl/cortex/core/session"
 )
 
-// grpcMaxRecvMsgSize is grpc-go's default server-side receive cap, which
-// cmd/cortex-envoy takes by not overriding it.
+// grpcMaxRecvMsgSize is grpc-go's DEFAULT server-side receive cap — the one
+// cmd/cortex-envoy takes by not overriding it, which is a separate fact pinned
+// separately (see the file comment).
 //
 // Written as a number AND asserted below against the figure the transport
 // reports, rather than only described in prose. That coupling is deliberate: a
 // grpc-go release changing this default would otherwise move the real ceiling
 // while every comment in this package went on naming 4 MiB — which is precisely
-// the drift between comment and code that this PR's review caught twice.
+// the drift between comment and code that this PR's review caught twice. It
+// covers the default moving under us; it cannot cover the call site opting out
+// of the default, because the assertions here build their own server.
 const grpcMaxRecvMsgSize = 4 << 20
 
 // grpcLimitRow is one expected session row, in order.
@@ -98,7 +117,10 @@ type grpcLimitRow struct {
 func TestExtprocGRPCReceiveLimit(t *testing.T) {
 	// Sizes straddle the two limits: maxBufferedBody (1 MiB, extproc's own cap)
 	// and grpcMaxRecvMsgSize (4 MiB). The 5 MiB cases are #864's measured
-	// request rounded to a power of two.
+	// 5,250,133-byte request rounded DOWN to a whole MiB — 5<<20 is 5,242,880,
+	// which is not a power of two and is not meant to be. Rounding down keeps
+	// the case on the same side of the 4 MiB ceiling as the real request while
+	// making the size readable.
 	reqDigest := spyPluginA + bodyReqDigestStrippedSuffix
 	respDigest := spyPluginA + bodyRespDigestStrippedSuffix
 	oneMiB := divergenceBody(maxBufferedBody)
@@ -361,7 +383,12 @@ func assertGRPCLimitRows(t *testing.T, store *session.Store, want []grpcLimitRow
 // newExtprocGRPCServer stands up the real listener behind a real gRPC server
 // over bufconn, reproducing cmd/cortex-envoy's startGRPCExtProc: a bare
 // grpc.NewServer() with NO options, so the server inherits grpc-go's default
-// receive limit exactly as production does.
+// receive limit as production does today.
+//
+// A reproduction, which is as close as this package can get — core cannot
+// import package main. It means an option added to the real startGRPCExtProc
+// would not fail anything here, so that call site has its own test beside it:
+// cmd/cortex-envoy's TestStartGRPCExtProcKeepsDefaultRecvLimit.
 //
 // The outbound slot gets the body-reading spy and inbound an empty pipeline,
 // matching the direction headersRequest declares. Outbound rather than inbound

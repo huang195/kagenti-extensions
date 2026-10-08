@@ -45,32 +45,43 @@ package parity
 //	                   end_of_stream then EOF, and         pipeline runs on the prefix
 //	                   records 200 with an EMPTY body
 //
-// A THIRD CEILING SITS IN FRONT OF BOTH COLUMNS, and it is the one that decides
-// what becomes of that 5 MiB request. cmd/cortex-envoy/main.go builds its
-// ext_proc server with a bare grpc.NewServer() and no options, so grpc-go's
-// 4 MiB default MaxRecvMsgSize applies to every ProcessingRequest Envoy sends.
-// A body past that is refused by the gRPC transport itself: the stream dies
-// ResourceExhausted and the listener's own check never runs, in either config.
-// Raising Envoy's buffer limit therefore does not make the right-hand column
-// unbounded — it moves the wall from 1 MiB to 4 MiB, and #864's measured
-// request is on the far side of that, so in envoy-sidecar mode it is lost as a
-// dead stream rather than as the 413 this file's first fixture pins.
+// A THIRD CEILING BOUNDS THE RIGHT-HAND COLUMN ONLY, and getting that wrong is
+// the obvious mistake: it sits BEHIND Envoy's buffer limit, not in front of it.
+// cmd/cortex-envoy's startGRPCExtProc builds its ext_proc server with a bare
+// grpc.NewServer() and passes no options, so grpc-go's 4 MiB default
+// MaxRecvMsgSize applies to every ProcessingRequest Envoy sends. On the SHIPPED
+// config nothing can reach it: Envoy buffers at most 1 MiB, so the message it
+// sends cannot approach 4 MiB, and #864's 5 MiB request gets Envoy's own 413
+// exactly as the left column says. What the gRPC limit changes is the right
+// column — once Envoy's buffer limit is raised past the body, the wall moves
+// from 1 MiB to 4 MiB rather than away. A body over 4 MiB is then refused by
+// the gRPC transport itself: the stream dies ResourceExhausted, the listener's
+// own check never runs, and Envoy answers the client an EMPTY 500. So the
+// operator who raises the buffer limit for #864's measured request does not get
+// the 413 this file's first fixture pins — and does not get the
+// ResourceExhausted either, which only ext_proc ever sees.
 //
 // Which direction the body was in decides what the store is left holding, and
 // the answer is not symmetric. An over-limit REQUEST leaves no row at all, the
 // same shape the 413 produces and for the same reason — both refuse before a
 // pipeline.Context exists. An over-limit RESPONSE books an ordinary 200 with
 // the body reported as zero bytes, because by then the request phase has run
-// and Process's teardown flush fires. That is a THIRD mechanism producing the
-// misleading 200 the last two fixtures below pin, and on the outbound leg it is
-// again a request whose spend silently becomes nothing.
+// and Process's teardown flush fires. The client got the empty 500 either way,
+// so that 200 is not merely incomplete: it is a THIRD mechanism producing
+// exactly the contradiction the last two fixtures below pin for Envoy's own
+// refusal — the event says the call succeeded while the caller was told it
+// failed — and on the outbound leg it is again a request whose spend silently
+// becomes nothing.
 //
 // TestExtprocGRPCReceiveLimit pins all of that — both ceilings, both
 // directions, and the rows each leaves behind. The fixtures below cannot,
 // because the parity drivers call Server.Process directly (see mockStream) and
 // there is no gRPC transport in them to have a limit. The 2 MiB bodies they use
 // sit under it, which is what keeps the listener's own cap the thing being
-// exercised.
+// exercised. The "no options" claim about startGRPCExtProc is not pinned from
+// this module at all — core cannot import package main — so it is pinned beside
+// the call site instead, by cmd/cortex-envoy's
+// TestStartGRPCExtProcKeepsDefaultRecvLimit.
 //
 // The first three fixtures pin the RIGHT column — the only config in which the
 // listener's own cap is reachable at all, and therefore the only one that can
@@ -372,9 +383,14 @@ const maxBufferedBody = 1 << 20
 // the forward proxy logs a 413 proxy_error row over its own cap.
 //
 // 2 MiB rather than #864's measured 5 MiB because of the gRPC ceiling the file
-// comment describes: past 4 MiB the stream dies ResourceExhausted and no 413 is
-// sent in either config, so this fixture would be pinning a different failure
-// under the same name. TestExtprocGRPCReceiveLimit pins that one.
+// comment describes, and the size is exactly what keeps the paragraph above
+// true. At 5 MiB the SHIPPED config still answers this same 413, Envoy having
+// refused over its 1 MiB default long before gRPC is involved; the RAISED one
+// no longer does, because past 4 MiB the stream dies ResourceExhausted and the
+// client gets an empty 500 instead. So at 5 MiB the two columns stop agreeing
+// and "the 413 holds on both configs" would be half wrong. 2 MiB is the size at
+// which this fixture pins one answer for both.
+// TestExtprocGRPCReceiveLimit pins the 5 MiB case.
 func TestDivergence_OutboundRequestBodyCap(t *testing.T) {
 	big := divergenceBody(2 << 20)
 	f := fixture{

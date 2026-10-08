@@ -597,9 +597,14 @@ func (k historyKeeper) Prior(id string, after uint64) (session.Prior, bool) {
 	return session.Prior{Fold: f}, f != nil && after == 1
 }
 
-// Removing a server that running sessions still use goes ahead, and says how many will now be
-// told to start a new session. Counted from where each session's inference went, port and case
+// Removing a server that running sessions still use goes ahead, and says how many last sent
+// their inference there. Counted from where each session's inference went, port and case
 // ignored, so ete's two count and glm's one and the tunnel-only session do not.
+//
+// AND SAYS WHICH OF THEM GET THE ERROR, because not all do. A session the router pinned to ete
+// gets it from its next request to a server that is left; one addressed to ete's own host is
+// not routed at all once ete is gone (skip/not_an_inference_server, seen live), and goes there
+// with the agent's own key. "Each gets an error" was true of neither half alone.
 func TestServerRemove_WarnsHowManyRunningSessionsUseIt(t *testing.T) {
 	sessions := sessionsAPI(t, "ete.example.com", "ETE.example.com:443", "glm.example.com:8443")
 	path := serverEnvWithSessions(t, newFakeStats(t, 0).addr(), sessions, routerBlock)
@@ -607,8 +612,31 @@ func TestServerRemove_WarnsHowManyRunningSessionsUseIt(t *testing.T) {
 	if code != 0 || !strings.Contains(out, "Removed ete.") {
 		t.Fatalf("exit %d, stdout:\n%s%s", code, out, errOut)
 	}
-	if want := "warning: 2 running sessions are still on ete. From its next request each gets an error asking for a new session, until ete is added back."; !strings.Contains(errOut, want) {
+	if want := "warning: 2 running sessions last sent inference to ete. A session the proxy routed there gets an error " +
+		"asking for a new session from its next request to a server that is left, until ete is added back; a request " +
+		"addressed to ete's own host is no longer routed, and goes there with the agent's own key."; !strings.Contains(flat(errOut), want) {
 		t.Errorf("want %q in stderr:\n%s", want, errOut)
+	}
+	if want := "A session the proxy routed to it now gets an error asking for a new session from its next request to a " +
+		"server that is left; a request addressed to ete's own host is no longer routed, and goes there with the agent's " +
+		"own key. Adding ete back routes them to it again."; !strings.Contains(flat(out), want) {
+		t.Errorf("want %q in stdout:\n%s", want, out)
+	}
+}
+
+// The listener's synthetic sessions — the default bucket and an agent's pending one — hold many
+// conversations, so the router never pins them: their requests follow the agent's current
+// server, which a remove cannot be (it refuses while an agent is routed there). None of them can
+// get the error, whatever their last host, so none is counted.
+func TestServerRemove_LeavesOutTheSessionsTheRouterNeverPins(t *testing.T) {
+	store := session.New(0, 0, 0)
+	store.Append(session.DefaultSessionID, inferenceTo("ete.example.com"))
+	store.Append(session.PendingPrefix+"claude-code", inferenceTo("ete.example.com"))
+	store.Append("pinned", inferenceTo("ete.example.com"))
+	path := serverEnvWithSessions(t, newFakeStats(t, 0).addr(), serveSessions(t, store), routerBlock)
+	code, out, errOut := runServerCmd(t, "", "remove", "ete", "--config", path)
+	if code != 0 || !strings.Contains(errOut, "warning: 1 running session last sent inference to ete.") {
+		t.Errorf("exit %d, stdout:\n%s\nstderr:\n%s", code, out, errOut)
 	}
 }
 
@@ -666,7 +694,7 @@ func TestServerRemove_WarnsOfOneSessionInTheSingularAndShowsNoCredential(t *test
 	sessions := sessionsAPI(t, "ete.example.com")
 	path := serverEnvWithSessions(t, newFakeStats(t, 0).addr(), sessions, routerBlock)
 	code, out, errOut := runServerCmd(t, "", "remove", "ete", "--config", path)
-	if code != 0 || !strings.Contains(errOut, "warning: 1 running session is still on ete. From its next request") {
+	if code != 0 || !strings.Contains(errOut, "warning: 1 running session last sent inference to ete. A session the proxy routed there") {
 		t.Fatalf("exit %d, stdout:\n%s\nstderr:\n%s", code, out, errOut)
 	}
 	for _, leak := range []string{"sk-ete", "ete.example.com", "https://"} {

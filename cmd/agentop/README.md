@@ -707,7 +707,10 @@ With Claude Code's `ANTHROPIC_BASE_URL` at `ete`, the listing after `use` reads:
   addressed to a server that is left: one addressed to the removed server's own
   host is not routed at all, and goes there with the agent's own key. So when
   sessions the proxy is running last sent their inference to the server, `remove`
-  warns how many before it goes ahead.
+  warns how many, in those terms, before it goes ahead. It leaves
+  out the default and `pending:` buckets, which the router never pins, and a session
+  resumed after a restart that has sent no inference since, which no pin survived
+  to hold.
 - **`agentop server`** lists each server's host (its whole URL when it is plain
   `http`), its model mapping and the agents routed to it, then checks
   `~/.claude/settings.json`: that `ANTHROPIC_BASE_URL` names one of the servers,

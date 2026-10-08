@@ -18,6 +18,7 @@ import (
 	"github.com/rossoctl/cortex/cmd/agentop/edit"
 	"github.com/rossoctl/cortex/cmd/agentop/servers"
 	"github.com/rossoctl/cortex/core/plugins/inferencerouter/routerconfig"
+	"github.com/rossoctl/cortex/core/session"
 )
 
 // serverConfirm asks before `server add` replaces a server. Its own var, as
@@ -236,19 +237,34 @@ func serverRemove(args []string, stdout, stderr io.Writer) int {
 	if statsURL != "" {
 		sessionsURL = dialURL(cfg.Listener.SessionAPIAddr)
 	}
+	// WHICH OF THEM GET THE ERROR, NOT "EACH": the router denies a session pinned to name only
+	// on a request addressed to a server that is left, since that is the only request it still
+	// handles. One addressed to name's own host is no longer an inference server's request
+	// (skip/not_an_inference_server) and goes there untouched, the client's key and all. The
+	// count cannot tell the two apart — the summary says where a session's requests went, not
+	// where they were addressed — so the warning says what happens to each.
 	if n := runningOn(sessionsURL, c, name); n > 0 {
-		fmt.Fprintf(stderr, "agentop server remove: warning: %s on %s. From its next request each gets an error "+
-			"asking for a new session, until %s is added back.\n", runningSessions(n), name, name)
+		fmt.Fprintf(stderr, "agentop server remove: warning: %s last sent inference to %s. A session the proxy routed "+
+			"there gets an error asking for a new session from its next request to a server that is left, until %s is "+
+			"added back; a request addressed to %s's own host is no longer routed, and goes there with the agent's own "+
+			"key.\n", runningSessions(n), name, name, name)
 	}
 	ch := edit.ConfigChange{Chain: "outbound", Plugin: routerName, Path: []string{"servers", name}}
 	return runServerWrite(stdout, stderr, path, statsURL, ch, writeReport{
 		done: "Removed " + name + ".",
-		live: fmt.Sprintf("A session that started on it now gets an error asking for a new session; adding %s back restores it.", name),
+		live: fmt.Sprintf("A session the proxy routed to it now gets an error asking for a new session from its next "+
+			"request to a server that is left; a request addressed to %s's own host is no longer routed, and goes "+
+			"there with the agent's own key. Adding %s back routes them to it again.", name, name),
 	})
 }
 
 // runningOn counts the sessions the proxy at sessionsURL holds in memory whose inference
-// traffic last went to server name — the ones a remove leaves asking for a new session.
+// traffic last went to server name: the ones a remove can leave asking for a new session.
+//
+// NOT THE LISTENER'S SYNTHETIC SESSIONS — the default bucket and the pending:<agent> ones.
+// Each holds many conversations, so the router never pins one; their requests follow the
+// agent's current server, which cannot be name, since remove refuses a server an agent is
+// routed to. None of them can get the error, whatever host it last sent to.
 //
 // IN MEMORY, NOT IN THE ARCHIVE, AND BY A REQUEST THIS PROXY SAW: the router pins a session by
 // the first request it routes and keeps the pin in memory, so a session only the archive holds
@@ -271,7 +287,7 @@ func runningOn(sessionsURL string, c routerconfig.Config, name string) int {
 	for _, s := range list {
 		// Its host only its history's: resumed after a restart, nothing sent since, so no pin
 		// survived to hold it to name (see SessionSummary.InferenceHostFromHistory).
-		if s.InferenceHostFromHistory {
+		if s.InferenceHostFromHistory || s.ID == session.DefaultSessionID || strings.HasPrefix(s.ID, session.PendingPrefix) {
 			continue
 		}
 		if on, ok := servers.ForHost(c, s.InferenceHost); ok && on == name {
@@ -281,12 +297,12 @@ func runningOn(sessionsURL string, c routerconfig.Config, name string) int {
 	return n
 }
 
-// runningSessions is "1 running session is still" or "n running sessions are still".
+// runningSessions is "1 running session" or "n running sessions".
 func runningSessions(n int) string {
 	if n == 1 {
-		return "1 running session is still"
+		return "1 running session"
 	}
-	return fmt.Sprintf("%d running sessions are still", n)
+	return fmt.Sprintf("%d running sessions", n)
 }
 
 func serverUse(args []string, stdout, stderr io.Writer) int {

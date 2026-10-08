@@ -47,7 +47,7 @@ package parity
 //
 // A THIRD CEILING BOUNDS THE RIGHT-HAND COLUMN ONLY, and getting that wrong is
 // the obvious mistake: it sits BEHIND Envoy's buffer limit, not in front of it.
-// cmd/cortex-envoy's startGRPCExtProc builds its ext_proc server with a bare
+// cmd/cortex-envoy's newExtProcServer builds its ext_proc server with a bare
 // grpc.NewServer() and passes no options, so grpc-go's 4 MiB default
 // MaxRecvMsgSize applies to every ProcessingRequest Envoy sends. On the SHIPPED
 // config nothing can reach it: Envoy buffers at most 1 MiB, so the message it
@@ -78,10 +78,12 @@ package parity
 // because the parity drivers call Server.Process directly (see mockStream) and
 // there is no gRPC transport in them to have a limit. The 2 MiB bodies they use
 // sit under it, which is what keeps the listener's own cap the thing being
-// exercised. The "no options" claim about startGRPCExtProc is not pinned from
+// exercised. The "no options" claim about newExtProcServer is not pinned from
 // this module at all — core cannot import package main — so it is pinned beside
 // the call site instead, by cmd/cortex-envoy's
-// TestStartGRPCExtProcKeepsDefaultRecvLimit.
+// TestStartGRPCExtProcKeepsDefaultRecvLimit, with
+// TestExtProcServerIsTheOnlyGRPCServerConstruction keeping that the only
+// construction site there is to pin.
 //
 // The first three fixtures pin the RIGHT column — the only config in which the
 // listener's own cap is reachable at all, and therefore the only one that can

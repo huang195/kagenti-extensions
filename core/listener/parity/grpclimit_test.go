@@ -11,7 +11,7 @@ package parity
 // therefore has no gRPC transport at all. Everything this package knows about
 // extproc's caps, it knows with that limit absent.
 //
-// WHAT THE LIMIT IS. cmd/cortex-envoy's startGRPCExtProc builds its ext_proc
+// WHAT THE LIMIT IS. cmd/cortex-envoy's newExtProcServer builds its ext_proc
 // server with a bare grpc.NewServer() and passes no options, so grpc-go's
 // default MaxRecvMsgSize — 4 MiB — applies to every ProcessingRequest Envoy
 // sends it. newExtprocGRPCServer below reconstructs that call site: a bare
@@ -20,12 +20,14 @@ package parity
 // this file measure itself.
 //
 // Reconstructs, not reaches — and the difference is load-bearing. core cannot
-// import package main, so nothing here would notice startGRPCExtProc gaining a
+// import package main, so nothing here would notice newExtProcServer gaining a
 // grpc.MaxRecvMsgSize option: every assertion below would stay green while the
 // real ceiling moved. What this file pins is grpc-go's DEFAULT and what the
 // listener does under it. The call site is pinned where it lives, by
-// cmd/cortex-envoy's TestStartGRPCExtProcKeepsDefaultRecvLimit; both halves are
-// needed, and neither substitutes for the other.
+// cmd/cortex-envoy's TestStartGRPCExtProcKeepsDefaultRecvLimit — and that
+// function exists so a test can reach the construction without a socket, with
+// TestExtProcServerIsTheOnlyGRPCServerConstruction keeping it the binary's only
+// one. Both halves are needed, and neither substitutes for the other.
 //
 // WHY IT MATTERS, AND IN WHICH ENVOY CONFIG. This ceiling sits BEHIND Envoy's
 // buffer limit. On the shipped config nothing reaches it: Envoy buffers at most
@@ -381,12 +383,12 @@ func assertGRPCLimitRows(t *testing.T, store *session.Store, want []grpcLimitRow
 }
 
 // newExtprocGRPCServer stands up the real listener behind a real gRPC server
-// over bufconn, reproducing cmd/cortex-envoy's startGRPCExtProc: a bare
+// over bufconn, reproducing cmd/cortex-envoy's newExtProcServer: a bare
 // grpc.NewServer() with NO options, so the server inherits grpc-go's default
 // receive limit as production does today.
 //
 // A reproduction, which is as close as this package can get — core cannot
-// import package main. It means an option added to the real startGRPCExtProc
+// import package main. It means an option added to the real newExtProcServer
 // would not fail anything here, so that call site has its own test beside it:
 // cmd/cortex-envoy's TestStartGRPCExtProcKeepsDefaultRecvLimit.
 //

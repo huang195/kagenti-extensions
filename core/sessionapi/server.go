@@ -289,6 +289,12 @@ type pipelinePluginView struct {
 	RequiresAny []string        `json:"requiresAny,omitempty"`
 	Description string          `json:"description,omitempty"`
 	Config      json.RawMessage `json:"config,omitempty"`
+	// OnError is the plugin's on_error policy, present only when it is not the default
+	// (enforce), so in practice only "observe": an off plugin is not built into the
+	// pipeline, and is not listed here at all. A reader needs it because a plugin under
+	// observe runs and records, but its rejections, body writes and redirects are
+	// dropped — so its config, read alone, describes what it would do, not what it does.
+	OnError pipeline.ErrorPolicy `json:"onError,omitempty"`
 	// Metrics is populated for plugins implementing pipeline.MetricsProvider.
 	// Omitted entirely when a plugin reports none, so agentop can distinguish
 	// "no such channel" from "channel with nothing in it".
@@ -342,7 +348,10 @@ func describePipeline(h *pipeline.Holder, direction string) []pipelinePluginView
 	if h == nil {
 		return []pipelinePluginView{}
 	}
-	plugins := h.Plugins()
+	// One Load for both the plugins and their policies: two calls through the Holder could
+	// straddle a reload and pair a plugin with the other pipeline's policy.
+	p := h.Load()
+	plugins := p.Plugins()
 	out := make([]pipelinePluginView, len(plugins))
 	for i, pl := range plugins {
 		caps := pl.Capabilities().Normalize()
@@ -354,6 +363,9 @@ func describePipeline(h *pipeline.Holder, direction string) []pipelinePluginView
 			Requires:    caps.Requires,
 			RequiresAny: caps.RequiresAny,
 			Description: caps.Description,
+		}
+		if policy := p.PolicyAt(i); policy != pipeline.ErrorPolicyEnforce {
+			view.OnError = policy
 		}
 		if rc, ok := pl.(pipeline.RawConfigProvider); ok {
 			view.Config = redact.JSON(rc.RawConfig())

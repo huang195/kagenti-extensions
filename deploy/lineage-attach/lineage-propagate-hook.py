@@ -47,15 +47,18 @@ def bridge_mcp_context() -> bool:
     boundary, for the mcp 1.x line. Returns True when the bridge is in place
     (or was already); False when ``mcp`` is absent or is a 2.x that propagates
     the context itself (silently), or when a 1.x lacks the seams (one
-    warning). A stamp that carries nothing is never attached, so a message
+    warning). An installed ``mcp`` that fails to import raises, so the caller
+    logs it instead of the bridge staying off in silence. A stamp that carries nothing is never attached, so a message
     built with no context leaves a post task's own context alone. Idempotent."""
     import importlib.util
 
     try:
         from mcp.client.streamable_http import RequestContext, StreamableHTTPTransport
         from mcp.shared.message import SessionMessage
-    except ImportError:
-        return False
+    except ModuleNotFoundError as e:
+        if e.name is not None and (e.name == "mcp" or e.name.startswith("mcp.")):
+            return False  # no mcp in this image: nothing to bridge
+        raise  # mcp is installed but will not import: the caller logs it
     if importlib.util.find_spec("mcp.shared._context_streams"):
         return False  # mcp >= 2.0 carries the sender's context through its streams itself
     import dataclasses

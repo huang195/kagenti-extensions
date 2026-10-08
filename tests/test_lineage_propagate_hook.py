@@ -286,6 +286,15 @@ def test_an_sdk_that_carries_the_context_itself_is_left_alone(monkeypatch, caplo
     assert caplog.records == []
 
 
+def test_an_installed_mcp_that_fails_to_import_is_not_swallowed(monkeypatch):
+    """A broken transitive dependency (the module exists, the name does not): the hook's outer guard
+    must get to log it, so the bridge does not stay off in silence."""
+    empty = type(mcp)("mcp.client.streamable_http")  # a module with none of the names the hook imports
+    monkeypatch.setitem(__import__("sys").modules, "mcp.client.streamable_http", empty)
+    with pytest.raises(ImportError):
+        load_hook().bridge_mcp_context()
+
+
 def test_without_mcp_the_bridge_is_silent(monkeypatch, caplog):
     monkeypatch.setitem(__import__("sys").modules, "mcp.client.streamable_http", None)
     with caplog.at_level(logging.WARNING):

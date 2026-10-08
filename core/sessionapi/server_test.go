@@ -782,3 +782,47 @@ func TestHandlePluginCatalog_NoProvider404(t *testing.T) {
 		t.Fatalf("status = %d, want 404", resp.StatusCode)
 	}
 }
+
+// /v1/pipeline names a plugin's on_error only where it is not the default, so a reader can tell a
+// plugin that acts from one that only observes: under observe a plugin runs and records, but its
+// rejections, body writes and redirects are dropped, and its config alone cannot say so. The
+// default is omitted, keeping every enforce-only payload as it was.
+//
+// Asserted on the raw body, through a real server, because omission is the contract.
+func TestHandlePipeline_ServesANonDefaultErrorPolicy(t *testing.T) {
+	outbound, err := pipeline.New([]pipeline.Plugin{
+		&fakePlugin{name: "inference-parser"},
+		&fakePlugin{name: "token-exchange"},
+		pipeline.WrapConfigured(&fakePlugin{name: "inference-router"}, json.RawMessage(`{"agents":{}}`)),
+	}, pipeline.WithPolicies("", pipeline.ErrorPolicyEnforce, pipeline.ErrorPolicyObserve))
+	if err != nil {
+		t.Fatal(err)
+	}
+	store := session.New(5*time.Minute, 100, 0)
+	defer store.Close()
+	ts := httptest.NewServer(New(":0", store, WithPipelines(nil, pipeline.NewHolder(outbound))).server.Handler)
+	defer ts.Close()
+
+	resp, err := http.Get(ts.URL + "/v1/pipeline")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	var body struct {
+		Outbound []map[string]json.RawMessage `json:"outbound"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
+		t.Fatal(err)
+	}
+	if len(body.Outbound) != 3 {
+		t.Fatalf("outbound = %d plugins, want 3", len(body.Outbound))
+	}
+	for _, p := range body.Outbound[:2] {
+		if v, ok := p["onError"]; ok {
+			t.Errorf("%s: onError = %s, want it omitted for the default", p["name"], v)
+		}
+	}
+	if got := string(body.Outbound[2]["onError"]); got != `"observe"` {
+		t.Errorf("inference-router: onError = %s, want \"observe\"", got)
+	}
+}

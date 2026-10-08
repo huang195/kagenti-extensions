@@ -16,14 +16,15 @@ import (
 	"text/tabwriter"
 	"unicode/utf8"
 
+	"github.com/rossoctl/cortex/cmd/agentop/servers"
 	"github.com/rossoctl/cortex/core/config"
-	"github.com/rossoctl/cortex/core/pipeline"
 	"github.com/rossoctl/cortex/core/plugins/inferencerouter/routerconfig"
 )
 
 // routerName is the inference-router plugin's registered name: the outbound entry
-// every `agentop server` form reads and writes.
-const routerName = "inference-router"
+// every `agentop server` form reads and writes. servers.PluginName, which the TUI's S
+// picker writes too.
+const routerName = servers.PluginName
 
 const serverUsage = `agentop server — choose the inference server each coding agent's new sessions use
 
@@ -160,25 +161,13 @@ func readRouter(cfg *config.Config) (c routerconfig.Config, present bool, err er
 }
 
 // routerInactive is why the router entry in cfg routes nothing although it is in
-// the chain, or "" when it routes: its on_error. Under observe the router redirects
-// nothing and records observe/would_route where it would have routed; under off it
-// does not run. Either way a server given to an agent changes no traffic, and a
-// command that said the agent's sessions now go there would be wrong. path is the
-// config file, for the fix.
+// the chain, or "" when it routes: its on_error, worded by servers.Inactive, which
+// the TUI's S shares. path is the config file, for the fix.
 func routerInactive(cfg *config.Config, path string) string {
 	for _, e := range cfg.Pipeline.Outbound.Plugins {
-		if e.Name != routerName {
-			continue
+		if e.Name == routerName {
+			return servers.Inactive(e.OnError, homeTilde(path))
 		}
-		fix := fmt.Sprintf("Remove on_error from the entry in %s, or set it to enforce, to route.", homeTilde(path))
-		switch e.OnError.Resolved() {
-		case pipeline.ErrorPolicyObserve:
-			return fmt.Sprintf("The %s entry runs under on_error: observe, so nothing is routed: a request it would "+
-				"route is only recorded, as observe/would_route. %s", routerName, fix)
-		case pipeline.ErrorPolicyOff:
-			return fmt.Sprintf("The %s entry runs under on_error: off, so it does not run and nothing is routed. %s", routerName, fix)
-		}
-		return ""
 	}
 	return ""
 }
@@ -230,7 +219,7 @@ func serverList(args []string, stdout, stderr io.Writer) int {
 	tw := tabwriter.NewWriter(&table, 0, 0, 3, ' ', 0)
 	for _, name := range slices.Sorted(maps.Keys(c.Servers)) {
 		s := c.Servers[name]
-		fmt.Fprintf(tw, "  %s\t%s\t%s\t%s\n", name, serverHost(s), mappingText(s), strings.Join(agentsOn(c, name), ", "))
+		fmt.Fprintf(tw, "  %s\t%s\t%s\t%s\n", name, servers.Host(s), servers.Mapping(s), strings.Join(agentsOn(c, name), ", "))
 	}
 	tw.Flush()
 	for line := range strings.Lines(table.String()) {
@@ -246,42 +235,6 @@ func serverList(args []string, stdout, stderr io.Writer) int {
 		printCheck(stdout, ck.ok, ck.text)
 	}
 	return 0
-}
-
-// serverHost is how a server's URL is listed: its host, or the whole URL for plain
-// http, so a server whose traffic crosses the network unencrypted says so.
-//
-// A URL the router refuses shows nothing of itself, not even its host: the likeliest
-// reason it is refused is a pasted key, and a key given as a username that contains
-// '/', '?' or '#' ends the authority early, so url.Parse takes the key for the host
-// (https://sk-.../x@gw.example parses with Host "sk-..."). No parentheses either:
-// `server add` already puts this in some.
-func serverHost(s routerconfig.Server) string {
-	ep, err := routerconfig.ParseURL(s.URL)
-	if err != nil {
-		return "not a valid URL"
-	}
-	if ep.Scheme == "http" {
-		return ep.URL()
-	}
-	return ep.Host
-}
-
-// mappingText is a server's model mapping as one cell.
-func mappingText(s routerconfig.Server) string {
-	switch {
-	case s.Opus == "" && s.Sonnet == "" && s.Haiku == "":
-		return "uses Claude Code's names"
-	case s.Opus == s.Sonnet && s.Sonnet == s.Haiku:
-		return "all → " + s.Opus
-	}
-	or := func(m string) string {
-		if m == "" {
-			return "—"
-		}
-		return m
-	}
-	return fmt.Sprintf("opus → %s · sonnet → %s · haiku → %s", or(s.Opus), or(s.Sonnet), or(s.Haiku))
 }
 
 // settingsCheck is one line of `agentop server`'s check of Claude Code's settings.
@@ -347,11 +300,10 @@ func baseURLCheck(raw, shown string, c routerconfig.Config) settingsCheck {
 	if err != nil || u.Host == "" {
 		return settingsCheck{false, fmt.Sprintf("ANTHROPIC_BASE_URL in %s is not a URL with a host, so nothing is routed. Point it at one of the servers above.", shown)}
 	}
-	host := routerconfig.Hostname(u.Host)
-	for _, name := range slices.Sorted(maps.Keys(c.Servers)) {
-		if ep, err := routerconfig.ParseURL(c.Servers[name].URL); err == nil && ep.Hostname == host {
-			return settingsCheck{true, fmt.Sprintf("Claude Code points at %s (%s)", name, shown)}
-		}
+	// servers.ForHost, the one rule for which server a host is: the router's, port-stripped and
+	// lowercased, and the one the sessions table's SERVER column and both session counts use.
+	if name, ok := servers.ForHost(c, u.Host); ok {
+		return settingsCheck{true, fmt.Sprintf("Claude Code points at %s (%s)", name, shown)}
 	}
 	where := "a URL that is"
 	if !strings.Contains(raw, "@") {

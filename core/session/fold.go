@@ -72,6 +72,21 @@ func agentLabelIn(agents []sessionAgent, name string) string {
 	return ""
 }
 
+// inferenceHostOf is the host e names for SessionSummary.InferenceHost, or "" when e does not
+// move it: only a request that carried an inference parse does. Shared by appendLocked and
+// SummaryFold for applyTitle's reason.
+//
+// "" FOR EVERYTHING ELSE, AND THE CALLERS KEEP WHAT THEY HAD. A session's events are not all
+// turns: a bridged CONNECT's tunnel-open lands between an inference request and its response, and
+// MCP calls and responses interleave too. Clearing the field on any of them would blank a
+// session's server on most of its rows — the intern table's lesson (CLAUDE.md, gotcha 14).
+func inferenceHostOf(e *pipeline.SessionEvent) string {
+	if e.Phase != pipeline.SessionRequest || e.Inference == nil {
+		return ""
+	}
+	return e.Host
+}
+
 // SummaryFold is ListSessions' per-session figures folded one event at a time and never shed:
 // the session archive's running summary for a session the store may no longer hold.
 //
@@ -103,6 +118,8 @@ type SummaryFold struct {
 	// folded since gives what one uninterrupted fold would have.
 	context         pipeline.PromptContextFold
 	restoredContext *pipeline.PromptContext
+	// inferenceHost is SessionSummary.InferenceHost: the latest inference request's host.
+	inferenceHost string
 }
 
 // NewSummaryFold returns an empty fold.
@@ -136,6 +153,9 @@ func (f *SummaryFold) Add(sessionID string, e *pipeline.SessionEvent) {
 	f.titleRank, f.title = applyTitle(f.titleRank, f.title, p.titleRank, p.titleText)
 	f.agents = applyAgent(f.agents, sessionID, p.agentName, e.Client)
 	f.context.Add(e)
+	if h := inferenceHostOf(e); h != "" {
+		f.inferenceHost = h
+	}
 }
 
 // promptContext is the fold's CTX figure, nil when nothing can be said.
@@ -144,8 +164,8 @@ func (f *SummaryFold) promptContext() *pipeline.PromptContext {
 }
 
 // Summary sets EventCount, Title, Agent, TotalTokens, CostMicros, AvoidedMicros, Currencies,
-// Saturated and PromptContext on a SessionSummary for sessionID, and nothing else: the
-// timestamps and the live-only fields (Active, Adopted) are the caller's.
+// Saturated, PromptContext and InferenceHost on a SessionSummary for sessionID, and nothing else:
+// the timestamps and the live-only fields (Active, Adopted) are the caller's.
 func (f *SummaryFold) Summary(sessionID string) SessionSummary {
 	sum := SessionSummary{
 		ID:            sessionID,
@@ -157,6 +177,7 @@ func (f *SummaryFold) Summary(sessionID string) SessionSummary {
 		Currencies:    currenciesOf(f.units),
 		Saturated:     f.cost.Saturated || f.avoided.Saturated,
 		PromptContext: f.promptContext(),
+		InferenceHost: f.inferenceHost,
 	}
 	if sessionID != DefaultSessionID && !strings.HasPrefix(sessionID, PendingPrefix) && len(f.agents) > 0 {
 		sum.Agent = f.agents[0].label
@@ -181,6 +202,10 @@ type foldJSON struct {
 	AvoidedSaturated bool                    `json:"avoidedSaturated,omitempty"`
 	Units            map[string]int          `json:"units,omitempty"`
 	PromptContext    *pipeline.PromptContext `json:"promptContext,omitempty"`
+	// InferenceHost is absent from a session.json written before it existed, which decodes to "".
+	// THERE "" MEANS UNKNOWN, NOT "NO INFERENCE TRAFFIC": that history may hold plenty, folded by
+	// a Cortex that did not record where it went. The session's next inference request sets it.
+	InferenceHost string `json:"inferenceHost,omitempty"`
 }
 
 type foldAgent struct {
@@ -202,6 +227,7 @@ func (f *SummaryFold) MarshalJSON() ([]byte, error) {
 		AvoidedSaturated: f.avoided.Saturated,
 		Units:            f.units,
 		PromptContext:    f.promptContext(),
+		InferenceHost:    f.inferenceHost,
 	}
 	for _, a := range f.agents {
 		j.Agents = append(j.Agents, foldAgent{Name: a.name, Label: a.label})
@@ -224,6 +250,7 @@ func (f *SummaryFold) UnmarshalJSON(b []byte) error {
 		titleRank:       rankNone,
 		title:           j.Title,
 		restoredContext: j.PromptContext,
+		inferenceHost:   j.InferenceHost,
 	}
 	if j.TitleRank != nil {
 		f.titleRank = *j.TitleRank

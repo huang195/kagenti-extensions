@@ -20,7 +20,7 @@ const DefaultFinishTimeout = 2 * time.Second
 // Pipeline holds an ordered list of plugins and runs them sequentially.
 // policies[i] holds the on_error ErrorPolicy that wraps plugins[i]; the
 // slice is always the same length as plugins (guaranteed by New) so
-// policyAt is a bounds-safe lookup. An empty ErrorPolicy resolves to
+// PolicyAt is a bounds-safe lookup. An empty ErrorPolicy resolves to
 // ErrorPolicyEnforce via the Resolved() method.
 type Pipeline struct {
 	plugins       []Plugin
@@ -116,7 +116,7 @@ func New(plugins []Plugin, opts ...Option) (*Pipeline, error) {
 // to itself.
 func (p *Pipeline) Run(ctx context.Context, pctx *Context) Action {
 	for i, plugin := range p.plugins {
-		policy := p.policyAt(i)
+		policy := p.PolicyAt(i)
 		if policy == ErrorPolicyOff {
 			slog.Debug("pipeline: plugin disabled (on_error: off)", "plugin", plugin.Name())
 			continue
@@ -161,7 +161,7 @@ func (p *Pipeline) Run(ctx context.Context, pctx *Context) Action {
 // InvocationPhaseResponse.
 func (p *Pipeline) RunResponse(ctx context.Context, pctx *Context) Action {
 	for i := len(p.plugins) - 1; i >= 0; i-- {
-		policy := p.policyAt(i)
+		policy := p.PolicyAt(i)
 		if policy == ErrorPolicyOff {
 			continue
 		}
@@ -211,7 +211,7 @@ func (p *Pipeline) RunResponse(ctx context.Context, pctx *Context) Action {
 // only); the contract leaves room for per-message enforcement later.
 func (p *Pipeline) RunResponseFrame(ctx context.Context, pctx *Context, frame []byte, last bool) Action {
 	for i := len(p.plugins) - 1; i >= 0; i-- {
-		policy := p.policyAt(i)
+		policy := p.PolicyAt(i)
 		if policy == ErrorPolicyOff {
 			continue
 		}
@@ -253,11 +253,19 @@ func (p *Pipeline) HasStreamingResponders() bool {
 	return false
 }
 
-// policyAt returns the resolved policy for plugins[i]. The policies
-// slice is always the same length as plugins (New guarantees this),
-// but we check defensively so a zero-value Pipeline (constructed
-// outside New, e.g. in a test) doesn't panic.
-func (p *Pipeline) policyAt(i int) ErrorPolicy {
+// PolicyAt returns the resolved policy for plugins[i] — Plugins()[i] —
+// the one Run dispatches it under. The policies slice is always the
+// same length as plugins (New guarantees this), but we check
+// defensively so a zero-value Pipeline (constructed outside New, e.g.
+// in a test) doesn't panic.
+//
+// Exported for the session API, which serves it on /v1/pipeline: a
+// plugin under observe runs and records, but its rejections, body
+// writes and redirects are dropped — header writes still apply — and
+// nothing else a reader can see says so. Read it from the
+// same *Pipeline as Plugins(), not through a Holder twice, or a reload
+// between the two calls pairs a plugin with another pipeline's policy.
+func (p *Pipeline) PolicyAt(i int) ErrorPolicy {
 	if i < len(p.policies) {
 		return p.policies[i].Resolved()
 	}
@@ -265,7 +273,7 @@ func (p *Pipeline) policyAt(i int) ErrorPolicy {
 }
 
 // redirectsAt reports whether plugins[i] declares WritesDestination. Bounds-safe,
-// like policyAt, so a Pipeline not built by New never panics.
+// like PolicyAt, so a Pipeline not built by New never panics.
 func (p *Pipeline) redirectsAt(i int) bool {
 	return i < len(p.redirects) && p.redirects[i]
 }

@@ -672,6 +672,9 @@ agentop server reset --agent claude-code                  # stop routing claude-
 agentop server remove glm                                 # refused while an agent uses it
 ```
 
+In the TUI, `S` on the agents pane does what `use` and `reset` do, for an agent
+the pane lists; see [Choosing an agent's server](#choosing-an-agents-server-s).
+
 With Claude Code's `ANTHROPIC_BASE_URL` at `ete`, the listing after `use` reads:
 
 ```
@@ -707,7 +710,14 @@ With Claude Code's `ANTHROPIC_BASE_URL` at `ete`, the listing after `use` reads:
   the command that takes the agent off it; it also refuses the last server. A
   session that started on a removed server gets a 503 asking for a new session
   until the server is added back, or until the proxy restarts, which forgets
-  which server each session started on.
+  which server each session started on. That holds while its requests are
+  addressed to a server that is left: one addressed to the removed server's own
+  host is not routed at all, and goes there with the agent's own key. So when
+  sessions the proxy is running last sent their inference to the server, `remove`
+  warns how many, in those terms, before it goes ahead. It leaves
+  out the default and `pending:` buckets, which the router never pins, and a session
+  resumed after a restart that has sent no inference since, which no pin survived
+  to hold.
 - **`agentop server`** lists each server's host (its whole URL when it is plain
   `http`), its model mapping and the agents routed to it, then checks
   `~/.claude/settings.json`: that `ANTHROPIC_BASE_URL` names one of the servers,
@@ -776,6 +786,17 @@ agentop is for, and the other three are surfaces you visit and leave.
   the better string; the two sides rank candidates differently and may not agree
   on a given session. The column does not say which source it used. Numerics are
   right-aligned so the digits line up between rows.
+
+  `SERVER` appears when this Cortex's `inference-router` routes — not under
+  `on_error: observe`, which routes nothing — and has more than one server: the
+  server each session's inference traffic last went to, which for a session that
+  was running when its agent was switched is still the one it started on. A host no
+  server has, such as an unrouted agent's own provider, is shown without its port in
+  parentheses, and a session with no inference traffic seen as an em dash. Read-only:
+  no key here moves a session, since that would move a running conversation. On a
+  terminal too narrow for it the column is left out, not squeezed, and so is
+  `AGENT`; neither shows until `COST` and `SAVED` do, so widening the window never
+  takes one away.
 
   A **`pending:` bucket**, where an agent's calls that name no session collect
   until one does, is listed after the real sessions. Its row shows the agent
@@ -1377,6 +1398,7 @@ Layered on top of all of them:
 | `A` | any session-view pane (not the picker) | open the per-agent cost breakdown — what each coding agent has spent today, plus a row of dashes for any agent that owns a listed session but has spent nothing today, since the sessions list is not limited to today and every session in it needs a row to scope to. Capital `A` because lowercase `a` cycles the spend drawer's axis. Refetches on every press and opens however many agents it finds, one or none included; pressed on the agents pane it only refreshes the rows. Not in the footer, for width; the `?` overlay names it |
 | `↑↓` / `jk` | agents | move the cursor |
 | `↵` | agents | scope to the agent under the cursor and list its sessions, whichever pane `A` was pressed on — including the agent already scoped, which stays scoped. **The first row, All agents, clears the scope.** It reaches the sessions list, the usage pane, and the spend band and its drawer; `agentop cost --agent` is a separate process |
+| `S` | agents | choose the inference server the highlighted agent's new sessions use: a picker over the pane, its cursor on what the agent has now. `↵` applies the highlighted entry, `Esc`/`q`/`Ctrl+C` close it, and an entry the config file already holds writes nothing. Opens only on an agent's row, when agentop is attached to this machine's Cortex and its `inference-router` routes; elsewhere a panel says why. See [Choosing an agent's server](#choosing-an-agents-server-s) |
 | `Esc` | agents | back to the pane `A` was pressed on, leaving the scope as it is. When the picker opened itself at startup, or was reached with `Esc` from the sessions list, it is the level above that list instead, and `Esc` backs out as `Esc` on sessions does: to the pods picker, or nowhere with `--endpoint` |
 | `e` | pipeline | edit pipeline subtree in `$EDITOR` |
 | `y` | edit/diff | apply the edit |
@@ -1445,6 +1467,68 @@ endpoint in every window. It reads `BY NONE` under `Other`, and against an older
 that cannot break the last hour down for one agent. Unscoped, the sessions pane gains an `AGENT` column when
 two agents are listed, and the agents pane a `SESSIONS` count once sessions name
 their agent.
+
+### Choosing an agent's server (`S`)
+
+When this Cortex runs the [`inference-router`](../../docs/plugin-catalog.md#inference-router),
+the agents pane gains a `SERVER` column: the server each agent's new sessions go to,
+or `own choice` for an agent the router leaves alone. `All agents`, `Other` and
+`unknown` show nothing there — routing is chosen per agent, `Other` is every client
+Cortex does not recognise, and `unknown` is requests that carry no User-Agent, which
+belong to no one agent. A router under `on_error: observe` records what it would
+route and routes nothing, so it gets no column.
+
+`S` on an agent's row opens a picker over the pane, its cursor on what the agent has
+now: *its own choice (not routed)* first, then each server with its host and model
+mapping. `↵` applies the highlighted entry, as in every agentop picker; `Esc`, `q` or
+`Ctrl+C` closes it; choosing what the config file already holds writes nothing — the
+file decides, not where the cursor opened, since the route can change while the
+picker is up. The change is
+the one `agentop server use` or `reset` makes — the same file, the same checks — and
+the footer shows `[switching claude-code → glm…]` until the proxy has reloaded, then
+one line, which stays until the next key:
+
+```
+New claude-code sessions → glm. 3 running sessions stay where they are.
+```
+
+The count is of the agent's sessions this proxy holds in memory whose inference last
+went somewhere other than the new choice (for a switch back to its own choice, to any
+of the servers), and is left out when there are none. A switch moves none of them:
+the router keeps a running session on the server it started on until the proxy
+restarts, unless the proxy dropped the session from memory before the router pinned
+it (see [`agentop server`](#choosing-an-inference-server-agentop-server)). So a
+session resumed after a restart that has sent no inference since is not counted: no
+pin survived the restart, and its next request goes to the new choice. The sessions
+table's `SERVER` column shows where each one is.
+
+When the switch does not go through, a panel over the pane says so, whole, and where
+it left the config file; `Esc`, `q`, `Ctrl+C` or `↵` closes it. A reload the proxy
+refused is the proxy's error, with the file put back and the agent where it was; a
+proxy that stopped answering before it reported the reload leaves the change
+unconfirmed and the file put back; an error before the write changed nothing. A
+failure that lands while another pane is up is the one line instead. A proxy that
+reports neither a reload nor a refusal within 30 seconds is the line too: the file is
+left as written, and it names the `/reload/status` to check. A choice the file
+already holds writes nothing and says so — that it is already in force, or, when the
+pane has not caught up with an `agentop server use` or a hand edit, that the file
+holds it. A line wider than the terminal loses its beginning, not its end, and after
+every outcome the pane rereads the proxy's pipeline, so the column shows what the
+proxy runs.
+
+`S` opens only on an agent's row, when agentop is attached to this machine's Cortex —
+the one `~/.cortex/config.yaml` names, its stats server answering when agentop
+started — and that Cortex's router routes; `[S] server` is in the footer only there.
+Elsewhere `S` opens a small panel saying why, which `Esc`, `q`, `Ctrl+C` or `↵`
+closes: on `All agents` or `Other`; on `unknown`, which the router refuses to route;
+away from this machine's Cortex; before agentop has read that Cortex's pipeline; while
+a switch is still in flight; under `on_error: observe`, in the words `agentop server`
+uses; on a router config this agentop cannot decode, which takes an agentop as new as
+the proxy; and with no router on `/v1/pipeline`, which is either none configured or
+one under `on_error: off` — the proxy does not build an `off` plugin, so agentop
+cannot tell the two apart, and the panel names both fixes. The pane lists only agents
+it has seen, so an agent that has not run yet is routed with `agentop server use
+<name> --agent <agent>` instead.
 
 ## Settings
 

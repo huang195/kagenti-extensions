@@ -66,6 +66,14 @@ func (m *model) handleKey(msg tea.KeyMsg) tea.Cmd {
 	if m.clearConfirm != nil {
 		return m.clearConfirmKey(msg)
 	}
+	// S's picker is modal too, and for the same pane-scoping reason as the column picker: a
+	// message can move the pane under it, and then it is inert rather than eating keys.
+	if m.serverPicker != nil && m.pane == paneAgents {
+		return m.serverPickerKey(msg)
+	}
+	if m.serverNotice != "" && m.pane == paneAgents {
+		return m.serverNoticeKey(msg)
+	}
 
 	// `?` opens the overlay from any pane, with two exceptions. While a
 	// pipeline edit is in flight that overlay is already modal and owns
@@ -864,6 +872,15 @@ func (m *model) handleKey(msg tea.KeyMsg) tea.Cmd {
 		m.rebuildPipelineTable()
 		return nil
 
+	case "S":
+		// Choose where the highlighted agent's new sessions go. Capital, for the reason `A` and
+		// `P` are: lowercase `s` hides skip rows on every pane. On the AGENTS pane only, the one
+		// surface whose rows are agents.
+		if m.pane == paneAgents {
+			return m.openServerPicker()
+		}
+		return nil
+
 	case "A":
 		// Open the per-agent cost breakdown.
 		//
@@ -1295,7 +1312,13 @@ func (m *model) helpView() string {
 				escHint = "  [esc] pods"
 			}
 		}
-		return "[↑↓] nav" + enterHint + escHint + "  [?] keys  [q] quit"
+		// [S] only on a row where it opens, so the footer never advertises a key that would only
+		// say why not. After esc, so fitHintLine — which drops from the front — gives up nav first.
+		serverHint := ""
+		if m.serverKeyOffered() {
+			serverHint = "  [S] server"
+		}
+		return "[↑↓] nav" + enterHint + escHint + serverHint + "  [?] keys  [q] quit"
 	}
 	return "[?] keys  [q] quit"
 }

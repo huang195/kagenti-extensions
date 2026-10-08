@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -14,6 +15,9 @@ import (
 	"time"
 
 	"github.com/rossoctl/cortex/cmd/agentop/edit"
+	"github.com/rossoctl/cortex/core/pipeline"
+	"github.com/rossoctl/cortex/core/session"
+	"github.com/rossoctl/cortex/core/sessionapi"
 )
 
 // fakeStats is a stats server whose /reload/status reports a reload at every poll,
@@ -591,5 +595,166 @@ func TestServerWrites_ForTheNextStartPromiseNoRunningSessionStays(t *testing.T) 
 				t.Errorf("does not say what the next start does:\n%s", out)
 			}
 		})
+	}
+}
+
+// sessionsAPI is a real session API over a store holding one session per host in hosts, each
+// with one inference request there, and one session with only a tunnel row. It returns the
+// address a config names for it.
+func sessionsAPI(t *testing.T, hosts ...string) string {
+	t.Helper()
+	store := session.New(0, 0, 0)
+	for i, h := range hosts {
+		store.Append(fmt.Sprintf("s%d", i), inferenceTo(h))
+	}
+	store.Append("tunnel-only", tunnelTo("ete.example.com:443"))
+	return serveSessions(t, store)
+}
+
+// inferenceTo is one inference request sent to host; tunnelTo a CONNECT tunnel-open to it.
+func inferenceTo(host string) pipeline.SessionEvent {
+	return pipeline.SessionEvent{At: time.Now(), Phase: pipeline.SessionRequest, Host: host,
+		Inference: &pipeline.InferenceExtension{Model: "claude-opus-5-5"}}
+}
+
+func tunnelTo(host string) pipeline.SessionEvent {
+	return pipeline.SessionEvent{At: time.Now(), Phase: pipeline.SessionRequest, Tunnel: true, HTTPMethod: "CONNECT", Host: host}
+}
+
+// serveSessions is a real session API over store, closed with the test; it returns the address a
+// config names for it.
+func serveSessions(t *testing.T, store *session.Store) string {
+	t.Helper()
+	ts := httptest.NewServer(sessionapi.New(":0", store).Server().Handler)
+	t.Cleanup(func() {
+		ts.Close()
+		store.Close()
+	})
+	return strings.TrimPrefix(ts.URL, "http://")
+}
+
+// historyKeeper is a session archive reduced to what ListSessions asks of one: for each id it
+// holds, one event of history (seq 1) folded as the archive folds it. A store it is added to
+// numbers that id's entry after the history, and lists the two together.
+type historyKeeper map[string]*session.SummaryFold
+
+func (k historyKeeper) Record(string, *pipeline.SessionEvent) {}
+
+func (k historyKeeper) LastSeq(id string) uint64 {
+	if k[id] != nil {
+		return 1
+	}
+	return 0
+}
+
+func (k historyKeeper) Prior(id string, after uint64) (session.Prior, bool) {
+	f := k[id]
+	return session.Prior{Fold: f}, f != nil && after == 1
+}
+
+// Removing a server that running sessions still use goes ahead, and says how many last sent
+// their inference there. Counted from where each session's inference went, port and case
+// ignored, so ete's two count and glm's one and the tunnel-only session do not.
+//
+// AND SAYS WHICH OF THEM GET THE ERROR, because not all do. A session the router pinned to ete
+// gets it from its next request to a server that is left; one addressed to ete's own host is
+// not routed at all once ete is gone (skip/not_an_inference_server, seen live), and goes there
+// with the agent's own key. "Each gets an error" was true of neither half alone.
+func TestServerRemove_WarnsHowManyRunningSessionsUseIt(t *testing.T) {
+	sessions := sessionsAPI(t, "ete.example.com", "ETE.example.com:443", "glm.example.com:8443")
+	path := serverEnvWithSessions(t, newFakeStats(t, 0).addr(), sessions, routerBlock)
+	code, out, errOut := runServerCmd(t, "", "remove", "ete", "--config", path)
+	if code != 0 || !strings.Contains(out, "Removed ete.") {
+		t.Fatalf("exit %d, stdout:\n%s%s", code, out, errOut)
+	}
+	if want := "warning: 2 running sessions last sent inference to ete. A session the proxy routed there gets an error " +
+		"asking for a new session from its next request to a server that is left, until ete is added back; a request " +
+		"addressed to ete's own host is no longer routed, and goes there with the agent's own key."; !strings.Contains(flat(errOut), want) {
+		t.Errorf("want %q in stderr:\n%s", want, errOut)
+	}
+	if want := "A session the proxy routed to it now gets an error asking for a new session from its next request to a " +
+		"server that is left; a request addressed to ete's own host is no longer routed, and goes there with the agent's " +
+		"own key. Adding ete back routes them to it again."; !strings.Contains(flat(out), want) {
+		t.Errorf("want %q in stdout:\n%s", want, out)
+	}
+}
+
+// The listener's synthetic sessions — the default bucket and an agent's pending one — hold many
+// conversations, so the router never pins them: their requests follow the agent's current
+// server, which a remove cannot be (it refuses while an agent is routed there). None of them can
+// get the error, whatever their last host, so none is counted.
+func TestServerRemove_LeavesOutTheSessionsTheRouterNeverPins(t *testing.T) {
+	store := session.New(0, 0, 0)
+	store.Append(session.DefaultSessionID, inferenceTo("ete.example.com"))
+	store.Append(session.PendingPrefix+"claude-code", inferenceTo("ete.example.com"))
+	store.Append("pinned", inferenceTo("ete.example.com"))
+	path := serverEnvWithSessions(t, newFakeStats(t, 0).addr(), serveSessions(t, store), routerBlock)
+	code, out, errOut := runServerCmd(t, "", "remove", "ete", "--config", path)
+	if code != 0 || !strings.Contains(errOut, "warning: 1 running session last sent inference to ete.") {
+		t.Errorf("exit %d, stdout:\n%s\nstderr:\n%s", code, out, errOut)
+	}
+}
+
+func TestServerRemove_SaysNothingWhenNoRunningSessionUsesIt(t *testing.T) {
+	sessions := sessionsAPI(t, "glm.example.com:8443")
+	path := serverEnvWithSessions(t, newFakeStats(t, 0).addr(), sessions, routerBlock)
+	code, _, errOut := runServerCmd(t, "", "remove", "ete", "--config", path)
+	if code != 0 || strings.Contains(errOut, "warning") {
+		t.Errorf("exit %d, stderr:\n%s", code, errOut)
+	}
+}
+
+// The count comes from the proxy the config names, and only when it answered: with no proxy
+// running the remove still goes ahead, quietly.
+func TestServerRemove_WithNoProxyRunningCountsNothing(t *testing.T) {
+	sessions := sessionsAPI(t, "ete.example.com")
+	path := serverEnvWithSessions(t, closedAddr(t), sessions, routerBlock)
+	code, out, errOut := runServerCmd(t, "", "remove", "ete", "--config", path)
+	if code != 0 || strings.Contains(errOut, "warning") || !strings.Contains(out, "applies when the proxy next starts") {
+		t.Errorf("exit %d, stdout:\n%s\nstderr:\n%s", code, out, errOut)
+	}
+}
+
+// A session resumed after a restart that has sent no inference since lists its history's host,
+// but the router's pins did not survive the restart: nothing holds it to ete, so its next request
+// goes to its agent's current server and gets no error. It is left out of the count; the session
+// whose own request this proxy saw is not.
+func TestServerRemove_LeavesOutASessionNoPinHolds(t *testing.T) {
+	earlier := session.NewSummaryFold()
+	e := inferenceTo("ete.example.com")
+	earlier.Add("resumed", &e)
+	store := session.New(0, 0, 0)
+	store.AddRecorder(historyKeeper{"resumed": earlier})
+	store.Append("resumed", tunnelTo("ete.example.com:443"))
+	store.Append("seen", inferenceTo("ete.example.com"))
+	path := serverEnvWithSessions(t, newFakeStats(t, 0).addr(), serveSessions(t, store), routerBlock)
+	code, out, errOut := runServerCmd(t, "", "remove", "ete", "--config", path)
+	if code != 0 || !strings.Contains(errOut, "warning: 1 running session ") {
+		t.Errorf("exit %d, stdout:\n%s\nstderr:\n%s", code, out, errOut)
+	}
+}
+
+// add points at both ways to route the new server: the agents pane's S and the command.
+func TestServerAdd_NamesBothWaysToRouteIt(t *testing.T) {
+	path := serverEnv(t, newFakeStats(t, 0).addr(), "")
+	_, out, _ := runServerCmd(t, "sk-ete", "add", "ete", "https://ete.example.com", "--key-stdin", "--config", path)
+	if want := "Added ete. No agent uses it yet: press S on agentop's agents pane, or run\n  agentop server use ete --agent claude-code"; !strings.Contains(out, want) {
+		t.Errorf("want %q in stdout:\n%s", want, out)
+	}
+}
+
+// One session reads in the singular, and the warning names the server and nothing of its URL
+// or key: a number and a name.
+func TestServerRemove_WarnsOfOneSessionInTheSingularAndShowsNoCredential(t *testing.T) {
+	sessions := sessionsAPI(t, "ete.example.com")
+	path := serverEnvWithSessions(t, newFakeStats(t, 0).addr(), sessions, routerBlock)
+	code, out, errOut := runServerCmd(t, "", "remove", "ete", "--config", path)
+	if code != 0 || !strings.Contains(errOut, "warning: 1 running session last sent inference to ete. A session the proxy routed there") {
+		t.Fatalf("exit %d, stdout:\n%s\nstderr:\n%s", code, out, errOut)
+	}
+	for _, leak := range []string{"sk-ete", "ete.example.com", "https://"} {
+		if strings.Contains(errOut, leak) {
+			t.Errorf("stderr shows %q:\n%s", leak, errOut)
+		}
 	}
 }

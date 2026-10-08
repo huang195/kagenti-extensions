@@ -10,12 +10,15 @@ import (
 	"os"
 	"slices"
 	"strings"
+	"time"
 
 	"github.com/charmbracelet/x/term"
 
+	"github.com/rossoctl/cortex/cmd/agentop/apiclient"
 	"github.com/rossoctl/cortex/cmd/agentop/edit"
-	"github.com/rossoctl/cortex/core/config"
+	"github.com/rossoctl/cortex/cmd/agentop/servers"
 	"github.com/rossoctl/cortex/core/plugins/inferencerouter/routerconfig"
+	"github.com/rossoctl/cortex/core/session"
 )
 
 // serverConfirm asks before `server add` replaces a server. Its own var, as
@@ -124,19 +127,19 @@ func serverAdd(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 		fmt.Fprintf(stderr, "agentop server add: %v\n", err)
 		return 1
 	}
-	for _, other := range slices.Sorted(maps.Keys(c.Servers)) {
-		if oep, err := routerconfig.ParseURL(c.Servers[other].URL); other != name && err == nil && oep.Hostname == ep.Hostname {
-			fmt.Fprintf(stderr, "agentop server add: %s is already on %s. Each server needs a host of its own, "+
-				"because agentop names a session's server from the host its requests went to.\n", other, ep.Hostname)
-			return 1
-		}
+	// servers.ForHost, the rule agentop then names a session's server by, so this refusal and
+	// what it protects cannot drift apart. A server replaced under its own name keeps its host.
+	if other, ok := servers.ForHost(c, ep.Host); ok && other != name {
+		fmt.Fprintf(stderr, "agentop server add: %s is already on %s. Each server needs a host of its own, "+
+			"because agentop names a session's server from the host its requests went to.\n", other, ep.Hostname)
+		return 1
 	}
 	old, replacing := c.Servers[name]
 	if replacing {
 		// The whole server is replaced, models included, so the question says what it
 		// will map to: re-adding it without the flags drops its mapping.
 		fmt.Fprintf(stdout, "%s is already configured (%s). Replacing it gives it this URL, key and model mapping (%s), "+
-			"and the sessions on it use them from their next request.\n", name, serverHost(old), mappingText(models))
+			"and the sessions on it use them from their next request.\n", name, servers.Host(old), servers.Mapping(models))
 		if !*yes && !serverConfirm(stdout) {
 			return exitDeclined
 		}
@@ -174,7 +177,7 @@ func serverAdd(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 		done = "Replaced " + name + "."
 	}
 	if len(agentsOn(c, name)) == 0 {
-		done += " No agent uses it yet. Route one with\n  agentop server use " + name + " --agent claude-code"
+		done += " No agent uses it yet: press S on agentop's agents pane, or run\n  agentop server use " + name + " --agent claude-code"
 	}
 	return runServerWrite(stdout, stderr, path, statsURL, ch, writeReport{
 		done:      done,
@@ -261,11 +264,77 @@ func serverRemove(args []string, stdout, stderr io.Writer) int {
 		}
 		return 1
 	}
+	// Only against a proxy that answered: its session API is the one with the pins.
+	sessionsURL := ""
+	if statsURL != "" {
+		sessionsURL = dialURL(cfg.Listener.SessionAPIAddr)
+	}
+	// WHICH OF THEM GET THE ERROR, NOT "EACH": the router denies a session pinned to name only
+	// on a request addressed to a server that is left, since that is the only request it still
+	// handles. One addressed to name's own host is no longer an inference server's request
+	// (skip/not_an_inference_server) and goes there untouched, the client's key and all. The
+	// count cannot tell the two apart — the summary says where a session's requests went, not
+	// where they were addressed — so the warning says what happens to each.
+	if n := runningOn(sessionsURL, c, name); n > 0 {
+		fmt.Fprintf(stderr, "agentop server remove: warning: %s last sent inference to %s. A session the proxy routed "+
+			"there gets an error asking for a new session from its next request to a server that is left, until %s is "+
+			"added back; a request addressed to %s's own host is no longer routed, and goes there with the agent's own "+
+			"key.\n", runningSessions(n), name, name, name)
+	}
 	ch := edit.ConfigChange{Chain: "outbound", Plugin: routerName, Path: []string{"servers", name}}
 	return runServerWrite(stdout, stderr, path, statsURL, ch, writeReport{
 		done: "Removed " + name + ".",
-		live: fmt.Sprintf("A session that started on it now gets an error asking for a new session; adding %s back restores it.", name),
+		live: fmt.Sprintf("A session the proxy routed to it now gets an error asking for a new session from its next "+
+			"request to a server that is left; a request addressed to %s's own host is no longer routed, and goes "+
+			"there with the agent's own key. Adding %s back routes them to it again.", name, name),
 	})
+}
+
+// runningOn counts the sessions the proxy at sessionsURL holds in memory whose inference
+// traffic last went to server name: the ones a remove can leave asking for a new session.
+//
+// NOT THE LISTENER'S SYNTHETIC SESSIONS — the default bucket and the pending:<agent> ones.
+// Each holds many conversations, so the router never pins one; their requests follow the
+// agent's current server, which cannot be name, since remove refuses a server an agent is
+// routed to. None of them can get the error, whatever host it last sent to.
+//
+// IN MEMORY, NOT IN THE ARCHIVE, AND BY A REQUEST THIS PROXY SAW: the router pins a session by
+// the first request it routes and keeps the pin in memory, so a session only the archive holds
+// has no pin left to break, and neither has a resident one whose host is only its history's.
+// SessionSummary.Active would not do — it marks the one most recently updated session.
+//
+// 0 when the proxy does not answer, which is the quiet side for a warning: the remove itself
+// is what matters, and it goes ahead either way.
+func runningOn(sessionsURL string, c routerconfig.Config, name string) int {
+	if sessionsURL == "" {
+		return 0
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	list, err := apiclient.New(sessionsURL).ListSessions(ctx)
+	if err != nil {
+		return 0
+	}
+	n := 0
+	for _, s := range list {
+		// Its host only its history's: resumed after a restart, nothing sent since, so no pin
+		// survived to hold it to name (see SessionSummary.InferenceHostFromHistory).
+		if s.InferenceHostFromHistory || s.ID == session.DefaultSessionID || strings.HasPrefix(s.ID, session.PendingPrefix) {
+			continue
+		}
+		if on, ok := servers.ForHost(c, s.InferenceHost); ok && on == name {
+			n++
+		}
+	}
+	return n
+}
+
+// runningSessions is "1 running session" or "n running sessions".
+func runningSessions(n int) string {
+	if n == 1 {
+		return "1 running session"
+	}
+	return fmt.Sprintf("%d running sessions", n)
 }
 
 func serverUse(args []string, stdout, stderr io.Writer) int {
@@ -305,7 +374,7 @@ func serverUse(args []string, stdout, stderr io.Writer) int {
 			name, configuredServers(c), name)
 		return 1
 	}
-	ch := edit.ConfigChange{Chain: "outbound", Plugin: routerName, Path: []string{"agents", *agent}, Value: edit.ScalarValue(name)}
+	ch := servers.AgentChange(*agent, name)
 	return runServerWrite(stdout, stderr, path, statsURL, ch, writeReport{
 		done:      fmt.Sprintf("New %s sessions → %s.", *agent, name),
 		live:      runningSessionsStay,
@@ -344,7 +413,7 @@ func serverReset(args []string, stdout, stderr io.Writer) int {
 		fmt.Fprintf(stdout, "%s is not routed; nothing to change.\n", *agent)
 		return 0
 	}
-	ch := edit.ConfigChange{Chain: "outbound", Plugin: routerName, Path: []string{"agents", *agent}}
+	ch := servers.AgentChange(*agent, "")
 	return runServerWrite(stdout, stderr, path, statsURL, ch, writeReport{
 		done:      fmt.Sprintf("New %s sessions are no longer routed.", *agent),
 		live:      runningSessionsStay,
@@ -361,20 +430,6 @@ func serverReset(args []string, stdout, stderr io.Writer) int {
 const runningSessionsStay = "Sessions already running stay where they are, except one that has sent nothing " +
 	"since the proxy last started, or that the proxy has dropped from memory (it keeps the most recently used, " +
 	"100 by default), which can be treated as a new one."
-
-// verifyRouter is the check every `agentop server` write makes of its result: the
-// router entry must pass the plugin's own validation, so agentop never writes a
-// config the proxy will refuse to reload.
-func verifyRouter(cfg *config.Config) error {
-	for _, e := range cfg.Pipeline.Outbound.Plugins {
-		if e.Name == routerName {
-			if _, err := routerconfig.Decode(e.Config); err != nil {
-				return fmt.Errorf("%s config: %w", routerName, err)
-			}
-		}
-	}
-	return nil
-}
 
 // writeReport is what runServerWrite says about a change, by how it landed.
 type writeReport struct {
@@ -394,7 +449,7 @@ type writeReport struct {
 // runServerWrite makes one change to the router entry and reports how it landed.
 func runServerWrite(stdout, stderr io.Writer, path, statsURL string, ch edit.ConfigChange, r writeReport) int {
 	res, err := writePluginConfig(context.Background(), edit.ConfigWrite{
-		Path: path, StatsURL: statsURL, Changes: []edit.ConfigChange{ch}, Verify: verifyRouter,
+		Path: path, StatsURL: statsURL, Changes: []edit.ConfigChange{ch}, Verify: servers.Verify,
 	})
 	if err != nil {
 		fmt.Fprintf(stderr, "agentop server: %v\n", err)

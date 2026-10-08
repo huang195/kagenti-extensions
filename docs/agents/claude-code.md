@@ -123,10 +123,10 @@ list. Claude Code is the only agent it can build a list for. See
 
 ## Switching inference servers
 
-With more than one LiteLLM server, `agentop server` chooses which one Claude
-Code's **new** sessions use, with one Claude Code configuration and without
-restarting anything. A running conversation stays on the server it started on,
-with the exceptions below.
+With more than one LiteLLM server, `agentop server` — or `S` on agentop's agents
+pane — chooses which one Claude Code's **new** sessions use, with one Claude Code
+configuration and without restarting anything. A running conversation stays on
+the server it started on, with the exceptions below.
 See [Choosing an inference server](../../cmd/agentop/README.md#choosing-an-inference-server-agentop-server).
 
 That one configuration is:
@@ -173,9 +173,10 @@ header, such as one set through `ANTHROPIC_CUSTOM_HEADERS`, reaches the server
 unchanged.
 
 Claude Code keeps naming the model it asked for, so agentop is where the server
-shows: the events table shows where each request went and, under METHOD, the
-model it was sent for, and the detail pane's `redirected:` and `model:` lines
-name the host and the model Claude Code asked for when they were others.
+shows: the sessions table's `SERVER` column names each session's server, the
+events table shows where each request went and, under METHOD, the model it was
+sent for, and the detail pane's `redirected:` and `model:` lines name the host
+and the model Claude Code asked for when they were others.
 
 A session is pinned on the first request the router sees from it, so switch
 **before** `/clear` or a new `claude`, not after. A conversation already running
@@ -228,8 +229,9 @@ Sonnet 5 and Claude Haiku 4.5. This was exercised:
 Not exercised: Linux; `install.sh --claude-code`; Claude Code talking to
 `api.anthropic.com` directly rather than through a gateway; Amazon Bedrock and Google
 Vertex AI; routing through `inference-router` with a live Claude Code, which so far is
-covered by unit and listener tests and by scratch-`HOME` runs of `agentop server`
-against a fake stats server.
+covered by unit and listener tests, by scratch-`HOME` runs of `agentop server`
+against a fake stats server, and by `S` driven in agentop against a second Cortex
+whose servers do not resolve.
 
 ## Known issues
 

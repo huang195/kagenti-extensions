@@ -791,3 +791,23 @@ func TestNew_RejectsTooManyPolicies(t *testing.T) {
 		t.Errorf("error should name WithPolicies: %q", err)
 	}
 }
+
+// PolicyAt is each plugin's on_error as the pipeline runs it, for a reader outside the package —
+// the session API serves it — so it resolves the default as Run does, and a plugin given no
+// policy reads as enforce rather than as "".
+func TestPolicyAt_IsThePolicyEachPluginRunsUnder(t *testing.T) {
+	p, err := New([]Plugin{&stubPlugin{name: "a"}, &stubPlugin{name: "b"}, &stubPlugin{name: "c"}},
+		WithPolicies("", ErrorPolicyObserve))
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	for i, want := range []ErrorPolicy{ErrorPolicyEnforce, ErrorPolicyObserve, ErrorPolicyEnforce} {
+		if got := p.PolicyAt(i); got != want {
+			t.Errorf("PolicyAt(%d) = %q, want %q", i, got, want)
+		}
+	}
+	// Bounds-safe, as the dispatch loops rely on: a Pipeline not built by New has no policies.
+	if got := (&Pipeline{plugins: []Plugin{&stubPlugin{name: "a"}}}).PolicyAt(0); got != ErrorPolicyEnforce {
+		t.Errorf("PolicyAt on a zero Pipeline = %q, want enforce", got)
+	}
+}

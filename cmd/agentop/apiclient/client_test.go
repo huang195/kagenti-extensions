@@ -765,3 +765,24 @@ func TestListSessionsArchived_AnOldProxyIgnoresTheQuery(t *testing.T) {
 		t.Fatalf("list = %+v, err %v", list, err)
 	}
 }
+
+// onError decodes when the proxy serves it — only for a plugin not under the default policy — and
+// is "" when it does not, which is how agentop tells an observing plugin from one that acts.
+func TestPipelinePluginDecodesOnError(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(`{"inbound":[],"outbound":[
+		  {"name":"inference-parser","direction":"outbound","position":1,"readsBody":true},
+		  {"name":"inference-router","direction":"outbound","position":2,"readsBody":true,"onError":"observe"}]}`))
+	}))
+	defer srv.Close()
+	view, err := New(srv.URL).GetPipeline(context.Background())
+	if err != nil {
+		t.Fatalf("GetPipeline: %v", err)
+	}
+	if got := view.Outbound[0].OnError; got != "" {
+		t.Errorf("inference-parser OnError = %q, want empty", got)
+	}
+	if got := view.Outbound[1].OnError; got != pipeline.ErrorPolicyObserve {
+		t.Errorf("inference-router OnError = %q, want observe", got)
+	}
+}

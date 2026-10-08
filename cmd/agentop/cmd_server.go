@@ -291,11 +291,10 @@ func baseURLCheck(raw, shown string, c routerconfig.Config) settingsCheck {
 	if err != nil || u.Host == "" {
 		return settingsCheck{false, fmt.Sprintf("ANTHROPIC_BASE_URL in %s is not a URL with a host, so nothing is routed. Point it at one of the servers above.", shown)}
 	}
-	host := routerconfig.Hostname(u.Host)
-	for _, name := range slices.Sorted(maps.Keys(c.Servers)) {
-		if ep, err := routerconfig.ParseURL(c.Servers[name].URL); err == nil && ep.Hostname == host {
-			return settingsCheck{true, fmt.Sprintf("Claude Code points at %s (%s)", name, shown)}
-		}
+	// servers.ForHost, the one rule for which server a host is: the router's, port-stripped and
+	// lowercased, and the one the sessions table's SERVER column and both session counts use.
+	if name, ok := servers.ForHost(c, u.Host); ok {
+		return settingsCheck{true, fmt.Sprintf("Claude Code points at %s (%s)", name, shown)}
 	}
 	where := "a URL that is"
 	if !strings.Contains(raw, "@") {

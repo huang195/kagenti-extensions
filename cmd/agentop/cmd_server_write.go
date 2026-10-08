@@ -117,12 +117,12 @@ func serverAdd(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 		fmt.Fprintf(stderr, "agentop server add: %v\n", err)
 		return 1
 	}
-	for _, other := range slices.Sorted(maps.Keys(c.Servers)) {
-		if oep, err := routerconfig.ParseURL(c.Servers[other].URL); other != name && err == nil && oep.Hostname == ep.Hostname {
-			fmt.Fprintf(stderr, "agentop server add: %s is already on %s. Each server needs a host of its own, "+
-				"because agentop names a session's server from the host its requests went to.\n", other, ep.Hostname)
-			return 1
-		}
+	// servers.ForHost, the rule agentop then names a session's server by, so this refusal and
+	// what it protects cannot drift apart. A server replaced under its own name keeps its host.
+	if other, ok := servers.ForHost(c, ep.Host); ok && other != name {
+		fmt.Fprintf(stderr, "agentop server add: %s is already on %s. Each server needs a host of its own, "+
+			"because agentop names a session's server from the host its requests went to.\n", other, ep.Hostname)
+		return 1
 	}
 	old, replacing := c.Servers[name]
 	if replacing {

@@ -252,8 +252,9 @@ func (p *Pipeline) HasStreamingResponders() bool {
 // in a test) doesn't panic.
 //
 // Exported for the session API, which serves it on /v1/pipeline: a
-// plugin under observe runs and records, but what it would change is
-// dropped, and nothing else a reader can see says so. Read it from the
+// plugin under observe runs and records, but its rejections, body
+// writes and redirects are dropped — header writes still apply — and
+// nothing else a reader can see says so. Read it from the
 // same *Pipeline as Plugins(), not through a Holder twice, or a reload
 // between the two calls pairs a plugin with another pipeline's policy.
 func (p *Pipeline) PolicyAt(i int) ErrorPolicy {

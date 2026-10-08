@@ -293,7 +293,8 @@ type pipelinePluginView struct {
 	// (enforce), so in practice only "observe": an off plugin is not built into the
 	// pipeline, and is not listed here at all. A reader needs it because a plugin under
 	// observe runs and records, but its rejections, body writes and redirects are
-	// dropped — so its config, read alone, describes what it would do, not what it does.
+	// dropped — header writes still apply — so in those respects its config, read alone,
+	// describes what it would do, not what it does.
 	OnError pipeline.ErrorPolicy `json:"onError,omitempty"`
 	// Metrics is populated for plugins implementing pipeline.MetricsProvider.
 	// Omitted entirely when a plugin reports none, so agentop can distinguish

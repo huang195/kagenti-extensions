@@ -258,8 +258,9 @@ type PipelinePlugin struct {
 	Description string          `json:"description,omitempty"`
 	Config      json.RawMessage `json:"config,omitempty"`
 	// OnError is the plugin's on_error policy, "" for the default (enforce): the proxy sends
-	// it only when it is not. A plugin under observe runs, but what it would change is
-	// dropped, so its Config says what it would do rather than what it does.
+	// it only when it is not. A plugin under observe runs, but its rejections, body writes and
+	// redirects are dropped — header writes still apply — so in those respects its Config says
+	// what it would do rather than what it does.
 	OnError pipeline.ErrorPolicy `json:"onError,omitempty"`
 	Metrics []PluginMetric       `json:"metrics,omitempty"`
 }

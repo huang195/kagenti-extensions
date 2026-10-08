@@ -170,4 +170,8 @@ func (s *Store) withPriorLocked(sum *SessionSummary, id string, sess *entry) {
 		sum.CreatedAt = p.CreatedAt
 	}
 	sum.PromptContext = pipeline.MergePromptContext(f.promptContext(), sum.PromptContext)
+	// The entry's own when it has one: everything it holds came after the history.
+	if sum.InferenceHost == "" {
+		sum.InferenceHost = f.inferenceHost
+	}
 }

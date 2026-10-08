@@ -32,6 +32,8 @@ func foldFixture(t *testing.T) []pipeline.SessionEvent {
 	turn := func(content string, tokens int, rec event.Event, c *pipeline.EventClient) []pipeline.SessionEvent {
 		req := titleEvent(content)
 		req.Phase, req.Client = pipeline.SessionRequest, c
+		// One host per agent, so the latest inference request is a different host from the first.
+		req.Host = c.Name + ".example.com"
 		tunnel := pipeline.SessionEvent{Phase: pipeline.SessionRequest, Tunnel: true, HTTPMethod: "CONNECT"}
 		resp := pipeline.SessionEvent{
 			Phase:     pipeline.SessionResponse,
@@ -79,11 +81,12 @@ func TestSummaryFold_AgreesWithListSessions(t *testing.T) {
 	if got.EventCount != want.EventCount || got.Title != want.Title || got.Agent != want.Agent ||
 		got.TotalTokens != want.TotalTokens || got.CostMicros != want.CostMicros ||
 		got.AvoidedMicros != want.AvoidedMicros || got.Saturated != want.Saturated ||
-		!slices.Equal(got.Currencies, want.Currencies) || !sameContext(got.PromptContext, want.PromptContext) {
+		!slices.Equal(got.Currencies, want.Currencies) || !sameContext(got.PromptContext, want.PromptContext) ||
+		got.InferenceHost != want.InferenceHost {
 		t.Fatalf("fold  = %+v\nstore = %+v", got, want)
 	}
 	if want.CostMicros == 0 || want.AvoidedMicros == 0 || want.Title == "" || want.Agent == "" ||
-		len(want.Currencies) != 2 || want.PromptContext == nil {
+		len(want.Currencies) != 2 || want.PromptContext == nil || want.InferenceHost != "claude-code.example.com" {
 		t.Fatalf("fixture no longer exercises every figure: %+v", want)
 	}
 }
@@ -126,7 +129,8 @@ func TestSummaryFold_ResumesFromJSON(t *testing.T) {
 	}
 	w, g := whole.Summary("s1"), resumed.Summary("s1")
 	if w.EventCount != g.EventCount || w.Title != g.Title || w.Agent != g.Agent || w.TotalTokens != g.TotalTokens ||
-		w.CostMicros != g.CostMicros || w.AvoidedMicros != g.AvoidedMicros || !slices.Equal(w.Currencies, g.Currencies) {
+		w.CostMicros != g.CostMicros || w.AvoidedMicros != g.AvoidedMicros || !slices.Equal(w.Currencies, g.Currencies) ||
+		w.InferenceHost != g.InferenceHost {
 		t.Fatalf("resumed = %+v\nwhole   = %+v", g, w)
 	}
 }

@@ -71,6 +71,11 @@ func (m *model) footerView() string {
 	if m.paused {
 		status.WriteString(styleWarn.Render("   [paused]"))
 	}
+	// A server switch S started, until its one flash replaces this. State, not a key, like
+	// [paused]: the write waits for the proxy's reload, which takes about a second.
+	if m.serverSwitch != nil {
+		status.WriteString(styleWarn.Render("   [" + m.serverSwitch.text() + "]"))
+	}
 	// A filter that is ON but not being edited has nowhere else to show: the filter
 	// box renders only while m.filtering, so a filter restored from the config file
 	// silently truncated the list with nothing on screen explaining it. Shown here

@@ -412,6 +412,10 @@ type model struct {
 	// so a snapshot answered before one is not stored after it. See clear.go.
 	clearConfirm *clearConfirm
 	clearGen     uint64
+	// serverPicker is S's picker on the AGENTS pane, modal while non-nil, and serverSwitch the
+	// write it started, until serverSwitchedMsg lands. See server_picker.go.
+	serverPicker *serverPicker
+	serverSwitch *serverSwitch
 	// events was labelled a ring buffer and has never been one. Nothing trims an entry in
 	// place; every write is one of six, and the CTX(1M) gauge folds forward off this map,
 	// so each one owes contextRun an action. The full inventory, because the gauge reads an
@@ -1068,6 +1072,10 @@ func (m *model) backToPodsPane() {
 	// puts m.pane back to paneEvents and the popup nobody reopened is there
 	// again, owning the keyboard until the user finds esc.
 	m.colPicker = false
+	// S's picker too, for the same reason: it names an agent and a value in force read off the
+	// connection being left. A switch already in flight is not cancelled — it writes this
+	// machine's config whichever pane is up, and its flash is still true when it lands.
+	m.serverPicker = nil
 	m.detailEvent = nil
 	m.detailPlugin = nil
 	m.selectedSess = ""
@@ -1722,6 +1730,9 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case clearDoneMsg:
 		return m, m.applyClearDone(msg)
 
+	case serverSwitchedMsg:
+		return m, m.applyServerSwitched(msg)
+
 	case olderPageLoadedMsg:
 		m.applyOlderPage(msg)
 		if m.pane == paneEvents && m.selectedSess == msg.id {
@@ -2236,6 +2247,11 @@ func (m *model) View() string {
 	}
 	if m.clearConfirm != nil {
 		return overlayCenter(base, renderClearConfirm(m.clearConfirm, m.width), m.width, m.height)
+	}
+	// Scoped to the pane it was opened on, as the column picker below is: a message can change
+	// panes under a modal even though no key can.
+	if m.serverPicker != nil && m.pane == paneAgents {
+		return overlayCenter(base, renderServerPicker(m.serverPicker, m.width), m.width, m.height)
 	}
 	// Same paneEvents scoping as the key block: an async pane change must not leave
 	// the popup drawn over a pane it does not belong to.

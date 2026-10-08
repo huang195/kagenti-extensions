@@ -14,7 +14,7 @@ import (
 	"github.com/charmbracelet/x/term"
 
 	"github.com/rossoctl/cortex/cmd/agentop/edit"
-	"github.com/rossoctl/cortex/core/config"
+	"github.com/rossoctl/cortex/cmd/agentop/servers"
 	"github.com/rossoctl/cortex/core/plugins/inferencerouter/routerconfig"
 )
 
@@ -124,7 +124,7 @@ func serverAdd(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 	old, replacing := c.Servers[name]
 	if replacing {
 		fmt.Fprintf(stdout, "%s is already configured (%s). Replacing it gives it this URL and key, "+
-			"and the sessions on it use them from their next request.\n", name, serverHost(old))
+			"and the sessions on it use them from their next request.\n", name, servers.Host(old))
 		if !*yes && !serverConfirm(stdout) {
 			return exitDeclined
 		}
@@ -273,7 +273,7 @@ func serverUse(args []string, stdout, stderr io.Writer) int {
 			name, configuredServers(c), name)
 		return 1
 	}
-	ch := edit.ConfigChange{Chain: "outbound", Plugin: routerName, Path: []string{"agents", *agent}, Value: edit.ScalarValue(name)}
+	ch := servers.AgentChange(*agent, name)
 	return runServerWrite(stdout, stderr, path, statsURL, ch, writeReport{
 		done:      fmt.Sprintf("New %s sessions → %s.", *agent, name),
 		live:      runningSessionsStay,
@@ -312,7 +312,7 @@ func serverReset(args []string, stdout, stderr io.Writer) int {
 		fmt.Fprintf(stdout, "%s is not routed; nothing to change.\n", *agent)
 		return 0
 	}
-	ch := edit.ConfigChange{Chain: "outbound", Plugin: routerName, Path: []string{"agents", *agent}}
+	ch := servers.AgentChange(*agent, "")
 	return runServerWrite(stdout, stderr, path, statsURL, ch, writeReport{
 		done:      fmt.Sprintf("New %s sessions are no longer routed.", *agent),
 		live:      runningSessionsStay,
@@ -329,20 +329,6 @@ func serverReset(args []string, stdout, stderr io.Writer) int {
 const runningSessionsStay = "Sessions already running stay where they are, except one that has sent nothing " +
 	"since the proxy last started, or that the proxy has dropped from memory (it keeps the most recently used, " +
 	"100 by default), which can be treated as a new one."
-
-// verifyRouter is the check every `agentop server` write makes of its result: the
-// router entry must pass the plugin's own validation, so agentop never writes a
-// config the proxy will refuse to reload.
-func verifyRouter(cfg *config.Config) error {
-	for _, e := range cfg.Pipeline.Outbound.Plugins {
-		if e.Name == routerName {
-			if _, err := routerconfig.Decode(e.Config); err != nil {
-				return fmt.Errorf("%s config: %w", routerName, err)
-			}
-		}
-	}
-	return nil
-}
 
 // writeReport is what runServerWrite says about a change, by how it landed.
 type writeReport struct {
@@ -362,7 +348,7 @@ type writeReport struct {
 // runServerWrite makes one change to the router entry and reports how it landed.
 func runServerWrite(stdout, stderr io.Writer, path, statsURL string, ch edit.ConfigChange, r writeReport) int {
 	res, err := writePluginConfig(context.Background(), edit.ConfigWrite{
-		Path: path, StatsURL: statsURL, Changes: []edit.ConfigChange{ch}, Verify: verifyRouter,
+		Path: path, StatsURL: statsURL, Changes: []edit.ConfigChange{ch}, Verify: servers.Verify,
 	})
 	if err != nil {
 		fmt.Fprintf(stderr, "agentop server: %v\n", err)

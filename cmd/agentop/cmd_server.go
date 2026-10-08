@@ -16,14 +16,16 @@ import (
 	"text/tabwriter"
 	"unicode/utf8"
 
+	"github.com/rossoctl/cortex/cmd/agentop/servers"
 	"github.com/rossoctl/cortex/core/config"
 	"github.com/rossoctl/cortex/core/pipeline"
 	"github.com/rossoctl/cortex/core/plugins/inferencerouter/routerconfig"
 )
 
 // routerName is the inference-router plugin's registered name: the outbound entry
-// every `agentop server` form reads and writes.
-const routerName = "inference-router"
+// every `agentop server` form reads and writes. servers.PluginName, which the TUI's S
+// picker writes too.
+const routerName = servers.PluginName
 
 const serverUsage = `agentop server — choose the inference server each coding agent's new sessions use
 
@@ -221,7 +223,7 @@ func serverList(args []string, stdout, stderr io.Writer) int {
 	tw := tabwriter.NewWriter(&table, 0, 0, 3, ' ', 0)
 	for _, name := range slices.Sorted(maps.Keys(c.Servers)) {
 		s := c.Servers[name]
-		fmt.Fprintf(tw, "  %s\t%s\t%s\t%s\n", name, serverHost(s), mappingText(s), strings.Join(agentsOn(c, name), ", "))
+		fmt.Fprintf(tw, "  %s\t%s\t%s\t%s\n", name, servers.Host(s), servers.Mapping(s), strings.Join(agentsOn(c, name), ", "))
 	}
 	tw.Flush()
 	for line := range strings.Lines(table.String()) {
@@ -237,42 +239,6 @@ func serverList(args []string, stdout, stderr io.Writer) int {
 		printCheck(stdout, ck.ok, ck.text)
 	}
 	return 0
-}
-
-// serverHost is how a server's URL is listed: its host, or the whole URL for plain
-// http, so a server whose traffic crosses the network unencrypted says so.
-//
-// A URL the router refuses shows nothing of itself, not even its host: the likeliest
-// reason it is refused is a pasted key, and a key given as a username that contains
-// '/', '?' or '#' ends the authority early, so url.Parse takes the key for the host
-// (https://sk-.../x@gw.example parses with Host "sk-..."). No parentheses either:
-// `server add` already puts this in some.
-func serverHost(s routerconfig.Server) string {
-	ep, err := routerconfig.ParseURL(s.URL)
-	if err != nil {
-		return "not a valid URL"
-	}
-	if ep.Scheme == "http" {
-		return ep.URL()
-	}
-	return ep.Host
-}
-
-// mappingText is a server's model mapping as one cell.
-func mappingText(s routerconfig.Server) string {
-	switch {
-	case s.Opus == "" && s.Sonnet == "" && s.Haiku == "":
-		return "uses Claude Code's names"
-	case s.Opus == s.Sonnet && s.Sonnet == s.Haiku:
-		return "all → " + s.Opus
-	}
-	or := func(m string) string {
-		if m == "" {
-			return "—"
-		}
-		return m
-	}
-	return fmt.Sprintf("opus → %s · sonnet → %s · haiku → %s", or(s.Opus), or(s.Sonnet), or(s.Haiku))
 }
 
 // settingsCheck is one line of `agentop server`'s check of Claude Code's settings.

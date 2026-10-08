@@ -10,8 +10,6 @@ import (
 	"strings"
 	"testing"
 	"unicode/utf8"
-
-	"github.com/rossoctl/cortex/core/plugins/inferencerouter/routerconfig"
 )
 
 // routerBlock is the inference-router entry agentop writes, with two servers and
@@ -195,21 +193,6 @@ func TestIsClaudeModel(t *testing.T) {
 	} {
 		if got := isClaudeModel(m); got != want {
 			t.Errorf("isClaudeModel(%q) = %v, want %v", m, got, want)
-		}
-	}
-}
-
-func TestMappingText(t *testing.T) {
-	for _, tc := range []struct {
-		s    routerconfig.Server
-		want string
-	}{
-		{routerconfig.Server{}, "uses Claude Code's names"},
-		{routerconfig.Server{Opus: "glm-5.3", Sonnet: "glm-5.3", Haiku: "glm-5.3"}, "all → glm-5.3"},
-		{routerconfig.Server{Opus: "big", Sonnet: "mid", Haiku: "small"}, "opus → big · sonnet → mid · haiku → small"},
-	} {
-		if got := mappingText(tc.s); got != tc.want {
-			t.Errorf("mappingText(%+v) = %q, want %q", tc.s, got, tc.want)
 		}
 	}
 }

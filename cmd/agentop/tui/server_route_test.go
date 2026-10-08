@@ -309,8 +309,8 @@ func TestAgentsPane_AnObservingRouterRoutesNothing(t *testing.T) {
 	if cmd := m.handleKey(keyRune('S')); cmd != nil || m.serverPicker != nil {
 		t.Fatalf("S opened something: cmd %v, picker %+v", cmd, m.serverPicker)
 	}
-	if want := servers.Inactive(pipeline.ErrorPolicyObserve, f.path); m.flash != want {
-		t.Errorf("flash %q\nwant  %q", m.flash, want)
+	if want := servers.Inactive(pipeline.ErrorPolicyObserve, f.path); m.serverNotice != want {
+		t.Errorf("notice %q\nwant   %q", m.serverNotice, want)
 	}
 	if f.config(t) != before {
 		t.Error("the config was written")
@@ -334,8 +334,8 @@ func TestServerPicker_EnterRefusesARouterThatStoppedRoutingWhileItWasOpen(t *tes
 	if cmd := m.handleKey(keyEnter); cmd != nil {
 		t.Fatal("↵ started a write to a router under on_error: observe")
 	}
-	if want := servers.Inactive(pipeline.ErrorPolicyObserve, f.path); m.flash != want {
-		t.Errorf("flash %q\nwant  %q", m.flash, want)
+	if want := servers.Inactive(pipeline.ErrorPolicyObserve, f.path); m.serverNotice != want {
+		t.Errorf("notice %q\nwant   %q", m.serverNotice, want)
 	}
 	if m.serverSwitch != nil || f.config(t) != before {
 		t.Errorf("a switch began (%+v) or the config was written", m.serverSwitch)
@@ -352,8 +352,8 @@ func TestServerPicker_NoRouterNamesBothReasonsItMayBeMissing(t *testing.T) {
 	onRow(t, m, "opencode/1.0.3")
 	m.handleKey(keyRune('S'))
 	for _, want := range []string{"runs no inference-router", "agentop server add", "on_error: off", f.path} {
-		if !strings.Contains(m.flash, want) {
-			t.Errorf("flash %q, want it to contain %q", m.flash, want)
+		if !strings.Contains(m.serverNotice, want) {
+			t.Errorf("notice %q, want it to contain %q", m.serverNotice, want)
 		}
 	}
 }
@@ -372,8 +372,8 @@ func TestActiveRouter_AConfigItCannotReadIsNotOn(t *testing.T) {
 	}
 	onRow(t, m, "opencode/1.0.3")
 	m.handleKey(keyRune('S'))
-	if m.serverPicker != nil || !strings.Contains(m.flash, "cannot read the inference-router's running config") {
-		t.Errorf("S: picker %+v, flash %q", m.serverPicker, m.flash)
+	if m.serverPicker != nil || !strings.Contains(m.serverNotice, "cannot read the inference-router's running config") {
+		t.Errorf("S: picker %+v, notice %q", m.serverPicker, m.serverNotice)
 	}
 }
 

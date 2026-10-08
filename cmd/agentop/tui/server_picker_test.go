@@ -12,7 +12,9 @@ import (
 
 	"github.com/rossoctl/cortex/cmd/agentop/apiclient"
 	"github.com/rossoctl/cortex/cmd/agentop/edit"
+	"github.com/rossoctl/cortex/cmd/agentop/servers"
 	"github.com/rossoctl/cortex/core/cost/usage"
+	"github.com/rossoctl/cortex/core/pipeline"
 	"github.com/rossoctl/cortex/core/session"
 )
 
@@ -31,7 +33,7 @@ func switchTo(t *testing.T, m *model, label, server string) string {
 	onRow(t, m, label)
 	m.handleKey(keyRune('S'))
 	if m.serverPicker == nil {
-		t.Fatalf("S on %s opened no picker; flash %q", label, m.flash)
+		t.Fatalf("S on %s opened no picker; notice %q", label, m.serverNotice)
 	}
 	for m.serverPicker.entries[m.serverPicker.cursor].name != server {
 		before := m.serverPicker.cursor
@@ -187,8 +189,12 @@ func TestServerPicker_RefusesWhereItCannotApply(t *testing.T) {
 			if cmd := m.handleKey(keyRune('S')); cmd != nil || m.serverPicker != nil {
 				t.Fatalf("S opened something: cmd %v, picker %+v", cmd, m.serverPicker)
 			}
-			if !strings.Contains(m.flash, tc.want) {
-				t.Errorf("flash %q, want it to contain %q", m.flash, tc.want)
+			if !strings.Contains(m.serverNotice, tc.want) {
+				t.Errorf("notice %q, want it to contain %q", m.serverNotice, tc.want)
+			}
+			// The reason is the panel, whole, over the pane — never a footer line cut short.
+			if view := m.View(); !strings.Contains(view, "[esc] close") {
+				t.Errorf("the reason is not shown over the pane:\n%s", view)
 			}
 		})
 	}
@@ -219,7 +225,7 @@ func TestServerPicker_ARefusedReloadFlashesItsErrorAndKeepsTheColumn(t *testing.
 	f := newFakeProxy(t, true)
 	m := serverModel(t, f)
 	switchTo(t, m, "claude-code/2.1.270", "glm")
-	if !strings.Contains(m.flash, "keeps claude-code where it was") || !strings.Contains(m.flash, `configure "inference-router": refused`) {
+	if !strings.Contains(m.flash, "claude-code stays where it was") || !strings.Contains(m.flash, `configure "inference-router": refused`) {
 		t.Errorf("flash %q", m.flash)
 	}
 	// edit.WritePluginConfig put the file back, and the flash says so: a refusal that read as
@@ -268,7 +274,7 @@ func TestServerSwitchedText_SaysWhatHappenedToTheFileAndTheRouting(t *testing.T)
 			[]string{"New opencode sessions are no longer routed. 1 running session stays where it is."}, nil},
 		{"refused", serverSwitchedMsg{agent: "opencode", server: "glm",
 			res: edit.WriteResult{Outcome: edit.WriteReloadFailed, ReloadError: "boom", RolledBack: true}},
-			[]string{"refused", "keeps opencode where it was", "put back", "boom"}, []string{"wrote"}},
+			[]string{"refused", "opencode stays where it was", "put back", "boom"}, []string{"wrote"}},
 		{"unreachable", serverSwitchedMsg{agent: "opencode", server: "glm",
 			res: edit.WriteResult{Outcome: edit.WriteStatusUnreachable, ReloadError: "reload status endpoint unreachable", RolledBack: true}},
 			[]string{"not confirmed", "stopped answering", "put back", "check the proxy is running"}, []string{"keeps", "refused"}},
@@ -316,9 +322,16 @@ func TestServerPicker_ClosesWithItsConnection(t *testing.T) {
 	}
 }
 
-// The footer advertises [S] only where it opens, and still fits 80 columns with [?] and [q].
+// The footer advertises [S] only on a row where it opens — an agent's, attached to this machine's
+// Cortex with a router that routes and no switch in flight — and there still fits 80 columns
+// with [?] and [q]. Where S would only explain why not, the hint is not there.
 func TestAgentsFooter_AdvertisesSWhereItOpensAndFits(t *testing.T) {
 	m := serverModel(t, newFakeProxy(t, false))
+	m.agents = append(m.agents,
+		agentRow{label: otherAgents, Counts: usage.Counts{Requests: 1}},
+		agentRow{label: "unknown", Counts: usage.Counts{Requests: 1}})
+	m.rebuildAgentsTable()
+	onRow(t, m, "claude-code/2.1.270")
 	for _, above := range []bool{false, true} {
 		m.agentsAboveSessions = above
 		m.parentCtx = context.Background()
@@ -332,6 +345,13 @@ func TestAgentsFooter_AdvertisesSWhereItOpensAndFits(t *testing.T) {
 			t.Errorf("above sessions %v: the footer is %d columns", above, w)
 		}
 	}
+	for _, row := range []string{"", otherAgents, "unknown"} {
+		onRow(t, m, row)
+		if strings.Contains(m.helpView(), "[S]") {
+			t.Errorf("row %q: the footer offers S, which there only says why not: %q", row, m.helpView())
+		}
+	}
+	onRow(t, m, "claude-code/2.1.270")
 	m.serverSwitch = &serverSwitch{agent: "opencode", server: "glm"}
 	if strings.Contains(m.helpView(), "[S]") {
 		t.Errorf("the footer offers S while a switch is in flight: %q", m.helpView())
@@ -347,5 +367,191 @@ func TestHelpOverlay_ListsS(t *testing.T) {
 	body := helpBodyLines(paneAgents, helpWide)
 	if !strings.Contains(body, "choose the inference server this agent's new sessions use") {
 		t.Errorf("the overlay does not list S:\n%s", body)
+	}
+}
+
+// squash is s with its whitespace and box-drawing characters removed, so a panel's wrapped text
+// can be compared with the string it wraps.
+func squash(s string) string {
+	return strings.Map(func(r rune) rune {
+		if strings.ContainsRune(" \n\t│╭╮╰╯─", r) {
+			return -1
+		}
+		return r
+	}, s)
+}
+
+// The result of a switch is the footer's whole line until the next key, cut from the LEFT where
+// it must be, so at 80 columns the part a reader acts on survives: the proxy's error after a
+// refusal, the URL to check after a timeout, the count after a success.
+func TestServerSwitch_TheResultIsReadableAt80Columns(t *testing.T) {
+	refused := serverModel(t, newFakeProxy(t, true))
+	refused.width = 80
+	switchTo(t, refused, "claude-code/2.1.270", "glm")
+	line := strings.SplitN(refused.footerView(), "\n", 2)[0]
+	for _, want := range []string{"put back", `configure "inference-router": refused`} {
+		if !strings.Contains(line, want) {
+			t.Errorf("after a refusal the footer at 80 lost %q: %q", want, line)
+		}
+	}
+	if w := lipgloss.Width(line); w > 80 {
+		t.Errorf("the footer's first line is %d columns", w)
+	}
+
+	ok := serverModel(t, newFakeProxy(t, false))
+	ok.width = 80
+	ok.sessions = []session.SessionSummary{
+		{ID: "a", Agent: "claude-code", InferenceHost: "ete.example.com"},
+		{ID: "b", Agent: "claude-code", InferenceHost: "ete.example.com"},
+	}
+	switchTo(t, ok, "claude-code/2.1.270", "glm")
+	if line := strings.SplitN(ok.footerView(), "\n", 2)[0]; !strings.Contains(line, "New claude-code sessions → glm. 2 running sessions stay where they are.") {
+		t.Errorf("after a success the footer at 80 is %q", line)
+	}
+
+	timedOut := serverModel(t, newFakeProxy(t, false))
+	timedOut.width = 80
+	timedOut.applyServerSwitched(serverSwitchedMsg{agent: "claude-code", server: "glm", statsURL: timedOut.localStatsURL,
+		res: edit.WriteResult{Outcome: edit.WriteReloadTimedOut}})
+	if line := strings.SplitN(timedOut.footerView(), "\n", 2)[0]; !strings.Contains(line, timedOut.localStatsURL+"/reload/status") {
+		t.Errorf("after a timeout the footer at 80 lost the URL to check: %q", line)
+	}
+
+	// Until the next key, which leaves it to the footer's usual state.
+	ok.handleKey(keyRune('j'))
+	if strings.Contains(ok.footerView(), "running sessions stay") {
+		t.Error("the result outlived the next key")
+	}
+}
+
+// Why S opens nothing is shown whole, wrapped in a panel over the pane, because no footer line
+// holds it: the observe reason is two sentences and a file path. At 80 columns, every word of it.
+func TestServerNotice_ShowsTheWholeReasonAt80Columns(t *testing.T) {
+	reason := servers.Inactive(pipeline.ErrorPolicyObserve, "/Users/someone/a/rather/long/path/to/.cortex/config.yaml")
+	panel := renderServerNotice(reason, 80)
+	if !strings.Contains(squash(panel), squash(reason)) {
+		t.Errorf("the panel does not carry the whole reason:\n%s", panel)
+	}
+	for i, l := range strings.Split(panel, "\n") {
+		if w := lipgloss.Width(l); w > 80 {
+			t.Errorf("line %d is %d columns: %q", i, w, l)
+		}
+	}
+
+	m := serverModel(t, newFakeProxy(t, false))
+	m.width = 80
+	m.pipeline = observing(routerPipeline(routerRaw))
+	m.rebuildAgentsTable()
+	onRow(t, m, "claude-code/2.1.270")
+	m.handleKey(keyRune('S'))
+	if m.serverNotice == "" {
+		t.Fatal("S under on_error: observe showed no reason")
+	}
+	view := m.View()
+	for i, l := range strings.Split(view, "\n") {
+		if w := lipgloss.Width(l); w > 80 {
+			t.Errorf("view line %d is %d columns", i, w)
+		}
+	}
+	if !strings.Contains(view, "[esc] close") {
+		t.Errorf("no panel over the pane:\n%s", view)
+	}
+}
+
+// The panel is modal, as the picker is: esc, q, ctrl+c and ↵ close it, and nothing else acts —
+// S included, so pressing it again does not open and close the panel by turns.
+func TestServerNotice_ClosesOnEscQCtrlCAndEnterOnly(t *testing.T) {
+	for _, key := range []tea.KeyMsg{keyEsc, keyRune('q'), {Type: tea.KeyCtrlC}, keyEnter} {
+		m := serverModel(t, newFakeProxy(t, false))
+		onRow(t, m, "")
+		m.handleKey(keyRune('S'))
+		if m.serverNotice == "" {
+			t.Fatal("S on All agents showed no reason")
+		}
+		if cmd := m.handleKey(keyRune('S')); cmd != nil || m.serverNotice == "" {
+			t.Fatalf("S inside the panel acted: cmd %v, notice %q", cmd, m.serverNotice)
+		}
+		if m.handleKey(keyDown); m.agentsTbl.Cursor() != 0 || m.serverNotice == "" {
+			t.Fatalf("↓ reached the pane under the panel")
+		}
+		if cmd := m.handleKey(key); cmd != nil || m.serverNotice != "" {
+			t.Errorf("%s: cmd %v, notice %q", key, cmd, m.serverNotice)
+		}
+	}
+}
+
+// q and ctrl+c close the picker as esc does: nothing written, nothing polled, agentop not quit.
+func TestServerPicker_QAndCtrlCCloseWritingNothing(t *testing.T) {
+	for _, key := range []tea.KeyMsg{keyRune('q'), {Type: tea.KeyCtrlC}} {
+		f := newFakeProxy(t, false)
+		m := serverModel(t, f)
+		onRow(t, m, "claude-code/2.1.270")
+		m.handleKey(keyRune('S'))
+		m.handleKey(keyDown)
+		if cmd := m.handleKey(key); cmd != nil || m.serverPicker != nil {
+			t.Errorf("%s: cmd %v, picker %+v", key, cmd, m.serverPicker)
+		}
+		if f.config(t) != routerYAML || m.serverSwitch != nil {
+			t.Errorf("%s wrote the config or began a switch", key)
+		}
+	}
+}
+
+// S while a switch is still landing says so, rather than starting a second write behind it.
+func TestServerPicker_RefusesWhileASwitchIsInFlight(t *testing.T) {
+	m := serverModel(t, newFakeProxy(t, false))
+	m.serverSwitch = &serverSwitch{agent: "opencode", server: "glm"}
+	onRow(t, m, "claude-code/2.1.270")
+	if cmd := m.handleKey(keyRune('S')); cmd != nil || m.serverPicker != nil {
+		t.Fatalf("S opened something: cmd %v, picker %+v", cmd, m.serverPicker)
+	}
+	if want := "a server switch for opencode is still in progress"; m.serverNotice != want {
+		t.Errorf("notice %q, want %q", m.serverNotice, want)
+	}
+}
+
+// A message can move the pane under the picker — a clear landing after its dialog was hidden
+// sets Sessions — and the next visit to the AGENTS pane must not find it there again.
+func TestServerPicker_DoesNotComeBackAfterThePaneMovesUnderIt(t *testing.T) {
+	m := serverModel(t, newFakeProxy(t, false))
+	onRow(t, m, "claude-code/2.1.270")
+	m.handleKey(keyRune('S'))
+	if m.serverPicker == nil {
+		t.Fatalf("no picker; notice %q", m.serverNotice)
+	}
+	m.Update(clearDoneMsg{res: apiclient.ClearResult{}})
+	if m.pane == paneAgents {
+		t.Fatal("the clear did not move the pane")
+	}
+	m.enterAgents(paneSessions)
+	if m.serverPicker != nil || strings.Contains(m.View(), "sessions use") {
+		t.Errorf("the picker came back: %+v", m.serverPicker)
+	}
+}
+
+// What the result says is settled when ↵ is pressed, against the Cortex it writes. Leaving for
+// another connection while the reload is awaited must neither count that connection's sessions
+// nor refetch its pipeline as if it were this machine's.
+func TestServerSwitch_ALaterConnectionNeitherCountsNorRefetches(t *testing.T) {
+	m := serverModel(t, newFakeProxy(t, false))
+	m.sessions = []session.SessionSummary{
+		{ID: "a", Agent: "claude-code", InferenceHost: "ete.example.com"},
+		{ID: "b", Agent: "claude-code", InferenceHost: "ete.example.com"},
+	}
+	onRow(t, m, "claude-code/2.1.270")
+	m.handleKey(keyRune('S'))
+	m.handleKey(keyDown)
+	cmd := m.handleKey(keyEnter)
+	if cmd == nil {
+		t.Fatalf("↵ started no write; notice %q", m.serverNotice)
+	}
+	// Another connection by the time the reload lands: a pod, with sessions of its own.
+	m.client = apiclient.New("http://127.0.0.1:1")
+	m.sessions = []session.SessionSummary{{ID: "p", Agent: "claude-code", InferenceHost: "api.example.com"}}
+	if _, refetch := m.Update(cmd()); refetch != nil {
+		t.Error("the result refetched another connection's pipeline")
+	}
+	if want := "New claude-code sessions → glm. 2 running sessions stay where they are."; m.flash != want {
+		t.Errorf("flash %q, want %q", m.flash, want)
 	}
 }

@@ -71,6 +71,9 @@ func (m *model) handleKey(msg tea.KeyMsg) tea.Cmd {
 	if m.serverPicker != nil && m.pane == paneAgents {
 		return m.serverPickerKey(msg)
 	}
+	if m.serverNotice != "" && m.pane == paneAgents {
+		return m.serverNoticeKey(msg)
+	}
 
 	// `?` opens the overlay from any pane, with two exceptions. While a
 	// pipeline edit is in flight that overlay is already modal and owns
@@ -1309,8 +1312,8 @@ func (m *model) helpView() string {
 				escHint = "  [esc] pods"
 			}
 		}
-		// [S] only where it can open, so the footer never advertises a key that only flashes why
-		// not. After esc, so fitHintLine — which drops from the front — gives up nav first.
+		// [S] only on a row where it opens, so the footer never advertises a key that would only
+		// say why not. After esc, so fitHintLine — which drops from the front — gives up nav first.
 		serverHint := ""
 		if m.serverKeyOffered() {
 			serverHint = "  [S] server"

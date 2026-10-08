@@ -390,6 +390,7 @@ func agentCostCellIn(c usage.Counts, units []string, budget int) string {
 // `from` IS PASSED IN, NOT READ OFF m.pane: this runs when the reply lands, and by then the reader
 // may have moved. agentRowsLoadedMsg.from carries the press-time pane across the round trip.
 func (m *model) enterAgents(from paneID) {
+	m.closeServerPanels()
 	m.previousPane = from
 	m.agentsAboveSessions = false
 	m.pane = paneAgents
@@ -406,6 +407,7 @@ func (m *model) enterAgentsAtStartup() bool {
 	if !agentsPaneApplies(m.agentChoices()) {
 		return false
 	}
+	m.closeServerPanels()
 	m.previousPane = paneNone
 	m.agentsAboveSessions = true
 	m.pane = paneAgents
@@ -472,6 +474,7 @@ func (m *model) leaveAgentsPane() tea.Cmd {
 // returnToAgentsPane is esc from a sessions list reached by picking an agent: back to the picker,
 // as the level above Sessions, with its rows refreshed.
 func (m *model) returnToAgentsPane() tea.Cmd {
+	m.closeServerPanels()
 	m.previousPane = paneNone
 	m.agentsAboveSessions = true
 	m.pane = paneAgents

@@ -36,9 +36,15 @@ type serverSwitch struct {
 }
 
 // serverSwitchedMsg is the result of the write S started. statsURL is where it polled the
-// proxy's reload, for a flash that has to point there.
+// proxy's reload, for a flash that has to point there and for the refetch to check it is still
+// what is on screen; staying is sessionsStaying's count as ↵ found it.
+//
+// SETTLED AT ↵, NOT WHEN IT LANDS: the write can take up to edit.LocalPollDeadline, and a reader
+// who leaves for another connection meanwhile would otherwise have that connection's sessions
+// counted as this machine's.
 type serverSwitchedMsg struct {
 	agent, server, statsURL string
+	staying                 int
 	res                     edit.WriteResult
 	err                     error
 }
@@ -74,25 +80,25 @@ func (m *model) serverKeyRefusal(label string) string {
 	return ""
 }
 
-// serverKeyOffered reports whether the footer advertises S: attached to this machine's Cortex,
-// with a router in its pipeline that routes, and no switch in flight — the status line shows
-// that one, and S would only say it is still going. Per pane, not per row — the row reasons are
-// S's to explain.
+// serverKeyOffered reports whether the footer advertises S: on the highlighted row, S would open.
+// The same serverKeyRefusal, so the hint and the key cannot disagree — no [S] on All agents,
+// Other or a row the router will not route, away from this machine's Cortex, without a router
+// that routes, or while a switch is in flight, where S would only say why not. Per row, as the
+// footer's [↵] is.
 func (m *model) serverKeyOffered() bool {
-	_, _, local := m.localCortexTarget()
-	_, on := m.activeRouter()
-	return local && on && m.serverSwitch == nil
+	label, ok := m.selectedAgentScope()
+	return ok && m.serverKeyRefusal(label) == ""
 }
 
 // openServerPicker is S on the AGENTS pane: the picker over the pane, its cursor on the value
-// the agent has now — or a flash saying why there is none to open.
+// the agent has now — or, in its place, the panel saying why there is none (renderServerNotice).
 func (m *model) openServerPicker() tea.Cmd {
 	label, ok := m.selectedAgentScope()
 	if !ok {
 		return nil
 	}
 	if why := m.serverKeyRefusal(label); why != "" {
-		m.setFlash(why)
+		m.serverNotice = why
 		return nil
 	}
 	router, _ := m.activeRouter()
@@ -146,18 +152,19 @@ func (m *model) applyServerChoice() tea.Cmd {
 	choice := p.entries[p.cursor]
 	// ASKED AGAIN, NOT CARRIED OVER FROM THE OPENING: the pane's rows refetch the pipeline while
 	// the picker is up, so the router may have stopped routing since — and then neither a write
-	// nor "already go to" below would be true. First, so no flash claims a route.
+	// nor "already go to" below would be true. First, so nothing shown claims a route.
 	if why := m.serverKeyRefusal(p.agent); why != "" {
-		m.setFlash(why)
+		m.serverNotice = why
 		return nil
 	}
 	if p.cursor == p.current {
-		m.setFlash(alreadyRouted(p.agent, choice.name))
+		m.setStickyFlash(alreadyRouted(p.agent, choice.name))
 		return nil
 	}
 	path, statsURL, _ := m.localCortexTarget()
 	m.serverSwitch = &serverSwitch{agent: p.agent, server: choice.name}
 	agent, server := p.agent, choice.name
+	staying := m.sessionsStaying(agent, server)
 	return func() tea.Msg {
 		res, err := edit.WritePluginConfig(context.Background(), edit.ConfigWrite{
 			Path:     path,
@@ -165,7 +172,7 @@ func (m *model) applyServerChoice() tea.Cmd {
 			Changes:  []edit.ConfigChange{servers.AgentChange(agent, server)},
 			Verify:   servers.Verify,
 		})
-		return serverSwitchedMsg{agent: agent, server: server, statsURL: statsURL, res: res, err: err}
+		return serverSwitchedMsg{agent: agent, server: server, statsURL: statsURL, staying: staying, res: res, err: err}
 	}
 }
 
@@ -173,10 +180,19 @@ func (m *model) applyServerChoice() tea.Cmd {
 // SERVER columns show what the proxy now runs. After every outcome, a refusal included: what the
 // proxy runs is the one thing a flash about an uncertain write cannot settle, and the column can.
 // A fetch of its own even when one is in flight: that one may predate the reload.
+//
+// STICKY, AS A YANK IS: the footer's whole line until the next key, cut from the left where it
+// must be. As a timed flash it sat after thirty columns of connection state and was cut from the
+// right, so at 80 columns a refusal lost the proxy's error, a timeout the URL to check and a
+// success its count — each the part the reader acts on, and each at the end of its line.
+//
+// THE REFETCH ONLY WHILE THIS MACHINE'S CORTEX IS STILL ON SCREEN, compared by the stats URL the
+// write polled: a reader who has left for a pod meanwhile would have that pod's pipeline fetched
+// and painted as the reload's result.
 func (m *model) applyServerSwitched(msg serverSwitchedMsg) tea.Cmd {
 	m.serverSwitch = nil
-	m.setFlash(serverSwitchedText(msg, m.sessionsStaying(msg.agent, msg.server)))
-	if m.client == nil {
+	m.setStickyFlash(serverSwitchedText(msg, msg.staying))
+	if _, statsURL, ok := m.localCortexTarget(); !ok || statsURL != msg.statsURL {
 		return nil
 	}
 	m.pipelineFetching = true
@@ -192,6 +208,10 @@ func (m *model) applyServerSwitched(msg serverSwitchedMsg) tea.Cmd {
 // after a timeout, and — the one error past the write — left as found when someone changed it
 // meanwhile. A flash that said "written" after a put-back would send the reader looking for an
 // edit that is not there.
+//
+// WHAT THE READER ACTS ON GOES LAST, because the footer cuts a line too long for it from the
+// left (applyServerSwitched): the proxy's error, the URL to check, the count. The lead-ins are
+// kept short so that, at 80 columns, what survives of them still says what happened.
 func serverSwitchedText(msg serverSwitchedMsg, staying int) string {
 	written := msg.res.Outcome == edit.WriteReloadFailed || msg.res.Outcome == edit.WriteStatusUnreachable
 	switch {
@@ -216,13 +236,14 @@ func serverSwitchedText(msg serverSwitchedMsg, staying int) string {
 		}
 		return "The config file already routes new " + msg.agent + " sessions to " + msg.server + "; nothing was written."
 	case edit.WriteReloadFailed:
-		return "the proxy refused the change and keeps " + msg.agent + " where it was, so the config file was put back: " +
-			msg.res.ReloadError
+		return "refused: " + msg.agent + " stays where it was, and the config file was put back: " + msg.res.ReloadError
 	case edit.WriteStatusUnreachable:
 		// Not a refusal: nothing said no, and whether the proxy took the change before it went
-		// away is unknown. So nothing here says where msg.agent's sessions go.
+		// away is unknown. So nothing here says where msg.agent's sessions go. Without ReloadError,
+		// which here is only the poller's "unreachable" and its hint, both said already: as the
+		// tail it would be all that survived at 80 columns, and the put-back would not.
 		return "the change to " + msg.agent + " was not confirmed: the proxy stopped answering before it reported the reload, " +
-			"so the config file was put back; check the proxy is running and try again: " + msg.res.ReloadError
+			"so the config file was put back; check the proxy is running and try again"
 	case edit.WriteReloadTimedOut:
 		return fmt.Sprintf("wrote the change to %s, but the proxy reported no reload within %s; check %s/reload/status",
 			msg.agent, edit.LocalPollDeadline, msg.statsURL)
@@ -235,7 +256,15 @@ func serverSwitchedText(msg serverSwitchedMsg, staying int) string {
 
 // sessionsStaying counts agent's running sessions that a switch to server leaves where they are:
 // the ones whose inference traffic last went somewhere other than server's host. For the agent's
-// own choice (server ""), the ones on a configured server, which they keep.
+// own choice (server ""), every one whose inference last went to any configured server.
+//
+// RESET'S COUNT IS AN UPPER BOUND, and says only what is true of each session it counts. The
+// router acts only on requests a client already addresses to a server's host, so an agent's own
+// choice is itself one of the servers — the one its client is pointed at — and its sessions there
+// stay where new ones go too. Nothing this side names that server: it is the client's setting,
+// and the summary carries where a session's requests went, not where they were addressed. So
+// those sessions are counted with the rest. Each counted session does stay where it is; what the
+// count cannot promise is that every one of them is somewhere new sessions will not be.
 //
 // HOW MANY WILL NOT MOVE TO THE NEW CHOICE, NOT HOW MANY MOVE. The router keeps every running
 // session where it started — by its pin, or, for one quiet since routing changed, by the server
@@ -288,6 +317,26 @@ func alreadyRouted(agent, server string) string {
 	return "New " + agent + " sessions already go to " + server + "."
 }
 
+// serverNoticeKey owns the keyboard while S's reason is up, as serverPickerKey does the picker's:
+// esc, q, ctrl+c and ↵ close it, and nothing else acts — S included, so pressing it again does
+// not open and close the panel by turns.
+func (m *model) serverNoticeKey(msg tea.KeyMsg) tea.Cmd {
+	switch msg.String() {
+	case "esc", "q", "ctrl+c", "enter":
+		m.serverNotice = ""
+	}
+	return nil
+}
+
+// closeServerPanels drops S's picker and its reason. Called wherever the AGENTS pane is entered
+// and where the connection is left: either is drawn only over that pane, but a message can move
+// the pane out from under one (a clear landing sets Sessions), and the next visit must not find a
+// picker for a value in force that may since have changed.
+func (m *model) closeServerPanels() {
+	m.serverPicker = nil
+	m.serverNotice = ""
+}
+
 // text is the footer's state while the switch is in flight.
 func (s *serverSwitch) text() string {
 	if s.server == "" {
@@ -302,6 +351,21 @@ const serverPickerHostMax = 32
 
 // ownChoiceEntry is the picker's first entry.
 const ownChoiceEntry = "its own choice (not routed)"
+
+// renderServerNotice draws why S opens nothing, wrapped, as X's dialog wraps its text. A panel and
+// not a flash because no footer line holds the longer reasons whole — under on_error: observe it
+// is the two sentences `agentop server` prints and the config file's path — and a reason cut
+// short is the part of it that says what to do. Returns the panel only; see overlayCenter.
+func renderServerNotice(text string, width int) string {
+	const wrap = 60
+	w := min(wrap, max(width-6, 20))
+	body := lipgloss.NewStyle().Width(w).Render(text) + "\n\n" + styleHint.Render("[esc] close")
+	box := styleBorder.Padding(0, 2)
+	if width > styleBorder.GetHorizontalBorderSize() {
+		box = box.MaxWidth(width)
+	}
+	return box.Render(body)
+}
 
 // renderServerPicker draws S's picker. Returns the panel only; see overlayCenter.
 func renderServerPicker(p *serverPicker, width int) string {

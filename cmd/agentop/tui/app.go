@@ -416,6 +416,9 @@ type model struct {
 	// write it started, until serverSwitchedMsg lands. See server_picker.go.
 	serverPicker *serverPicker
 	serverSwitch *serverSwitch
+	// serverNotice is why S opened nothing, drawn whole over the AGENTS pane and modal while
+	// non-empty. See renderServerNotice.
+	serverNotice string
 	// events was labelled a ring buffer and has never been one. Nothing trims an entry in
 	// place; every write is one of six, and the CTX(1M) gauge folds forward off this map,
 	// so each one owes contextRun an action. The full inventory, because the gauge reads an
@@ -1072,10 +1075,10 @@ func (m *model) backToPodsPane() {
 	// puts m.pane back to paneEvents and the popup nobody reopened is there
 	// again, owning the keyboard until the user finds esc.
 	m.colPicker = false
-	// S's picker too, for the same reason: it names an agent and a value in force read off the
-	// connection being left. A switch already in flight is not cancelled — it writes this
-	// machine's config whichever pane is up, and its flash is still true when it lands.
-	m.serverPicker = nil
+	// S's picker and its reason too, for the same reason: they name an agent and a value in force
+	// read off the connection being left. A switch already in flight is not cancelled — it writes
+	// this machine's config whichever pane is up, and its flash is still true when it lands.
+	m.closeServerPanels()
 	m.detailEvent = nil
 	m.detailPlugin = nil
 	m.selectedSess = ""
@@ -2252,6 +2255,9 @@ func (m *model) View() string {
 	// panes under a modal even though no key can.
 	if m.serverPicker != nil && m.pane == paneAgents {
 		return overlayCenter(base, renderServerPicker(m.serverPicker, m.width), m.width, m.height)
+	}
+	if m.serverNotice != "" && m.pane == paneAgents {
+		return overlayCenter(base, renderServerNotice(m.serverNotice, m.width), m.width, m.height)
 	}
 	// Same paneEvents scoping as the key block: an async pane change must not leave
 	// the popup drawn over a pane it does not belong to.

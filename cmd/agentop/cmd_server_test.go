@@ -43,13 +43,24 @@ func closedAddr(t *testing.T) string {
 // ~/.claude or ~/.cortex, and a config in it whose stats address is statsAddr and
 // whose outbound chain ends with router (none when ""). It returns the config's
 // path, which sits directly in that HOME: filepath.Dir of it is the scratch home.
+//
+// Its session API is an address nothing listens on, so no test reaches whatever
+// answers on the default :9094 — a port-forward to a cluster, as often as not.
 func serverEnv(t *testing.T, statsAddr, router string) string {
+	t.Helper()
+	return serverEnvWithSessions(t, statsAddr, closedAddr(t), router)
+}
+
+// serverEnvWithSessions is serverEnv with the config's session API at sessionsAddr.
+func serverEnvWithSessions(t *testing.T, statsAddr, sessionsAddr, router string) string {
 	t.Helper()
 	home := t.TempDir()
 	t.Setenv("HOME", home)
 	src := fmt.Sprintf(`mode: proxy-sidecar
 stats:
   address: %s
+listener:
+  session_api_addr: %s
 pipeline:
   outbound:
     plugins:
@@ -57,7 +68,7 @@ pipeline:
       - name: tool-prune
         config:
           remove: []
-%s`, statsAddr, router)
+%s`, statsAddr, sessionsAddr, router)
 	path := filepath.Join(home, "cortex.yaml")
 	if err := os.WriteFile(path, []byte(src), 0o600); err != nil {
 		t.Fatal(err)

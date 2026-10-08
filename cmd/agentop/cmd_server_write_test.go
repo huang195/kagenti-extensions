@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -14,6 +15,9 @@ import (
 	"time"
 
 	"github.com/rossoctl/cortex/cmd/agentop/edit"
+	"github.com/rossoctl/cortex/core/pipeline"
+	"github.com/rossoctl/cortex/core/session"
+	"github.com/rossoctl/cortex/core/sessionapi"
 )
 
 // fakeStats is a stats server whose /reload/status reports a reload at every poll,
@@ -536,5 +540,85 @@ func TestServerWrites_ForTheNextStartPromiseNoRunningSessionStays(t *testing.T) 
 				t.Errorf("does not say what the next start does:\n%s", out)
 			}
 		})
+	}
+}
+
+// sessionsAPI is a real session API over a store holding one session per host in hosts, each
+// with one inference request there, and one session with only a tunnel row. It returns the
+// address a config names for it.
+func sessionsAPI(t *testing.T, hosts ...string) string {
+	t.Helper()
+	store := session.New(0, 0, 0)
+	for i, h := range hosts {
+		store.Append(fmt.Sprintf("s%d", i), pipeline.SessionEvent{At: time.Now(), Phase: pipeline.SessionRequest,
+			Host: h, Inference: &pipeline.InferenceExtension{Model: "claude-opus-5-5"}})
+	}
+	store.Append("tunnel-only", pipeline.SessionEvent{At: time.Now(), Phase: pipeline.SessionRequest, Tunnel: true,
+		HTTPMethod: "CONNECT", Host: "ete.example.com:443"})
+	ts := httptest.NewServer(sessionapi.New(":0", store).Server().Handler)
+	t.Cleanup(func() {
+		ts.Close()
+		store.Close()
+	})
+	return strings.TrimPrefix(ts.URL, "http://")
+}
+
+// Removing a server that running sessions still use goes ahead, and says how many will now be
+// told to start a new session. Counted from where each session's inference went, port and case
+// ignored, so ete's two count and glm's one and the tunnel-only session do not.
+func TestServerRemove_WarnsHowManyRunningSessionsUseIt(t *testing.T) {
+	sessions := sessionsAPI(t, "ete.example.com", "ETE.example.com:443", "glm.example.com:8443")
+	path := serverEnvWithSessions(t, newFakeStats(t, 0).addr(), sessions, routerBlock)
+	code, out, errOut := runServerCmd(t, "", "remove", "ete", "--config", path)
+	if code != 0 || !strings.Contains(out, "Removed ete.") {
+		t.Fatalf("exit %d, stdout:\n%s%s", code, out, errOut)
+	}
+	if want := "warning: 2 running sessions are still on ete. From its next request each gets an error asking for a new session, until ete is added back."; !strings.Contains(errOut, want) {
+		t.Errorf("want %q in stderr:\n%s", want, errOut)
+	}
+}
+
+func TestServerRemove_SaysNothingWhenNoRunningSessionUsesIt(t *testing.T) {
+	sessions := sessionsAPI(t, "glm.example.com:8443")
+	path := serverEnvWithSessions(t, newFakeStats(t, 0).addr(), sessions, routerBlock)
+	code, _, errOut := runServerCmd(t, "", "remove", "ete", "--config", path)
+	if code != 0 || strings.Contains(errOut, "warning") {
+		t.Errorf("exit %d, stderr:\n%s", code, errOut)
+	}
+}
+
+// The count comes from the proxy the config names, and only when it answered: with no proxy
+// running the remove still goes ahead, quietly.
+func TestServerRemove_WithNoProxyRunningCountsNothing(t *testing.T) {
+	sessions := sessionsAPI(t, "ete.example.com")
+	path := serverEnvWithSessions(t, closedAddr(t), sessions, routerBlock)
+	code, out, errOut := runServerCmd(t, "", "remove", "ete", "--config", path)
+	if code != 0 || strings.Contains(errOut, "warning") || !strings.Contains(out, "applies when the proxy next starts") {
+		t.Errorf("exit %d, stdout:\n%s\nstderr:\n%s", code, out, errOut)
+	}
+}
+
+// add points at both ways to route the new server: the agents pane's S and the command.
+func TestServerAdd_NamesBothWaysToRouteIt(t *testing.T) {
+	path := serverEnv(t, newFakeStats(t, 0).addr(), "")
+	_, out, _ := runServerCmd(t, "sk-ete", "add", "ete", "https://ete.example.com", "--key-stdin", "--config", path)
+	if want := "Added ete. No agent uses it yet: press S on agentop's agents pane, or run\n  agentop server use ete --agent claude-code"; !strings.Contains(out, want) {
+		t.Errorf("want %q in stdout:\n%s", want, out)
+	}
+}
+
+// One session reads in the singular, and the warning names the server and nothing of its URL
+// or key: a number and a name.
+func TestServerRemove_WarnsOfOneSessionInTheSingularAndShowsNoCredential(t *testing.T) {
+	sessions := sessionsAPI(t, "ete.example.com")
+	path := serverEnvWithSessions(t, newFakeStats(t, 0).addr(), sessions, routerBlock)
+	code, out, errOut := runServerCmd(t, "", "remove", "ete", "--config", path)
+	if code != 0 || !strings.Contains(errOut, "warning: 1 running session is still on ete. From its next request") {
+		t.Fatalf("exit %d, stdout:\n%s\nstderr:\n%s", code, out, errOut)
+	}
+	for _, leak := range []string{"sk-ete", "ete.example.com", "https://"} {
+		if strings.Contains(errOut, leak) {
+			t.Errorf("stderr shows %q:\n%s", leak, errOut)
+		}
 	}
 }

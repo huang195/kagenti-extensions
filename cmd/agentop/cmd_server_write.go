@@ -10,9 +10,11 @@ import (
 	"os"
 	"slices"
 	"strings"
+	"time"
 
 	"github.com/charmbracelet/x/term"
 
+	"github.com/rossoctl/cortex/cmd/agentop/apiclient"
 	"github.com/rossoctl/cortex/cmd/agentop/edit"
 	"github.com/rossoctl/cortex/cmd/agentop/servers"
 	"github.com/rossoctl/cortex/core/plugins/inferencerouter/routerconfig"
@@ -156,7 +158,7 @@ func serverAdd(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 		done = "Replaced " + name + "."
 	}
 	if len(agentsOn(c, name)) == 0 {
-		done += " No agent uses it yet. Route one with\n  agentop server use " + name + " --agent claude-code"
+		done += " No agent uses it yet: press S on agentop's agents pane, or run\n  agentop server use " + name + " --agent claude-code"
 	}
 	return runServerWrite(stdout, stderr, path, statsURL, ch, writeReport{
 		done:      done,
@@ -229,11 +231,56 @@ func serverRemove(args []string, stdout, stderr io.Writer) int {
 		}
 		return 1
 	}
+	// Only against a proxy that answered: its session API is the one with the pins.
+	sessionsURL := ""
+	if statsURL != "" {
+		sessionsURL = dialURL(cfg.Listener.SessionAPIAddr)
+	}
+	if n := runningOn(sessionsURL, c, name); n > 0 {
+		fmt.Fprintf(stderr, "agentop server remove: warning: %s on %s. From its next request each gets an error "+
+			"asking for a new session, until %s is added back.\n", runningSessions(n), name, name)
+	}
 	ch := edit.ConfigChange{Chain: "outbound", Plugin: routerName, Path: []string{"servers", name}}
 	return runServerWrite(stdout, stderr, path, statsURL, ch, writeReport{
 		done: "Removed " + name + ".",
 		live: fmt.Sprintf("A session that started on it now gets an error asking for a new session; adding %s back restores it.", name),
 	})
+}
+
+// runningOn counts the sessions the proxy at sessionsURL holds in memory whose inference
+// traffic last went to server name — the ones a remove leaves asking for a new session.
+//
+// IN MEMORY, NOT IN THE ARCHIVE: a resident session has had traffic since this proxy started,
+// so the router has pinned it; a session only the archive holds has no pin left to break.
+// SessionSummary.Active would not do — it marks the one most recently updated session.
+//
+// 0 when the proxy does not answer, which is the quiet side for a warning: the remove itself
+// is what matters, and it goes ahead either way.
+func runningOn(sessionsURL string, c routerconfig.Config, name string) int {
+	if sessionsURL == "" {
+		return 0
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	list, err := apiclient.New(sessionsURL).ListSessions(ctx)
+	if err != nil {
+		return 0
+	}
+	n := 0
+	for _, s := range list {
+		if on, ok := servers.ForHost(c, s.InferenceHost); ok && on == name {
+			n++
+		}
+	}
+	return n
+}
+
+// runningSessions is "1 running session is still" or "n running sessions are still".
+func runningSessions(n int) string {
+	if n == 1 {
+		return "1 running session is still"
+	}
+	return fmt.Sprintf("%d running sessions are still", n)
 }
 
 func serverUse(args []string, stdout, stderr io.Writer) int {

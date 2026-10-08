@@ -66,20 +66,23 @@ type fixture struct {
 	// envoyAbortsResponseBody makes the ext_proc driver send ResponseHeaders with
 	// end_of_stream FALSE and then no ResponseBody at all, ending the stream.
 	//
-	// That is not a malformed stream — it is what the SHIPPED Kubernetes config
-	// produces for a response over Envoy's buffer limit. ext_proc asks for
-	// ResponseBodyMode BUFFERED (requestBodyResponse's response-side twin), and
-	// neither the chart's envoy-config nor the operator's envoy.yaml.tmpl sets
-	// per_connection_buffer_limit_bytes or per_request_buffer_limit_bytes, so
-	// Envoy's 1 MiB default applies; its docs for BUFFERED say the downstream
-	// system receives an error when the body exceeds it. Envoy sends the headers
-	// it had already seen, fails the stream, and answers the client 500 itself.
+	// That is not a malformed stream — it is what the SHIPPED envoy-sidecar
+	// config produces for a response over Envoy's buffer limit. ext_proc asks
+	// for ResponseBodyMode BUFFERED (set inline in handleResponseHeaders, the
+	// response-side counterpart to the request mode requestBodyResponse
+	// returns), and neither the chart's envoy-config nor the operator's
+	// envoy.yaml.tmpl sets per_connection_buffer_limit_bytes or
+	// per_request_buffer_limit_bytes, so Envoy's 1 MiB default applies; its docs
+	// for BUFFERED say the downstream system receives an error when the body
+	// exceeds it. Envoy sends the headers it had already seen, fails the stream,
+	// and answers the client 500 itself.
 	//
 	// ext_proc ONLY, like splitResponseBodyAt, and for a stronger reason than
-	// that one: there is no Envoy on the laptop path at all, so this models a
-	// filter the other legs genuinely do not have. A fixture setting it is
-	// therefore comparing two SHIPPED DEPLOYMENTS of the same request, which is
-	// the divergence, not an asymmetry in the harness.
+	// that one: proxy-sidecar mode — the laptop install and the Kubernetes
+	// default alike — has no Envoy at all, so this models a filter the other
+	// legs genuinely do not have. A fixture setting it is therefore comparing
+	// two REAL DEPLOYMENT SHAPES of the same request, which is the divergence,
+	// not an asymmetry in the harness.
 	//
 	// The 500 itself is not representable here and must not be faked: Envoy
 	// generates it, the listener never sees it, and extproc's wire status stays 0
@@ -113,6 +116,11 @@ type fixture struct {
 	// still compares PipelineRan pairwise, so a fixture that set this and then
 	// asked for parity would fail on the very divergence it declared — which is
 	// why divergence_test.go exists and this does not loosen anything here.
+	//
+	// A DIVERGENCE FIXTURE MUST NOT SET THIS. assertDivergence derives the map
+	// from its rows' pipelineRan and rejects a fixture that also filled it in by
+	// hand, so that the refusal is declared once. Say pipelineRan: false on the
+	// row instead.
 	refusedPreRunBy map[string]bool
 
 	// expectedWireStatus, when non-zero, is asserted against every
@@ -730,7 +738,15 @@ func finalizeObservation(t *testing.T, f fixture, listener string, obs *observat
 	refused := f.refusedPreRun(listener)
 	if obs == nil {
 		if !refused {
-			t.Errorf("no session event recorded for fixture %q on %s; set pipelineRefusedPreRun (or refusedPreRunBy[%q]) if expected", f.name, listener, listener)
+			// Two fixture shapes reach here and the remedy is NOT the same one.
+			// A parity fixture declares a pre-run refusal with
+			// pipelineRefusedPreRun or refusedPreRunBy; a divergence fixture
+			// must set neither — assertDivergence derives refusedPreRunBy from
+			// the rows' pipelineRan and rejects a hand-written one outright — so
+			// its remedy is pipelineRan: false on this listener's row. Naming
+			// only the fixture fields sent half the callers to a knob
+			// assertDivergence ignores or refuses.
+			t.Errorf("no session event recorded for fixture %q on %s; if that is expected: an assertParity fixture sets pipelineRefusedPreRun or refusedPreRunBy[%q], an assertDivergence fixture sets pipelineRan: false on the %q row", f.name, listener, listener, listener)
 			return nil
 		}
 		return &observation{PipelineRan: false, WireStatus: wireStatus}
@@ -827,8 +843,9 @@ func runReverseProxy(t *testing.T, f fixture, wantPhase pipeline.SessionPhase) *
 // --- forwardproxy driver -------------------------------------------------
 
 // runForwardProxy drives the fixture through the forward-proxy listener
-// via a proxy-configured http.Client. Outbound-only; this is the
-// listener agents egress through in the laptop (proxy-sidecar) shape.
+// via a proxy-configured http.Client. Outbound-only; this is the listener
+// agents egress through in proxy-sidecar mode — the laptop install and the
+// Kubernetes default both.
 func runForwardProxy(t *testing.T, f fixture, wantPhase pipeline.SessionPhase) *observation {
 	t.Helper()
 	if f.direction != pipeline.Outbound {

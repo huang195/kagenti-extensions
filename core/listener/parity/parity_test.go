@@ -345,8 +345,9 @@ func TestParity_RequestBodyMutation(t *testing.T) {
 // TestParity_OutboundRequestBodyMutation is the egress mirror, and the shape
 // that actually runs in production: tool-prune and context-guru both sit on
 // the outbound pipeline, rewriting an agent's request on its way to the model
-// gateway. extproc vs forwardproxy here is Kubernetes envoy-sidecar vs the
-// laptop proxy-sidecar — the two shapes a prune has to behave the same in.
+// gateway. extproc vs forwardproxy here is envoy-sidecar vs proxy-sidecar —
+// the latter being the laptop install and the Kubernetes default both, so these
+// are the two shapes a prune has to behave the same in.
 func TestParity_OutboundRequestBodyMutation(t *testing.T) {
 	reqBody := []byte(`{"model":"claude","tools":["alpha","beta","gamma"]}`)
 	mutated := []byte(`{"model":"claude","tools":["alpha"]}`)

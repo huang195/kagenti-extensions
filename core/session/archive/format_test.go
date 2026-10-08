@@ -108,6 +108,26 @@ func TestSplit_ThresholdIsInternMinLen(t *testing.T) {
 	}
 }
 
+// Tool results dedup on disk as they do in memory — every request re-sends all of them —
+// under the same threshold, and come back intact.
+func TestSplit_ToolResultIsAReference(t *testing.T) {
+	e := pipeline.SessionEvent{Inference: &pipeline.InferenceExtension{ToolResults: []pipeline.InferenceToolResult{
+		{ToolUseID: "toolu_1", Content: strings.Repeat("r", session.InternMinLen)},
+		{ToolUseID: "toolu_2", Content: "short", IsError: true},
+	}}}
+	stripped, r, _ := split(e, map[string]struct{}{})
+	if r == nil || len(r.TR) != 2 || r.TR[0] == nil || stripped.Inference.ToolResults[0].Content != "" {
+		t.Fatalf("a %d-byte tool result must be a reference: refs %+v", session.InternMinLen, r)
+	}
+	if r.TR[1] != nil || stripped.Inference.ToolResults[1].Content != "short" {
+		t.Fatalf("a short tool result must stay inline: refs %+v", r)
+	}
+	got := throughLines(t, []pipeline.SessionEvent{e})
+	if w, g := onceThroughJSON(t, e), mustJSON(t, got[0]); w != g {
+		t.Fatalf("tool results differ after the round trip:\nwant %s\ngot  %s", w, g)
+	}
+}
+
 // split runs on events the store also holds and serves; it must clone what it blanks.
 func TestSplit_NeverMutatesItsInput(t *testing.T) {
 	for _, e := range append(synthSession(2, 3, 2048), edgeEvents()...) {

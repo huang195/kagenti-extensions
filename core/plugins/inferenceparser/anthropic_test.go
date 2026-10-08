@@ -477,6 +477,89 @@ func TestInferenceParser_AnthropicMessages_RequestContentBytes(t *testing.T) {
 	}
 }
 
+// TestInferenceParser_AnthropicMessages_ToolResults pins what a Claude Code turn looks
+// like after tools ran: tool_result blocks — string content and text-block content,
+// errors flagged — sitting in user messages, sometimes beside ordinary text. Each block
+// becomes one ToolResults entry in wire order; message Content stays text-only, which is
+// what keeps tool output away from the plugins that read Messages.
+func TestInferenceParser_AnthropicMessages_ToolResults(t *testing.T) {
+	p := NewInferenceParser()
+	pctx := &pipeline.Context{
+		Path: "/v1/messages",
+		Body: []byte(`{
+			"model": "claude-opus-5-5",
+			"max_tokens": 64,
+			"messages": [
+				{"role": "user", "content": "check the hosts file and the shells"},
+				{"role": "assistant", "content": [
+					{"type": "tool_use", "id": "toolu_1", "name": "Read", "input": {"file_path": "/etc/hosts"}},
+					{"type": "tool_use", "id": "toolu_2", "name": "Bash", "input": {"command": "cat /etc/shellz"}}
+				]},
+				{"role": "user", "content": [
+					{"type": "tool_result", "tool_use_id": "toolu_1", "content": "127.0.0.1 localhost"},
+					{"type": "tool_result", "tool_use_id": "toolu_2", "is_error": true, "content": [
+						{"type": "text", "text": "Exit code 1"},
+						{"type": "text", "text": "cat: /etc/shellz: No such file or directory"}
+					]},
+					{"type": "text", "text": "<system-reminder>keep going</system-reminder>"}
+				]}
+			]
+		}`),
+	}
+	p.OnRequest(context.Background(), pctx)
+
+	ext := pctx.Extensions.Inference
+	if ext == nil {
+		t.Fatal("Extensions.Inference is nil")
+	}
+	want := []pipeline.InferenceToolResult{
+		{ToolUseID: "toolu_1", Content: "127.0.0.1 localhost"},
+		{ToolUseID: "toolu_2", Content: "Exit code 1\ncat: /etc/shellz: No such file or directory", IsError: true},
+	}
+	if len(ext.ToolResults) != len(want) {
+		t.Fatalf("ToolResults = %+v, want %+v", ext.ToolResults, want)
+	}
+	for i := range want {
+		if ext.ToolResults[i] != want[i] {
+			t.Errorf("ToolResults[%d] = %+v, want %+v", i, ext.ToolResults[i], want[i])
+		}
+	}
+	// The message that carried them keeps only its own text: tool output must not reach
+	// Content, which IBAC reads as the user's intent.
+	if got := ext.Messages[2].Content; got != "<system-reminder>keep going</system-reminder>" {
+		t.Errorf("Messages[2].Content = %q, want only the text block", got)
+	}
+}
+
+// TestInferenceParser_AnthropicMessages_ToolResultImageNotRecorded: a Read of an image
+// returns an image block, and its base64 is exactly what must not land in the store.
+func TestInferenceParser_AnthropicMessages_ToolResultImageNotRecorded(t *testing.T) {
+	p := NewInferenceParser()
+	pctx := &pipeline.Context{
+		Path: "/v1/messages",
+		Body: []byte(`{
+			"model": "claude-opus-5-5",
+			"max_tokens": 64,
+			"messages": [
+				{"role": "user", "content": [
+					{"type": "tool_result", "tool_use_id": "toolu_9", "content": [
+						{"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "iVBORw0KGgo="}}
+					]}
+				]}
+			]
+		}`),
+	}
+	p.OnRequest(context.Background(), pctx)
+
+	ext := pctx.Extensions.Inference
+	if ext == nil || len(ext.ToolResults) != 1 {
+		t.Fatalf("ToolResults = %+v, want one entry for toolu_9", ext)
+	}
+	if got := ext.ToolResults[0]; got.ToolUseID != "toolu_9" || got.Content != "" {
+		t.Errorf("ToolResults[0] = %+v, want toolu_9 with no content", got)
+	}
+}
+
 // TestInferenceParser_AnthropicMessages_QueryStringPath pins dialect dispatch
 // when Context.Path carries a query string. extproc populates Path from the
 // HTTP/2 :path pseudo-header, which includes the query, so Claude Code's

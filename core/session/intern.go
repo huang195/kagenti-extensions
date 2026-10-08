@@ -21,9 +21,11 @@ import (
 // immutable, so two events sharing one backing array cannot tell, and a consumer sees
 // the same bytes it always did.
 //
-// SCOPE: string fields only — inference messages and completions, A2A part content, and
-// the tool manifest's descriptions AND schemas. The manifest earns its place: a client
-// re-sends it on every request, so it duplicates harder than the conversation does.
+// SCOPE: string fields only — inference messages and completions, tool results, A2A part
+// content, and the tool manifest's descriptions AND schemas. Tool results repeat exactly as
+// the conversation does: a client re-sends every earlier one on every request. The manifest
+// earns its place: a client re-sends it on every request, so it duplicates harder than the
+// conversation does.
 // Measured on a live 272-event session, 10.3MB of tool JSON held against 0.1MB distinct —
 // 154x, where the conversation itself was 6.5x. Interning the descriptions took that
 // session's tool retention from 7.12MB to 0.37MB.
@@ -48,7 +50,7 @@ const (
 	// constantly and all cost less to duplicate than to hash. The savings live in
 	// message bodies, which are orders of magnitude past this.
 	//
-	// Exported for the session archive, which deduplicates the same five fields on disk
+	// Exported for the session archive, which deduplicates the same six fields on disk
 	// and must agree with the store on what is worth sharing — one threshold, not two
 	// numbers kept equal by hand.
 	InternMinLen = 64
@@ -179,6 +181,12 @@ func (in *Interner) InternEvent(e *pipeline.SessionEvent) {
 			// and not a json.RawMessage; see pipeline.RawJSON.
 			cp.Tools[i].Parameters = pipeline.RawJSON(
 				in.intern(string(cp.Tools[i].Parameters), next))
+		}
+		// Tool results repeat like the conversation — every request re-sends all of them — and
+		// alias across both phases of a request the same way, so they are cloned first too.
+		cp.ToolResults = slices.Clone(e.Inference.ToolResults)
+		for i := range cp.ToolResults {
+			cp.ToolResults[i].Content = in.intern(cp.ToolResults[i].Content, next)
 		}
 		e.Inference = &cp
 	}

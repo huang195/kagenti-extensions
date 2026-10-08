@@ -201,7 +201,7 @@ local install so do the sessions themselves, in the session archive; see below f
 ## Cost history is written to `~/.cortex/cost`
 
 **A local install keeps a cost ledger on disk, on by default.** Sessions themselves —
-prompts, completions, tool arguments — are kept by the [session
+prompts, completions, tool arguments and results — are kept by the [session
 archive](#session-history-is-kept-in-cortexsessions), a separate store with its own retention
 and its own way to clear it. Per-minute
 cost totals do not: they are appended to `~/.cortex/cost/YYYY-MM-DD.jsonl`, one file per

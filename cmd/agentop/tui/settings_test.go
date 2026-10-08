@@ -21,9 +21,15 @@ func resetSettingsForTest(t *testing.T) {
 
 // TestColumnSelection_AbsentColumnsDefaultOn is the headline rule of the file
 // format: the config records deviations, so a column the file does not mention takes
-// its own default — VISIBLE for every default column. Inverting this would mean a
-// column added in a later agentop starts hidden for everyone who already has a config
-// file; ignoring the default would switch on the opt-in BYTES for all of them.
+// its own default. Inverting this would mean a column added in a later agentop starts
+// hidden for everyone who already has a config file.
+//
+// Asserted against each column's own defaultOn rather than against a literal true,
+// which is the same distinction columnSelection itself draws: every column is
+// defaultOn today (#1309 turned the last one on), so a test written as "absent means
+// visible" would pass now and quietly stop testing the rule the next time a column
+// ships opt-in. TestColumnSettings_RoundTripsADefaultOffColumn covers that case with
+// a synthetic column.
 func TestColumnSelection_AbsentColumnsDefaultOn(t *testing.T) {
 	s := UserSettings{Events: EventSettings{Columns: []ColumnSetting{
 		{Name: string(colCost), Visible: false},
@@ -42,24 +48,34 @@ func TestColumnSelection_AbsentColumnsDefaultOn(t *testing.T) {
 			t.Errorf("column %q is absent from the config; want its default %v, got %v", c.id, c.defaultOn, sel[c.id])
 		}
 	}
-	if sel[colBytes] {
-		t.Error("BYTES is opt-in, but a config that never mentions it turned it on")
-	}
 }
 
 // TestColumnSettings_EnablingAnOptInColumnPersists: turning ON a defaultOn:false column
-// is a deviation too, so it must be written and read back. BYTES is the first such
-// column; before it this path had no real case to test.
+// is a deviation too, so it must be written and read back. Recording only the off-list
+// would make it unpersistable — the user would enable the column, close the picker, and
+// find it off again next launch.
+//
+// Exercised through a synthetic column because no real one is default-off any more:
+// BYTES was, until #1309 populated it for ordinary traffic and turned it on. The scheme
+// still has to carry such a column, so this keeps testing it rather than retiring with
+// the last real example.
 func TestColumnSettings_EnablingAnOptInColumnPersists(t *testing.T) {
+	prev := eventColumns
+	t.Cleanup(func() { eventColumns = prev })
+	eventColumns = []eventColumn{
+		{id: colTime, width: 12, defaultOn: true, cell: func(cellContext) string { return "" }},
+		{id: "OPTIONAL", width: 8, defaultOn: false, cell: func(cellContext) string { return "" }},
+	}
+
 	sel := defaultColumnSelection()
-	sel[colBytes] = true
+	sel["OPTIONAL"] = true
 	written := columnSettingsFrom(sel)
-	if len(written) != 1 || written[0].Name != string(colBytes) || !written[0].Visible {
-		t.Fatalf("enabling BYTES wrote %+v, want exactly [{BYTES true}]", written)
+	if len(written) != 1 || written[0] != (ColumnSetting{Name: "OPTIONAL", Visible: true}) {
+		t.Fatalf("enabling OPTIONAL wrote %+v, want exactly [{OPTIONAL true}]", written)
 	}
 	back := UserSettings{Events: EventSettings{Columns: written}}.columnSelection()
-	if !back[colBytes] {
-		t.Error("BYTES was enabled and saved, but reads back off")
+	if !back["OPTIONAL"] {
+		t.Error("OPTIONAL was enabled and saved, but reads back off")
 	}
 }
 

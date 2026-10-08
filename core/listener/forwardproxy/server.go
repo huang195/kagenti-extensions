@@ -24,6 +24,7 @@ import (
 
 	"errors"
 	"github.com/rossoctl/cortex/core/listener/httpx"
+	"github.com/rossoctl/cortex/core/listener/internal/bodycount"
 	"github.com/rossoctl/cortex/core/listener/internal/bodyread"
 	"github.com/rossoctl/cortex/core/listener/internal/sessionevent"
 	"github.com/rossoctl/cortex/core/listener/internal/sseframe"
@@ -587,6 +588,23 @@ func (s *Server) serveOutbound(w http.ResponseWriter, r *http.Request, tl *tunne
 	pctx.StatusCode = resp.StatusCode
 	pctx.ResponseHeaders = resp.Header.Clone()
 
+	// BytesDown for the response row (#1309), counted HERE and nowhere else. Every
+	// arm below reads this one body — buffered whole, re-framed as SSE, relayed
+	// chunk by chunk, or copied straight through at the bottom of this function —
+	// so one wrapper covers all of them, and the arms that go on to replace
+	// resp.Body with a bytes.Reader over what they already read cannot
+	// double-count. Counted at the wire and not per arm because the SSE arm's
+	// frames have their `data: ` framing stripped by then, which is 32 bytes short
+	// of what extproc reports for the same response: see bodycount.
+	//
+	// What the wrapper does NOT reach is the final io.Copy at the bottom of this
+	// function — the arm a response takes when nothing buffered it and it was not
+	// streamed. The row is recorded above that copy, so those bytes are counted
+	// after the figure has been read and the row reports zero, which agentop
+	// renders blank rather than wrong. reverseproxy's unbuffered relay has the same
+	// shape for the same reason.
+	resp.Body = bodycount.Wrap(resp.Body, &pctx.ResponseBytes)
+
 	// SkipHosts: bypass response-phase pipeline + recording entirely.
 	// Stream the upstream body straight through to the caller. Falls
 	// out below to the unconditional header copy + io.Copy.
@@ -949,6 +967,7 @@ func (s *Server) recordOutboundRequestEvent(tl *tunnelLog, pctx *pipeline.Contex
 		Direction:     pipeline.Outbound,
 		Phase:         pipeline.SessionRequest,
 		RequestID:     pctx.RequestID(),
+		BytesUp:       int64(len(pctx.Body)),
 		MCP:           pipeline.SnapshotMCP(pctx.Extensions.MCP),
 		Inference:     pipeline.SnapshotInference(pctx.Extensions.Inference),
 		Invocations:   pipeline.SnapshotInvocations(pctx.Extensions.Invocations, pipeline.InvocationPhaseRequest),
@@ -1176,6 +1195,7 @@ func (s *Server) recordOutboundResponseEvent(pctx *pipeline.Context, statusCode 
 		Direction:     pipeline.Outbound,
 		Phase:         pipeline.SessionResponse,
 		RequestID:     pctx.RequestID(),
+		BytesDown:     pctx.ResponseBytes,
 		MCP:           pipeline.SnapshotMCP(pctx.Extensions.MCP),
 		Inference:     pipeline.SnapshotInference(pctx.Extensions.Inference),
 		Invocations:   pipeline.SnapshotInvocations(pctx.Extensions.Invocations, pipeline.InvocationPhaseResponse),
@@ -1341,7 +1361,6 @@ func (s *Server) handleStreamingResponse(w http.ResponseWriter, r *http.Request,
 	flusher.Flush()
 
 	reader := sseframe.NewReader(idleReader(resp.Body, streamReadIdleTimeout), maxBodySize)
-	bytesWritten := 0
 	for {
 		frame, err := reader.ReadFrame()
 		if err == io.EOF {
@@ -1352,7 +1371,11 @@ func (s *Server) handleStreamingResponse(w http.ResponseWriter, r *http.Request,
 			// already received some frames; the cleanest signal is to
 			// close the connection and log. We can't promote this to
 			// 502 — headers are sent.
-			slog.Warn("forward-proxy: streaming response read error", "host", r.Host, "error", err, "bytesWritten", bytesWritten)
+			// bytesRead, not the bytesWritten this used to keep in a local: the
+			// local was declared after the recording defer and never reached the
+			// session event, so the figure is now taken off the counting wrapper
+			// around resp.Body — which is bytes received, not frames relayed.
+			slog.Warn("forward-proxy: streaming response read error", "host", r.Host, "error", err, "bytesRead", pctx.ResponseBytes)
 			break
 		}
 
@@ -1382,7 +1405,6 @@ func (s *Server) handleStreamingResponse(w http.ResponseWriter, r *http.Request,
 			break
 		}
 		flusher.Flush()
-		bytesWritten += len(frame)
 	}
 }
 

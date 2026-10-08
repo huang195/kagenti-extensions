@@ -141,6 +141,28 @@ type fixture struct {
 	// where the fixture controls the request shape, so fixtures opt in
 	// rather than inheriting a comparison they were not written for.
 	expectedUpstream *upstreamSummary
+
+	// expectedBytes, when non-nil, pins BytesUp and BytesDown EXACTLY on every
+	// listener rather than only comparing them (#1309).
+	//
+	// Absolute as well as pairwise because zero is the default and the pairwise
+	// diff cannot see a gap both legs share: three listeners that all count nothing
+	// agree perfectly, which is what BYTES looked like before this change and what
+	// a regression would look like after it. A pointer and not a plain pair of
+	// int64s for the same reason — zero is a value a fixture may want to pin (a
+	// body-less GET must report zero, not a length), so "assert nothing" needs to
+	// be a distinct state.
+	expectedBytes *bytesSummary
+}
+
+// bytesSummary is a fixture's claim about the two byte counts on one row.
+//
+// Up and Down are populated per PHASE, not per row: a request row counts what was
+// forwarded and a response row what came back, so a fixture asserting both runs
+// the same shape twice with different wantPhase values.
+type bytesSummary struct {
+	Up   int64
+	Down int64
 }
 
 // contentType returns the fixture's response content-type or a sensible
@@ -225,6 +247,24 @@ type observation struct {
 	// did not ask (expectedUpstream) or when nothing reached the upstream at
 	// all — a denial, where nil on every leg is the correct answer.
 	Upstream *upstreamSummary
+	// BytesUp and BytesDown are the body sizes the event reported (#1309). A
+	// cross-listener obligation with nothing behind it until now: all three
+	// listeners count, each from its own machinery — extproc sums the chunks Envoy
+	// hands it, the proxies count off the upstream body — and the same body has to
+	// come out the same figure whichever shape the operator deployed.
+	//
+	// Compared as VALUES, unlike HasDuration above, and that is the point: a
+	// duration legitimately differs between two legs of one fixture because it is
+	// measured, while a body length is counted and must agree exactly.
+	//
+	// It earned its keep on the first run. The proxies originally tallied inside
+	// each response arm, where the SSE arm has sseframe PAYLOADS in hand — `data: `
+	// prefixes and blank-line separators already stripped — so on the four-event
+	// reads-body-sse fixture extproc reported 137 and reverseproxy 105. Both
+	// numbers are defensible in isolation; only one of them can be what BYTES
+	// means. See listener/internal/bodycount for where the proxies count now.
+	BytesUp   int64
+	BytesDown int64
 	// Inference is the token report the event carried, nil when it carried none.
 	//
 	// IT IS NOT A RESTATEMENT OF THE COST RECORD, which travels separately in
@@ -348,6 +388,8 @@ func observe(t *testing.T, store *session.Store, wantDir pipeline.Direction, wan
 		Phase:           ev.Phase.String(),
 		StatusCode:      ev.StatusCode,
 		HasDuration:     ev.Duration > 0,
+		BytesUp:         ev.BytesUp,
+		BytesDown:       ev.BytesDown,
 		PluginEventJSON: map[string]string{},
 	}
 	if ev.Identity != nil {

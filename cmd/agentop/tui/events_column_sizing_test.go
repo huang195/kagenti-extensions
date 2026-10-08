@@ -239,11 +239,17 @@ func TestEventsTable_WiderFigureKeepsScrollPosition(t *testing.T) {
 }
 
 // The picker's "(no room)" marker is judged against the widths the table is using. At
-// 150 columns the default set fits only because TOKENS and COST are sized to their
+// this width the default set fits only because TOKENS and COST are sized to their
 // figures; judged at their declared widths, COST would be marked as having no room while
 // the table beside it showed it.
+//
+// 169 and not 150: #1309 turned BYTES on by default, which is 19 more columns of
+// declared width (17 + cellPadding) and does not size to its content, so the window
+// where sizing is what makes the defaults fit moved up by exactly that. The control
+// assertion below is what keeps this honest — at declared widths this width must still
+// be too narrow, or the test proves nothing.
 func TestColumnPicker_NoRoomAgreesWithTheSizedTable(t *testing.T) {
-	const width = 150
+	const width = 169
 	m := sizingModel(t, width,
 		sizingExchange(t, "r1", "api.anthropic.com", time.Now(), 1_048_576, nil))
 	if m.eventColsDropped != 0 {
@@ -264,14 +270,19 @@ func TestColumnPicker_NoRoomAgreesWithTheSizedTable(t *testing.T) {
 }
 
 // A widening that crosses a fit boundary changes the column COUNT, not only widths, and
-// must not re-anchor the pane either. At 150 columns the fixture's sized defaults fit; the
-// first counted saving widens TOKENS and COST past that, a column is dropped, and the
+// must not re-anchor the pane either. At the narrow width the fixture's sized defaults fit;
+// the first counted saving widens TOKENS and COST past that, a column is dropped, and the
 // headings change. Then the reverse: a wider terminal lets the column back on, so the count
 // grows. Each direction takes a different SetRows/SetColumns order, and the two together are
 // the only ones a toggle or a resize can produce.
+//
+// Both widths moved up by BYTES' 19 declared columns when #1309 turned it on by default —
+// the test needs a width where all thirteen fit and a wider one that still has room after
+// the saving, not these particular numbers. The two Fatalf guards below catch it if a
+// future column moves the boundary again.
 func TestEventsTable_WideningPastTheTerminalKeepsScrollPosition(t *testing.T) {
 	m := cursorModel(t, 40)
-	m.width = 150
+	m.width = 169
 	m.rebuildEventsTable()
 	if m.eventColsDropped != 0 {
 		t.Fatalf("%d columns dropped at %d before any saving; the fixture should start with all of them",
@@ -292,7 +303,7 @@ func TestEventsTable_WideningPastTheTerminalKeepsScrollPosition(t *testing.T) {
 		check func(n int) bool
 	}{
 		{"a saving pushes a column off", func() {}, func(n int) bool { return n < before }},
-		{"a wider terminal lets it back", func() { m.width = 200 }, func(n int) bool { return n == before }},
+		{"a wider terminal lets it back", func() { m.width = 219 }, func(n int) bool { return n == before }},
 	} {
 		step.apply()
 		m.rebuildEventsTable()

@@ -357,6 +357,7 @@ func (s *Server) recordInboundSession(pctx *pipeline.Context) {
 		Direction:   pipeline.Inbound,
 		Phase:       pipeline.SessionRequest,
 		RequestID:   pctx.RequestID(),
+		BytesUp:     int64(len(pctx.Body)),
 		A2A:         pipeline.SnapshotA2A(pctx.Extensions.A2A),
 		Inference:   pipeline.SnapshotInference(pctx.Extensions.Inference),
 		Invocations: pipeline.SnapshotInvocations(pctx.Extensions.Invocations, pipeline.InvocationPhaseRequest),
@@ -441,6 +442,7 @@ func (s *Server) recordInboundResponseSession(pctx *pipeline.Context) {
 		Direction:   pipeline.Inbound,
 		Phase:       pipeline.SessionResponse,
 		RequestID:   pctx.RequestID(),
+		BytesDown:   pctx.ResponseBytes,
 		A2A:         pipeline.SnapshotA2A(pctx.Extensions.A2A),
 		Inference:   pipeline.SnapshotInference(pctx.Extensions.Inference),
 		Invocations: pipeline.SnapshotInvocations(pctx.Extensions.Invocations, pipeline.InvocationPhaseResponse),
@@ -474,6 +476,7 @@ func (s *Server) recordOutboundResponseSession(pctx *pipeline.Context) {
 		Direction:   pipeline.Outbound,
 		Phase:       pipeline.SessionResponse,
 		RequestID:   pctx.RequestID(),
+		BytesDown:   pctx.ResponseBytes,
 		MCP:         pipeline.SnapshotMCP(pctx.Extensions.MCP),
 		Inference:   pipeline.SnapshotInference(pctx.Extensions.Inference),
 		Invocations: pipeline.SnapshotInvocations(pctx.Extensions.Invocations, pipeline.InvocationPhaseResponse),
@@ -525,6 +528,7 @@ func (s *Server) recordOutboundSession(pctx *pipeline.Context) {
 		Direction:   pipeline.Outbound,
 		Phase:       pipeline.SessionRequest,
 		RequestID:   pctx.RequestID(),
+		BytesUp:     int64(len(pctx.Body)),
 		MCP:         pipeline.SnapshotMCP(pctx.Extensions.MCP),
 		Inference:   pipeline.SnapshotInference(pctx.Extensions.Inference),
 		Invocations: pipeline.SnapshotInvocations(pctx.Extensions.Invocations, pipeline.InvocationPhaseRequest),
@@ -839,6 +843,15 @@ func (s *Server) handleResponseBody(ctx context.Context, body []byte, pctx *pipe
 			},
 		}
 	}
+
+	// Count before either arm touches the buffer. Neither arm's result is a tally: the SSE arm
+	// REPLACES ResponseBody with carry + this message, and the non-SSE arm stops growing at
+	// maxBodySize. So the length of that field is the trailing chunk on one path and a floor on
+	// the other, while this is the whole body as Envoy relayed it — which is what BytesDown
+	// reports. On the shipped Envoy config an oversized response never reaches here at all
+	// (Envoy's own buffer limit refuses it first, see #1325), leaving this zero, and zero is
+	// read as "not counted" rather than as an empty body.
+	pctx.ResponseBytes += int64(len(body))
 
 	// A ResponseBody message is a chunk of a byte stream and NOT a unit of anything else: nothing
 	// aligns Envoy's chunk boundaries with the body's own structure. Both arms exist because of

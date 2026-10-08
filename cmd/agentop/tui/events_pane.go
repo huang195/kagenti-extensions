@@ -829,15 +829,34 @@ func generatedTokensCell(e *pipeline.SessionEvent) string {
 	return formatCount(n)
 }
 
-// bytesCell renders a tunnel close row's byte counts, up (client to destination) then
-// down. Blank on every other row: only an opaque tunnel's close has counts. They are
-// absent on the wire when zero, so a zero on one side is shown only once the other
-// side proves this row carries counts at all.
+// bytesCell renders a row's byte counts, up (client to destination) then down.
+//
+// A tunnel's close row is the one that reports BOTH, and it keeps the pair rendering
+// even where one side is zero: the counts are absent on the wire when zero, so a
+// genuine zero one way is shown only once the other side proves the row carries
+// counts at all. Every other row reports a single side — a request knows what it
+// forwarded, a response what came back — so printing the pair there would put a
+// fabricated "↓0B" next to every request size.
+//
+// Blank when nothing was counted, which is NOT the same as a body of zero bytes:
+// an unbuffered body is relayed unmeasured and reads here exactly as a body-less GET
+// does. See pipeline.SessionEvent.BytesUp — formatBytes renders 0 as "0B", never
+// blank, so the decision is this gate's alone.
 func bytesCell(e pipeline.SessionEvent) string {
 	if e.BytesUp == 0 && e.BytesDown == 0 {
 		return ""
 	}
-	return "↑" + formatBytes(e.BytesUp) + " ↓" + formatBytes(e.BytesDown)
+	if e.Tunnel {
+		return "↑" + formatBytes(e.BytesUp) + " ↓" + formatBytes(e.BytesDown)
+	}
+	var parts []string
+	if e.BytesUp > 0 {
+		parts = append(parts, "↑"+formatBytes(e.BytesUp))
+	}
+	if e.BytesDown > 0 {
+		parts = append(parts, "↓"+formatBytes(e.BytesDown))
+	}
+	return strings.Join(parts, " ")
 }
 
 // formatBytes renders a byte count in decimal units, 1kB being 1000 bytes. Like

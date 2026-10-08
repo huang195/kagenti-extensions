@@ -548,9 +548,10 @@ func TestColumnPicker_CursorStaysVisibleWhenClipped(t *testing.T) {
 //
 // bubbles pads each cell on both sides (Padding(0, 1) on Cell and Header), so a
 // column occupies width+2. Modelling it as +1 under-counted by one per column: a
-// row of all twelve rendered at 168 against a computed 156, so the table wrapped
-// at 80 and — worse, between 156 and 167 — reported dropped==0 while up to twelve
-// columns sat off the edge, with no footer count and no "(no room)" marker.
+// row of all the columns there were then — twelve, before #1309 turned BYTES on —
+// rendered at 168 against a computed 156, so the table wrapped at 80 and — worse,
+// between 156 and 167 — reported dropped==0 while up to twelve columns sat off the
+// edge, with no footer count and no "(no room)" marker.
 func TestFitColumns_RenderedWidthNeverExceedsTerminal(t *testing.T) {
 	// Several selections, not just all-on. The all-on case alone let a real bug
 	// through: fitColumns credited back width+1 while columnsWidth charged

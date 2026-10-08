@@ -3,6 +3,9 @@ package tui
 import (
 	"encoding/json"
 	"maps"
+	"os"
+	"path/filepath"
+	"strings"
 
 	"github.com/rossoctl/cortex/cmd/agentop/servers"
 	"github.com/rossoctl/cortex/core/pipeline"
@@ -19,7 +22,8 @@ func (m *model) activeRouter() (c routerconfig.Config, on bool) {
 
 // routerStatus is the inference-router entry of the outbound pipeline the proxy runs, and why it
 // routes nothing — "" when it routes. The reason is S's refusal, so it names this machine's
-// config file, m.localConfigPath, where the fix goes; S asks only when attached to it.
+// config file, m.localConfigPath, where the fix goes, as `agentop server` does (homeTilde); S
+// asks only when attached to it.
 //
 // THE RUNNING CONFIGURATION, NOT THE FILE: what the SERVER columns and the S picker show is
 // what the proxy routes by now, and an edit it has not reloaded — or refused — is not that. The
@@ -44,7 +48,7 @@ func (m *model) routerStatus() (c routerconfig.Config, why string) {
 		if p.Name != servers.PluginName {
 			continue
 		}
-		if why := servers.Inactive(p.OnError, m.localConfigPath); why != "" {
+		if why := servers.Inactive(p.OnError, homeTilde(m.localConfigPath)); why != "" {
 			return routerconfig.Config{}, why
 		}
 		if err := json.Unmarshal(p.Config, &c); err != nil {
@@ -56,7 +60,24 @@ func (m *model) routerStatus() (c routerconfig.Config, why string) {
 	// NOT CONFIGURED, OR OFF, AND THIS SIDE CANNOT TELL WHICH: the proxy does not build an
 	// on_error: off plugin, so /v1/pipeline lists neither. Both fixes, then.
 	return routerconfig.Config{}, "this Cortex runs no inference-router: add a server with agentop server add <name> <url>, " +
-		"or, if " + m.localConfigPath + " has one under on_error: off, remove on_error to route"
+		"or, if " + homeTilde(m.localConfigPath) + " has one under on_error: off, remove on_error to route"
+}
+
+// homeTilde is path as agentop's commands print it: under the home directory, as ~/…. S's
+// reasons are in the words `agentop server` prints (servers.Inactive), which names the file this
+// way, so the two say the same thing about the same file. package main's homeTilde is the same
+// rule; the subcommands live there, which this package cannot import.
+//
+// Reads $HOME and nothing under it, so a test points it with t.Setenv.
+func homeTilde(path string) string {
+	home, err := os.UserHomeDir()
+	if err != nil || home == "" {
+		return path
+	}
+	if rel, err := filepath.Rel(home, path); err == nil && !strings.HasPrefix(rel, "..") {
+		return filepath.Join("~", rel)
+	}
+	return path
 }
 
 // sameRouter reports whether two router configs route alike, so a pipeline refetch repaints the

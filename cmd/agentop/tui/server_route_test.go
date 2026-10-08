@@ -430,3 +430,31 @@ func TestAgentServerCell_NamesNoServerWhereNoneCanBeChosen(t *testing.T) {
 		}
 	}
 }
+
+// S's reasons name the config file as `agentop server` prints it, under the home directory as
+// ~/…, so the panel and the command say the same thing about the same file.
+func TestServerNotice_NamesTheConfigFileAsAgentopServerDoes(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	const shown = "~/.cortex/config.yaml"
+	for _, pv := range []*apiclient.PipelineView{
+		observing(routerPipeline(routerRaw)),
+		{Outbound: []apiclient.PipelinePlugin{{Name: "inference-parser"}}},
+	} {
+		m := serverModel(t, newFakeProxy(t, false))
+		m.localConfigPath = filepath.Join(home, ".cortex", "config.yaml")
+		m.pipeline = pv
+		m.rebuildAgentsTable()
+		onRow(t, m, "claude-code/2.1.270")
+		m.handleKey(keyRune('S'))
+		if !strings.Contains(m.serverNotice, shown) || strings.Contains(m.serverNotice, home) {
+			t.Errorf("notice %q, want it to name %s", m.serverNotice, shown)
+		}
+	}
+	m := serverModel(t, newFakeProxy(t, false))
+	m.localConfigPath = filepath.Join(home, ".cortex", "config.yaml")
+	m.pipeline = observing(routerPipeline(routerRaw))
+	if _, why := m.routerStatus(); why != servers.Inactive(pipeline.ErrorPolicyObserve, shown) {
+		t.Errorf("reason %q, want agentop server's words", why)
+	}
+}

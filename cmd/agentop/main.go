@@ -34,13 +34,17 @@ import (
 // -ldflags "-X main.version=<tag>". Defaults to "dev" for local builds.
 var version = "dev"
 
-// dispatchableSubcommands are the names main routes on, in the order the usage
-// block lists them.
+// dispatchableSubcommands are the documented names main routes on, in the order
+// the usage block lists them.
 //
 // One list rather than two: the unknown-subcommand error used to hardcode its own
 // copy, so adding a subcommand meant editing both and forgetting one left a typo
 // getting an incomplete list. A test holds the usage block to this slice.
-var dispatchableSubcommands = []string{"observe", "setup", "doctor", "uninstall", "service", "configure", "claude-code", "exec", "server", "tools", "pipeline", "pricing", "cost", "experimental"}
+//
+// The deprecated "claude-code" alias still dispatches (its case stays in main)
+// but is intentionally omitted here: it is no longer advertised in the usage
+// block or the unknown-subcommand hint. Use "configure claude-code" instead.
+var dispatchableSubcommands = []string{"observe", "setup", "doctor", "uninstall", "service", "configure", "exec", "server", "tools", "pipeline", "pricing", "cost", "experimental"}
 
 // unknownSubcommandMessage is the error for an unrecognised first argument.
 func unknownSubcommandMessage(name string) string {
@@ -62,8 +66,8 @@ Usage:
   agentop uninstall            remove Cortex from this machine (--help)
   agentop service <action>     run Cortex as a service: install, uninstall,
                                status, stop, start, restart
-  agentop configure <agent>    point a coding agent at Cortex: claude-code, bob,
-                               bobshell, codex, opencode
+  agentop configure <agent>    point a coding agent (claude-code, bob, bobshell,
+                               codex, opencode) at Cortex: enable, disable, status
   agentop exec -- CMD [ARG...] run CMD with Cortex's proxy and CA in its
                                environment, for tools with no settings file
   agentop server [<action>]    the inference server each agent's new sessions
@@ -75,8 +79,6 @@ Usage:
   agentop experimental <action>
                                unstable helpers: read-claude-sessions
 
-  agentop claude-code <action> deprecated: same as "agentop configure claude-code".
-                               Still works; prefer the new spelling.
   agentop                      deprecated: same as "agentop observe". Bare agentop
                                will stop opening the viewer in a future release.
 

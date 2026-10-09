@@ -170,4 +170,9 @@ func (s *Store) withPriorLocked(sum *SessionSummary, id string, sess *entry) {
 		sum.CreatedAt = p.CreatedAt
 	}
 	sum.PromptContext = pipeline.MergePromptContext(f.promptContext(), sum.PromptContext)
+	// The entry's own when it has one: everything it holds came after the history. When it has
+	// none the row says so, since a request the entry holds is what a router's pin is made by.
+	if sum.InferenceHost == "" && f.inferenceHost != "" {
+		sum.InferenceHost, sum.InferenceHostFromHistory = f.inferenceHost, true
+	}
 }

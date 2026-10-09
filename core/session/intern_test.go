@@ -432,6 +432,72 @@ func TestAppend_SharesRepeatedToolDescriptions(t *testing.T) {
 	}
 }
 
+// Tool results repeat the way the conversation does: Claude Code re-sends every earlier
+// result on every request, so without sharing a session would hold one copy per request.
+func TestAppend_SharesRepeatedToolResults(t *testing.T) {
+	s := New(0, 0, 100)
+	defer s.Close()
+
+	const turns = 4
+	for i := 0; i < turns; i++ {
+		s.Append("s1", pipeline.SessionEvent{
+			Inference: &pipeline.InferenceExtension{Model: "m", ToolResults: toolResults()},
+		})
+	}
+
+	v := s.View("s1")
+	for r := range toolResults() {
+		first := backing(v.Events[0].Inference.ToolResults[r].Content)
+		for i := range v.Events {
+			if backing(v.Events[i].Inference.ToolResults[r].Content) != first {
+				t.Errorf("event %d holds its own copy of tool result %d", i, r)
+			}
+		}
+	}
+	if backing(v.Events[0].Inference.ToolResults[0].Content) ==
+		backing(v.Events[0].Inference.ToolResults[1].Content) {
+		t.Error("two tool results were collapsed into one string")
+	}
+	if got, want := v.Events[turns-1].Inference.ToolResults[1], toolResults()[1]; got != want {
+		t.Errorf("tool result changed: %+v", got)
+	}
+}
+
+// Both phases of one request alias the same ToolResults array, as they do Messages and
+// Tools, so interning must rewrite a copy — never the caller's array.
+func TestAppend_DoesNotMutateTheCallersToolResults(t *testing.T) {
+	s := New(0, 0, 100)
+	defer s.Close()
+
+	live := &pipeline.InferenceExtension{Model: "m", ToolResults: toolResults()} // array A
+	before := make([]uintptr, len(live.ToolResults))
+	for i := range live.ToolResults {
+		before[i] = backing(live.ToolResults[i].Content)
+	}
+	s.Append("s1", pipeline.SessionEvent{Phase: pipeline.SessionRequest, Inference: pipeline.SnapshotInference(live)})
+	// Roll the table past A's strings, then mint equal content in a separate allocation.
+	s.Append("s1", pipeline.SessionEvent{Inference: &pipeline.InferenceExtension{
+		Messages: []pipeline.InferenceMessage{{Role: "user", Content: strings.Repeat("unrelated filler ", 8)}},
+	}})
+	s.Append("s1", pipeline.SessionEvent{Inference: &pipeline.InferenceExtension{ToolResults: toolResults()}}) // array B
+	s.Append("s1", pipeline.SessionEvent{Phase: pipeline.SessionResponse, Inference: pipeline.SnapshotInference(live)})
+
+	for i := range live.ToolResults {
+		if backing(live.ToolResults[i].Content) != before[i] {
+			t.Errorf("tool result %d of the caller's live extension was rewritten by the store", i)
+		}
+	}
+}
+
+// toolResults is the results a client re-sends on every request, rebuilt on every call so
+// equal content arrives in separate allocations — see manifest.
+func toolResults() []pipeline.InferenceToolResult {
+	return []pipeline.InferenceToolResult{
+		{ToolUseID: "toolu_1", Content: strings.Repeat("127.0.0.1 localhost\n", 8)},
+		{ToolUseID: "toolu_2", Content: strings.Repeat("cat: /etc/shellz: No such file\n", 4), IsError: true},
+	}
+}
+
 // The SCHEMAS share too, which is the part the field's type change exists for and the
 // largest term measured on a live session: 84KB per event as a map, 4.1x its JSON text.
 //

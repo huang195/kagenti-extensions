@@ -57,17 +57,22 @@ func synthSession(seed int64, turns, promptBytes int) []pipeline.SessionEvent {
 		at = at.Add(time.Second)
 		evs = append(evs, e)
 	}
+	// Tool results accumulate like the conversation: each request re-sends every earlier one.
+	var results []pipeline.InferenceToolResult
 	for i := range turns {
 		convo = append(convo, pipeline.InferenceMessage{Role: "user", Content: text(80 + r.Intn(400))})
 		msgs := slices.Clone(convo)
+		res := slices.Clone(results)
 		add(pipeline.SessionEvent{Direction: pipeline.Outbound, Phase: pipeline.SessionRequest, Host: "api.example.com",
-			Inference: &pipeline.InferenceExtension{Model: "m", Messages: msgs, Tools: tools}})
+			Inference: &pipeline.InferenceExtension{Model: "m", Messages: msgs, Tools: tools, ToolResults: res}})
 		add(pipeline.SessionEvent{Direction: pipeline.Outbound, Phase: pipeline.SessionRequest, Host: "api.example.com:443",
 			Tunnel: true, HTTPMethod: "CONNECT"})
 		reply := text(100 + r.Intn(800))
 		add(pipeline.SessionEvent{Direction: pipeline.Outbound, Phase: pipeline.SessionResponse, StatusCode: 200,
-			Inference: &pipeline.InferenceExtension{Model: "m", Messages: msgs, Tools: tools, Completion: reply, TotalTokens: 1000 + i}})
+			Inference: &pipeline.InferenceExtension{Model: "m", Messages: msgs, Tools: tools, ToolResults: res, Completion: reply, TotalTokens: 1000 + i}})
 		convo = append(convo, pipeline.InferenceMessage{Role: "assistant", Content: reply})
+		results = append(results, pipeline.InferenceToolResult{
+			ToolUseID: fmt.Sprintf("toolu_%d", i), Content: text(60 + r.Intn(600)), IsError: i%5 == 4})
 	}
 	return evs
 }

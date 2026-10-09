@@ -282,6 +282,21 @@ func (m *model) rebuildAgentsTable() {
 	if withSessions {
 		cols = append(cols[:1:1], append([]table.Column{{Title: "SESSIONS", Width: 8}}, cols[1:]...)...)
 	}
+	// SERVER, last, only while the proxy runs an inference-router that routes — not one under
+	// on_error: observe, which keeps its config but moves nothing (see routerStatus). Without
+	// one no agent is routed, and a column reading "own choice" on every row would be noise.
+	//
+	// SQUEEZING AGENT ON A NARROW TERMINAL, NOT DROPPED AS THE SESSIONS TABLE'S IS, and on
+	// purpose: this column is the one place the pane shows where each agent's new sessions go.
+	// AGENT is the widest, so the fitter takes the room from it — 30 to 16 at 80 columns with
+	// SESSIONS up, whole again from 98 — and what survives is the agent's name and minor version,
+	// "claude-code/2.1…". That name is what SERVER and S act on, so two patch versions' rows that
+	// read alike there are one agent with one server
+	// (TestAgentsPane_TheAgentsNameSurvivesTheServerColumnAt80).
+	router, routed := m.activeRouter()
+	if routed {
+		cols = append(cols, table.Column{Title: "SERVER", Width: agentsServerWidth})
+	}
 	if want := fitTableColumns(cols, m.width); !sameColumns(m.agentsTbl.Columns(), want) {
 		m.agentsTbl.SetRows(nil)
 		m.agentsTbl.SetColumns(want)
@@ -292,6 +307,10 @@ func (m *model) rebuildAgentsTable() {
 	// across agents billing in different units it would only read as mixed.
 	all := table.Row{allAgentsLabel, "", "", ""}
 	if withSessions {
+		all = append(all, "")
+	}
+	// Nothing under SERVER either: routing is chosen per agent, and S on this row says so.
+	if routed {
 		all = append(all, "")
 	}
 	rows = append(rows, all)
@@ -318,6 +337,9 @@ func (m *model) rebuildAgentsTable() {
 		if withSessions {
 			r := rows[len(rows)-1]
 			rows[len(rows)-1] = append(r[:1:1], append(table.Row{m.agentSessionsCell(a.label)}, r[1:]...)...)
+		}
+		if routed {
+			rows[len(rows)-1] = append(rows[len(rows)-1], agentServerCell(router, a.label))
 		}
 	}
 	m.agentsTbl.SetRows(rows)
@@ -376,6 +398,7 @@ func agentCostCellIn(c usage.Counts, units []string, budget int) string {
 // `from` IS PASSED IN, NOT READ OFF m.pane: this runs when the reply lands, and by then the reader
 // may have moved. agentRowsLoadedMsg.from carries the press-time pane across the round trip.
 func (m *model) enterAgents(from paneID) {
+	m.closeServerPanels()
 	m.previousPane = from
 	m.agentsAboveSessions = false
 	m.pane = paneAgents
@@ -392,6 +415,7 @@ func (m *model) enterAgentsAtStartup() bool {
 	if !agentsPaneApplies(m.agentChoices()) {
 		return false
 	}
+	m.closeServerPanels()
 	m.previousPane = paneNone
 	m.agentsAboveSessions = true
 	m.pane = paneAgents
@@ -458,6 +482,7 @@ func (m *model) leaveAgentsPane() tea.Cmd {
 // returnToAgentsPane is esc from a sessions list reached by picking an agent: back to the picker,
 // as the level above Sessions, with its rows refreshed.
 func (m *model) returnToAgentsPane() tea.Cmd {
+	m.closeServerPanels()
 	m.previousPane = paneNone
 	m.agentsAboveSessions = true
 	m.pane = paneAgents

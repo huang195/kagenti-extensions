@@ -329,7 +329,19 @@ func main() {
 	}
 }
 
-func startGRPCExtProc(inbound, outbound *pipeline.Holder, sessions *session.Store, store pipeline.SharedStore, skipHosts *skiphost.Matcher, addr string) *grpc.Server {
+// newExtProcServer builds the ext_proc gRPC server: the ONLY grpc.NewServer
+// call in this binary, and therefore the only place its ServerOptions are
+// chosen. It is passed none, so grpc-go's 4 MiB default MaxRecvMsgSize is the
+// real ceiling on every ProcessingRequest Envoy sends — the third limit a large
+// body meets in envoy-sidecar mode, behind Envoy's
+// per_connection_buffer_limit_bytes and ahead of the listener's own 1 MiB cap.
+// core/listener/parity/grpclimit_test.go documents the three together.
+//
+// Split out of startGRPCExtProc so that fact is reachable from a test without a
+// listening socket: options cannot be added to a grpc.Server after
+// construction, so pinning this function pins the binary's receive limit.
+// TestStartGRPCExtProcKeepsDefaultRecvLimit does exactly that.
+func newExtProcServer(inbound, outbound *pipeline.Holder, sessions *session.Store, store pipeline.SharedStore, skipHosts *skiphost.Matcher) *grpc.Server {
 	srv := grpc.NewServer()
 	extprocv3.RegisterExternalProcessorServer(srv, &extproc.Server{
 		InboundPipeline:  inbound,
@@ -340,6 +352,11 @@ func startGRPCExtProc(inbound, outbound *pipeline.Holder, sessions *session.Stor
 	})
 	registerHealth(srv)
 	reflection.Register(srv)
+	return srv
+}
+
+func startGRPCExtProc(inbound, outbound *pipeline.Holder, sessions *session.Store, store pipeline.SharedStore, skipHosts *skiphost.Matcher, addr string) *grpc.Server {
+	srv := newExtProcServer(inbound, outbound, sessions, store, skipHosts)
 
 	go func() {
 		lis, err := net.Listen("tcp", addr)

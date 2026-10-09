@@ -122,9 +122,8 @@ func (m *model) localEndpointOr() string {
 // is the in-cluster 9094, and matching that would claim a hand-run
 // port-forward to a POD is this machine's config file.
 func (m *model) pipelineStore() (edit.Store, string) {
-	if m.client != nil && m.localEndpoint != "" && sameEndpoint(m.client.Endpoint(), m.localEndpoint) &&
-		m.localConfigPath != "" && m.localStatsURL != "" {
-		return edit.FileStore{Path: m.localConfigPath}, m.localStatsURL
+	if path, statsURL, ok := m.localCortexTarget(); ok {
+		return edit.FileStore{Path: path}, statsURL
 	}
 	if m.editRunner != nil && m.selectedNamespace != "" && m.selectedPod != "" && m.statusURL != "" {
 		return edit.ConfigMapStore{
@@ -413,6 +412,13 @@ type model struct {
 	// so a snapshot answered before one is not stored after it. See clear.go.
 	clearConfirm *clearConfirm
 	clearGen     uint64
+	// serverPicker is S's picker on the AGENTS pane, modal while non-nil, and serverSwitch the
+	// write it started, until serverSwitchedMsg lands. See server_picker.go.
+	serverPicker *serverPicker
+	serverSwitch *serverSwitch
+	// serverNotice is why S opened nothing, or why a switch did not go through, drawn whole over
+	// the AGENTS pane and modal while non-empty. See renderServerNotice.
+	serverNotice string
 	// events was labelled a ring buffer and has never been one. Nothing trims an entry in
 	// place; every write is one of six, and the CTX(1M) gauge folds forward off this map,
 	// so each one owes contextRun an action. The full inventory, because the gauge reads an
@@ -1069,6 +1075,10 @@ func (m *model) backToPodsPane() {
 	// puts m.pane back to paneEvents and the popup nobody reopened is there
 	// again, owning the keyboard until the user finds esc.
 	m.colPicker = false
+	// S's picker and its reason too, for the same reason: they name an agent and a value in force
+	// read off the connection being left. A switch already in flight is not cancelled — it writes
+	// this machine's config whichever pane is up, and its flash is still true when it lands.
+	m.closeServerPanels()
 	m.detailEvent = nil
 	m.detailPlugin = nil
 	m.selectedSess = ""
@@ -1470,6 +1480,14 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			// runs a round trip later. See agentRowsLoadedMsg.from.
 			m.enterAgents(msg.from)
 		}
+		// AND THE PIPELINE WITH THE ROWS, because the pane's SERVER column and S read the router's
+		// config off it, and nothing else refetches it off the pipeline panes: an `agentop server
+		// use` run in a shell since then would otherwise show here only after a restart, and S
+		// would open with its cursor on a value the proxy no longer runs.
+		if m.client != nil && !m.pipelineFetching {
+			m.pipelineFetching = true
+			return m, m.loadPipelineCmd()
+		}
 		return m, nil
 
 	case usageLoadedMsg:
@@ -1624,8 +1642,15 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if msg == nil {
 			return m, nil // fetch failed; keep the view we have
 		}
+		before, hadRouter := m.activeRouter()
 		m.pipeline = (*apiclient.PipelineView)(msg)
 		m.rebuildPipelineTable()
+		// The SERVER columns are read off the router's config, so they follow the pipeline — but
+		// only when the router changed, since this lands every 2s on the pipeline pane.
+		if after, hasRouter := m.activeRouter(); hasRouter != hadRouter || !sameRouter(before, after) {
+			m.rebuildSessionsTable()
+			m.rebuildAgentsTable()
+		}
 		// Re-render an open plugin detail pane against the new view. Without
 		// this the pane keeps showing the snapshot it was opened with, so
 		// Metrics would still read (none) however long traffic ran.
@@ -1707,6 +1732,9 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case clearDoneMsg:
 		return m, m.applyClearDone(msg)
+
+	case serverSwitchedMsg:
+		return m, m.applyServerSwitched(msg)
 
 	case olderPageLoadedMsg:
 		m.applyOlderPage(msg)
@@ -2222,6 +2250,14 @@ func (m *model) View() string {
 	}
 	if m.clearConfirm != nil {
 		return overlayCenter(base, renderClearConfirm(m.clearConfirm, m.width), m.width, m.height)
+	}
+	// Scoped to the pane it was opened on, as the column picker below is: a message can change
+	// panes under a modal even though no key can.
+	if m.serverPicker != nil && m.pane == paneAgents {
+		return overlayCenter(base, renderServerPicker(m.serverPicker, m.width), m.width, m.height)
+	}
+	if m.serverNotice != "" && m.pane == paneAgents {
+		return overlayCenter(base, renderServerNotice(m.serverNotice, m.width), m.width, m.height)
 	}
 	// Same paneEvents scoping as the key block: an async pane change must not leave
 	// the popup drawn over a pane it does not belong to.

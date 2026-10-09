@@ -50,9 +50,10 @@ func sessionsColumns() []table.Column {
 		// columns it was spending are the ones the money columns need. `/` filters on the
 		// FULL id, so nothing is lost for finding a session — only for reading one.
 		{Title: "SESSION", Width: 14},
-		// After SESSION, never before it: rebuildSessionsTable and selectedSessionID both
-		// read row[0] as the session id, so a column at index 0 would silently make the
-		// cursor restore and every Enter act on a title instead.
+		// After SESSION, never before it. Nothing reads the id off a row any more —
+		// selectedSessionID and the cursor restore read sessionRowIDs, kept beside the rows —
+		// but SESSION first is where a reader looks for it, and withColumnIfItFits seats every
+		// optional column after it for that reason.
 		{Title: "TITLE", Width: sessionsTitleWidth},
 		{Title: "UPDATED", Width: 14},
 		{Title: "EVENTS", Width: 8},
@@ -248,8 +249,11 @@ func (m *model) rebuildSessionsTable() {
 	// fitter settled on, so padding first would pad to a width the column no longer has. Every
 	// lookup below still finds its column, because they go through headerTitle.
 	scope := m.sessionsScope()
-	want := alignSessionsHeaders(fitTableColumns(sessionsColumnsWithAgent(m.width, m.sessionsListTwoAgents(scope)), m.width))
+	router, showServer := m.sessionsShowServer()
+	want := alignSessionsHeaders(fitTableColumns(
+		sessionsColumnsWith(m.width, m.sessionsListTwoAgents(scope), showServer), m.width))
 	agentW := sessionsColumnWidth(want, "AGENT")
+	serverW := sessionsColumnWidth(want, "SERVER")
 	costW := sessionsColumnWidth(want, "COST")
 	savedW := sessionsColumnWidth(want, "SAVED")
 	// The other cells are fitted too: padLeft right-aligns into the FITTED width, so digits
@@ -296,6 +300,11 @@ func (m *model) rebuildSessionsTable() {
 		}
 		if agentW > 0 {
 			row = append(row, sessionAgentCell(s, agentW))
+		}
+		// Read-only: where the session's inference went. No key here changes it — that would
+		// move a running conversation, which the router exists not to do.
+		if serverW > 0 {
+			row = append(row, sessionServerCell(router, s.InferenceHost, serverW))
 		}
 		row = append(row,
 			relTime(now, s.UpdatedAt),
@@ -346,6 +355,10 @@ func (m *model) rebuildSessionsTable() {
 		}
 		if agentW > 0 {
 			row = append(row, sessionAgentCell(session.SessionSummary{ID: id}, agentW))
+		}
+		// No summary, so no inference host to name a server from.
+		if serverW > 0 {
+			row = append(row, emptyCell)
 		}
 		row = append(row,
 			// "cached" sits in UPDATED now, where an em dash used to, because ACTIVE is gone
@@ -1521,33 +1534,78 @@ func sessionsShowMoney(termWidth int) bool {
 // sessionsColumnsFor is the column set this terminal actually gets. Paired with
 // sessionsShowMoney in rebuildSessionsTable so the row arity always matches the header.
 func sessionsColumnsFor(termWidth int) []table.Column {
-	return sessionsColumnsWithAgent(termWidth, false)
+	return sessionsColumnsWith(termWidth, false, false)
 }
 
 // sessionsAgentWidth fits "claude-code", an agent label (versionless; see pipeline.AgentName).
 const sessionsAgentWidth = 11
 
-// sessionsColumnsWithAgent is sessionsColumnsFor plus an AGENT column after TITLE when agent is set
-// and the column fits without narrowing any other; see rebuildSessionsTable for when it is asked.
-func sessionsColumnsWithAgent(termWidth int, agent bool) []table.Column {
+// sessionsColumnsWith is sessionsColumnsFor plus an AGENT column after TITLE when agent is set,
+// and a SERVER column after that when server is set, each only when it fits without narrowing any
+// other; see rebuildSessionsTable for when each is asked.
+//
+// DROPPED WHOLE ON A NARROW TERMINAL, never squeezed, the rule the money columns follow: AGENT
+// first, since it is offered first, then SERVER against what is left. Squeezing either would cut
+// it to a fragment and narrow the columns every width test here pins.
+//
+// AND NEVER TAKEN AWAY BY WIDENING (TestSessionsTable_WideningNeverDropsAColumnOrNarrowsTitle):
+// see withColumnIfItFits for presence, and growSessionsTitle's pending for TITLE's width, which
+// does not grow into the room an asked-for column has yet to claim.
+func sessionsColumnsWith(termWidth int, agent, server bool) []table.Column {
 	cols := sessionsBaseColumns(termWidth)
-	if agent {
-		with := make([]table.Column, 0, len(cols)+1)
-		for _, c := range cols {
-			with = append(with, c)
-			if t := headerTitle(c); t == "TITLE" || (t == "SESSION" && !sessionsShowTitle(termWidth)) {
-				with = append(with, table.Column{Title: "AGENT", Width: sessionsAgentWidth})
-			}
+	pending := 0
+	for _, opt := range []struct {
+		asked bool
+		col   table.Column
+	}{
+		{agent, table.Column{Title: "AGENT", Width: sessionsAgentWidth}},
+		{server, table.Column{Title: "SERVER", Width: sessionsServerWidth}},
+	} {
+		if !opt.asked {
+			continue
 		}
-		fitted, fits := fitTableColumns(with, termWidth), true
-		for i := range with {
-			fits = fits && fitted[i].Width >= with[i].Width
-		}
-		if fits {
+		if with, ok := withColumnIfItFits(cols, opt.col, termWidth); ok {
 			cols = with
+		} else {
+			pending += opt.col.Width + cellPadding
 		}
 	}
-	return growSessionsTitle(cols, termWidth)
+	return growSessionsTitle(cols, termWidth, pending)
+}
+
+// withColumnIfItFits is cols with col inserted after the identifying columns — SESSION, then
+// TITLE and AGENT where present — and true, or cols unchanged and false when the fitter would
+// have to narrow any column to make room.
+//
+// After them, in the order they are offered, so a row reads which session, then whose, then
+// where — and SESSION, always present, stays first, where a reader looks for the id.
+//
+// ONLY WHERE COST AND SAVED RENDER. Below that width TITLE holds them out, and the room they
+// leave is room they take back at the width they return: a column seated in it showed at 90,
+// vanished at 93 and came back near 113, so widening the window took a column away. They rank
+// above AGENT and SERVER — a session's spend is what this table is read for — so those two wait.
+func withColumnIfItFits(cols []table.Column, col table.Column, termWidth int) ([]table.Column, bool) {
+	if termWidth > 0 && !sessionsShowMoney(termWidth) {
+		return cols, false
+	}
+	at := 0
+	for i, c := range cols {
+		switch headerTitle(c) {
+		case "SESSION", "TITLE", "AGENT":
+			at = i + 1
+		}
+	}
+	with := make([]table.Column, 0, len(cols)+1)
+	with = append(with, cols[:at]...)
+	with = append(with, col)
+	with = append(with, cols[at:]...)
+	fitted := fitTableColumns(with, termWidth)
+	for i := range with {
+		if fitted[i].Width < with[i].Width {
+			return cols, false
+		}
+	}
+	return with, true
 }
 
 func sessionsBaseColumns(termWidth int) []table.Column {
@@ -1640,8 +1698,12 @@ func sessionsShowTitle(termWidth int) bool {
 // and computing the slack first would hand TITLE a width that the narrower set then leaves
 // stale. Growing only into slack that already exists means widening never costs another
 // column anything, and a terminal with none hands the set back untouched.
-func growSessionsTitle(cols []table.Column, termWidth int) []table.Column {
-	slack := termWidth - tableWidth(cols)
+//
+// pending is the room of the optional columns asked for but not yet seated (AGENT, SERVER; see
+// sessionsColumnsWith), and is not slack for the money columns' reason below: TITLE grown into it
+// collapsed to its floor the moment the column arrived — 23 to 11 at 113 — as the window widened.
+func growSessionsTitle(cols []table.Column, termWidth, pending int) []table.Column {
+	slack := termWidth - tableWidth(cols) - pending
 	if slack <= 0 || termWidth <= 0 {
 		return cols
 	}
@@ -1653,7 +1715,9 @@ func growSessionsTitle(cols []table.Column, termWidth int) []table.Column {
 	//
 	// So growth stops at what survives their return. Below the width where they fit, the room
 	// they will take is reserved rather than lent: TITLE grows steadily instead of ballooning
-	// and collapsing. Column PRESENCE was already monotonic; this is what makes width so.
+	// and collapsing. Column PRESENCE is monotonic — TITLE from 69, the money columns from 93,
+	// AGENT and SERVER only where those render (withColumnIfItFits) — and this, with pending, is
+	// what makes TITLE's width so.
 	if !sessionsShowMoney(termWidth) {
 		reserved := 0
 		for _, c := range sessionsColumns() {

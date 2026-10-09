@@ -43,6 +43,7 @@ func fullEvent() pipeline.SessionEvent {
 			// fixture with those two the same size makes the projection look 3x
 			// rather than the ~163x it measures against a live proxy.
 			Messages:         bigConversation(24, 8192),
+			ToolResults:      []pipeline.InferenceToolResult{{ToolUseID: "toolu_1", Content: strings.Repeat("r", 4096)}},
 			Tools:            []pipeline.InferenceTool{{Name: "search"}},
 			AgentRole:        pipeline.AgentRoleMain,
 			Completion:       strings.Repeat("y", 2048),
@@ -55,6 +56,8 @@ func fullEvent() pipeline.SessionEvent {
 			OutputTokens:     50,
 			PresentKinds:     9,
 			FinishReason:     "stop",
+			// Set only when a plugin changed the model; differs from Model on purpose.
+			RequestedModel: "claude-opus-5-5",
 		},
 		A2A: &pipeline.A2AExtension{
 			Method:       "message/send",
@@ -95,6 +98,11 @@ func TestSummarizeEvent_DropsPayloadsKeepsTimelineFields(t *testing.T) {
 	if got.Inference.ToolCalls != nil {
 		t.Error("Inference.ToolCalls survived")
 	}
+	// Tool results grow with the conversation exactly as Messages does — every request
+	// re-sends all of them — and only the detail pane reads them.
+	if got.Inference.ToolResults != nil {
+		t.Error("Inference.ToolResults survived")
+	}
 	// …but their LENGTHS are stated in their place. A third category beside dropped and kept:
 	// derived from a payload that goes, and the only thing left that says what it was.
 	if got.Inference.MessageCount != len(full.Inference.Messages) {
@@ -109,6 +117,12 @@ func TestSummarizeEvent_DropsPayloadsKeepsTimelineFields(t *testing.T) {
 	// CONTEXT gauge exactly as dropping the counts did.
 	if got.Inference.AgentRole != full.Inference.AgentRole {
 		t.Errorf("agentRole = %q, want %q", got.Inference.AgentRole, full.Inference.AgentRole)
+	}
+	// requestedModel is kept for the reason requestedHost is, below: agentop's detail pane
+	// draws its model: line from the projected event before the full one arrives.
+	if got.Inference.RequestedModel != full.Inference.RequestedModel {
+		t.Errorf("requestedModel = %q, want %q — the detail pane's model: line reads it",
+			got.Inference.RequestedModel, full.Inference.RequestedModel)
 	}
 	if got.A2A.Artifact != "" {
 		t.Error("A2A.Artifact survived")
@@ -323,7 +337,10 @@ func TestSummarizeEvent_ShapeIsGuarded(t *testing.T) {
 		// row the timeline serves. It needs no assertion of its own in the projection test
 		// beyond the equality one there — a scalar survives the struct copy, unlike the two
 		// slices whose lengths had to be recorded before they were dropped.
-		{"InferenceExtension", reflect.TypeOf(pipeline.InferenceExtension{}), 25},
+		// 26 since RequestedModel, which is kept as RequestedHost is: agentop's detail pane
+		// draws its model: line from the projected event. A scalar; asserted above.
+		// 27 since ToolResults, which is DETAIL data: dropped, asserted above.
+		{"InferenceExtension", reflect.TypeOf(pipeline.InferenceExtension{}), 27},
 		{"A2AExtension", reflect.TypeOf(pipeline.A2AExtension{}), 11},
 		{"MCPExtension", reflect.TypeOf(pipeline.MCPExtension{}), 6},
 	} {

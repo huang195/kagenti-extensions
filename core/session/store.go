@@ -159,6 +159,11 @@ type entry struct {
 	// So this needs none of the machinery cost needs: no subtraction on trim, and no parallel
 	// per-event slice to make that subtraction decode-free. Fixed size per SESSION.
 	context pipeline.PromptContextFold
+
+	// inferenceHost is SessionSummary.InferenceHost, folded by Append and read by ListSessions.
+	// A LATEST VALUE, NOT A SUM, so in context's class above: a trim has nothing to subtract, and
+	// the request that set it is the newest of its kind, which is the last a trim would take.
+	inferenceHost string
 }
 
 // MaxSessionIDLen is the longest session ID the store keeps intact; longer ids
@@ -558,6 +563,11 @@ func (s *Store) appendLocked(sessionID string, b *Bucket, event pipeline.Session
 	// shared with SummaryFold so an archived session is titled exactly as a resident one.
 	sess.titleRank, sess.Title = applyTitle(sess.titleRank, sess.Title, titleRank, titleText)
 	sess.agents = applyAgent(sess.agents, sessionID, agentName, event.Client)
+	// A field compare and a string header copy, so under the lock like context.Add. From &event,
+	// the local parameter, for the reason given there.
+	if h := inferenceHostOf(&event); h != "" {
+		sess.inferenceHost = h
+	}
 	if b == nil {
 		sess.UpdatedAt = now
 		s.activeID = sessionID
@@ -968,6 +978,42 @@ type SessionSummary struct {
 	// pipeline.MergePromptContext, which is how the two combine.
 	PromptContext *pipeline.PromptContext `json:"promptContext,omitempty"`
 
+	// InferenceHost is where this session's inference traffic goes: the host of its most recent
+	// request that carried an inference parse, as the event recorded it. After a redirect that is
+	// the server it was sent to, whether or not that server answered, and not the host the client
+	// named (see SessionEvent.RequestedHost).
+	// Absent for a session with no inference traffic — and for one resumed from an archive written
+	// before this field existed, until its next inference request, where absent means unknown:
+	// that history was folded without it (see foldJSON.InferenceHost).
+	//
+	// LATEST WINS, AND ONLY AN INFERENCE REQUEST MOVES IT. A CONNECT tunnel row, an MCP call, any
+	// response or a denial leaves it where it was: live traffic interleaves those between turns,
+	// and a field they cleared would read "no inference traffic" on a session that has plenty. A
+	// denial carries its request's parse but went nowhere, so its host is not where anything goes.
+	//
+	// GENERIC, NOT THE ROUTER'S: it says where a session's inference goes with or without the
+	// inference-router. agentop names a session's server from it, which is why the router refuses
+	// two servers on one host. A host[:port] as the request carried it, so compare it
+	// port-stripped and lowercased.
+	//
+	// CONTINUES ACROSS A RESTART WHERE A SESSION ARCHIVE RUNS, like Title: the archive's fold
+	// persists it, and a resumed session reports it until its own next inference request.
+	InferenceHost string `json:"inferenceHost,omitempty"`
+
+	// InferenceHostFromHistory is true when InferenceHost came from the session's history before
+	// this store entry — the archive's fold — because no request the entry holds has set it: a
+	// session resumed after a restart, or re-created after an eviction, that has sent no inference
+	// request since. Absent otherwise, and on a row only the archive holds (Resident false), all of
+	// whose figures are history.
+	//
+	// WHAT A CLIENT NEEDS TO COUNT WHERE RUNNING SESSIONS STAY. The inference-router pins a session
+	// in process memory by the first request it routes, so after a restart nothing holds such a
+	// session where its history says it was: its next request is decided as a new one's, and goes
+	// to its agent's current server. After an eviction alone the pin can survive, so a count that
+	// leaves these rows out errs low there, which is the quiet side. InferenceHost itself is
+	// unchanged by this: it still says where the session's inference last went.
+	InferenceHostFromHistory bool `json:"inferenceHostFromHistory,omitempty"`
+
 	// Resident is false on a row the session archive served because the store no longer holds
 	// the session (GET /v1/sessions?archived=true), and absent otherwise. A POINTER because
 	// omitempty on a bool drops exactly the false the wire needs; absent then means "resident",
@@ -1068,6 +1114,8 @@ func (s *Store) ListSessions() []SessionSummary {
 			// under the read lock, on agentop's two-second poll, in front of a lock whose writer side
 			// is Append on the proxy's request path, with maxEvents unset by default.
 			PromptContext: sess.context.Publish(),
+			// Read, not computed, like Title: Append folds it.
+			InferenceHost: sess.inferenceHost,
 		}
 		s.withPriorLocked(&sum, id, sess)
 		out = append(out, sum)

@@ -45,10 +45,14 @@ type anthropicTool struct {
 // the dropped blocks are the bulk of the conversation: every tool result comes
 // back as a tool_result block, so a turn that reads a large file shows up as an
 // empty Content and would otherwise look free.
+//
+// ToolResults keeps the one dropped block type worth reading back: tool_result, the output
+// of an earlier tool call. It goes to InferenceExtension.ToolResults, never into Content.
 type anthropicReqMessage struct {
 	Role         string
 	Content      string
 	ContentBytes int
+	ToolResults  []pipeline.InferenceToolResult
 }
 
 func (m *anthropicReqMessage) UnmarshalJSON(data []byte) error {
@@ -60,9 +64,46 @@ func (m *anthropicReqMessage) UnmarshalJSON(data []byte) error {
 		return err
 	}
 	m.Role = raw.Role
-	m.Content = flattenContent(raw.Content)
+	m.Content, m.ToolResults = flattenAnthropicContent(raw.Content)
 	m.ContentBytes = contentBytes(raw.Content)
 	return nil
+}
+
+// flattenAnthropicContent is flattenContent for an Anthropic message, which can also carry
+// tool_result blocks. One decode of the block array yields both the text and the results,
+// so a request full of tool output is not parsed twice. A result's own content is a string
+// or text blocks, which flattenContent already reads; its non-text blocks (an image a Read
+// returned) are dropped, as flattenContent drops them everywhere.
+func flattenAnthropicContent(raw json.RawMessage) (string, []pipeline.InferenceToolResult) {
+	var blocks []struct {
+		Type      string          `json:"type"`
+		Text      string          `json:"text"`
+		ToolUseID string          `json:"tool_use_id"`
+		Content   json.RawMessage `json:"content"`
+		IsError   bool            `json:"is_error"`
+	}
+	if err := json.Unmarshal(raw, &blocks); err != nil {
+		// A plain string, null, or a shape we do not model: none of them holds a tool result.
+		return flattenContent(raw), nil
+	}
+	var text strings.Builder
+	var results []pipeline.InferenceToolResult
+	for _, b := range blocks {
+		switch b.Type {
+		case "text":
+			if b.Text != "" {
+				if text.Len() > 0 {
+					text.WriteByte('\n')
+				}
+				text.WriteString(b.Text)
+			}
+		case "tool_result":
+			results = append(results, pipeline.InferenceToolResult{
+				ToolUseID: b.ToolUseID, Content: flattenContent(b.Content), IsError: b.IsError,
+			})
+		}
+	}
+	return text.String(), results
 }
 
 // parseAnthropicRequest builds an InferenceExtension from an Anthropic Messages
@@ -108,6 +149,7 @@ func parseAnthropicRequest(body []byte) *pipeline.InferenceExtension {
 		ext.Messages = append(ext.Messages, pipeline.InferenceMessage{
 			Role: msg.Role, Content: msg.Content, ContentBytes: msg.ContentBytes,
 		})
+		ext.ToolResults = append(ext.ToolResults, msg.ToolResults...)
 	}
 	for _, tool := range req.Tools {
 		if tool.Name == "" {

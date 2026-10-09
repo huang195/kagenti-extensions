@@ -52,6 +52,7 @@ func ReplayCopy(e *pipeline.SessionEvent) pipeline.SessionEvent {
 	if e.Inference != nil {
 		inf := *e.Inference
 		inf.Messages, inf.Tools, inf.ToolChoice, inf.ToolCalls, inf.Completion = nil, nil, nil, nil, ""
+		inf.ToolResults = nil
 		c.Inference = &inf
 	}
 	c.Plugins = nil

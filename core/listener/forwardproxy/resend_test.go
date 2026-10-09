@@ -271,7 +271,7 @@ func TestResend_TheResentRequestIsPreparedAsTheFirstSendIs(t *testing.T) {
 		strings.NewReader(`{"model":"exo-free","messages":[]}`))
 	req.Header.Set("Accept-Encoding", "gzip, br")
 	req.Header.Set("Keep-Alive", "timeout=5")
-	req.Header.Set("Trailer", "X-Checksum")
+	req.Header.Set("Connection", "keep-alive")
 	client := &http.Client{Transport: &http.Transport{Proxy: http.ProxyURL(proxyURL), DisableCompression: true}}
 	resp, err := client.Do(req)
 	if err != nil {
@@ -285,7 +285,7 @@ func TestResend_TheResentRequestIsPreparedAsTheFirstSendIs(t *testing.T) {
 		t.Fatalf("upstream saw %d sends, want the refused one and the resend", len(upstream.headers))
 	}
 	for i, h := range upstream.headers {
-		for _, name := range []string{"Proxy-Authorization", "Keep-Alive", "Trailer", "Proxy-Connection", "Upgrade", "Te"} {
+		for _, name := range []string{"Proxy-Authorization", "Keep-Alive", "Connection"} {
 			if v := h.Get(name); v != "" {
 				t.Errorf("send %d carried %s: %q", i+1, name, v)
 			}

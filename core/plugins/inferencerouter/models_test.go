@@ -425,10 +425,9 @@ func TestInit_FetchesEachServersModelsAndKeepsThem(t *testing.T) {
 	}
 }
 
-// A captured request was addressed to the agent's provider, so the credentials it
-// carries are the provider's: none of them reaches the inference server, only the
-// server's key, in the header the agent sent its own in. Headers that are no
-// credential go as they came.
+// On a captured request the provider's credential headers below are dropped, the
+// server's key goes in the header the agent sent its own in, and the other headers
+// below go as they came.
 func TestRouter_ACapturedRequestCarriesNoCredentialOfTheHostItAddressed(t *testing.T) {
 	for _, tc := range []struct {
 		name     string
@@ -495,4 +494,24 @@ func TestRouter_ARequestAddressedToAServerKeepsItsOtherHeaders(t *testing.T) {
 		t.Errorf("Cookie = %q, want it kept: the agent addressed glm", got)
 	}
 	assertRouted(t, pctx, glmHost, "glm-key")
+}
+
+// A request addressed to one server and routed to another goes to a host it did not
+// address, as a captured one does: the first server's credential headers stay behind.
+func TestRouter_ARequestRoutedToAnotherServerLeavesTheFirstServersCredentials(t *testing.T) {
+	_, p := buildRouter(t, wordConfig(`"opencode": "glm"`))
+	pctx := chat(newStore(t), eteHost, "/v1/chat/completions", opencodeUA, "s1", "exo-free", true)
+	pctx.Headers.Set("Cookie", "meant=for-ete")
+	pctx.Headers.Set("X-Litellm-Api-Key", "ete-custom")
+	pctx.Headers.Set("Anthropic-Version", "2023-06-01")
+	run(t, p, pctx)
+	assertRouted(t, pctx, glmHost, "glm-key")
+	for _, k := range []string{"Cookie", "X-Litellm-Api-Key"} {
+		if v := pctx.Headers.Get(k); v != "" {
+			t.Errorf("%s = %q reaches glm; it was ete's", k, v)
+		}
+	}
+	if got := pctx.Headers.Get("Anthropic-Version"); got != "2023-06-01" {
+		t.Errorf("Anthropic-Version = %q, want it kept", got)
+	}
 }

@@ -276,6 +276,7 @@ func (p *Router) OnRequest(_ context.Context, pctx *pipeline.Context) pipeline.A
 	// to any other host is captured when it is a routed agent's inference request,
 	// and sent to the server's path for its API format.
 	captured := ""
+	addressed := p.byHost[routerconfig.Hostname(pctx.Host)] // the server the request named, "" for none
 	if _, ok := p.byHost[routerconfig.Hostname(pctx.Host)]; !ok {
 		path, ok := capture(pctx)
 		if !ok || p.agents[agentOf(pctx)] == "" {
@@ -343,7 +344,7 @@ func (p *Router) OnRequest(_ context.Context, pctx *pipeline.Context) pipeline.A
 	// changes nothing.
 	p.chooseModel(pctx, name)
 	pin.settle(name)
-	if captured != "" {
+	if addressed != name {
 		dropProviderCredentials(pctx.Headers)
 	}
 	setKey(pctx, srv.key)
@@ -588,11 +589,10 @@ func agentOf(pctx *pipeline.Context) string {
 var credentialWords = []string{"key", "apikey", "token", "auth", "authorization", "cookie",
 	"secret", "signature", "password", "credential", "credentials"}
 
-// dropProviderCredentials removes from h every header a captured request carries for
-// the provider the agent addressed: each one with a credential word in its name,
-// split at "-" and "_", case ignored — Api-Key, X-Goog-Api-Key, Cookie, X-Auth-Token
-// and a gateway's own alike. Authorization and X-Api-Key stay for setKey, which puts
-// the server's key in whichever of them the agent used.
+// dropProviderCredentials removes from h each header whose name, split at "-" and
+// "_" with case ignored, has one of credentialWords. Authorization and X-Api-Key stay
+// for setKey, which puts the server's key in whichever of them the agent used. The
+// router calls it on a request it sends to a server the request did not name.
 func dropProviderCredentials(h http.Header) {
 	for name := range h {
 		switch http.CanonicalHeaderKey(name) {

@@ -151,9 +151,7 @@ is added with `agentop server add glm <url> --main glm --helper nemotron`.
 The key is the server's: on a routed request the router puts the configured
 server's key in the header Claude Code sent its own in, `X-Api-Key` for
 `ANTHROPIC_API_KEY` and `Authorization` for `ANTHROPIC_AUTH_TOKEN`, so either can
-stay as it is. Those two headers are all it replaces: a credential in any other
-header, such as one set through `ANTHROPIC_CUSTOM_HEADERS`, reaches the server
-unchanged.
+stay as it is.
 
 Claude Code keeps naming the model it asked for, so agentop is where the server
 shows: the sessions table's `SERVER` column names each session's server, the

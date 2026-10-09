@@ -31,6 +31,10 @@ func (p *substituter) Capabilities() pipeline.PluginCapabilities {
 	return pipeline.PluginCapabilities{WritesDestination: true, WritesRequestBody: true, Description: "test"}
 }
 func (p *substituter) OnRequest(_ context.Context, pctx *pipeline.Context) pipeline.Action {
+	// The parse inference-parser would have made, so the rows carry a model.
+	if m, ok := pctx.RequestModel(); ok {
+		pctx.Extensions.Inference = &pipeline.InferenceExtension{Model: m}
+	}
 	u, _ := url.Parse(p.target)
 	if err := pctx.Redirect(u); err != nil {
 		panic(err)
@@ -218,5 +222,12 @@ func TestResend_BothAttemptsAreRecordedAndPairByRequestID(t *testing.T) {
 	}
 	if ev[1].Error == nil || ev[1].Error.Message != "team_model_access_denied" {
 		t.Errorf("refusal row error = %+v, want the upstream's error type", ev[1].Error)
+	}
+	// Each attempt's rows name the model it was sent with: the refused one the
+	// client's, the resent one the substitute, with the client's beside it.
+	for i, want := range []struct{ model, requested string }{{"exo-free", ""}, {"exo-free", ""}, {"glm-5-3", "exo-free"}, {"glm-5-3", "exo-free"}} {
+		if inf := ev[i].Inference; inf == nil || inf.Model != want.model || inf.RequestedModel != want.requested {
+			t.Errorf("row %d inference = %+v, want model %q requested %q", i, inf, want.model, want.requested)
+		}
 	}
 }

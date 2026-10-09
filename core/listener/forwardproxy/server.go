@@ -997,6 +997,9 @@ func (s *Server) resendIfAsked(r *http.Request, pctx *pipeline.Context, client *
 		return resp, nil
 	}
 	head, _ := io.ReadAll(io.LimitReader(resp.Body, pipeline.ResendPeekLimit))
+	// The parse as the refused attempt was sent: a Resender may rewrite the model,
+	// and the refused attempt's row must name the one the upstream refused.
+	sent := pipeline.SnapshotInference(pctx.Extensions.Inference)
 	if !s.OutboundPipeline.Resend(r.Context(), pctx, resp.StatusCode, head) {
 		resp.Body = struct {
 			io.Reader
@@ -1009,9 +1012,10 @@ func (s *Server) resendIfAsked(r *http.Request, pctx *pipeline.Context, client *
 		// The refused answer's row: its status and error, from the bytes read. Put back
 		// at once, because the status of the answer the client gets is the one
 		// OutcomeFromContext must read.
-		pctx.StatusCode, pctx.ResponseBody = resp.StatusCode, head
+		resent := pctx.Extensions.Inference
+		pctx.StatusCode, pctx.ResponseBody, pctx.Extensions.Inference = resp.StatusCode, head, sent
 		s.recordOutboundResponseEvent(pctx, resp.StatusCode, nil)
-		pctx.StatusCode, pctx.ResponseBody = 0, nil
+		pctx.StatusCode, pctx.ResponseBody, pctx.Extensions.Inference = 0, nil, resent
 		pctx.RenewRequestID()
 		s.recordOutboundRequestEvent(tl, pctx, pctx.OutboundSessionID)
 	}

@@ -331,9 +331,13 @@ Not tested live:
   [#941](https://github.com/rossoctl/cortex/issues/941) has one user's report of a
   LiteLLM run, started with `agentop exec` under its earlier name, in which token counts
   showed.
-- **Routing through `inference-router`** with a live OpenCode. It is covered so far by
-  unit and listener tests and by scratch-`HOME` runs of `agentop server` against a fake
-  stats server.
+
+Routing through `inference-router` was tested live on 2026-10-09 with OpenCode 2.0.26
+(`opencode run --standalone`), through a scratch Cortex in front of a GLM LiteLLM
+server: Zen's `nemotron-3.5-lightning-free` was captured from `opencode.ai`, refused by
+the server, and sent again with the server's main model for the tool-carrying turns and
+its helper for the title, before OpenCode saw a refusal; a file was written and read
+back.
 
 ## Known issues
 

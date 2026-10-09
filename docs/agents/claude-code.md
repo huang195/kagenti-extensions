@@ -209,10 +209,14 @@ Sonnet 5 and Claude Haiku 4.5. This was exercised:
 
 Not exercised: Linux; `install.sh --claude-code`; Claude Code talking to
 `api.anthropic.com` directly rather than through a gateway; Amazon Bedrock and Google
-Vertex AI; routing through `inference-router` with a live Claude Code, which so far is
-covered by unit and listener tests, by scratch-`HOME` runs of `agentop server`
-against a fake stats server, and by `S` driven in agentop against a second Cortex
-whose servers do not resolve.
+Vertex AI.
+
+Routing through `inference-router` was tested live on 2026-10-09 with Claude Code
+2.1.295 (`claude --bare -p`, an API key and no `ANTHROPIC_BASE_URL`), through a scratch
+Cortex: its requests to `api.anthropic.com` were captured and sent to the server. On a
+GLM server `claude-opus-5-5` was refused once and sent again with the server's main
+model, then sent with it from the start; on a server that serves Claude's names it went
+as Claude Code asked. A file was written and read back on each.
 
 ## Known issues
 

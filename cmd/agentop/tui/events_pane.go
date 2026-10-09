@@ -16,7 +16,7 @@ import (
 
 // eventKey pins a row to a specific event across rebuilds, so the
 // cursor follows the same event when the underlying slice shifts:
-// FIFO eviction at session.max_events, filter typed, hideInactive
+// FIFO eviction at session.max_events, a re-sort, hideInactive
 // toggled. Zero value = unpinned. `at` is UnixNano so struct == is
 // safe against time.Time's monotonic clock and Location pointer.
 type eventKey struct {
@@ -89,7 +89,8 @@ func (er eventRow) invocations() []pipeline.Invocation {
 }
 
 // rebuildEventsTable populates the events table from the cache for the
-// currently selected session, applying filter + preserving cursor. Also
+// currently selected session, applying hideInactive, marking the search's
+// matches and preserving the cursor. Also
 // resizes the table height to account for the IDENTITY banner — when
 // the session has inbound identity, subtract the banner's rendered
 // height so it doesn't push rows off-screen; otherwise claim the full
@@ -123,15 +124,15 @@ func (m *model) rebuildEventsTable() {
 	// exchange is read off the timeline.
 	ids, partner := computeEventPairs(eventRows)
 
-	// One cellContext per row of the SESSION, before any filter. The fitsContent
-	// columns are measured over all of them (see measureColumns), and the row loop
-	// below shows the cells measured there, so a column cannot be sized from one
+	// One cellContext per row of the SESSION, before hideInactive drops any. The
+	// fitsContent columns are measured over all of them (see measureColumns), and the row
+	// loop below shows the cells measured there, so a column cannot be sized from one
 	// reading of a row and filled from another.
 	//
-	// That computes invocations, rowAction and the measured cells for rows a filter
+	// That computes invocations, rowAction and the measured cells for rows hideInactive
 	// then hides, which the loop used to skip. Each is evaluated once per row, which is
-	// what the unfiltered view pays on every rebuild anyway, so filtering never makes a
-	// rebuild dearer than not filtering.
+	// what showing every row pays on every rebuild anyway, so hiding rows never makes a
+	// rebuild dearer than showing them.
 	ctxs := make([]cellContext, len(eventRows))
 	for i, er := range eventRows {
 		// One invocations and one rowAction per row: hideInactive below reads invs,
@@ -176,9 +177,6 @@ func (m *model) rebuildEventsTable() {
 		}
 	}
 	for j, cc := range ctxs {
-		if m.filter != "" && !matchEventRow(cc.row, m.filter) {
-			continue
-		}
 		// hideInactive (the `s` toggle) is off by default — every message is
 		// shown, including passthrough/skip-only ones, per "I should see all
 		// network messages". Turning it on focuses the timeline on plugin
@@ -232,6 +230,16 @@ func (m *model) rebuildEventsTable() {
 	if sortCol != nil {
 		sortEventRows(rows, m.visibleRows, keys, m.sortDesc)
 	}
+	// The search's matches, read off the rows in their final order so the marks land on the
+	// rows they describe however the sort permuted them.
+	var matches []int
+	if q := m.searchQuery(paneEvents); q != "" {
+		for i, r := range m.visibleRows {
+			if matchEventRow(r, q) {
+				matches = append(matches, i)
+			}
+		}
+	}
 	// Columns are re-set only when they actually differ, and in an order that keeps
 	// every intermediate state renderable.
 	//
@@ -262,6 +270,8 @@ func (m *model) rebuildEventsTable() {
 		m.eventsTbl.SetColumns(newCols)
 		m.eventsTbl.SetRows(rows)
 	}
+	m.eventsTbl.SetMarked(matches)
+	m.eventMatches = matches
 
 	// Auto-follow: if user was at the bottom, stay at the bottom. Otherwise
 	// preserve position so reading isn't disturbed by new events.
@@ -307,7 +317,7 @@ func (m *model) rebuildEventsTable() {
 
 	// An OPENING, not a refresh: the session under the table changed. This is the
 	// one rebuild that gets to choose an end, because there is no position to
-	// preserve yet — every later one (the poll, a filter, a column toggle) must
+	// preserve yet — every later one (the poll, a search, a column toggle) must
 	// leave the operator where they are.
 	//
 	// LATCHED ONLY ONCE THERE ARE ROWS, which is the whole subtlety. Entering a
@@ -1021,11 +1031,11 @@ func computeEventPairs(rows []eventRow) (map[*pipeline.SessionEvent]int, map[int
 // matchEventRow does a case-insensitive substring match across every string
 // field the operator might reasonably search for — the event's host/method,
 // the fields of every plugin invocation on it, and its protocol extensions.
-// A folded tunnel's fields are searched too, so filtering by a bridged
-// origin's host still surfaces the collapsed row. Two prefix shortcuts:
+// A folded tunnel's fields are searched too, so searching for a bridged
+// origin's host still finds the collapsed row. Two prefix shortcuts:
 //
 //   - `deny` alone matches a SessionDenied event and any invocation whose
-//     Action == ActionDeny — the one-word "show me failures" filter.
+//     Action == ActionDeny — the one-word "find the failures" search.
 //   - `plugin:<name>` matches rows whose escape-hatch Plugins map has <name>
 //     as a key.
 func matchEventRow(r eventRow, q string) bool {
@@ -1081,7 +1091,7 @@ func eventHaystack(e *pipeline.SessionEvent) []string {
 	for _, iv := range allInvocations(e) {
 		hay = append(hay, iv.Plugin, string(iv.Action), iv.Reason, iv.Path)
 		// Plugin-specific diagnostic context — iterate keys + values so
-		// filter text matches on e.g. "target_audience" / the target
+		// search text matches on e.g. "target_audience" / the target
 		// audience value without the UI having to know which keys each
 		// plugin writes.
 		for k, v := range iv.Details {

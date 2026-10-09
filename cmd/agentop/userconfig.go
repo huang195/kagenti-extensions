@@ -88,7 +88,7 @@ func loadUserConfig(path string, warn io.Writer) tui.UserSettings {
 // Lstat-every-component sweep that tui's checkYankDir applies to the same tree.
 // That sweep exists because yanked events carry identity subjects, raw LLM
 // completions and tool arguments, so a redirected write leaks secrets. This file
-// holds a filter string and a list of column names — a redirect leaks nothing worth
+// holds view choices — column names, a sort, a usage metric — and a redirect leaks nothing worth
 // having, and the sweep's other half (chmod 0700 in place) would mean that merely
 // opening the viewer retightens a directory the user or an installer deliberately
 // set. The residual symlink risk is closed more cheaply instead: the tempfile is

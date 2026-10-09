@@ -532,17 +532,17 @@ func TestHelpOverlayScrollKeys(t *testing.T) {
 // helpNoScrollHeight is a terminal tall enough to show the whole reference at
 // helpWideTerminal columns, so the no-affordance case is testable.
 //
-// IT IS BIG, AND THAT IS THE POINT. The body is 102 lines once every pane carries
-// its purpose and its descriptions, and 105 rows is the exact floor. The previous
+// IT IS BIG, AND THAT IS THE POINT. The body is 104 lines once every pane carries
+// its purpose and its descriptions, and 107 rows is the exact floor. The previous
 // version of this test asked for 60 and t.Skip()ed when the content did not fit —
 // which, the moment the body grew, silently took the three short-terminal
 // assertions below with it and reported PASS. A number that has to track the body's
 // height is asserted, never skipped.
 //
 // It has earned that three times now. Adding the MOVING AROUND THIS HELP group took the
-// body from 86 lines to 91, adding the AGENTS pane took it from 91 to 99, and the AGENTS
-// pane's S took it from 101 to 102 — each time this failed naming the value to use
-// rather than going quiet again.
+// body from 86 lines to 91, adding the AGENTS pane took it from 91 to 99, the AGENTS
+// pane's S took it from 101 to 102, and search's n / N on SESSIONS and EVENTS took it to
+// 104 — each time this failed naming the value to use rather than going quiet again.
 //
 // A PANE COSTS ITS TITLE, ITS PURPOSE, ITS BINDINGS AND ITS NOTES, so this constant
 // moves whenever a pane is added or its prose changes — and it is only ever right as
@@ -554,7 +554,7 @@ func TestHelpOverlayScrollKeys(t *testing.T) {
 // that no longer existed. Too small fails loudly; too large fails silently.
 const (
 	helpWideTerminal   = 100
-	helpNoScrollHeight = 105
+	helpNoScrollHeight = 107
 )
 
 // With everything visible there must be no scroll affordance — it would be noise
@@ -657,45 +657,45 @@ func TestHelpOverlayScrollDoesNotDisturbDetailPane(t *testing.T) {
 	}
 }
 
-// `?` is a legitimate filter character — session IDs and hosts can
-// contain one — so the filter input must receive it rather than having it
+// `?` is a legitimate search character — session IDs and hosts can
+// contain one — so the search prompt must receive it rather than having it
 // stolen to open the help overlay.
-func TestHelpOverlayDoesNotStealFilterInput(t *testing.T) {
+func TestHelpOverlayDoesNotStealSearchInput(t *testing.T) {
 	mm := helpModelAt(t, paneSessions, 100, 40)
-	// Close the overlay opened by the helper; we want the filter path.
+	// Close the overlay opened by the helper; we want the search path.
 	u, _ := mm.Update(tea.KeyMsg{Type: tea.KeyEsc})
 	mm = u.(*model)
 
-	// Enter filter mode, then type a value containing `?`.
+	// Open the search prompt, then type a value containing `?`.
 	u, _ = mm.Update(keyRune('/'))
 	mm = u.(*model)
-	if !mm.filtering {
-		t.Fatal("setup: `/` should enter filter mode")
+	if !mm.searching {
+		t.Fatal("setup: `/` should open the search prompt")
 	}
 	for _, r := range "ab?c" {
 		u, _ = mm.Update(keyRune(r))
 		mm = u.(*model)
 	}
 	if mm.helpVisible {
-		t.Fatal("`?` while filtering should not open the help overlay")
+		t.Fatal("`?` while searching should not open the help overlay")
 	}
-	if got := mm.filterInput.Value(); got != "ab?c" {
-		t.Fatalf("filter input should have received the `?`, got %q", got)
-	}
-	if mm.filter != "ab?c" {
-		t.Fatalf("live filter should be %q, got %q", "ab?c", mm.filter)
+	if got := mm.searchInput.Value(); got != "ab?c" {
+		t.Fatalf("search prompt should have received the `?`, got %q", got)
 	}
 
-	// Committing the filter releases the keyboard, so `?` works again.
+	// Committing the search releases the keyboard, so `?` works again.
 	u, _ = mm.Update(tea.KeyMsg{Type: tea.KeyEnter})
 	mm = u.(*model)
-	if mm.filtering {
-		t.Fatal("setup: Enter should commit the filter")
+	if mm.searching {
+		t.Fatal("setup: Enter should commit the search")
+	}
+	if got := mm.search[paneSessions]; got != "ab?c" {
+		t.Fatalf("committed search should be %q, got %q", "ab?c", got)
 	}
 	u, _ = mm.Update(keyRune('?'))
 	mm = u.(*model)
 	if !mm.helpVisible {
-		t.Fatal("`?` should open the overlay once the filter input is unfocused")
+		t.Fatal("`?` should open the overlay once the search prompt is closed")
 	}
 }
 

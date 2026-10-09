@@ -27,10 +27,8 @@ var Settings UserSettings
 type UserSettings struct {
 	Events EventSettings `yaml:"events,omitempty"`
 	Usage  UsageSettings `yaml:"usage,omitempty"`
-	// Filter is the committed substring filter. One field because there is one
-	// m.filter: the sessions and events panes share it (sessions_pane.go, and
-	// events_pane.go's matchEventRow).
-	Filter string `yaml:"filter,omitempty"`
+	// No filter: `/` searches now and a search is not saved (#1339). A `filter:` key an
+	// older agentop wrote loads as an unknown key — ignored — and the next save drops it.
 }
 
 // EventSettings is the events-table view state.

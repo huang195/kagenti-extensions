@@ -397,7 +397,7 @@ func registerObserveFlags(fs *flag.FlagSet) observeFlags {
 		// backquoted word as the value's NAME, so "`agentop service`" rendered the flag as
 		// "-prefs agentop service" instead of "-prefs string".
 		prefs: fs.String("prefs", "",
-			"agentop's own settings file — events-table columns and the active filter, saved as you change them (default ~/.cortex/agentop-config.yaml). Not the Cortex proxy config, which is --config on 'agentop service' and 'agentop configure claude-code'."),
+			"agentop's own settings file — events-table columns, sort and the usage view, saved as you change them (default ~/.cortex/agentop-config.yaml). Not the Cortex proxy config, which is --config on 'agentop service' and 'agentop configure claude-code'."),
 		// --kubernetes exists because "is a local Cortex answering?" is a poor proxy for
 		// "which Cortex did you mean". Someone who runs Cortex on their laptop AND works
 		// against a cluster otherwise has no way to reach the picker: the local probe

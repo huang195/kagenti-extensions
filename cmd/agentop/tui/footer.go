@@ -76,28 +76,17 @@ func (m *model) footerView() string {
 	if m.serverSwitch != nil {
 		status.WriteString(styleWarn.Render("   [" + m.serverSwitch.text() + "]"))
 	}
-	// A filter that is ON but not being edited has nowhere else to show: the filter
-	// box renders only while m.filtering, so a filter restored from the config file
-	// silently truncated the list with nothing on screen explaining it. Shown here
-	// rather than in the hint line because it is state, not a keybinding — the same
-	// reason [paused] sits above.
-	//
-	// Pane-gated for the same reason as [sort: …] below, and it is the same defect:
-	// m.filter is model-global and restored from settings, so it survived onto panes
-	// that filter nothing — the Usage pane fetches an aggregate the filter never
-	// reaches, so "[filter: github-tool]" there claims the chart is narrowed when
-	// every bucket in it is unfiltered.
-	//
-	// Two panes rather than one, unlike the sort indicator: sessions_pane.go and
-	// events_pane.go both read m.filter (the namespaces picker has its own model and
-	// its own copy). Nothing else in the tree does.
-	if m.filter != "" && !m.filtering && (m.pane == paneSessions || m.pane == paneEvents) {
-		status.WriteString(styleWarn.Render("   [filter: " + m.filter + "]"))
+	// The active pane's search: which match the cursor is on, how many there are, or that
+	// there are none — see searchStatus. Here rather than in the hint line because it is
+	// state, not a keybinding — the same reason [paused] sits above. Only the sessions and
+	// events panes search, and each its own, so no other pane shows one.
+	if s := m.searchStatus(); s != "" {
+		status.WriteString(styleWarn.Render("   " + s))
 	}
 	if m.pane == paneSessions && m.agentScope != "" && m.sessionsScope() == "" {
 		status.WriteString(styleWarn.Render("   [no session names its agent: list not scoped]"))
 	}
-	// A non-chronological sort, for the same reason as [filter: …] above: it is
+	// A non-chronological sort, for the same reason as the search above: it is
 	// state the operator chose, and a table in an order the eye does not expect
 	// reads as a bug when nothing on screen names the ordering.
 	//
@@ -149,8 +138,8 @@ func (m *model) footerView() string {
 // layout() reserves exactly three rows for title + blank + footer, so a status row
 // wider than the terminal wraps and costs the hint line below it — the row carrying
 // [?] keys and [q] quit. Every writer above appends unconditionally, and only the
-// feedback link checked the width, so a state-rich row (paused + a restored filter +
-// an active sort) overflowed at 80 columns: measured 87.
+// feedback link checked the width, so a state-rich row (paused + a search + an active
+// sort) overflows at 80 columns: measured 87 with the filter the search replaced.
 //
 // Truncates from the RIGHT, unlike fitHintLine's drop-from-the-front. The two lines
 // rank their contents oppositely: the hint line's last entries are the escape hatches

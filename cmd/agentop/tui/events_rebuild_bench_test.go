@@ -15,19 +15,19 @@ import (
 //
 // The cost record is what makes TOKENS and COST the expensive cells — each decodes it —
 // so a fixture without one would not show what evaluating them twice per row costs.
-// "filtered" keeps one row in ten, and must never cost more than "unfiltered": a filter
-// hides rows, it should not add work.
+// "searched" marks one row in ten, which costs one match per row on top of "plain": a search
+// hides nothing, so every row is still rendered.
 func BenchmarkRebuildEventsTable(b *testing.B) {
 	for _, bc := range []struct {
 		name   string
-		filter string
+		search string
 	}{
-		{"unfiltered", ""},
-		{"filtered", "h7.example"},
+		{"plain", ""},
+		{"searched", "h7.example"},
 	} {
 		b.Run(bc.name, func(b *testing.B) {
 			m := rebuildBenchModel(b, 1000)
-			m.filter = bc.filter
+			m.search = map[paneID]string{paneEvents: bc.search}
 			b.ReportAllocs()
 			for b.Loop() {
 				m.rebuildEventsTable()
@@ -38,7 +38,7 @@ func BenchmarkRebuildEventsTable(b *testing.B) {
 
 // rebuildBenchModel is an events pane over n inference exchanges, every response priced and
 // every other one carrying an estimated tool-prune saving. Hosts cycle through ten values so
-// a filter on one of them keeps a tenth of the rows.
+// a search for one of them matches a tenth of the rows.
 func rebuildBenchModel(b *testing.B, n int) *model {
 	b.Helper()
 	plain, err := json.Marshal(event.Event{CostUSD: 0.2767, Settled: true, PromptUSD: 0.2546, OutputUSD: 0.0221})

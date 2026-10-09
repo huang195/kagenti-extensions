@@ -299,7 +299,8 @@ var paneKeys = map[paneID]keyGroup{
 		bindings: []keyBinding{
 			{"↑↓ / jk", "navigate"},
 			{"↵ / → / l", "drill into session"},
-			{"/", "filter"},
+			{"/", "search SESSION, TITLE and AGENT (enter keeps, esc cancels)"},
+			{"n / N", "next / previous match"},
 			{"X", "clear all history, in memory and on disk (asks first; the cost ledger is kept)"},
 			{"esc", "back to the agents picker, else pods picker"},
 		},
@@ -310,7 +311,8 @@ var paneKeys = map[paneID]keyGroup{
 		bindings: []keyBinding{
 			{"↑↓ / jk", "navigate"},
 			{"↵ / → / l", "event detail"},
-			{"/", "filter"},
+			{"/", "search (deny, plugin:<name>, or any text); enter keeps, esc cancels"},
+			{"n / N", "next / previous match"},
 			{"s", "toggle passthru/skip rows"},
 			{"c", "column picker (checkboxes + descriptions)"},
 			{"c then s", "sort by a column: desc → asc → chronological"},

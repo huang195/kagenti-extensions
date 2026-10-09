@@ -71,7 +71,7 @@ automatically and drops you into the **Sessions** pane:
 │  (no sessions yet)                                                             │
 │                                                                                │
 │  ● connected   0.0 events/sec                                                  │
-│  [↑↓] nav  [↵] drill  [/] filter  [p] pause  [P] pipeline  [?] help  [q]      │
+│  [↑↓] nav  [↵] drill  [/] search  [p] pause  [P] pipeline  [?] help  [q]      │
 ╰────────────────────────────────────────────────────────────────────────────────╯
 ```
 
@@ -126,7 +126,7 @@ Select the row with `↑`/`↓` (or `j`/`k`) and press `Enter` to open the **Eve
 │ 12:24:43.40 in  └resp a2a   message/stream   200    4256ms              │
 │                                                                          │
 │ ● connected   focus=4647e888   23 events                                 │
-│ [↑↓] nav  [↵] detail  [esc] back  [/] filter  [p] pause  [q] quit       │
+│ [↑↓] nav  [↵] detail  [esc] back  [/] search  [p] pause  [q] quit       │
 ╰──────────────────────────────────────────────────────────────────────────╯
 ```
 
@@ -243,14 +243,14 @@ Back in the Sessions or Events pane, everything is **streamed via SSE** from the
 
 The bottom-footer rate indicator (`3.2 events/sec`) is a live events-per-second gauge — useful to tell if traffic is flowing or something upstream is stuck. It is the count over the last tick, not a smoothed average, so it moves abruptly.
 
-## 8. Filter and search
+## 8. Search
 
-Press `/` in Sessions or Events to open a substring filter. Filters apply to:
+Press `/` in Sessions or Events to search, as in a text editor. Every row stays on screen: as you type, the matching rows are highlighted and the cursor jumps to the first match at or after where you pressed `/`. A search matches any part of, ignoring case:
 
-- **Sessions pane**: session ID, title, or agent substring.
-- **Events pane**: matches across `host`, `method`, `proto`, `A2A parts content`, `LLM completion`, `MCP error message`, caller `subject` / `clientId`.
+- **Sessions pane**: the session ID, title, or agent.
+- **Events pane**: `host`, `method`, each plugin's name, action, reason and details, `A2A parts content`, `LLM completion`, `MCP error message`, caller `subject` / `clientId`. Two special searches: `deny` finds the denied events, and `plugin:<name>` the events that plugin ran on.
 
-`Esc` to cancel, `Enter` to commit. Press `/` again and clear with `Esc` to remove the filter.
+`Enter` keeps the cursor on the match; `Esc` cancels and puts the cursor back. `n` / `N` jump to the next / previous match, and the footer shows where you are — for example `[/weather 2/5]`. Press `/` then `Enter` on the empty box to clear the search. Nothing about a search is saved, and opening a different session's events starts with no search.
 
 ## 9. Pause / resume
 

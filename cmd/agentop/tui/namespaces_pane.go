@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/charmbracelet/bubbles/textinput"
 	"github.com/charmbracelet/bubbles/viewport"
 	tea "github.com/charmbracelet/bubbletea"
 
@@ -80,16 +79,6 @@ func newPickerModel(ctx context.Context, lister cluster.Lister, pf cluster.PortF
 	parentCtx := ctx
 	ctx, cancel := context.WithCancel(ctx)
 
-	ti := textinput.New()
-	ti.Placeholder = "filter…"
-	ti.Prompt = "/ "
-	// Seed the input, not just m.filter: the filter box renders only while filtering,
-	// so a restored filter was applied invisibly — the list came back truncated with
-	// nothing on screen saying why. Worse, `/` then one character replaced the saved
-	// filter with that character, and `/` then Esc persisted an empty one, discarding
-	// it for good.
-	ti.SetValue(Settings.Filter)
-
 	// Resolved once, as in New: see the note there.
 	sortCol, sortDesc := Settings.sortSelection()
 
@@ -111,7 +100,6 @@ func newPickerModel(ctx context.Context, lister cluster.Lister, pf cluster.PortF
 		sortCol:      sortCol,
 		sortDesc:     sortDesc,
 		usage:        usageState{metric: usageMetric, windowIdx: usageWindowIdx, group: usageGroup},
-		filter:       Settings.Filter,
 		sessionsData: loadSessionMetadataForModel(),
 		sessionsTbl:  newSessionsTable(),
 		eventsTbl:    newEventsTable(),
@@ -123,7 +111,7 @@ func newPickerModel(ctx context.Context, lister cluster.Lister, pf cluster.PortF
 		// the zero value, which is paneNamespaces — see New.
 		pipelineReturnPane: paneNone,
 		detailVp:           viewport.New(0, 0),
-		filterInput:        ti,
+		searchInput:        newSearchInput(),
 		lastTick:           time.Now(),
 		connState:          connStateInfo{phase: connConnecting},
 

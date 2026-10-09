@@ -132,14 +132,10 @@ func TestModel_PauseTogglesViaKey(t *testing.T) {
 	}
 }
 
-// TestModel_FilterNarrowsSessions exercises the filter path on the sessions
-// pane: entering `/ foo enter` should narrow the table to rows matching
-// "foo".
-func TestModel_FilterNarrowsSessions(t *testing.T) {
-	// Before New: the constructors seed filter and filterInput from Settings, so a
-	// filter another test committed would make the "unfiltered" baseline below
-	// already filtered. Committing "foo" here also writes Settings, so this keeps it
-	// from leaking outward too.
+// TestModel_SearchKeepsEverySession exercises the search path on the sessions
+// pane: `/ bar enter` keeps every row and leaves the cursor on the one that
+// matches "bar".
+func TestModel_SearchKeepsEverySession(t *testing.T) {
 	resetSettingsForTest(t)
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -154,22 +150,25 @@ func TestModel_FilterNarrowsSessions(t *testing.T) {
 	}
 	mdl.rebuildSessionsTable()
 	if got := len(mdl.sessionsTbl.Rows()); got != 3 {
-		t.Fatalf("unfiltered: %d rows, want 3", got)
+		t.Fatalf("before the search: %d rows, want 3", got)
 	}
 
-	// Open filter with `/`, type "foo", commit with Enter.
+	// Open the search with `/`, type "bar", commit with Enter.
 	mdl.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'/'}})
-	if !mdl.filtering {
-		t.Fatal("expected filtering=true after /")
+	if !mdl.searching {
+		t.Fatal("expected searching=true after /")
 	}
-	for _, r := range "foo" {
+	for _, r := range "bar" {
 		mdl.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{r}})
 	}
 	mdl.Update(tea.KeyMsg{Type: tea.KeyEnter})
-	if mdl.filtering {
-		t.Error("filtering should close on Enter")
+	if mdl.searching {
+		t.Error("the prompt should close on Enter")
 	}
-	if got := len(mdl.sessionsTbl.Rows()); got != 2 {
-		t.Errorf("after filter 'foo': %d rows, want 2 (ctx-foo, ctx-fooo)", got)
+	if got := len(mdl.sessionsTbl.Rows()); got != 3 {
+		t.Errorf("after searching 'bar': %d rows, want all 3", got)
+	}
+	if got := mdl.selectedSessionID(); got != "ctx-bar" {
+		t.Errorf("after searching 'bar' the cursor is on %q, want ctx-bar", got)
 	}
 }

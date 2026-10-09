@@ -265,13 +265,29 @@ jobs:
               gh api --method PATCH "repos/${GITHUB_REPOSITORY}/git/refs/tags/${TAG}" \
                 -f sha="${GITHUB_SHA}" -F force=true >/dev/null
             fi
-            # --clobber replaces same-named assets but never deletes others, so if a
-            # proxy_variants entry is ever retired its *_main-latest_* archive lingers
-            # while checksums.txt stops listing it: downloadable but unverifiable. The
-            # installer is unaffected (it fetches two exact names and needs two checksum
-            # lines), so this is a note rather than a prune — delete stale assets by hand
-            # when retiring a variant.
             gh release upload "${TAG}" dist/*.tar.gz dist/checksums.txt --clobber
+            # --clobber replaces same-named assets but never deletes others, so every
+            # name this build stops producing lingers on the rolling release: frozen at
+            # its last build, and missing from checksums.txt, so nothing can verify it.
+            # Leaving that to a human did not work: abctl_*, authbridge-proxy*_* and
+            # cortex-{lite,sessionbudget}_* all outlived the builds that made them. So
+            # delete whatever dist/ does not hold. After the upload, so a failed upload
+            # deletes nothing; a failed list or delete only leaves what was already
+            # there, so either one warns rather than fails the publish. Only for the
+            # rolling tag: a v* release is published once, and may carry assets
+            # attached by hand.
+            if [ "${TAG}" = "main-latest" ]; then
+              if names=$(gh release view "${TAG}" --json assets --jq '.assets[].name'); then
+                printf '%s\n' "${names}" | while IFS= read -r name; do
+                  [ -e "dist/${name}" ] && continue
+                  echo "Deleting stale asset ${name}"
+                  gh release delete-asset "${TAG}" "${name}" --yes \
+                    || echo "::warning::Could not delete stale asset ${name} from ${TAG}."
+                done
+              else
+                echo "::warning::Could not list the assets of ${TAG}; stale ones were not pruned."
+              fi
+            fi
             # A v* release that already exists was created either by an earlier run of
             # this job, flagged already, or by hand before this ran — from the Releases
             # page, say, where nothing flags it by its tag. Unflagged, a release

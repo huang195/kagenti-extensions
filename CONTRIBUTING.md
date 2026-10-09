@@ -177,10 +177,13 @@ moment and are inert until then:
   tag pushes. It builds only first-party code with SHA-pinned actions, but that is a
   wider blast radius than before. If you want it narrower, split build (`contents: read`)
   from publish (`contents: write`) and pass `dist/` between them as an artifact.
-- **The job moves the `main-latest` tag** on each publish. That is the one destructive
-  operation in the workflow. It is guarded to the rolling tag, and `install_test.sh`
-  asserts no `${TAG}` comparison in the workflow names anything other than
-  `CHANNEL_TAG`, so a `v*` release cannot become movable by a rename going unnoticed.
+- **The job moves the `main-latest` tag and prunes its assets** on each publish,
+  deleting any asset that build did not produce, so a retired binary does not linger
+  beside the current ones with no checksum to verify it. Those are the two destructive
+  operations in the workflow. Both are guarded to the rolling tag, and `install_test.sh`
+  asserts that each sits inside that guard and that no `${TAG}` comparison in the
+  workflow names anything other than `CHANNEL_TAG`, so a `v*` release cannot become
+  movable or prunable by a rename going unnoticed.
 
 The middle step is load-bearing, though not for the reason it first appears. The default
 one-liner is safe as soon as `main` carries the `newest_release()` v-tag filter: it

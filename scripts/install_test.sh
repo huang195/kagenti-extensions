@@ -602,6 +602,24 @@ if [ -f "${WORKFLOW}" ]; then
 		"$(grep -oE '\[ "\$\{TAG\}" = "[^"]*" \]' "${WORKFLOW}" | grep -cv "\"${CHANNEL_TAG}\"" || true)"
 	check "at least one TAG comparison names CHANNEL_TAG" "1" \
 		"$(grep -oE '\[ "\$\{TAG\}" = "[^"]*" \]' "${WORKFLOW}" | grep -c "\"${CHANNEL_TAG}\"" | awk '$1>0{print 1; exit} {print 0}')"
+	# The checks above prove every guard names CHANNEL_TAG, not that the destructive
+	# operations sit inside one. Both of them — moving the tag, deleting the assets the
+	# build no longer makes — would rewrite a v* release if they ran for one, so assert
+	# each appears, and only inside an `if [ "${TAG}" = "<CHANNEL_TAG>" ]; then` block
+	# (from that line to the `fi` at its indent). "missing" means the pattern no longer
+	# matches the workflow, which would otherwise pass vacuously.
+	channel_guarded() { # pattern
+		awk -v tag="${CHANNEL_TAG}" -v pat="$1" '
+			index($0, "if [ \"${TAG}\" = \"" tag "\" ]; then") {
+				match($0, /^ */); indent = RLENGTH; inside = 1; next
+			}
+			inside && match($0, /^ *fi$/) && RLENGTH == indent + 2 { inside = 0; next }
+			/^ *#/ { next }
+			$0 ~ pat { if (inside) ok++; else bad++ }
+			END { print (bad ? "unguarded" : ok ? "guarded" : "missing") }' "${WORKFLOW}"
+	}
+	check "the tag move runs only for CHANNEL_TAG" "guarded" "$(channel_guarded 'git/refs/tags/')"
+	check "the stale-asset prune runs only for CHANNEL_TAG" "guarded" "$(channel_guarded 'release delete-asset')"
 else
 	check "release-binaries.yaml is where expected" "found" "missing at ${WORKFLOW}"
 fi

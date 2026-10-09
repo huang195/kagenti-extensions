@@ -226,9 +226,10 @@ function renderDaily(snapshots) {
     const ciRuns = haveBounds
       ? runsBetween(prevSnap.taken_at, currSnap.taken_at) : null;
 
-    // Each successful run is TWO installs, not one: the smoke test fresh-installs
-    // the newest stable tag and then upgrades to the tag under test, and each leg
-    // fetches its own checksums.txt.
+    // One install per run reaches these figures. The run installs three times, but
+    // on a push to main the two extra legs land on main-latest, which the collector
+    // excludes from .totals. See CI_INSTALLS_PER_RUN for the arithmetic that
+    // settles it.
     const ciInstalls = ciRuns === null ? null : ciRuns * CI_INSTALLS_PER_RUN;
     const est = ciInstalls === null
       ? { value: null, underflow: false, raw: null }
@@ -374,11 +375,18 @@ function renderReleases(snapshots) {
   // history and nothing is missing -- even though its earliest run postdates a
   // release published before the workflow existed. Without the total_count test
   // that case marks a false floor, which is what v0.8.1 was showing.
-  const everCount = snapshots
-    .map((s) => s.smoke_runs_total_count)
-    .filter((n) => typeof n === "number")
-    .shift();
+  // Read total_count from the same snapshot that supplied the earliest run, not
+  // from whichever snapshot happens to carry one first. A snapshot whose runs
+  // query failed can still have populated total_count, and pairing that count
+  // with a different snapshot's earliest run compares two unrelated moments.
+  const firstWithRuns = snapshots.find((s) => Array.isArray(s.smoke_runs)
+    && s.smoke_runs.length > 0);
+  const everCount = firstWithRuns
+    ? firstWithRuns.smoke_runs_total_count : null;
   const historyComplete = typeof everCount === "number" && everCount <= 100;
+  // runTimes[0] is the earliest run across ALL snapshots, which is the right
+  // bound: it is the oldest run the page actually knows about, whatever snapshot
+  // reported it. total_count above only decides whether anything is missing at all.
   const ciPartial = ciRuns !== null && runTimes.length > 0
     && !historyComplete
     && currentRel.published_at < runTimes[0];

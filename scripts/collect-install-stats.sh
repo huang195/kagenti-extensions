@@ -71,11 +71,18 @@ while [ $# -gt 0 ]; do
 		shift 2
 		;;
 	-h | --help)
-		# The whole leading comment block, not a line range: a hardcoded range
-		# silently stops matching when the header grows, which is how --help came
-		# to end mid-sentence and never reach Usage. This stops at the first line
-		# that is not a comment.
-		sed -n '2,/^[^#]/p' "$0" | sed '/^[^#]/d; s/^# \{0,1\}//'
+		# Every comment line before the first line of code, rather than a
+		# hardcoded range: a range silently stops matching when the header grows,
+		# which is how --help came to end mid-sentence and never reach Usage.
+		#
+		# grep-then-stop rather than a sed range, so a blank line anywhere in or
+		# after the header cannot truncate the output early: awk tracks whether it
+		# is still in the leading block and exits at the first non-comment,
+		# non-blank line.
+		awk 'NR == 1 { next }
+		     /^#/ { sub(/^# ?/, ""); print; next }
+		     /^[[:space:]]*$/ { print ""; next }
+		     { exit }' "$0"
 		exit 0
 		;;
 	*)
@@ -96,7 +103,8 @@ tmp=$(mktemp)
 snap=$(mktemp)
 runs=$(mktemp)
 latest=$(mktemp)
-trap 'rm -f "${tmp}" "${snap}" "${runs}" "${latest}"' EXIT INT TERM
+merged=$(mktemp)
+trap 'rm -f "${tmp}" "${snap}" "${runs}" "${latest}" "${merged}"' EXIT INT TERM
 
 # --paginate to cover every release, not just the first page: lifetime totals on
 # older tags still move (mirrors, stragglers) and dropping them would silently
@@ -251,18 +259,16 @@ mkdir -p "$(dirname "${OUT}")"
 # Re-running on the same day replaces that day's snapshot instead of appending a
 # second one. Makes the job idempotent, so a manual workflow_dispatch after a
 # failed cron run is safe and leaves exactly one row per date.
-merged=$(mktemp)
 jq --slurpfile snap "${snap}" '
   .snapshots
   |= ( map(select(.date != $snap[0].date)) + $snap
        | sort_by(.date) )
 ' "${OUT}" >"${merged}"
 
-# cat rather than mv: OUT may live on a different filesystem than TMPDIR (it
-# does under the Actions worktree), where mv across devices is not atomic
-# anyway, and this keeps the trap's cleanup list accurate.
+# cat rather than mv: OUT may live on a different filesystem than TMPDIR (it does
+# under the Actions worktree), where mv across devices is not atomic anyway, and
+# leaving the file in place keeps the trap responsible for removing it.
 cat "${merged}" >"${OUT}"
-rm -f "${merged}"
 
 days=$(jq '.snapshots | length' "${OUT}")
 echo "recorded ${today} in ${OUT} (${days} day(s) of history)"

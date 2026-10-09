@@ -112,6 +112,7 @@ import (
 	"log/slog"
 	"net/http"
 	"net/url"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -342,6 +343,9 @@ func (p *Router) OnRequest(_ context.Context, pctx *pipeline.Context) pipeline.A
 	// changes nothing.
 	p.chooseModel(pctx, name)
 	pin.settle(name)
+	if captured != "" {
+		dropProviderCredentials(pctx.Headers)
+	}
 	setKey(pctx, srv.key)
 	d := details()
 	if captured != "" {
@@ -578,6 +582,30 @@ func agentOf(pctx *pipeline.Context) string {
 		return ""
 	}
 	return agent
+}
+
+// credentialWords are the words of a header name that make the header a credential.
+var credentialWords = []string{"key", "apikey", "token", "auth", "authorization", "cookie",
+	"secret", "signature", "password", "credential", "credentials"}
+
+// dropProviderCredentials removes from h every header a captured request carries for
+// the provider the agent addressed: each one with a credential word in its name,
+// split at "-" and "_", case ignored — Api-Key, X-Goog-Api-Key, Cookie, X-Auth-Token
+// and a gateway's own alike. Authorization and X-Api-Key stay for setKey, which puts
+// the server's key in whichever of them the agent used.
+func dropProviderCredentials(h http.Header) {
+	for name := range h {
+		switch http.CanonicalHeaderKey(name) {
+		case "Authorization", "X-Api-Key":
+			continue
+		}
+		for _, w := range strings.FieldsFunc(strings.ToLower(name), func(r rune) bool { return r == '-' || r == '_' }) {
+			if slices.Contains(credentialWords, w) {
+				h.Del(name)
+				break
+			}
+		}
+	}
 }
 
 // setKey puts key in the header the client authenticated with: X-Api-Key when it

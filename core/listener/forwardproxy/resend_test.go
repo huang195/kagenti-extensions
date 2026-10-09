@@ -66,9 +66,10 @@ type modelServer struct {
 	stream bool
 	big    int // when > 0, the refusal body is padded to this many bytes
 
-	mu    sync.Mutex
-	paths []string
-	model []string
+	mu      sync.Mutex
+	paths   []string
+	model   []string
+	headers []http.Header
 }
 
 func (m *modelServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -77,6 +78,7 @@ func (m *modelServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	m.mu.Lock()
 	m.paths = append(m.paths, r.URL.RequestURI())
 	m.model = append(m.model, model)
+	m.headers = append(m.headers, r.Header.Clone())
 	m.mu.Unlock()
 	if model != m.served {
 		w.Header().Set("Content-Type", "application/json")
@@ -229,5 +231,70 @@ func TestResend_BothAttemptsAreRecordedAndPairByRequestID(t *testing.T) {
 		if inf := ev[i].Inference; inf == nil || inf.Model != want.model || inf.RequestedModel != want.requested {
 			t.Errorf("row %d inference = %+v, want model %q requested %q", i, inf, want.model, want.requested)
 		}
+	}
+}
+
+// bodyReader reads response bodies, as inference-parser does, so the listener strips
+// the client's Accept-Encoding and lets its transport negotiate and decode.
+type bodyReader struct{}
+
+func (bodyReader) Name() string { return "body-reader" }
+func (bodyReader) Capabilities() pipeline.PluginCapabilities {
+	return pipeline.PluginCapabilities{ReadsBody: true, Description: "test"}
+}
+func (bodyReader) OnRequest(context.Context, *pipeline.Context) pipeline.Action {
+	return pipeline.Action{Type: pipeline.Continue}
+}
+func (bodyReader) OnResponse(context.Context, *pipeline.Context) pipeline.Action {
+	return pipeline.Action{Type: pipeline.Continue}
+}
+
+// The resent request is prepared for the upstream as the first send is: the client's
+// proxy credential and hop-by-hop headers stay with the proxy, and the client's
+// Accept-Encoding is left to the transport when a plugin reads response bodies.
+func TestResend_TheResentRequestIsPreparedAsTheFirstSendIs(t *testing.T) {
+	upstream := &modelServer{served: "glm-5-3"}
+	backend := httptest.NewServer(upstream)
+	defer backend.Close()
+
+	p, err := pipeline.New([]pipeline.Plugin{bodyReader{}, &substituter{target: backend.URL, sub: "glm-5-3", resend: true}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	srv := &Server{OutboundPipeline: pipeline.NewHolder(p), Client: http.DefaultClient}
+	proxy := httptest.NewServer(srv.Handler())
+	defer proxy.Close()
+
+	proxyURL := mustParseURL(proxy.URL)
+	proxyURL.User = url.UserPassword("user", "proxy-secret")
+	req, _ := http.NewRequest(http.MethodPost, "http://agent-provider.example/v1/chat/completions",
+		strings.NewReader(`{"model":"exo-free","messages":[]}`))
+	req.Header.Set("Accept-Encoding", "gzip, br")
+	req.Header.Set("Keep-Alive", "timeout=5")
+	req.Header.Set("Trailer", "X-Checksum")
+	client := &http.Client{Transport: &http.Transport{Proxy: http.ProxyURL(proxyURL), DisableCompression: true}}
+	resp, err := client.Do(req)
+	if err != nil {
+		t.Fatalf("request: %v", err)
+	}
+	resp.Body.Close()
+
+	upstream.mu.Lock()
+	defer upstream.mu.Unlock()
+	if len(upstream.headers) != 2 {
+		t.Fatalf("upstream saw %d sends, want the refused one and the resend", len(upstream.headers))
+	}
+	for i, h := range upstream.headers {
+		for _, name := range []string{"Proxy-Authorization", "Keep-Alive", "Trailer", "Proxy-Connection", "Upgrade", "Te"} {
+			if v := h.Get(name); v != "" {
+				t.Errorf("send %d carried %s: %q", i+1, name, v)
+			}
+		}
+		if got := h.Get("Accept-Encoding"); got == "gzip, br" {
+			t.Errorf("send %d carried the client's Accept-Encoding %q", i+1, got)
+		}
+	}
+	if a, b := upstream.headers[0].Get("Accept-Encoding"), upstream.headers[1].Get("Accept-Encoding"); a != b {
+		t.Errorf("Accept-Encoding %q on the first send but %q on the resend", a, b)
 	}
 }

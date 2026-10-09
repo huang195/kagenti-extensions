@@ -424,3 +424,75 @@ func TestInit_FetchesEachServersModelsAndKeepsThem(t *testing.T) {
 		t.Errorf("stored list = %s, want the fetched one kept", v)
 	}
 }
+
+// A captured request was addressed to the agent's provider, so the credentials it
+// carries are the provider's: none of them reaches the inference server, only the
+// server's key, in the header the agent sent its own in. Headers that are no
+// credential go as they came.
+func TestRouter_ACapturedRequestCarriesNoCredentialOfTheHostItAddressed(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		apiKey   bool // the agent authenticated with X-Api-Key rather than a bearer token
+		wantAuth string
+		wantKey  string
+	}{
+		{"a bearer token", false, "Bearer glm-key", ""},
+		{"an X-Api-Key", true, "", "glm-key"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			_, p := buildRouter(t, wordConfig(`"opencode": "glm"`))
+			pctx := chat(newStore(t), "opencode.ai", "/zen/v1/chat/completions", opencodeUA, "s1", "exo-free", true)
+			if tc.apiKey {
+				pctx.Headers.Del("Authorization")
+				pctx.Headers.Set("X-Api-Key", "provider-key")
+			}
+			provider := map[string]string{
+				"Api-Key":                   "azure-key",
+				"X-Goog-Api-Key":            "google-key",
+				"Cookie":                    "session=provider",
+				"X-Auth-Token":              "gateway-token",
+				"Ocp-Apim-Subscription-Key": "apim-key",
+				"X-Request-Signature":       "hmac",
+				"X-Client-Secret":           "secret",
+			}
+			for k, v := range provider {
+				pctx.Headers.Set(k, v)
+			}
+			benign := map[string]string{"Content-Type": "application/json", "Anthropic-Version": "2023-06-01", "X-Team-Id": "t1"}
+			for k, v := range benign {
+				pctx.Headers.Set(k, v)
+			}
+			run(t, p, pctx)
+
+			for k := range provider {
+				if v := pctx.Headers.Get(k); v != "" {
+					t.Errorf("%s = %q reaches the server; it was the provider's", k, v)
+				}
+			}
+			for k, v := range benign {
+				if got := pctx.Headers.Get(k); got != v {
+					t.Errorf("%s = %q, want %q kept", k, got, v)
+				}
+			}
+			if got := pctx.Headers.Get("Authorization"); got != tc.wantAuth {
+				t.Errorf("Authorization = %q, want %q", got, tc.wantAuth)
+			}
+			if got := pctx.Headers.Get("X-Api-Key"); got != tc.wantKey {
+				t.Errorf("X-Api-Key = %q, want %q", got, tc.wantKey)
+			}
+		})
+	}
+}
+
+// A request the agent addressed to a server's own host carries what the agent meant
+// for that server, and only the key is replaced.
+func TestRouter_ARequestAddressedToAServerKeepsItsOtherHeaders(t *testing.T) {
+	_, p := buildRouter(t, wordConfig(`"opencode": "glm"`))
+	pctx := chat(newStore(t), glmHost, "/v1/chat/completions", opencodeUA, "s1", "exo-free", true)
+	pctx.Headers.Set("Cookie", "meant=for-glm")
+	run(t, p, pctx)
+	if got := pctx.Headers.Get("Cookie"); got != "meant=for-glm" {
+		t.Errorf("Cookie = %q, want it kept: the agent addressed glm", got)
+	}
+	assertRouted(t, pctx, glmHost, "glm-key")
+}

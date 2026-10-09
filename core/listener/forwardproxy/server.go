@@ -494,44 +494,8 @@ func (s *Server) serveOutbound(w http.ResponseWriter, r *http.Request, tl *tunne
 		setBody(r, pctx.Body)
 	}
 
-	// Remove hop-by-hop headers
-	r.Header.Del("Connection")
-	r.Header.Del("Keep-Alive")
-	r.Header.Del("Proxy-Authenticate")
-	r.Header.Del("Proxy-Authorization")
-	r.Header.Del("Proxy-Connection")
-	r.Header.Del("TE")
-	r.Header.Del("Trailer")
-	r.Header.Del("Transfer-Encoding")
-	r.Header.Del("Upgrade")
-
-	// Strip the client's Accept-Encoding so Go's transport negotiates content
-	// coding on its own behalf.
-	//
-	// net/http auto-decompresses a gzip response ONLY when the transport added
-	// Accept-Encoding itself. Forwarding the caller's header suppresses that:
-	// resp.Body then yields raw compressed bytes. Every body-reading plugin
-	// sees binary — the SSE re-framer finds no "data:" lines and reports a
-	// clean EOF on its first ReadFrame, so a gzipped text/event-stream relayed
-	// zero frames downstream and finalized aggregating plugins on empty state.
-	// The symptom is silent in both directions: the client sees a stream that
-	// opens and dies, and token telemetry reads as absent rather than wrong.
-	//
-	// This proxy re-frames and inspects bodies, so it cannot be encoding-blind.
-	// Taking ownership of the negotiation means the transport hands us
-	// plaintext and strips Content-Encoding from resp.Header, keeping the
-	// bytes we relay consistent with the headers we forward.
-	//
-	// Gated on a plugin actually inspecting the response body, mirroring the
-	// reverse proxy (see listener/reverseproxy: same reasoning, same
-	// condition). When nothing reads the body this listener is a pure
-	// pass-through, so leaving the client's header intact avoids forcing an
-	// upstream→client decompression that buys nothing — which matters for a
-	// remote backend or a large non-streamed body, and is harmless either way
-	// on a loopback sidecar hop.
-	if !skipped && (s.OutboundPipeline.NeedsResponseBody() || s.OutboundPipeline.HasStreamingResponders()) {
-		r.Header.Del("Accept-Encoding")
-	}
+	ownEncoding := !skipped && (s.OutboundPipeline.NeedsResponseBody() || s.OutboundPipeline.HasStreamingResponders())
+	stripForUpstream(r, ownEncoding)
 
 	// Clear RequestURI — set by the server but must be empty for client requests
 	r.RequestURI = ""
@@ -542,7 +506,7 @@ func (s *Server) serveOutbound(w http.ResponseWriter, r *http.Request, tl *tunne
 	}
 	resp, err := client.Do(r)
 	if err == nil && !skipped {
-		resp, err = s.resendIfAsked(r, pctx, client, resp, tl)
+		resp, err = s.resendIfAsked(r, pctx, client, resp, tl, ownEncoding)
 	}
 	if err != nil {
 		// A 502 with the cause, or a 499 when the client hung up first — which,
@@ -972,6 +936,50 @@ func syncHeaders(r *http.Request, h http.Header) {
 	}
 }
 
+// stripForUpstream removes from r what is the proxy's and not the upstream's: the
+// hop-by-hop headers, and, when ownEncoding, the client's Accept-Encoding. It runs on
+// every request the proxy sends upstream for a client, a resend included.
+func stripForUpstream(r *http.Request, ownEncoding bool) {
+	// Remove hop-by-hop headers
+	r.Header.Del("Connection")
+	r.Header.Del("Keep-Alive")
+	r.Header.Del("Proxy-Authenticate")
+	r.Header.Del("Proxy-Authorization")
+	r.Header.Del("Proxy-Connection")
+	r.Header.Del("TE")
+	r.Header.Del("Trailer")
+	r.Header.Del("Transfer-Encoding")
+	r.Header.Del("Upgrade")
+
+	// Strip the client's Accept-Encoding so Go's transport negotiates content
+	// coding on its own behalf.
+	//
+	// net/http auto-decompresses a gzip response ONLY when the transport added
+	// Accept-Encoding itself. Forwarding the caller's header suppresses that:
+	// resp.Body then yields raw compressed bytes. Every body-reading plugin
+	// sees binary — the SSE re-framer finds no "data:" lines and reports a
+	// clean EOF on its first ReadFrame, so a gzipped text/event-stream relayed
+	// zero frames downstream and finalized aggregating plugins on empty state.
+	// The symptom is silent in both directions: the client sees a stream that
+	// opens and dies, and token telemetry reads as absent rather than wrong.
+	//
+	// This proxy re-frames and inspects bodies, so it cannot be encoding-blind.
+	// Taking ownership of the negotiation means the transport hands us
+	// plaintext and strips Content-Encoding from resp.Header, keeping the
+	// bytes we relay consistent with the headers we forward.
+	//
+	// Gated on a plugin actually inspecting the response body, mirroring the
+	// reverse proxy (see listener/reverseproxy: same reasoning, same
+	// condition). When nothing reads the body this listener is a pure
+	// pass-through, so leaving the client's header intact avoids forcing an
+	// upstream→client decompression that buys nothing — which matters for a
+	// remote backend or a large non-streamed body, and is harmless either way
+	// on a loopback sidecar hop.
+	if ownEncoding {
+		r.Header.Del("Accept-Encoding")
+	}
+}
+
 // setBody gives r the body a plugin wrote, and clears Content-Encoding, since the
 // bytes are the plugin's and carry none.
 func setBody(r *http.Request, body []byte) {
@@ -992,7 +1000,7 @@ func setBody(r *http.Request, body []byte) {
 // id, so the timeline shows both attempts and each pairs with its own answer. A
 // refused answer that is not sent again goes to the client byte for byte, the bytes
 // read for the Resender included.
-func (s *Server) resendIfAsked(r *http.Request, pctx *pipeline.Context, client *http.Client, resp *http.Response, tl *tunnelLog) (*http.Response, error) {
+func (s *Server) resendIfAsked(r *http.Request, pctx *pipeline.Context, client *http.Client, resp *http.Response, tl *tunnelLog, ownEncoding bool) (*http.Response, error) {
 	if resp.StatusCode/100 == 2 || !s.OutboundPipeline.HasResenders() || !s.OutboundPipeline.NeedsRequestBody() {
 		return resp, nil
 	}
@@ -1022,6 +1030,7 @@ func (s *Server) resendIfAsked(r *http.Request, pctx *pipeline.Context, client *
 	again := r.Clone(r.Context())
 	syncHeaders(again, pctx.Headers)
 	setBody(again, pctx.Body)
+	stripForUpstream(again, ownEncoding)
 	return client.Do(again)
 }
 

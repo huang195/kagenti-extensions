@@ -224,9 +224,9 @@ func TestServerPicker_TheFlashCountsTheRunningSessionsThatStay(t *testing.T) {
 }
 
 // A session resumed after a restart that has sent no inference since shows its history's host,
-// but no pin holds it there: its next request is decided as a new one's and goes to the new
-// choice. So it is not among those that stay — for a switch to a server, or back to own choice.
-func TestServerPicker_TheCountLeavesOutASessionNoPinHolds(t *testing.T) {
+// and its pin survived the restart in the plugin store, so it stays where it is like any other —
+// for a switch to a server, or back to own choice.
+func TestServerPicker_TheCountIncludesASessionResumedAfterARestart(t *testing.T) {
 	for _, server := range []string{"glm", ""} {
 		m := serverModel(t, newFakeProxy(t, false))
 		m.sessions = []session.SessionSummary{
@@ -234,8 +234,8 @@ func TestServerPicker_TheCountLeavesOutASessionNoPinHolds(t *testing.T) {
 			{ID: "resumed", Agent: "claude-code", InferenceHost: "ete.example.com", InferenceHostFromHistory: true},
 		}
 		switchTo(t, m, "claude-code/2.1.270", server)
-		if !strings.Contains(m.flash, " 1 running session stays where it is.") {
-			t.Errorf("switch to %q: flash %q, want the one session a pin holds", server, m.flash)
+		if !strings.Contains(m.flash, " 2 running sessions stay where they are.") {
+			t.Errorf("switch to %q: flash %q, want both sessions their pins hold", server, m.flash)
 		}
 	}
 }

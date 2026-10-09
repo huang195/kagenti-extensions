@@ -658,8 +658,7 @@ With several LiteLLM servers, each with its own URL and key, `agentop server`
 chooses which one an agent's **new** sessions use, through the
 [`inference-router`](../../docs/plugin-catalog.md#inference-router) plugin. A
 session stays on the server it started on, including one already running when its
-agent is first routed, until the proxy restarts: a restarted proxy treats every
-session it sees as a new one. Routing is opt-in per agent: until an agent is given
+agent is first routed. Routing is opt-in per agent: until an agent is given
 a server, its traffic goes where the agent sends it.
 
 ```sh
@@ -702,22 +701,17 @@ With Claude Code's `ANTHROPIC_BASE_URL` at `ete`, the listing after `use` reads:
   before replacing it says which mapping it will have.
 - **`use <name> --agent <agent>`** routes the agent's new sessions to the server,
   including an agent that has not run yet. **`reset --agent <agent>`** stops
-  routing it. Either way a session already running stays where it is if it has sent
-  a request to one of the servers since the proxy started, which is how the router
-  knows where it is — unless the proxy has since dropped it from memory, which keeps
-  the most recently used sessions (100 by default), before the router pinned it.
+  routing it. Either way a session already running stays where it is: its pin holds
+  it, kept in `~/.cortex/plugin-state.json` so a proxy restart forgets none.
 - **`remove <name>`** refuses while an agent is routed to the server, and names
   the command that takes the agent off it; it also refuses the last server. A
   session that started on a removed server gets a 503 asking for a new session
-  until the server is added back, or until the proxy restarts, which forgets
-  which server each session started on. That holds while its requests are
+  until the server is added back. That holds while its requests are
   addressed to a server that is left: one addressed to the removed server's own
   host is not routed at all, and goes there with the agent's own key. So when
   sessions the proxy is running last sent their inference to the server, `remove`
   warns how many, in those terms, before it goes ahead. It leaves
-  out the default and `pending:` buckets, which the router never pins, and a session
-  resumed after a restart that has sent no inference since, which no pin survived
-  to hold.
+  out the default and `pending:` buckets, which the router never pins.
 - **`agentop server`** lists each server's host (its whole URL when it is plain
   `http`), its model mapping and the agents routed to it, then checks
   `~/.claude/settings.json`: that `ANTHROPIC_BASE_URL` names one of the servers,
@@ -751,8 +745,7 @@ the same way, says the proxy stopped answering, and exits 1. A file someone edit
 while the proxy was reloading is not put back but left as found, with an error
 saying so. If the proxy reports neither a reload nor a refusal within 30 seconds,
 the command exits 1 and leaves the file as written. With no proxy running the file is still written, and the change applies at
-the next start, to every session from then: a proxy that starts knows where no
-session is. Nothing is written unless the result loads as a Cortex config and
+the next start. Nothing is written unless the result loads as a Cortex config and
 passes the router's own rules; what only the running proxy can check, such as
 whether its build includes the router, is what a refused reload reports. A change
 that changes nothing writes nothing. `--config PATH` points every form at another
@@ -1495,12 +1488,9 @@ New claude-code sessions → glm. 3 running sessions stay where they are.
 The count is of the agent's sessions this proxy holds in memory whose inference last
 went somewhere other than the new choice (for a switch back to its own choice, to any
 of the servers), and is left out when there are none. A switch moves none of them:
-the router keeps a running session on the server it started on until the proxy
-restarts, unless the proxy dropped the session from memory before the router pinned
-it (see [`agentop server`](#choosing-an-inference-server-agentop-server)). So a
-session resumed after a restart that has sent no inference since is not counted: no
-pin survived the restart, and its next request goes to the new choice. The sessions
-table's `SERVER` column shows where each one is.
+the router keeps a running session on the server it started on, across a proxy
+restart too (see [`agentop server`](#choosing-an-inference-server-agentop-server)).
+The sessions table's `SERVER` column shows where each one is.
 
 When the switch does not go through, a panel over the pane says so, whole, and where
 it left the config file; `Esc`, `q`, `Ctrl+C` or `↵` closes it. A reload the proxy

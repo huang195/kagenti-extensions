@@ -41,8 +41,9 @@ that Claude Code's settings let it be routed.
 A server is a gateway, such as LiteLLM, with its own URL and key. Routing is per
 agent and opt-in: until "use" gives an agent a server, its traffic goes wherever
 the agent sends it. A session stays on the server it started on, so a change
-applies to new sessions only. A proxy restart forgets where each session is, and
-treats each one it then sees as new.
+applies to new sessions only, and a proxy restart moves none, since each
+session's server is kept in ~/.cortex. A Claude Code conversation that began
+before routing was set up stays where Claude Code sends it.
 
 "add" reads the server's API key at a prompt that does not echo, or from stdin
 with --key-stdin; it is never an argument. Adding a name that exists asks before

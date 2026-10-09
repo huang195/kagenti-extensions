@@ -347,11 +347,8 @@ func TestServerUse_RoutesTheAgentsNewSessions(t *testing.T) {
 	path := serverEnv(t, newFakeStats(t, 0).addr(), routerBlock)
 	code, out, errOut := runServerCmd(t, "", "use", "ete", "--agent", "opencode", "--config", path)
 	// A running session stays because the proxy holds its pin or the request its
-	// history records: it has neither for a session it has not seen since it
-	// started, and no history for a quiet one its store has since evicted.
-	if code != 0 || out != "New opencode sessions → ete.\nSessions already running stay where they are, except one that has "+
-		"sent nothing since the proxy last started, or that the proxy has dropped from memory (it keeps the most recently "+
-		"used, 100 by default), which can be treated as a new one.\n" {
+	// history records.
+	if code != 0 || out != "New opencode sessions → ete.\nSessions already running stay where they are.\n" {
 		t.Fatalf("exit %d, stdout:\n%s%s", code, out, errOut)
 	}
 	if !strings.Contains(readConfig(t, path), "            claude-code: glm\n            opencode: ete\n") {
@@ -573,9 +570,8 @@ func TestServerRemove_TheOnlyServerWithAnAgentNamesBothSteps(t *testing.T) {
 	}
 }
 
-// A proxy that is not running holds no pins and, once started, no history, so it
-// routes every session it then sees as a new one. Written for the next start, the
-// change must not promise that running sessions stay where they are.
+// Written for the next start, the change must not promise that running sessions
+// stay where they are.
 func TestServerWrites_ForTheNextStartPromiseNoRunningSessionStays(t *testing.T) {
 	for _, args := range [][]string{
 		{"use", "ete", "--agent", "opencode"},
@@ -591,8 +587,8 @@ func TestServerWrites_ForTheNextStartPromiseNoRunningSessionStays(t *testing.T) 
 			if strings.Contains(out, "stay where they are") || strings.Contains(out, "now gets an error") {
 				t.Errorf("promises what a restart does not keep:\n%s", out)
 			}
-			if !strings.Contains(flat(out), "treats every session it sees as a new one, the ones running now included") {
-				t.Errorf("does not say what the next start does:\n%s", out)
+			if strings.Contains(out, "new one") {
+				t.Errorf("says the next start takes running sessions for new ones:\n%s", out)
 			}
 		})
 	}
@@ -716,10 +712,9 @@ func TestServerRemove_WithNoProxyRunningCountsNothing(t *testing.T) {
 }
 
 // A session resumed after a restart that has sent no inference since lists its history's host,
-// but the router's pins did not survive the restart: nothing holds it to ete, so its next request
-// goes to its agent's current server and gets no error. It is left out of the count; the session
-// whose own request this proxy saw is not.
-func TestServerRemove_LeavesOutASessionNoPinHolds(t *testing.T) {
+// and its pin survived the restart in the plugin store: it is held where it was, as the session
+// whose own request this proxy saw is, so both are counted.
+func TestServerRemove_CountsASessionResumedAfterARestart(t *testing.T) {
 	earlier := session.NewSummaryFold()
 	e := inferenceTo("ete.example.com")
 	earlier.Add("resumed", &e)
@@ -729,7 +724,7 @@ func TestServerRemove_LeavesOutASessionNoPinHolds(t *testing.T) {
 	store.Append("seen", inferenceTo("ete.example.com"))
 	path := serverEnvWithSessions(t, newFakeStats(t, 0).addr(), serveSessions(t, store), routerBlock)
 	code, out, errOut := runServerCmd(t, "", "remove", "ete", "--config", path)
-	if code != 0 || !strings.Contains(errOut, "warning: 1 running session ") {
+	if code != 0 || !strings.Contains(errOut, "warning: 2 running sessions ") {
 		t.Errorf("exit %d, stdout:\n%s\nstderr:\n%s", code, out, errOut)
 	}
 }

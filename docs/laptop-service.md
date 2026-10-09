@@ -346,9 +346,9 @@ first by the time they were last written:
 A full disk does not stop the proxy. The archive stops writing until its next hourly pass,
 and requests are served as before; only the history has a gap.
 
-**What it does not promise.** Writing happens off the request path, so a request never waits
-on the disk — and the cost of that is that a burst the writer cannot keep up with is dropped
-*from the archive*, never from memory. An unclean kill loses at most the last second.
+**What it does not promise.** Writing happens off the request path — and the cost of that is
+that a burst the writer cannot keep up with is dropped *from the archive*, never from memory. An
+unclean kill loses at most the last second.
 `GET /v1/sessions?archived=true` reports both the archive's size and what it lost, under
 `archive` (`bytes`, `maxBytes`, `retentionDays`, and `droppedEvents`, `writeErrors`,
 `droppedRenames`, `paused` when any is nonzero); nonzero means what you are reading has gaps.
@@ -385,6 +385,14 @@ session:
 
 That stops new writes and leaves what is on disk; clear first with `X` if you want it gone, or
 `rm -rf ~/.cortex/sessions` with the proxy stopped.
+
+## Plugin state is kept in `~/.cortex/plugin-state.json`
+
+Plugins that need state to outlive a restart keep it here. Today that is the inference router:
+which server each session is on, as its session id, its agent's name and the server's name. It
+holds no prompts and no keys. A session's entry expires 29 to 30 days after its last request; `X`
+does not clear it. The proxy saves changes within two seconds and on stop, and sets aside a file it
+cannot read as `plugin-state.json.corrupt` and starts empty.
 
 ## `agentop: command not found`
 

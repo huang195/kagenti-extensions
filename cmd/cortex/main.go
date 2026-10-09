@@ -279,6 +279,9 @@ func fatalf(format string, args ...any) {
 	if closeArchiveOnFatal != nil {
 		closeArchiveOnFatal()
 	}
+	if closePluginStoreOnFatal != nil {
+		closePluginStoreOnFatal()
+	}
 	log.Fatalf(format, args...)
 }
 
@@ -408,6 +411,12 @@ func main() {
 	}
 	localInstall = startedFromLocalInstall(*configPath)
 
+	// Opened before the first pipeline build and kept for the process's life: every
+	// build, the initial one and each reload's, injects this same store, so what a
+	// plugin saves survives a reload as well as a restart. Nil off a local install.
+	pluginStore := openPluginStore(*configPath)
+	history := &archiveHistory{}
+
 	// Build the SPIFFE Provider when the spiffe block is configured. The
 	// Provider drives both mTLS (via X509Source) and token-exchange's
 	// spiffe identity (via JWTSource). Construction blocks until the first
@@ -510,8 +519,8 @@ func main() {
 		// cannot honor fails here — on startup and on every reload — instead of
 		// running to no effect. The reverse proxy honors no redirect, which is what
 		// keeps a WritesDestination plugin off the inbound chain.
-		inDeps := plugins.Deps{SPIFFE: provider, Pricing: pricingRegistry, Listener: reverseproxy.Support()}
-		outDeps := plugins.Deps{SPIFFE: provider, Pricing: pricingRegistry, Listener: forwardproxy.Support(c.MTLS != nil)}
+		inDeps := plugins.Deps{SPIFFE: provider, Pricing: pricingRegistry, Store: pluginStore, History: history, Listener: reverseproxy.Support()}
+		outDeps := plugins.Deps{SPIFFE: provider, Pricing: pricingRegistry, Store: pluginStore, History: history, Listener: forwardproxy.Support(c.MTLS != nil)}
 		in, err := plugins.BuildWithDeps(c.Pipeline.Inbound.Plugins, inDeps)
 		if err != nil {
 			return nil, nil, nil, fmt.Errorf("inbound: %w", err)
@@ -696,6 +705,7 @@ func main() {
 		// sessions survive a restart and the store's eviction. See core/session/archive.
 		sessArchive = openSessionArchive(cfg, *configPath, sessions)
 		if sessArchive != nil {
+			history.open(sessArchive)
 			// Before any listener starts: see replayUsage for why that is the whole design.
 			replayUsageAtStartup(sessArchive, usageAgg)
 		}
@@ -1101,6 +1111,15 @@ func main() {
 	if sessArchive != nil {
 		if err := sessArchive.Close(); err != nil {
 			slog.Warn("session archive: final flush failed", "error", err)
+		}
+	}
+
+	// The plugin store once no pipeline can still write to it: both have stopped. Close saves
+	// what the last interval held, so an orderly stop loses nothing; a SIGKILL loses at most
+	// that interval.
+	if pluginStore != nil {
+		if err := pluginStore.Close(); err != nil {
+			slog.Warn("plugin store: final save failed; changes since the last save are lost", "error", err)
 		}
 	}
 

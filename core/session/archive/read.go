@@ -177,3 +177,27 @@ func (l *lastN) items() []*pipeline.SessionEvent {
 	}
 	return append(slices.Clone(l.buf[l.next:]), l.buf[:l.next]...)
 }
+
+var _ session.History = (*Archive)(nil)
+
+// earlierPage is how many events Earlier asks Page for at a time, which bounds the events one
+// read holds.
+var earlierPage = 500
+
+// Earlier implements session.History: Page after Page, each below the oldest event the last
+// one returned, until fn returns false or the session's oldest archived event.
+func (a *Archive) Earlier(id string, before uint64, fn func(*pipeline.SessionEvent) bool) error {
+	for {
+		n, last, stopped := 0, uint64(0), false
+		_, ok, err := a.Page(id, before, earlierPage, func(e *pipeline.SessionEvent) bool {
+			n, last = n+1, e.Seq
+			stopped = !fn(e)
+			return !stopped
+		})
+		// last <= 1: nothing is numbered below it, and a before of 0 would start over.
+		if err != nil || !ok || stopped || n < earlierPage || last <= 1 {
+			return err
+		}
+		before = last
+	}
+}

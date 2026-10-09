@@ -298,10 +298,11 @@ func serverRemove(args []string, stdout, stderr io.Writer) int {
 // agent's current server, which cannot be name, since remove refuses a server an agent is
 // routed to. None of them can get the error, whatever host it last sent to.
 //
-// IN MEMORY, NOT IN THE ARCHIVE, AND BY A REQUEST THIS PROXY SAW: the router pins a session by
-// the first request it routes and keeps the pin in memory, so a session only the archive holds
-// has no pin left to break, and neither has a resident one whose host is only its history's.
-// SessionSummary.Active would not do — it marks the one most recently updated session.
+// IN MEMORY, NOT IN THE ARCHIVE: running means a session this proxy has seen a request from.
+// One resumed after a restart counts, its host its history's: the router keeps its pins in the
+// plugin store, so its pin survived. One only the archive holds has sent nothing since and is
+// not running. SessionSummary.Active would not do — it marks the one most recently updated
+// session.
 //
 // 0 when the proxy does not answer, which is the quiet side for a warning: the remove itself
 // is what matters, and it goes ahead either way.
@@ -317,9 +318,7 @@ func runningOn(sessionsURL string, c routerconfig.Config, name string) int {
 	}
 	n := 0
 	for _, s := range list {
-		// Its host only its history's: resumed after a restart, nothing sent since, so no pin
-		// survived to hold it to name (see SessionSummary.InferenceHostFromHistory).
-		if s.InferenceHostFromHistory || s.ID == session.DefaultSessionID || strings.HasPrefix(s.ID, session.PendingPrefix) {
+		if s.ID == session.DefaultSessionID || strings.HasPrefix(s.ID, session.PendingPrefix) {
 			continue
 		}
 		if on, ok := servers.ForHost(c, s.InferenceHost); ok && on == name {
@@ -423,21 +422,15 @@ func serverReset(args []string, stdout, stderr io.Writer) int {
 
 // runningSessionsStay is what use and reset mean for sessions already running,
 // said once the running proxy has the change. It holds a session by its pin or by
-// the request to a server its history records. One that has sent nothing since the
-// proxy started has neither, and a quiet one the store has evicted (session.max_sessions,
-// least recently used first, or a configured session.ttl) has no history, so either
-// looks new unless the router pinned it; hence "can be".
-const runningSessionsStay = "Sessions already running stay where they are, except one that has sent nothing " +
-	"since the proxy last started, or that the proxy has dropped from memory (it keeps the most recently used, " +
-	"100 by default), which can be treated as a new one."
+// the request to a server its history records.
+const runningSessionsStay = "Sessions already running stay where they are."
 
 // writeReport is what runServerWrite says about a change, by how it landed.
 type writeReport struct {
 	// done is the change, said once the proxy has it or will load it at start.
 	done string
 	// live is what the change means for sessions already running. Said only when
-	// the running proxy reloaded it: that proxy's pins and history are what hold a
-	// running session where it is, and a proxy that starts later has neither.
+	// the running proxy reloaded it.
 	live string
 	// unchanged is said when there was nothing to write.
 	unchanged string
@@ -470,11 +463,6 @@ func runServerWrite(stdout, stderr io.Writer, path, statsURL string, ch edit.Con
 		say(r.done, r.live, r.note)
 	case edit.WriteNotRunning:
 		next := fmt.Sprintf("Written to %s. No Cortex answered at its stats address, so this applies when the proxy next starts.", shown)
-		if r.live != "" {
-			// Not r.live: a proxy that starts holds no pins and no history.
-			next += " A proxy that starts knows where no session is, so it treats every session it sees as a new one, " +
-				"the ones running now included."
-		}
 		say(r.done, next, r.note)
 	case edit.WriteReloadFailed:
 		// WritePluginConfig has put the file back, so it does not hold the change;

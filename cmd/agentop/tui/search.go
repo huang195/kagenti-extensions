@@ -111,6 +111,19 @@ func (m *model) openSearch(t paneID) {
 	m.searchLayout()
 }
 
+// redrawSearches redraws every target against its query, for a change to more than one of
+// them at once.
+func (m *model) redrawSearches() {
+	for t := paneID(0); t <= lastPaneID; t++ {
+		if s := m.surface(t); s != nil {
+			s.redraw()
+		}
+	}
+	if s := m.surface(targetHelp); s != nil {
+		s.redraw()
+	}
+}
+
 // closeSearch closes the prompt; the target is redrawn for the committed search.
 func (m *model) closeSearch() {
 	m.searching = false

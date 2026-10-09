@@ -1076,13 +1076,23 @@ func (m *model) backToPodsPane() {
 	m.detailPlugin = nil
 	m.selectedSess = ""
 	m.selectedEventKey = eventKey{}
-	// A search names rows of the connection being left, so it goes with it.
-	m.search = nil
+	// A search names rows of the connection being left, so it goes with it — except on the two
+	// pickers, which list the cluster rather than the connection, and on the help overlay,
+	// whose search lasts until agentop exits.
+	for t := range m.search {
+		if t != paneNamespaces && t != panePods && t != targetHelp {
+			delete(m.search, t)
+		}
+	}
 	m.searching = false
 	m.searchInput.SetValue("")
 	// The prompt's line comes off the height budget while it is open, so dropping the flag
 	// has to give it back — see layout().
 	m.layout()
+	// Every table keeps its own copy of its query, and only some panes rebuild here, so each
+	// target is redrawn against what is left: a query deleted from the map under a table left
+	// its highlights on screen and n moving between them.
+	m.redrawSearches()
 	m.visibleRows = nil
 	m.connState = connStateInfo{phase: connConnecting}
 

@@ -4,6 +4,7 @@ import (
 	"slices"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/charmbracelet/x/ansi"
 )
@@ -97,5 +98,23 @@ func TestSearchDoc_TheCurrentRowSurvivesARedrawOfTheSameText(t *testing.T) {
 	d.setLines([]string{"other"}, 40)
 	if _, ok := d.currentRow(); ok {
 		t.Error("new text kept the current row")
+	}
+}
+
+// TestSearchDoc_RenderIsLinearInALongLine: rowStarts measured each wrapped row's prefix from
+// column 0 again, so one 225KB string cost 2.2s per keystroke at 200 columns — more on a
+// narrower terminal, and Update is synchronous, so the whole TUI froze. The bound is loose on
+// purpose: linear is tens of milliseconds, quadratic is seconds.
+func TestSearchDoc_RenderIsLinearInALongLine(t *testing.T) {
+	line := `  "completion": "` + strings.Repeat("filler words here ", 12500) + `",`
+	var d searchDoc
+	d.setLines([]string{line}, 200)
+	start := time.Now()
+	d.render("words")
+	if dt := time.Since(start); dt > 500*time.Millisecond {
+		t.Errorf("render of one %dKB line took %v", len(line)/1024, dt)
+	}
+	if len(d.matches) == 0 {
+		t.Error("no matches")
 	}
 }

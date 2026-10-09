@@ -250,8 +250,11 @@ func (m *model) rebuildSessionsTable() {
 	// lookup below still finds its column, because they go through headerTitle.
 	scope := m.sessionsScope()
 	router, showServer := m.sessionsShowServer()
+	// AGENT and SERVER are asked for by what is listed, then dropped whole when the terminal has
+	// no room. Kept, so the search can still read a dropped one.
+	twoAgents := m.sessionsListTwoAgents(scope)
 	want := alignSessionsHeaders(fitTableColumns(
-		sessionsColumnsWith(m.width, m.sessionsListTwoAgents(scope), showServer), m.width))
+		sessionsColumnsWith(m.width, twoAgents, showServer), m.width))
 	agentW := sessionsColumnWidth(want, "AGENT")
 	serverW := sessionsColumnWidth(want, "SERVER")
 	costW := sessionsColumnWidth(want, "COST")
@@ -306,14 +309,19 @@ func (m *model) rebuildSessionsTable() {
 			// TITLE is the column a narrow terminal gives up; it is still searched.
 			b.dropped(title)
 		}
+		agent := func() string { return sessionAgentCell(s, noLimit) }
 		if agentW > 0 {
-			b.cut(sessionAgentCell(s, agentW), func() string { return sessionAgentCell(s, noLimit) })
+			b.cut(sessionAgentCell(s, agentW), agent)
+		} else if twoAgents {
+			b.dropped(agent)
 		}
 		// Read-only: where the session's inference went. No key here changes it — that would
 		// move a running conversation, which the router exists not to do.
+		server := func() string { return sessionServerCell(router, s.InferenceHost, noLimit) }
 		if serverW > 0 {
-			b.cut(sessionServerCell(router, s.InferenceHost, serverW),
-				func() string { return sessionServerCell(router, s.InferenceHost, noLimit) })
+			b.cut(sessionServerCell(router, s.InferenceHost, serverW), server)
+		} else if showServer {
+			b.dropped(server)
 		}
 		b.cell(relTime(now, s.UpdatedAt))
 		// The server's count, and only ever the server's: it is the complete one. agentop's
@@ -366,9 +374,12 @@ func (m *model) rebuildSessionsTable() {
 		} else {
 			b.dropped(title)
 		}
+		summary := session.SessionSummary{ID: id}
+		agent := func() string { return sessionAgentCell(summary, noLimit) }
 		if agentW > 0 {
-			agent := session.SessionSummary{ID: id}
-			b.cut(sessionAgentCell(agent, agentW), func() string { return sessionAgentCell(agent, noLimit) })
+			b.cut(sessionAgentCell(summary, agentW), agent)
+		} else if twoAgents {
+			b.dropped(agent)
 		}
 		// No summary, so no inference host to name a server from.
 		if serverW > 0 {

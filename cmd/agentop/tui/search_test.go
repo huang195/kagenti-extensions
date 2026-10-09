@@ -629,3 +629,33 @@ func TestSearch_StreamedEventsUnderAnOpenPrompt(t *testing.T) {
 		t.Errorf("status row = %q, want the live search", st)
 	}
 }
+
+// TestSearch_SessionsMatchColumnsTheTerminalDropped: AGENT and SERVER are asked for here — two
+// agents, a router with two servers — and at 80 columns the terminal has room for neither. Both
+// are still searched, as a dropped column is everywhere, and as the old matcher always searched
+// the agent.
+func TestSearch_SessionsMatchColumnsTheTerminalDropped(t *testing.T) {
+	m := sessionsServerModel(routerRaw)
+	m.width = 80
+	m.rebuildSessionsTable()
+	for _, title := range []string{"AGENT", "SERVER"} {
+		if _, shown := serverCellOf(t, m, "on-glm", title); shown {
+			t.Fatalf("setup: %s is shown at 80 columns", title)
+		}
+	}
+	// Neither query is in any session id, so only the dropped column can match it.
+	for q, want := range map[string][]string{
+		"opencode":  {"elsewhere", "quiet"},
+		"anthropic": {"elsewhere"},
+	} {
+		m.search = map[paneID]string{paneSessions: q}
+		m.rebuildSessionsTable()
+		got := []string{}
+		for _, i := range m.sessionsTbl.Matches() {
+			got = append(got, m.sessionRowIDs[i])
+		}
+		if !slices.Equal(got, want) {
+			t.Errorf("/%s matched %v, want %v", q, got, want)
+		}
+	}
+}

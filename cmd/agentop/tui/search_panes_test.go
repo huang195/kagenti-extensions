@@ -180,3 +180,37 @@ func TestHelp_SearchIsAnAnywhereKey(t *testing.T) {
 		}
 	}
 }
+
+// TestSearch_LeavingTheConnectionClearsItsSearches: a search on a pane that shows the
+// connection's data goes when the connection does — and off the table too, which keeps its own
+// copy of the query: a map entry deleted under it left the old highlights on screen and n moving
+// between them. The pickers list the cluster, not the connection, and help's search lasts until
+// agentop exits, so those three stay.
+func TestSearch_LeavingTheConnectionClearsItsSearches(t *testing.T) {
+	m := newPanesModel(t)
+	for p, q := range map[paneID]string{panePipeline: "jwt", paneCatalog: "alpha", panePods: "weather"} {
+		m.pane = p
+		typeKeys(m, "/"+q)
+		press(m, tea.KeyEnter)
+	}
+	m.Update(keyRune('?'))
+	typeKeys(m, "/quit")
+	press(m, tea.KeyEnter)
+	m.Update(keyRune('?'))
+	if len(m.pipelineTbl.Matches()) == 0 || len(m.podsTbl.Matches()) == 0 {
+		t.Fatal("setup: the searches did not match")
+	}
+
+	m.backToPodsPane()
+	for p, tbl := range map[paneID]*table.Model{panePipeline: &m.pipelineTbl, paneCatalog: &m.catalogTbl} {
+		if m.search[p] != "" || len(tbl.Matches()) != 0 {
+			t.Errorf("pane %v kept its search: query %q, matches %v", p, m.search[p], tbl.Matches())
+		}
+	}
+	if m.search[panePods] != "weather" || len(m.podsTbl.Matches()) == 0 {
+		t.Errorf("the pods picker lost its search: query %q", m.search[panePods])
+	}
+	if m.search[targetHelp] != "quit" {
+		t.Errorf("help lost its search: %q", m.search[targetHelp])
+	}
+}

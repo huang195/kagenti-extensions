@@ -88,14 +88,20 @@ func (d *searchDoc) render(q string) string {
 // rowStarts is the column of plain at which each of its wrapped rows begins. ansi.Wrap drops
 // a space it breaks at and keeps one it does not, so each row is looked for where the last one
 // ended, past any spaces the wrap dropped.
+//
+// The column is carried forward, measuring only what was passed since the last row. Measuring
+// each row's whole prefix again made one long string quadratic: 2.2s per keystroke on a 225KB
+// completion.
 func rowStarts(plain string, rows []string) []int {
 	starts := make([]int, len(rows))
-	p := 0
+	p, measured, col := 0, 0, 0
 	for k, r := range rows {
 		for p < len(plain) && plain[p] == ' ' && !strings.HasPrefix(plain[p:], r) {
 			p++
 		}
-		starts[k] = ansi.StringWidth(plain[:p])
+		col += ansi.StringWidth(plain[measured:p])
+		measured = p
+		starts[k] = col
 		if strings.HasPrefix(plain[p:], r) {
 			p += len(r)
 		}

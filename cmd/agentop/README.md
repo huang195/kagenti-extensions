@@ -1540,7 +1540,8 @@ pane's view in `~/.cortex/agentop-config.yaml`. Columns and the sort are saved w
 column picker closes with `Esc`/`Enter`/`c` (`q` quits without saving). There is no
 explicit save step.
 
-A `/` search is not saved: it lasts until you clear it or leave the connection. Older
+A `/` search is not saved: it lasts until you clear it or leave the connection — except on
+the namespaces and pods pickers and the key help, whose searches last until agentop exits. Older
 agentops filtered with `/` and saved the filter as `filter:`; this one ignores that key
 and drops it the next time it saves.
 

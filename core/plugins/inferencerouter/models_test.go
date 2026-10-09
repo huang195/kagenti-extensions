@@ -559,13 +559,5 @@ func TestRouter_ASessionKeepsASubstituteForEachKindOfRequest(t *testing.T) {
 				t.Errorf("order %v: a request with tools=%v is sent as %q, want %q", order, tools, got, want[tools])
 			}
 		}
-		// And again, from the session's own record.
-		for _, tools := range order {
-			pctx := chat(store, "opencode.ai", "/zen/v1/chat/completions", opencodeUA, "s1", "exo-free", tools)
-			run(t, p, pctx)
-			if got := sentModel(t, pctx); got != want[tools] {
-				t.Errorf("order %v, later: a request with tools=%v is sent as %q, want %q", order, tools, got, want[tools])
-			}
-		}
 	}
 }

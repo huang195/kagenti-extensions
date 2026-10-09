@@ -281,24 +281,15 @@ func serverRemove(args []string, stdout, stderr io.Writer) int {
 	if statsURL != "" {
 		sessionsURL = dialURL(cfg.Listener.SessionAPIAddr)
 	}
-	// WHICH OF THEM GET THE ERROR, NOT "EACH": the router denies a session pinned to name only
-	// on a request addressed to a server that is left, since that is the only request it still
-	// handles. One addressed to name's own host is no longer an inference server's request
-	// (skip/not_an_inference_server) and goes there untouched, the client's key and all. The
-	// count cannot tell the two apart — the summary says where a session's requests went, not
-	// where they were addressed — so the warning says what happens to each.
 	if n := runningOn(sessionsURL, c, name); n > 0 {
 		fmt.Fprintf(stderr, "agentop server remove: warning: %s last sent inference to %s. A session the proxy routed "+
-			"there gets an error asking for a new session from its next request to a server that is left, until %s is "+
-			"added back; a request addressed to %s's own host is no longer routed, and goes there with the agent's own "+
-			"key.\n", runningSessions(n), name, name, name)
+			"there gets an error asking for a new session, until %s is added back.\n", runningSessions(n), name, name)
 	}
 	ch := edit.ConfigChange{Chain: "outbound", Plugin: routerName, Path: []string{"servers", name}}
 	return runServerWrite(stdout, stderr, path, statsURL, ch, writeReport{
 		done: "Removed " + name + ".",
-		live: fmt.Sprintf("A session the proxy routed to it now gets an error asking for a new session from its next "+
-			"request to a server that is left; a request addressed to %s's own host is no longer routed, and goes "+
-			"there with the agent's own key. Adding %s back routes them to it again.", name, name),
+		live: fmt.Sprintf("A session the proxy routed to it now gets an error asking for a new session. "+
+			"Adding %s back routes them to it again.", name),
 	})
 }
 

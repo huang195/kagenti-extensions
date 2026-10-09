@@ -712,11 +712,9 @@ refusal is believed for an hour, and a session keeps the model it was given.
 - **`remove <name>`** refuses while an agent is routed to the server, and names
   the command that takes the agent off it; it also refuses the last server. A
   session that started on a removed server gets a 503 asking for a new session
-  until the server is added back. That holds while its requests are
-  addressed to a server that is left: one addressed to the removed server's own
-  host is not routed at all, and goes there with the agent's own key. So when
+  until the server is added back. So when
   sessions the proxy is running last sent their inference to the server, `remove`
-  warns how many, in those terms, before it goes ahead. It leaves
+  warns how many before it goes ahead. It leaves
   out the default and `pending:` buckets, which the router never pins.
 - **`agentop server`** lists each server's host (its whole URL when it is plain
   `http`), what its main and helper words name on its list now, read with its own

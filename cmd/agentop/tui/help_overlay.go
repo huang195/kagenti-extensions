@@ -7,6 +7,7 @@ import (
 
 	"github.com/charmbracelet/bubbles/viewport"
 	"github.com/charmbracelet/lipgloss"
+	"github.com/charmbracelet/x/ansi"
 )
 
 // keyBinding is one row in the help overlay: the key(s) and what they do.
@@ -782,7 +783,7 @@ const helpPadX = 2
 //
 // Returns the panel only — placement over the underlying view is the
 // caller's job (see overlayCenter).
-func renderHelpOverlay(vp viewport.Model, width, height int) string {
+func renderHelpOverlay(vp viewport.Model, width, height int, prompt, status string) string {
 	// Scroll affordance: only shown when the body doesn't fit, so a
 	// terminal tall enough for the whole reference stays uncluttered.
 	// Degrades to the bare close hint when the viewport is too narrow for
@@ -796,8 +797,20 @@ func renderHelpOverlay(vp viewport.Model, width, height int) string {
 			hint = annotated
 		}
 	}
+	// The overlay is drawn over the footer, so its search is drawn here: the prompt in place
+	// of the hint while it is open, else the search's status ahead of the hint.
+	switch {
+	case prompt != "":
+		hint = prompt
+	case status != "":
+		hint = status + "  ·  " + hint
+	}
 	if lipgloss.Width(hint) > vp.Width {
-		hint = truncToWidth(hint, vp.Width)
+		if prompt != "" {
+			hint = ansi.Truncate(hint, vp.Width, "")
+		} else {
+			hint = truncToWidth(hint, vp.Width)
+		}
 	}
 
 	inner := vp.View() + "\n" + styleHint.Render(hint)

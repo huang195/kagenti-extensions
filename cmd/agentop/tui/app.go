@@ -563,6 +563,8 @@ type model struct {
 	pane paneID
 	// usage is the Usage pane's view state (metric, window, scope, snapshot).
 	usage usageState
+	// usageDoc is the usage pane's drawn lines, searched — see usageBody.
+	usageDoc searchDoc
 
 	// spend backs the always-on spend strip. Separate from usage on purpose —
 	// see spendState, which records why sharing one poll chain would blank the
@@ -721,6 +723,8 @@ type model struct {
 	// a shared one because the overlay can open over the detail panes,
 	// which would otherwise have their scroll position clobbered.
 	helpVp viewport.Model
+	// helpDoc is the help overlay's drawn lines, searched — see syncHelpViewport.
+	helpDoc searchDoc
 
 	// catalog is the registered-plugin catalog from /v1/plugins,
 	// fetched lazily when the user first opens the catalog pane via
@@ -1113,7 +1117,10 @@ func (m *model) syncHelpViewport(resetScroll bool) {
 	w, h := helpViewportSize(m.width, m.height, helpBodyWidth(body))
 	m.helpVp.Width = w
 	m.helpVp.Height = h
-	m.helpVp.SetContent(body)
+	// The overlay lays itself out — each group wraps its descriptions under a hanging indent —
+	// so its drawn lines are what search reads; there is no unwrapped form to match.
+	m.helpDoc.setLines(strings.Split(body, "\n"), 0)
+	m.helpVp.SetContent(m.helpDoc.render(m.searchQuery(targetHelp)))
 	if resetScroll {
 		m.helpVp.GotoTop()
 		return
@@ -2224,13 +2231,21 @@ func (m *model) flushSessionsTable() {
 	m.rebuildSessionsTable()
 }
 
+// helpPrompt is the search prompt when it is open on the help overlay, else "".
+func (m *model) helpPrompt() string {
+	if m.searching && m.searchPane == targetHelp {
+		return m.searchInput.View()
+	}
+	return ""
+}
+
 // View composes the full screen. The [?] key-help overlay is layered on
 // top of whatever the pane rendered, so it works over the picker and the
 // session views alike.
 func (m *model) View() string {
 	base := m.paneView()
 	if m.helpVisible {
-		return overlayCenter(base, renderHelpOverlay(m.helpVp, m.width, m.height), m.width, m.height)
+		return overlayCenter(base, renderHelpOverlay(m.helpVp, m.width, m.height, m.helpPrompt(), m.searchStatus(targetHelp)), m.width, m.height)
 	}
 	if m.clearConfirm != nil {
 		return overlayCenter(base, renderClearConfirm(m.clearConfirm, m.width), m.width, m.height)
@@ -2397,7 +2412,7 @@ func (m *model) paneView() string {
 		if m.agentScope != "" {
 			title += " · agent=" + sanitizeLabel(m.agentScope)
 		}
-		body = m.renderUsage(m.width, m.bodyHeight)
+		body = m.usageBody()
 	case paneAgents:
 		// The window is in the title because the figures are a day's, not a lifetime's, and
 		// this pane has no window cycle of its own to make that discoverable.
@@ -2443,7 +2458,7 @@ func (m *model) paneView() string {
 		title += " · agent=" + sanitizeLabel(m.agentScope)
 	}
 	header := styleTitle.Render(title)
-	if m.searching {
+	if m.searching && m.searchPane != targetHelp {
 		body = m.searchInput.View() + "\n" + body
 	}
 	// A row slice rather than a fixed JoinVertical, so the strip's row can be absent

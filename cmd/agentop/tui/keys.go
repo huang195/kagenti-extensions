@@ -48,6 +48,12 @@ func (m *model) handleKey(msg tea.KeyMsg) tea.Cmd {
 	// is genuinely available everywhere.
 	if m.helpVisible {
 		switch msg.String() {
+		case "/":
+			m.openSearch(targetHelp)
+			return nil
+		case "n", "N":
+			m.searchStep(targetHelp, msg.String() == "n")
+			return nil
 		case "?", "esc", "q", "ctrl+c":
 			// `q`/ctrl+c close the overlay rather than quitting agentop:
 			// dismissing a help panel is the overwhelmingly likely intent,

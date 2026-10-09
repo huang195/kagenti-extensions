@@ -103,6 +103,11 @@ func (m *model) openSearch(t paneID) {
 	m.searchOrigin = s.spot()
 	m.searchInput.SetValue("")
 	m.searchInput.Focus()
+	if t == targetHelp {
+		// Drawn on the overlay's bottom line, so sized to it; layout() puts the width back
+		// for a pane's prompt the next time one opens.
+		m.searchInput.Width = max(m.helpVp.Width-4, 1)
+	}
 	m.searchLayout()
 }
 

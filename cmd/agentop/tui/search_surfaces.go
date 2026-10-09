@@ -27,6 +27,10 @@ func (m *model) surface(t paneID) searchSurface {
 		return tableSurface{m, t, &m.podsTbl}
 	case paneDetail, panePluginDetail:
 		return docSurface{m, t, &m.detailVp, &m.detailDoc}
+	case targetHelp:
+		return docSurface{m, t, &m.helpVp, &m.helpDoc}
+	case paneUsage:
+		return usageSurface{m}
 	}
 	return nil
 }
@@ -151,3 +155,19 @@ func (s docSurface) restore(sp searchSpot) {
 }
 
 func (s docSurface) redraw() { s.vp.SetContent(s.doc.render(s.m.searchQuery(s.t))) }
+
+// usageSurface is the usage pane: drawn to fit, so it never scrolls, and its place is only
+// which matching line is current.
+type usageSurface struct{ m *model }
+
+func (s usageSurface) matchLines() []int { return s.m.usageDoc.matches }
+
+func (s usageSurface) spot() searchSpot {
+	r, _ := s.m.usageDoc.currentRow()
+	return searchSpot{row: r}
+}
+
+func (s usageSurface) lineOf(sp searchSpot) int { return sp.row }
+func (s usageSurface) reveal(i int)             { s.m.usageDoc.setCurrent(i); s.redraw() }
+func (s usageSurface) restore(searchSpot)       { s.m.usageDoc.clearCurrent(); s.redraw() }
+func (s usageSurface) redraw()                  { s.m.usageBody() }

@@ -29,29 +29,29 @@
 // named.
 //
 // A session is pinned by where the request that decides it went, not by the choice
-// made for it: to the server when the request was redirected there; to "not routed" when it
-// stayed where the client sent it, because the agent is not routed or because the
-// router runs under on_error: observe; and not at all when the redirect failed or
-// the request was refused for its model, so the session's next request decides
-// again. A pin by choice would hold a session started under observe to a server it
-// never used, and turning enforce on would then move it there mid-conversation,
-// which is the switch the pin exists to prevent.
+// made for it: to the server when the request was redirected there; to "not routed"
+// when it stayed where the client sent it, because the agent is not routed or
+// because the router runs under on_error: observe; and not at all when the redirect
+// failed or the request was refused for its model, so the session's next request
+// decides again. A pin by choice would hold a session started under observe to a
+// server it never used, and turning enforce on would then move it there
+// mid-conversation, which is the switch the pin exists to prevent.
 //
 // The first request the router sees is not always a session's first. A session
 // already running when routing is first configured, quiet while it was, has no pin,
-// and neither has one whose pin lapsed. The session's history tells such a
-// session from a new one: on a pin miss for a routed agent, the latest earlier
-// inference request, not a side request, that agent sent in the session to a
-// server's host keeps the session on that server, and only a session with no such request is new and goes
-// to its agent's current server. Without this, the documented first setup — add
-// the servers, then route Claude Code — would move every conversation that sent
+// and neither has one whose pin lapsed. The session's history tells such a session
+// from a new one: on a pin miss for a routed agent, the latest earlier inference
+// request, not a side request, that agent sent in the session to a server's host
+// keeps the session on that server, and only a session with no such request is new
+// and goes to its agent's current server. Without this, the documented first setup —
+// add the servers, then route Claude Code — would move every conversation that sent
 // nothing between the router's arrival and the route to the new server on its next
 // turn. A request to any other host is no evidence: the router never routes one, so
 // it says nothing about which server the session is on. Reading it as "not routed"
 // would leave an agent that switches providers inside a session, as OpenCode does,
-// unrouted for good once its first request went elsewhere, still sending its own
-// key to the server it then addresses. Only a non-empty history is evidence: a
-// view is empty for a session the store has recorded nothing of yet.
+// unrouted for good once its first request went elsewhere, still sending its own key
+// to the server it then addresses. Only a non-empty history is evidence: a view is
+// empty for a session the store has recorded nothing of yet.
 //
 // With no pin and no history, a Claude Code inference request says itself whether
 // the router is seeing its conversation begin. Its system prompt states the caller,
@@ -579,12 +579,13 @@ func turnOf(ext *pipeline.InferenceExtension) string {
 // Only an outbound request row a parser read as inference counts, and only one that
 // reached a server. A tunnel row, a count_tokens or a /v1/models request no parser
 // claimed, a side request (see turnOf), which decides nothing, and a denied request,
-// which went nowhere, say nothing about where the conversation is; nor does a request to any other host, which the router never
-// routes (see the package doc). Another agent's row says nothing about this agent's
-// conversation, and following it would hand this request that agent's server and
-// key. A row's Host is where the bytes went, the server's host for a routed request,
-// because the listener records it after the redirect; RequestedHost, where the
-// client asked to go, is not where the session is.
+// which went nowhere, say nothing about where the conversation is; nor does a
+// request to any other host, which the router never routes (see the package doc).
+// Another agent's row says nothing about this agent's conversation, and following it
+// would hand this request that agent's server and key. A row's Host is where the
+// bytes went, the server's host for a routed request, because the listener records
+// it after the redirect; RequestedHost, where the client asked to go, is not where
+// the session is.
 func (p *Router) wentTo(view *pipeline.SessionView, agent string) (server string, ok bool) {
 	events := view.Events
 	for i := len(events) - 1; i >= 0; i-- {

@@ -17,18 +17,28 @@
 # by behaviour. Treating linux_amd64 as "CI" would therefore erase every real
 # Linux user -- confidently wrong rather than merely noisy.
 #
-# What the smoke test IS, is countable -- but NOT as one install per run. It is an
-# install/upgrade/uninstall test: it fresh-installs the newest stable tag, then
-# upgrades to the tag under test, and each leg fetches its own checksums.txt. So a
-# tag-push run consumes TWO installs.
+# What the smoke test IS, is countable: ONE install per successful run, as far as
+# these figures are concerned.
 #
-#   CI installs per run = 2 (fresh install of latest stable, then upgrade)
+# The run itself installs three times -- a fresh install of the newest stable tag,
+# an upgrade to the tag under test, and a no-op re-run of it -- so it fetches more
+# than one checksums.txt. But on a push to main the tag under test is main-latest,
+# which is excluded from .totals below (--clobber resets its download_count on
+# every push, so its counts mean "since the last push" and its contribution is
+# noise that can go negative when a real --ref=main install is erased). One fetch
+# therefore lands where this page counts.
 #
-# The upgrade leg of a main-push run lands on main-latest, which is excluded from
-# .totals below because --clobber resets its download_count on every push; its
-# share of the change in totals.checksums is noise around zero and can go negative
-# when a real --ref=main install is erased. The upgrade leg of a TAG-push run does
-# land on a real release and is counted.
+#   CI installs per run = 1
+#
+# The live figures settle it rather than the reading of the workflow: v0.8.1 has 71
+# checksums fetches against 51 successful runs since it published. At 2 per run, CI
+# alone would be 102 -- more than the release has ever been fetched. At 1 per run,
+# 51 CI + 20 people = 71, and the Linux tarballs agree independently (112 / 2 = 56
+# = 51 + 5).
+#
+# A TAG-push run is the exception: its upgrade leg lands on a real release, so the
+# people figure can run 1-2 low on a day that cut a tag. Stated in the page
+# footnote rather than modelled.
 #
 # Only `success` counts. Of 64 runs in the first sampled window, 18 were
 # `skipped` and downloaded nothing, so counting runs naively overstates CI by
@@ -114,9 +124,10 @@ gh api "repos/${REPO}/releases" --paginate >"${tmp}"
 SMOKE_WORKFLOW="release-smoke-linux.yaml"
 if ! gh api \
 	"repos/${REPO}/actions/workflows/${SMOKE_WORKFLOW}/runs?per_page=100" \
-	--jq '[.workflow_runs[]
-	       | select(.conclusion == "success")
-	       | {id: .id, created_at: .created_at}]' >"${runs}" 2>/dev/null; then
+	--jq '{total_count: .total_count,
+	       runs: [.workflow_runs[]
+	              | select(.conclusion == "success")
+	              | {id: .id, created_at: .created_at}]}' >"${runs}" 2>/dev/null; then
 	# A missing or renamed workflow must not take the whole snapshot down: the
 	# download series is the primary signal and stands on its own.
 	#
@@ -186,7 +197,19 @@ jq --arg date "${today}" \
     # Successful smoke runs as {id, created_at}, or null when the query failed.
     # The page merges these across snapshots on id, so a run stays counted after it
     # falls out of the last-100 window the API returns.
-    smoke_runs: $smoke[0],
+    smoke_runs: ($smoke[0].runs // null),
+
+    # How many runs the workflow has EVER had, successful or not, per the API.
+    #
+    # Lets the page tell a truncated history from a complete one. A page of 100 is
+    # all the API gives, so when total_count is at or below 100 the first snapshot
+    # holds the entire history for this workflow and no run is missing -- without
+    # this, a release published before the workflow existed gets a floor marker for
+    # runs that never happened.
+    #
+    # (No apostrophes in this jq program: it is single-quoted in the shell, so one
+    # would end the quote and produce a confusing jq syntax error. Bitten 3x.)
+    smoke_runs_total_count: ($smoke[0].total_count // null),
 
     # The tag GitHub serves as /releases/latest -- the release the plain installer
     # takes, and so the one CI installs. Recorded rather than derived: see the

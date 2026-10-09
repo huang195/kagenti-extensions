@@ -67,7 +67,7 @@
 
 <h1>Cortex install stats</h1>
 <p class="sub">
-  Estimated installs per day by platform, with CI subtracted out.
+  Estimated installs per day, with CI subtracted out.
   Updated daily by <code>.github/workflows/install-stats.yaml</code>.
 </p>
 
@@ -79,8 +79,9 @@
   The release smoke test installs <em>exactly as a real user would</em>
   (<code>curl | sh</code> from GitHub Releases), so it lands in that number too and
   cannot be filtered out by behaviour. It can be subtracted by <em>count</em>: one
-  job, no matrix, and it installs twice per run — a fresh install of the newest
-  stable tag, then an upgrade to the tag under test.
+  job, no matrix, and one install per run lands in these figures — it installs
+  three times, but on a push to main the other two land on <code>main-latest</code>,
+  whose counts reset on every push and are excluded here.
   <br><br>
   <strong>What it still cannot tell you.</strong> <em>Cortex Installs</em> means
   "not CI" — it <strong>still includes maintainers and contributors</strong>, and at
@@ -111,11 +112,23 @@
 // count does not have that failure mode.
 const PLATFORMS = ["darwin_arm64", "darwin_amd64", "linux_amd64", "linux_arm64"];
 
-// Installs consumed by one successful smoke run. It is an install/upgrade test:
-// it fresh-installs the newest stable tag, then upgrades to the tag under test,
-// and each leg fetches its own checksums.txt. Was assumed to be 1, which
-// understated CI by half.
-const CI_INSTALLS_PER_RUN = 2;
+// Installs one successful smoke run adds to the figures THIS PAGE reads.
+//
+// The run installs three times -- a fresh install of the newest stable tag, an
+// upgrade to the tag under test, and a no-op re-run of it -- so it fetches more
+// than one checksums.txt. But on a main push the tag under test is main-latest,
+// which the collector excludes from .totals because --clobber resets its counts.
+// So exactly one of those fetches lands where this page counts.
+//
+// The live figures settle it: v0.8.1 has 71 checksums fetches against 51
+// successful runs since it published. At 2 per run CI alone would be 102, more
+// than the release has ever been fetched. At 1 per run, 51 CI + 20 people = 71,
+// and the Linux tarballs agree independently (112 / 2 = 56 = 51 + 5).
+//
+// A TAG-push run does add a little more, on the tag under test, so the people
+// figure can run 1-2 high on a day that cut a tag. That is stated in the footnote
+// rather than modelled.
+const CI_INSTALLS_PER_RUN = 1;
 
 const esc = (s) =>
   String(s).replace(/[&<>"']/g, (c) =>
@@ -199,9 +212,17 @@ function renderDaily(snapshots) {
     // double-counts and this does not.
     const installs = at(curr, "checksums") - at(prev, "checksums");
 
-    // An interval can only be adjusted if both ends are timestamped. Snapshots
-    // written before taken_at existed are shown unadjusted rather than guessed at.
-    const haveBounds = prevSnap.taken_at && currSnap.taken_at && runTimes.length > 0;
+    // An interval can only be adjusted if both ends are timestamped AND some
+    // snapshot at or after its end actually carries a run list.
+    //
+    // That second test is the one that matters: a snapshot whose query failed holds
+    // null, mergeRunTimes skips it, and no earlier snapshot's window reaches forward
+    // into this interval -- so runsBetween would return 0 and the row would read
+    // "no CI" on the strength of a failed request. Checking from i onward is enough
+    // because the next successful snapshot's last-100 list covers the gap, which is
+    // why this self-repairs the following day.
+    const measured = snapshots.slice(i).some((s) => Array.isArray(s.smoke_runs));
+    const haveBounds = prevSnap.taken_at && currSnap.taken_at && measured;
     const ciRuns = haveBounds
       ? runsBetween(prevSnap.taken_at, currSnap.taken_at) : null;
 
@@ -255,11 +276,11 @@ function renderDaily(snapshots) {
     <code>checksums.txt</code>, one per install on every platform — and this column
     is that figure minus the CI installs beside it. Add the two columns back
     together to recover it.
-    <strong>Cortex CI Tests</strong> counts installs, not runs: the release smoke
-    test installs the newest stable tag and then upgrades to the tag under test, so
-    each successful run consumes two (hover for the run count). It installs exactly
-    the way a person does, which is why it has to be subtracted rather than filtered
-    out.
+    <strong>Cortex CI Tests</strong> is one install per successful run of the
+    release smoke test. It installs exactly the way a person does, which is why it
+    has to be subtracted rather than filtered out. On a day that cut a release tag
+    the real figure is 1-2 higher, because the run's upgrade leg lands on that tag
+    instead of on <code>main-latest</code>.
     Each row covers the span between two snapshots, and CI runs are counted over
     that same span rather than by calendar date.
     <code>~0</code> marks an interval where CI was counted higher than installs
@@ -272,12 +293,11 @@ function renderDaily(snapshots) {
 // count rather than by date, because the question this answers is "what is in
 // use", not "what shipped when".
 //
-// No per-release CI column: runs are recorded per DAY, and every one so far has
-// head_branch=main, attributing to whichever tag was newest at run time. Splitting
-// a day's runs across releases would be a guess, so this table shows the combined
-// total and names the one release CI is currently installing. Per-release subtraction
-// is still available by hand for the current release, which is where it is
-// meaningful -- both sides are large enough there to survive it.
+// CI is filled for the CURRENT release only. A run carries head_branch=main and no
+// tag, so what is known is that it installed whichever release was newest at the
+// time -- which is this one, for every run since it was published. Attributing runs
+// to an older release would need the boundary with its successor and a run history
+// reaching that far back, so those rows stay blank rather than truncated.
 function renderReleases(snapshots) {
   const el = document.getElementById("releases");
   const sub = document.getElementById("by-release-sub");
@@ -299,7 +319,8 @@ function renderReleases(snapshots) {
   // against one checksums file, so a raw tarball count double-counts. Halving is
   // exact for anything installed normally; a hand-downloaded single binary makes
   // a platform column land on .5, which is rounded and so may not sum to the
-  // Installs column. The total is the figure to trust if they disagree.
+  // checksums count. checksums is the figure to trust if they disagree, and it is
+  // what the Cortex Installs column subtracts from.
   const perInstall = 2;
   const half = (n) => Math.round(n / perInstall);
 
@@ -346,16 +367,32 @@ function renderReleases(snapshots) {
     : null;
   const ciInstalls = ciRuns === null ? null : ciRuns * CI_INSTALLS_PER_RUN;
 
-  // The merged run list only reaches as far back as the series has been collected.
-  // If it starts after this release was published, the CI count is a floor, not a
-  // total -- say so rather than implying completeness.
+  // Is the CI count a floor rather than a total?
+  //
+  // Only when runs are actually missing. The first snapshot's page holds 100 runs,
+  // so if the workflow has ever had 100 or fewer in total, that page IS its whole
+  // history and nothing is missing -- even though its earliest run postdates a
+  // release published before the workflow existed. Without the total_count test
+  // that case marks a false floor, which is what v0.8.1 was showing.
+  const everCount = snapshots
+    .map((s) => s.smoke_runs_total_count)
+    .filter((n) => typeof n === "number")
+    .shift();
+  const historyComplete = typeof everCount === "number" && everCount <= 100;
   const ciPartial = ciRuns !== null && runTimes.length > 0
+    && !historyComplete
     && currentRel.published_at < runTimes[0];
 
   const rows = rels.map((r) => {
     const isCurrent = r.tag === current;
+    // Through people(), not a bare Math.max: the clamp alone renders an underflow
+    // as a bold, plausible 0, which is the failure people() exists to prevent.
+    //
+    // And from r.installs (checksums.txt), not the halved tarball columns beside
+    // it: checksums is the independent count, it is what the daily table uses, and
+    // the two disagree slightly when a binary is downloaded by hand.
     const est = isCurrent && ciInstalls !== null
-      ? Math.max(0, r.linux + r.mac - ciInstalls) : null;
+      ? people(r.installs, ciInstalls) : null;
 
     return `<tr>
       <td><code>${esc(r.tag)}</code>${
@@ -370,7 +407,16 @@ function renderReleases(snapshots) {
         ciInstalls === null || !isCurrent ? "—"
           : (ciPartial ? "≥" : "") + ciInstalls
       }</td>
-      <td>${est === null ? "—" : `<strong class="mac">${est}</strong>`}</td>
+      <td>${
+        est === null ? "—"
+          : est.underflow
+            ? `<span class="delta" title="${r.installs} installs against ${ciInstalls} CI, so this would be ${est.raw}">~0</span>`
+            // Subtracting a floor gives an upper bound, not a figure. When CI is
+            // marked "≥", this has to be marked "≤" or it reads as exact.
+            : ciPartial
+              ? `<span class="delta" title="CI for this release is a floor, so this remainder is an upper bound">≤${est.value}</span>`
+              : `<strong class="mac">${est.value}</strong>`
+      }</td>
     </tr>`;
   }).join("");
 
@@ -387,8 +433,8 @@ function renderReleases(snapshots) {
     including CI, from tarball downloads, halved because each install fetches two
     binaries of one platform.
     <strong>CI Tests</strong> counts installs consumed by the release smoke test —
-    two per successful run, since it installs the newest stable tag and then
-    upgrades. It is filled for the current release only: a run carries no tag, so
+    one per successful run. It is filled for the current release only: a run
+    carries no tag, so
     what is known is that it installed whichever release was newest at the time.
     <code>—</code> means unknown, not zero, and <code>≥</code> means the run history
     does not reach back to publication so the figure is a floor.

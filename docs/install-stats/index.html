@@ -262,6 +262,8 @@ function renderReleases(snapshots) {
       linux: half(at(r.platforms, "linux_amd64") + at(r.platforms, "linux_arm64")),
       mac: half(at(r.platforms, "darwin_arm64") + at(r.platforms, "darwin_amd64")),
       tarballs: PLATFORMS.reduce((n, p) => n + at(r.platforms, p), 0),
+      // Carried for ordering only -- see the current-release selection below.
+      published_at: r.published_at,
     }))
     .filter((r) => r.installs || r.tarballs)
     .sort((a, b) => b.installs - a.installs || b.tarballs - a.tarballs);
@@ -274,35 +276,48 @@ function renderReleases(snapshots) {
   // Which release CI is hitting: the newest stable one, same rule the installer
   // and the smoke test both follow (GitHub's Latest badge never goes to a
   // prerelease). Marked rather than subtracted, for the reason above.
-  const current = rels.filter((r) => !r.prerelease)
+  //
+  // Ordered by published_at, NOT by sorting the tag strings: a lexical sort puts
+  // v0.9.0 above v0.10.0, which would pin the CI figure to the wrong row the first
+  // time a minor version reaches double digits. Dates sort correctly without
+  // needing a semver parser on a page that has no dependencies.
+  const current = rels.filter((r) => !r.prerelease && r.published_at)
+    .sort((a, b) => a.published_at < b.published_at ? -1
+                  : a.published_at > b.published_at ? 1 : 0)
     .map((r) => r.tag)
-    .sort()
     .pop();
 
-  // CI is attributed to the current release only, and is Linux-only, so it comes
-  // off the Linux column of that one row. Every other row's CI is unknown rather
-  // than zero -- see smoke_runs_total in the collector for why -- and renders "—".
+  // CI is NOT subtracted from these rows, and that is deliberate: the two figures
+  // cover different periods and cannot be differenced.
+  //
+  // A release's download count is LIFETIME. The CI count is the last ~100 runs --
+  // roughly two weeks at the current rate, shorter when releases are busy. So
+  // "lifetime Linux downloads minus a fortnight of CI" is not a quantity. It looks
+  // plausible for a release younger than the window and silently overstates
+  // installs for anything older, which is the worse failure because nothing about
+  // the output says which case it is in.
+  //
+  // So the CI column reports what is known, beside the figure it bears on, and the
+  // reader does the comparison with the periods visible. The daily table above is
+  // where subtraction is sound: both sides of it are per-day.
   const ciTotal = latest.smoke_runs_total;
   const haveCI = typeof ciTotal === "number";
 
   const rows = rels.map((r) => {
     const isCurrent = !r.prerelease && r.tag === current;
-    const ci = isCurrent && haveCI ? ciTotal : null;
-    // Clamped: the attribution window and the install history do not line up
-    // exactly, so the subtraction can undershoot.
-    const linux = ci === null ? r.linux : Math.max(0, r.linux - ci);
-    const underflow = ci !== null && r.linux - ci < 0;
 
     return `<tr>
       <td><code>${esc(r.tag)}</code>${
         r.prerelease ? ' <span class="pre">pre-release</span>'
           : isCurrent ? ' <span class="pre">current</span>' : ""
       }</td>
-      <td class="ci"${underflow
-        ? ` title="${r.linux} Linux downloads against ${ci} CI runs — CI is attributed to this release in full, so the subtraction undershoots"`
-        : ""}>${underflow ? "~0" : linux}</td>
+      <td class="ci">${r.linux}</td>
       <td class="mac">${r.mac}</td>
-      <td class="delta">${ci === null ? "—" : ci}</td>
+      <td class="delta">${
+        isCurrent && haveCI
+          ? `~${ciTotal} <span class="pre">last ~2wk</span>`
+          : "—"
+      }</td>
     </tr>`;
   }).join("");
 
@@ -315,15 +330,19 @@ function renderReleases(snapshots) {
     <tbody>${rows}</tbody>
   </table>
   <p class="sub" style="margin-top:.7rem">
-    <strong>Linux</strong> and <strong>Mac Installs</strong> exclude CI and are
-    derived from tarball downloads, halved because each install fetches two binaries
-    of one platform. Mac needs no subtraction — the release smoke test runs only on
-    Linux.
-    <strong>CI Tests</strong> is filled for the current release only:
-    a run reports no tag, so all that is known is that it installed whichever
-    release was newest at the time. <code>—</code> means CI for that period is
-    <em>unknown</em>, not zero. Once the daily series above is long enough to say
-    which release was current on each day, every row can be adjusted properly.
+    <strong>Lifetime totals, CI included.</strong> Unlike the daily table above,
+    nothing is subtracted here — a release count is lifetime while the CI figure
+    covers only the last fortnight, so differencing them would not give a real
+    quantity.
+    <strong>Linux</strong> and <strong>Mac Installs</strong> come from tarball
+    downloads, halved because each install fetches two binaries of one platform.
+    <strong>CI Tests</strong> is shown against the current release because that is
+    the one CI installs — a run reports no tag, so all that is known is that it
+    installed whichever release was newest at the time. <code>—</code> means CI for
+    that release is <em>unknown</em>, not zero.
+    For the current release, Linux installs minus the CI figure is a reasonable
+    estimate while the release is younger than the CI window; for older releases it
+    is not, which is why the page does not do that arithmetic for you.
   </p>`;
 }
 

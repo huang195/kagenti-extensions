@@ -34,6 +34,11 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: write # commit the snapshot to gh-pages
+      # Required by the collector's workflow-runs query, which supplies the CI
+      # count. Without it that request 403s, the collector falls back to "no CI
+      # data", and the page publishes install figures with nothing subtracted --
+      # silently, on every run, because the fallback is not an error.
+      actions: read
     steps:
       - name: Check out main
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1

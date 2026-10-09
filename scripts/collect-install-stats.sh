@@ -93,10 +93,15 @@ gh api "repos/${REPO}/releases" --paginate >"${tmp}"
 # repo-wide /actions/runs endpoint needs --paginate over thousands of runs and
 # takes minutes, while this one returns the workflow's own runs in a single page.
 #
-# A 30-day window rather than all time: 100 runs per page covers it comfortably
-# at the observed rate (~6/day), and the series only needs enough overlap to
-# cover a gap between snapshots. Note this is a BOUNDED window -- once the
-# series is long enough, old days keep whatever was recorded at the time.
+# The window is the last 100 RUNS, not a fixed number of days: the request has no
+# date filter, so its reach in days is 100 divided by the current run rate. At the
+# observed ~6/day that is around two weeks, and a busier release period shortens
+# it. That is enough for the only thing the window has to do -- cover the gap
+# between two snapshots -- but it is not a 30-day guarantee, and a sustained rate
+# above ~14/day would start dropping days the series has not yet recorded.
+#
+# Old days keep whatever was recorded at the time, so shrinking reach does not
+# rewrite history; it only limits how far back a correction can reach.
 SMOKE_WORKFLOW="release-smoke-linux.yaml"
 if ! gh api \
 	"repos/${REPO}/actions/workflows/${SMOKE_WORKFLOW}/runs?per_page=100" \

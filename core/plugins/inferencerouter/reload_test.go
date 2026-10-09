@@ -9,9 +9,10 @@ import (
 	"github.com/rossoctl/cortex/core/plugins"
 )
 
-// entries is the outbound chain a config file with only the router would build.
+// entries is the outbound chain a config file with inference-parser and the router
+// would build.
 func entries(routerConfig string) []config.PluginEntry {
-	return []config.PluginEntry{{Name: Name, Config: json.RawMessage(routerConfig)}}
+	return []config.PluginEntry{{Name: "inference-parser"}, {Name: Name, Config: json.RawMessage(routerConfig)}}
 }
 
 // reloadBuild builds the chain the way cmd/cortex does on startup and on every

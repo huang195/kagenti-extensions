@@ -6,7 +6,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/charmbracelet/bubbles/textinput"
 	"github.com/charmbracelet/bubbles/viewport"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
@@ -36,8 +35,8 @@ func fitModel(t *testing.T, p paneID, w, h int, events []pipeline.SessionEvent) 
 		events: map[string][]pipeline.SessionEvent{"sess-1": events},
 	}
 	// The same construction the real model uses: a zero-value textinput panics on Focus
-	// (its cursor has no blink context), and the filter cases below press "/".
-	m.filterInput = textinput.New()
+	// (its cursor has no blink context), and the search cases below press "/".
+	m.searchInput = newSearchInput()
 	m.detailVp = viewport.New(0, 0)
 	m.eventColumns = defaultColumnSelection()
 	m.eventsTbl = newEventsTable()
@@ -200,7 +199,7 @@ func assertFits(t *testing.T, m *model, label string) {
 
 var fitSizes = [][2]int{{60, 20}, {80, 24}, {100, 30}, {120, 40}, {200, 50}}
 
-// Every pane, at every size, with and without the filter open.
+// Every pane, at every size, and the two that search with the search prompt open too.
 func TestLayout_EveryPaneFitsTheTerminal(t *testing.T) {
 	// Styling real, not a no-op. CI has no TTY, so lipgloss defaults to Ascii and every Render
 	// returns its input — which is the wrong thing to measure here of all places, since this is the
@@ -221,19 +220,22 @@ func TestLayout_EveryPaneFitsTheTerminal(t *testing.T) {
 				// pre-existing bug rather than on anything this test is guarding.
 				continue
 			}
-			for _, filtering := range []bool{false, true} {
+			for _, searching := range []bool{false, true} {
+				if searching && !searchable(p) {
+					continue
+				}
 				m := fitModel(t, p, dim[0], dim[1], cursorRowsFixture(60))
-				if filtering {
+				if searching {
 					// Through the real key, not by setting the flag: the budget changes
-					// with m.filtering, so the handler has to recompute the layout, and a
+					// with m.searching, so the handler has to recompute the layout, and a
 					// test that recomputed it itself would pass over a handler that
-					// forgot. Opening the filter is the whole point of the case.
+					// forgot. Opening the prompt is the whole point of the case.
 					m.handleKey(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'/'}})
-					if !m.filtering {
-						t.Fatalf("%s: \"/\" did not open the filter", name)
+					if !m.searching {
+						t.Fatalf("%s: \"/\" did not open the search prompt", name)
 					}
 				}
-				assertFits(t, m, fmt.Sprintf("%s %dx%d filter=%v", name, dim[0], dim[1], filtering))
+				assertFits(t, m, fmt.Sprintf("%s %dx%d searching=%v", name, dim[0], dim[1], searching))
 			}
 		}
 	}
@@ -315,29 +317,31 @@ func probeIdentity(subject, client string) pipeline.SessionEvent {
 // costs the hint line below it, which is the row carrying [?] keys and [q] quit.
 //
 // TestLayout_EveryPaneFitsTheTerminal cannot catch this: it never sets sortCol,
-// filter or paused, so the row it measures has none of the optional markers on it.
-// Measured before fitStatusLine: paused + a restored filter + an active sort rendered
-// 87 columns at width 80.
+// a search or paused, so the row it measures has none of the optional markers on it.
+// Measured before fitStatusLine: paused + a restored filter (the search's predecessor)
+// + an active sort rendered 87 columns at width 80.
 func TestLayout_StateRichFooterFitsTheTerminal(t *testing.T) {
 	for _, dim := range fitSizes {
 		for _, tc := range []struct {
 			name    string
 			sortCol eventColumnID
-			filter  string
+			search  string
 			paused  bool
 			flash   string
 		}{
 			{name: "sort only", sortCol: colDuration},
-			{name: "sort+filter", sortCol: colDuration, filter: "github-tool"},
-			{name: "sort+filter+paused", sortCol: colDuration, filter: "github-tool", paused: true},
+			{name: "sort+search", sortCol: colDuration, search: "github-tool"},
+			{name: "sort+search+paused", sortCol: colDuration, search: "github-tool", paused: true},
 			// The longest header, so the indicator itself is at its widest.
-			{name: "widest sort column", sortCol: colDuration, filter: "api.anthropic.com", paused: true},
-			{name: "everything plus a flash", sortCol: colCost, filter: "github-tool", paused: true,
+			{name: "widest sort column", sortCol: colDuration, search: "api.anthropic.com", paused: true},
+			// Every row matches, so the status names a position out of the most matches.
+			{name: "search matching every row", sortCol: colDuration, search: "h", paused: true},
+			{name: "everything plus a flash", sortCol: colCost, search: "github-tool", paused: true,
 				flash: "yanked → ~/.cortex/agentop-events/evt-20260916-103000.json"},
 		} {
 			m := fitModel(t, paneEvents, dim[0], dim[1], cursorRowsFixture(60))
 			m.sortCol, m.sortDesc = tc.sortCol, true
-			m.filter = tc.filter
+			m.search = map[paneID]string{paneEvents: tc.search}
 			m.paused = tc.paused
 			if tc.flash != "" {
 				m.setStickyFlash(tc.flash)
@@ -609,7 +613,7 @@ func TestLayout_DrawerReservationMatchesWhatItDraws(t *testing.T) {
 		for span := spendSpan(0); span < numSpendSpans; span++ {
 			m.spend.chains[span].snap = reasoningSnap()
 		}
-		// Through the real key, like the filter cases: the budget changes with
+		// Through the real key, like the search cases: the budget changes with
 		// spend.expanded, so the handler has to recompute the layout. A test that set the
 		// flag itself would pass over a handler that forgot.
 		m.handleKey(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'$'}})

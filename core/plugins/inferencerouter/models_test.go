@@ -463,10 +463,11 @@ func TestRouter_RunsLastInTheLaptopChain(t *testing.T) {
 // since it would read the server's model rather than the client's.
 func TestRouter_IsRefusedBeforeABodyReader(t *testing.T) {
 	_, err := plugins.BuildWithDeps([]config.PluginEntry{
-		{Name: Name, Config: json.RawMessage(mappedConfig(``))},
 		{Name: "inference-parser"},
+		{Name: Name, Config: json.RawMessage(mappedConfig(``))},
+		{Name: "mcp-parser"},
 	}, plugins.Deps{Listener: pipeline.ListenerSupport{Listener: "forward proxy", Destination: true}})
-	if err == nil || !strings.Contains(err.Error(), `"inference-parser" reads body after mutator "inference-router"`) {
+	if err == nil || !strings.Contains(err.Error(), `"mcp-parser" reads body after mutator "inference-router"`) {
 		t.Fatalf("err = %v, want the reader rule naming both", err)
 	}
 }

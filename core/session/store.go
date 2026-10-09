@@ -1006,12 +1006,12 @@ type SessionSummary struct {
 	// request since. Absent otherwise, and on a row only the archive holds (Resident false), all of
 	// whose figures are history.
 	//
-	// WHAT A CLIENT NEEDS TO COUNT WHERE RUNNING SESSIONS STAY. The inference-router pins a session
-	// in process memory by the first request it routes, so after a restart nothing holds such a
-	// session where its history says it was: its next request is decided as a new one's, and goes
-	// to its agent's current server. After an eviction alone the pin can survive, so a count that
-	// leaves these rows out errs low there, which is the quiet side. InferenceHost itself is
-	// unchanged by this: it still says where the session's inference last went.
+	// WHAT IT TELLS A CLIENT: the host is the archive's word, from before this process, and not a
+	// request this process saw. Whether something still holds the session there is the router's
+	// business: on a local install it keeps its pins in the plugin store, which a restart keeps, and
+	// agentop counts such a session as staying; a process with no plugin store keeps them in memory
+	// and forgets them on restart. InferenceHost itself is unchanged by this: it still says where
+	// the session's inference last went.
 	InferenceHostFromHistory bool `json:"inferenceHostFromHistory,omitempty"`
 
 	// Resident is false on a row the session archive served because the store no longer holds

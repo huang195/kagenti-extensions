@@ -851,9 +851,9 @@ func TestHandleKey_TheDrawersBindings(t *testing.T) {
 	// A resize below the floor is the other way the flag and the screen part company.
 	//
 	// ON paneEvents, whose esc backs out to Sessions, so the key's arrival at the pane is
-	// observable without disturbing the handler under test. An open filter looked like the
-	// cheaper signal and was inert: keys.go gates the whole spend block on `!m.filtering`, so
-	// `m.filtering = true` skipped the esc case entirely — which made the flag assertion below
+	// observable without disturbing the handler under test. An open search prompt looked like the
+	// cheaper signal and was inert: keys.go gates the whole spend block on `!m.searching`, so
+	// `m.searching = true` skipped the esc case entirely — which made the flag assertion below
 	// vacuous too, since nothing could have cleared it. The first version of this subtest
 	// asserted less than the one it replaced.
 	t.Run("esc is not swallowed below the height floor", func(t *testing.T) {

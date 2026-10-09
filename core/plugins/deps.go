@@ -8,7 +8,9 @@ import (
 	"github.com/rossoctl/cortex/core/config"
 	"github.com/rossoctl/cortex/core/cost/pricing"
 	"github.com/rossoctl/cortex/core/pipeline"
+	"github.com/rossoctl/cortex/core/session"
 	"github.com/rossoctl/cortex/core/spiffe"
+	"github.com/rossoctl/cortex/core/storage"
 )
 
 // Deps are the process-wide dependencies a pipeline build can inject into plugins.
@@ -28,6 +30,15 @@ type Deps struct {
 	// Long-lived: the reloader rebuilds pipelines but the resolver is swapped in
 	// place, so a plugin from any build sees current rates. See pricing.Registry.
 	Pricing *pricing.Registry
+
+	// Store is injected into plugins implementing storage.StoreConsumer: the process's
+	// state that outlives it. Long-lived like Pricing: every build gets the same one,
+	// so state a plugin saves survives a reload as well as a restart.
+	Store storage.Store
+
+	// History is injected into plugins implementing session.HistoryConsumer: the
+	// session archive's events, for a process that keeps one.
+	History session.History
 
 	// Listener says which listener-dependent capabilities the listener this pipeline
 	// serves can honor; a plugin declaring one it cannot is refused. The zero value
@@ -88,6 +99,12 @@ func BuildWithDeps(entries []config.PluginEntry, deps Deps, opts ...pipeline.Opt
 		}
 		if c, ok := p.(pricing.ResolverConsumer); ok && deps.Pricing != nil {
 			c.SetPricingResolver(deps.Pricing)
+		}
+		if c, ok := p.(storage.StoreConsumer); ok && deps.Store != nil {
+			c.SetStore(deps.Store)
+		}
+		if c, ok := p.(session.HistoryConsumer); ok && deps.History != nil {
+			c.SetHistory(deps.History)
 		}
 
 		if c, ok := p.(pipeline.Configurable); ok {

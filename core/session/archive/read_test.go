@@ -171,3 +171,37 @@ func equalSeqs(a, b []uint64) bool {
 	}
 	return true
 }
+
+func earlier(t *testing.T, a *Archive, id string, before uint64, stopAt uint64) []uint64 {
+	t.Helper()
+	var seqs []uint64
+	if err := a.Earlier(id, before, func(e *pipeline.SessionEvent) bool {
+		seqs = append(seqs, e.Seq)
+		return e.Seq != stopAt
+	}); err != nil {
+		t.Fatal(err)
+	}
+	return seqs
+}
+
+// Earlier reads a session's archived events newest first, a page at a time across segments,
+// from below before to the oldest, and stops when fn says so.
+func TestEarlier_ReadsNewestFirstPageByPageUntilToldToStop(t *testing.T) {
+	defer func(n int) { earlierPage = n }(earlierPage)
+	earlierPage = 5
+	a, _ := twoSegments(t)
+	tick(a)
+
+	if seqs := earlier(t, a, "s1", 0, 0); !equalSeqs(seqs, []uint64{12, 11, 10, 9, 8, 7, 6, 5, 4, 3, 2, 1}) {
+		t.Errorf("all: %v, want 12 down to 1", seqs)
+	}
+	if seqs := earlier(t, a, "s1", 8, 0); !equalSeqs(seqs, []uint64{7, 6, 5, 4, 3, 2, 1}) {
+		t.Errorf("before=8: %v, want 7 down to 1", seqs)
+	}
+	if seqs := earlier(t, a, "s1", 0, 4); !equalSeqs(seqs, []uint64{12, 11, 10, 9, 8, 7, 6, 5, 4}) {
+		t.Errorf("stopped at 4: %v, want 12 down to 4", seqs)
+	}
+	if seqs := earlier(t, a, "nope", 0, 0); len(seqs) != 0 {
+		t.Errorf("unknown session: %v, want nothing", seqs)
+	}
+}

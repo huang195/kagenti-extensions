@@ -207,8 +207,8 @@ func newSessionsTable() table.Model {
 	return t
 }
 
-// rebuildSessionsTable updates the rows from m.sessions, applies the current
-// filter, and keeps the cursor on the previously-selected session if still
+// rebuildSessionsTable updates the rows from m.sessions, marks the rows the pane's
+// search matches, and keeps the cursor on the previously-selected session if still
 // present.
 func (m *model) rebuildSessionsTable() {
 	// The FULL id of the previously-selected row, read out of band. Taken from the rendered
@@ -270,19 +270,25 @@ func (m *model) rebuildSessionsTable() {
 	contextW := sessionsColumnWidth(want, contextColumnTitle)
 	rows := make([]table.Row, 0, len(m.sessions))
 	ids := make([]string, 0, len(m.sessions))
+	var hits []bool
 	var bucketRows []table.Row
 	var bucketIDs []string
-	emit := func(id string, row table.Row) {
+	var bucketHits []bool
+	emit := func(id string, row table.Row, hit bool) {
 		if _, _, ok := pendingBucket(id); ok {
 			bucketRows = append(bucketRows, row)
 			bucketIDs = append(bucketIDs, id)
+			bucketHits = append(bucketHits, hit)
 			return
 		}
 		rows = append(rows, row)
 		// APPENDED IN LOCKSTEP, one line apart, so the two cannot drift: the row carries what
-		// a reader sees and this carries what the code acts on.
+		// a reader sees and this carries what the code acts on. The search's hit too, for the
+		// row it is marked on.
 		ids = append(ids, id)
+		hits = append(hits, hit)
 	}
+	q := m.searchQuery(paneSessions)
 	for _, s := range m.sessions {
 		if !m.sessionListed(s, scope) {
 			continue
@@ -326,7 +332,7 @@ func (m *model) rebuildSessionsTable() {
 		// why neither source dominates. It is what lets a row idle since before agentop attached
 		// draw a gauge on the first poll, with nothing opened.
 		row = append(row, padLeft(contextGauge(m.sessionContextFor(s.ID, s.PromptContext), contextW), contextW))
-		emit(s.ID, row)
+		emit(s.ID, row, m.sessionMatchesSearch(q, s.ID, s.Title, s.Agent))
 	}
 	// Sessions whose events agentop still holds but the server no longer lists.
 	// Retaining the events (#870) is only half a fix if there is no row to
@@ -339,7 +345,7 @@ func (m *model) rebuildSessionsTable() {
 		// A scope lists only sessions the server names an agent for, and an adopted pending bucket
 		// lives on under the session that adopted it. Other is the exception: a session the server
 		// no longer lists names no agent, which is that row's definition.
-		if !m.sessionMatchesFilter(id, noServedTitle, "") || (scope != "" && scope != otherAgents) || adopted[id] {
+		if (scope != "" && scope != otherAgents) || adopted[id] {
 			continue
 		}
 		cached := m.events[id]
@@ -383,9 +389,15 @@ func (m *model) rebuildSessionsTable() {
 		// It does not list these rows at all, so there is no summary and no published figure —
 		// hence the nil, which is the merge's identity.
 		row = append(row, padLeft(contextGauge(m.sessionContextFor(id, nil), contextW), contextW))
-		emit(id, row)
+		emit(id, row, m.sessionMatchesSearch(q, id, noServedTitle, ""))
 	}
-	rows, ids = append(rows, bucketRows...), append(ids, bucketIDs...)
+	rows, ids, hits = append(rows, bucketRows...), append(ids, bucketIDs...), append(hits, bucketHits...)
+	var matches []int
+	for i, hit := range hits {
+		if hit {
+			matches = append(matches, i)
+		}
+	}
 	// ONLY WHEN THE HEADER ACTUALLY CHANGES, which is a resize and nothing else. SetRows(nil)
 	// resets the viewport's offset, and this function runs on every poll — clearing
 	// unconditionally scrolled the picker back under the operator twice a second, which
@@ -399,8 +411,10 @@ func (m *model) rebuildSessionsTable() {
 		m.sessionsTbl.SetColumns(want)
 	}
 	m.sessionsTbl.SetRows(rows)
-	// Published with the rows it describes, never separately.
+	m.sessionsTbl.SetMarked(matches)
+	// Published with the rows they describe, never separately.
 	m.sessionRowIDs = ids
+	m.sessionMatches = matches
 
 	// Restore cursor position if possible. Through setCursorVisible: a restored row
 	// past the first screenful would otherwise land one line below the rendered
@@ -436,12 +450,10 @@ func (m *model) cachedOnlySessionIDs() []string {
 	return out
 }
 
-// sessionListed reports whether the sessions table shows s: the filter, and under an agent scope
-// only the sessions of that agent — under Other, every session that names no recognised agent.
+// sessionListed reports whether the sessions table shows s: every session, and under an agent
+// scope only the sessions of that agent — under Other, every session that names no recognised
+// agent. A search hides nothing; it marks.
 func (m *model) sessionListed(s session.SessionSummary, scope string) bool {
-	if !m.sessionMatchesFilter(s.ID, s.Title, s.Agent) {
-		return false
-	}
 	switch scope {
 	case "":
 		return true
@@ -451,14 +463,14 @@ func (m *model) sessionListed(s session.SessionSummary, scope string) bool {
 	return s.Agent == scope
 }
 
-// sessionMatchesFilter reports whether the filter is a case-insensitive substring of the full
-// session id, the agent, or the title the TITLE cell shows (untruncated). Title goes last, being
-// the only one that costs a lookup.
-func (m *model) sessionMatchesFilter(id, served, agent string) bool {
-	if m.filter == "" {
-		return true
+// sessionMatchesSearch reports whether q is a case-insensitive substring of the full session id,
+// the agent, or the title the TITLE cell shows (untruncated). Title goes last, being the only one
+// that costs a lookup. An empty q matches nothing: no search marks no rows.
+func (m *model) sessionMatchesSearch(q, id, served, agent string) bool {
+	if q == "" {
+		return false
 	}
-	q := strings.ToLower(m.filter)
+	q = strings.ToLower(q)
 	has := func(s string) bool { return strings.Contains(strings.ToLower(s), q) }
 	return has(id) || has(agent) || has(m.sessionTitleFor(id, served))
 }

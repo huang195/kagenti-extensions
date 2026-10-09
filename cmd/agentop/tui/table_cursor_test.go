@@ -268,24 +268,36 @@ func TestEventsTable_ResizeKeepsSelectionVisible(t *testing.T) {
 	}
 }
 
-// TestEventsTable_FilterShrinkKeepsSelectionVisible covers the rows-SHRINK case, the one the
-// old `else if prevRow < len(rows)` skipped outright: typing a filter or toggling
-// hideInactive can pull the list out from under the cursor, and with no restore the cursor
-// was left wherever SetRows had clamped it, with an offset nobody reconciled.
+// TestEventsTable_ShrinkKeepsSelectionVisible covers the rows-SHRINK case, the one the
+// old `else if prevRow < len(rows)` skipped outright: toggling hideInactive can pull the
+// list out from under the cursor, and with no restore the cursor was left wherever SetRows
+// had clamped it, with an offset nobody reconciled. (Typing a filter could too, until `/`
+// became a search that hides nothing.)
 //
-// Both shrink paths are exercised, and both directions of the round trip, because the
-// interesting state is the one where the stale offset still addresses a line of the new,
-// shorter content — a drastic shrink is self-correcting, a moderate one is not.
-func TestEventsTable_FilterShrinkKeepsSelectionVisible(t *testing.T) {
+// Two sizes of shrink, and both directions of the round trip, because the interesting state
+// is the one where the stale offset still addresses a line of the new, shorter content — a
+// drastic shrink is self-correcting, a moderate one is not.
+func TestEventsTable_ShrinkKeepsSelectionVisible(t *testing.T) {
+	// keep gives events [from, to) a plugin invocation, so hiding inactive rows keeps those.
+	keep := func(from, to int) func(m *model) {
+		return func(m *model) {
+			for i := from; i < to; i++ {
+				m.events["s"][i].Invocations = &pipeline.Invocations{Outbound: []pipeline.Invocation{
+					{Plugin: "tool-prune", Action: pipeline.ActionModify, Reason: "tools_pruned"},
+				}}
+			}
+			m.hideInactive = true
+		}
+	}
 	for _, tc := range []struct {
 		name     string
 		shrink   func(m *model)
 		wantRows int
 	}{
-		// "h3" keeps h30..h39: ten rows, every one of them below the parked cursor.
-		{"filter to ten rows", func(m *model) { m.filter = "h3" }, 10},
+		// h30..h39: ten rows, every one of them below the parked cursor.
+		{"shrink to ten rows", keep(30, 40), 10},
 		// A single row is the drastic case: shorter than the table height.
-		{"filter to one row", func(m *model) { m.filter = "h07" }, 1},
+		{"shrink to one row", keep(7, 8), 1},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			m := cursorModel(t, 40)
@@ -295,9 +307,9 @@ func TestEventsTable_FilterShrinkKeepsSelectionVisible(t *testing.T) {
 			tc.shrink(m)
 			m.rebuildEventsTable()
 			if got := len(m.eventsTbl.Rows()); got != tc.wantRows {
-				t.Fatalf("filter left %d rows, want %d", got, tc.wantRows)
+				t.Fatalf("the shrink left %d rows, want %d", got, tc.wantRows)
 			}
-			assertSelectionVisible(t, m.eventsTbl, "after the filter shrank the list")
+			assertSelectionVisible(t, m.eventsTbl, "after the list shrank")
 			if got, want := m.eventsTbl.Cursor(), tc.wantRows-1; got > want {
 				t.Errorf("cursor %d addresses no row in a %d-row list", got, tc.wantRows)
 			}
@@ -307,15 +319,15 @@ func TestEventsTable_FilterShrinkKeepsSelectionVisible(t *testing.T) {
 				t.Error("no selected row resolves after the shrink")
 			}
 
-			// Clearing the filter grows the list back; the cursor must still be on screen.
-			m.filter = ""
+			// Showing every row grows the list back; the cursor must still be on screen.
+			m.hideInactive = false
 			m.rebuildEventsTable()
 			if got := len(m.eventsTbl.Rows()); got != 40 {
-				t.Fatalf("clearing the filter left %d rows, want 40", got)
+				t.Fatalf("showing every row left %d rows, want 40", got)
 			}
-			assertSelectionVisible(t, m.eventsTbl, "after clearing the filter")
+			assertSelectionVisible(t, m.eventsTbl, "after showing every row")
 			if _, ok := m.selectedEventRow(); !ok {
-				t.Error("no selected row resolves after clearing the filter")
+				t.Error("no selected row resolves after showing every row")
 			}
 		})
 	}

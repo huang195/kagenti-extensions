@@ -92,5 +92,10 @@ func tableStyles() table.Styles {
 		BorderForeground(colorMuted).
 		Bold(true)
 	s.Selected = lipgloss.NewStyle().Bold(true).Background(colorSelectedBg)
+	// A search's matches. Ink rather than a background, so a match never reads as the cursor,
+	// and the warn colour the footer's search status is drawn in, so the two read as one thing.
+	// Recolouring ink is safe for the context gauge, unlike inverting it: the gauge's value is
+	// which cells are filled, and a colour change leaves that where it was.
+	s.Marked = lipgloss.NewStyle().Foreground(colorWarn)
 	return s
 }

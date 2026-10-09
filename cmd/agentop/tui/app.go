@@ -602,19 +602,21 @@ type model struct {
 	sortCol      eventColumnID
 	sortDesc     bool
 	selectedSess string
-	// filter is the ACTIVE filter, which is not the same as the saved one:
-	// backToPodsPane clears this on teardown so a filter cannot survive a pod
-	// switch and read as data loss. Settings.Filter is the persisted value that
-	// seeds it, and that clear deliberately does not write back.
-	filter    string
-	filtering bool
-	// filterBeforeEdit is the committed filter as it stood when `/` was pressed, so
-	// Esc can restore it. Esc is documented as cancelling and means cancel everywhere
-	// else in agentop, but it used to clear the filter outright — and once the filter
-	// began persisting, that turned a mis-keyed Esc into the permanent loss of a
-	// committed filter. Clearing is still one action: empty the box and press Enter.
-	filterBeforeEdit string
-	paused           bool
+	// search is each pane's committed `/` query — only paneSessions and paneEvents have one —
+	// and searching is whether the prompt is open, on searchPane. Never saved, and cleared by
+	// backToPodsPane. See search.go.
+	search     map[paneID]string
+	searching  bool
+	searchPane paneID
+	// searchOrigin is where the cursor was when `/` was pressed: the row typing searches from,
+	// and the row Esc puts the cursor back on.
+	searchOrigin searchSpot
+	// sessionMatches and eventMatches are the rows of the sessions and events tables the
+	// pane's search matches, ascending. Each is published by its table's rebuild together with
+	// the rows, so it is index-aligned with sessionRowIDs and visibleRows.
+	sessionMatches []int
+	eventMatches   []int
+	paused         bool
 	// hideInactive toggles whether passthrough / skip-only messages are
 	// hidden from the events table. False (default) shows every message —
 	// the operator asked to see all network traffic, processed or not.
@@ -677,7 +679,7 @@ type model struct {
 	//
 	// Kept in lockstep with the rows, built in the same loop, and the only writer is
 	// rebuildSessionsTable. A parallel slice rather than a map because the lookup key is the
-	// cursor's row INDEX, and rather than indexing m.sessions because the rows are filtered and
+	// cursor's row INDEX, and rather than indexing m.sessions because the rows are scoped and
 	// interleaved with cached-only entries, so position does not map back.
 	sessionRowIDs []string
 	eventsTbl     table.Model
@@ -690,7 +692,7 @@ type model struct {
 	// the detail pane on resize without re-deriving the tunnel fold.
 	detailRow    eventRow
 	detailPlugin *apiclient.PipelinePlugin
-	filterInput  textinput.Model
+	searchInput  textinput.Model
 
 	// visibleRows holds the eventRow for each rendered row in eventsTbl —
 	// one per network message. Populated by rebuildEventsTable so
@@ -836,7 +838,7 @@ type model struct {
 	// eventsBuiltFor is the session the events table was last built for. When it
 	// differs from selectedSess the next rebuild is an OPENING, which is the only
 	// moment the OpenAtOldest preference applies — every later rebuild (the
-	// two-second poll, a filter, a column toggle) must preserve where the operator
+	// two-second poll, a search, a column toggle) must preserve where the operator
 	// is, not re-anchor them to an end.
 	eventsBuiltFor string
 
@@ -896,16 +898,6 @@ func (m *model) clock() time.Time {
 func New(ctx context.Context, c *apiclient.Client, opts ...Option) tea.Model {
 	ctx, cancel := context.WithCancel(ctx)
 
-	ti := textinput.New()
-	ti.Placeholder = "filter…"
-	ti.Prompt = "/ "
-	// Seed the input, not just m.filter: the filter box renders only while filtering,
-	// so a restored filter was applied invisibly — the list came back truncated with
-	// nothing on screen saying why. Worse, `/` then one character replaced the saved
-	// filter with that character, and `/` then Esc persisted an empty one, discarding
-	// it for good.
-	ti.SetValue(Settings.Filter)
-
 	// Resolved once: sortSelection walks eventColumns to validate the persisted name,
 	// and the two fields are two halves of one answer.
 	sortCol, sortDesc := Settings.sortSelection()
@@ -929,7 +921,6 @@ func New(ctx context.Context, c *apiclient.Client, opts ...Option) tea.Model {
 		sortCol:      sortCol,
 		sortDesc:     sortDesc,
 		usage:        usageState{metric: usageMetric, windowIdx: usageWindowIdx, group: usageGroup},
-		filter:       Settings.Filter,
 		sessionsData: sessionMeta,
 		sessionsTbl:  newSessionsTable(),
 		eventsTbl:    newEventsTable(),
@@ -941,7 +932,7 @@ func New(ctx context.Context, c *apiclient.Client, opts ...Option) tea.Model {
 		// of "namespaces" would send esc from the pipeline into the picker.
 		pipelineReturnPane: paneNone,
 		detailVp:           viewport.New(0, 0),
-		filterInput:        ti,
+		searchInput:        newSearchInput(),
 		lastTick:           time.Now(),
 		connState:          connStateInfo{phase: connConnecting},
 	}
@@ -1083,18 +1074,13 @@ func (m *model) backToPodsPane() {
 	m.detailPlugin = nil
 	m.selectedSess = ""
 	m.selectedEventKey = eventKey{}
-	m.filter = ""
-	m.filtering = false
-	// The filter's line comes off the height budget while it is open, so dropping the flag
+	// A search names rows of the connection being left, so it goes with it.
+	m.search = nil
+	m.searching = false
+	m.searchInput.SetValue("")
+	// The prompt's line comes off the height budget while it is open, so dropping the flag
 	// has to give it back — see layout().
 	m.layout()
-	// The input too, not just the value. Since the input is seeded from saved
-	// settings it is a second source of truth, and leaving it behind meant that after
-	// backing out and entering the next pod, `/` presented the OLD filter text
-	// already in the box — one keystroke then committed "github-toolx" and Enter
-	// persisted it, over a list the footer correctly showed as unfiltered.
-	m.filterInput.SetValue("")
-	m.filterBeforeEdit = ""
 	m.visibleRows = nil
 	m.connState = connStateInfo{phase: connConnecting}
 
@@ -2447,8 +2433,8 @@ func (m *model) paneView() string {
 		title += " · agent=" + sanitizeLabel(m.agentScope)
 	}
 	header := styleTitle.Render(title)
-	if m.filtering {
-		body = m.filterInput.View() + "\n" + body
+	if m.searching {
+		body = m.searchInput.View() + "\n" + body
 	}
 	// A row slice rather than a fixed JoinVertical, so the strip's row can be absent
 	// without needing a second call site. It sits directly under the title because that
@@ -2849,7 +2835,7 @@ func Run(ctx context.Context, opts RunOptions) error {
 // follow xterm (the xterm-256color terminfo says khome=\EOH, kend=\EOF) then send
 // Home and End as ESC O H and ESC O F, and bubbletea v1.3.10 cannot read either —
 // it splits each into alt+O and a bare letter, so the tables' home/end bindings
-// stop working and Home in the filter box types an H. Terminal.app keeps Home and
+// stop working and Home in the search prompt types an H. Terminal.app keeps Home and
 // End for scrolling its own window by default, so it pays nothing for the mode.
 // GNOME Terminal, Konsole, Alacritty and kitty are believed to turn an alt-screen
 // scroll into arrows without it (not verified here), so elsewhere the mode would

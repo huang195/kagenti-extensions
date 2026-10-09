@@ -13,6 +13,16 @@ func (m *model) surface(t paneID) searchSurface {
 		return sessionsSurface{m}
 	case paneEvents:
 		return eventsSurface{m}
+	case panePipeline:
+		return tableSurface{m, t, &m.pipelineTbl}
+	case paneCatalog:
+		return tableSurface{m, t, &m.catalogTbl}
+	case paneAgents:
+		return tableSurface{m, t, &m.agentsTbl}
+	case paneNamespaces:
+		return tableSurface{m, t, &m.namespacesTbl}
+	case panePods:
+		return tableSurface{m, t, &m.podsTbl}
 	}
 	return nil
 }

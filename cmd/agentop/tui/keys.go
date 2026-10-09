@@ -34,6 +34,14 @@ func (m *model) handleKey(msg tea.KeyMsg) tea.Cmd {
 	// Only the flag is cleared, never m.flash, so timed messages are unaffected.
 	m.flashSticky = false
 
+	// The search prompt consumes every key while it is open, on every pane — checked first,
+	// before the pickers and the overlays, so a `q`, `?` or `u` in a query is typed rather
+	// than acted on. Nothing below can open while the prompt is: every key that would open
+	// one is a character here.
+	if m.searching {
+		return m.searchKey(msg)
+	}
+
 	// The help overlay is modal: while it's up, it owns the keyboard so a
 	// stray key can't navigate the pane hidden underneath. Checked before
 	// every other handler, including the picker and edit overlays, so `?`
@@ -73,6 +81,21 @@ func (m *model) handleKey(msg tea.KeyMsg) tea.Cmd {
 	}
 	if m.serverNotice != "" && m.pane == paneAgents {
 		return m.serverNoticeKey(msg)
+	}
+
+	// `/`, n and N search the pane, on every pane. Above the pickers, which handle their own
+	// keys and return. Not over the column picker or an edit, which own their keys.
+	if m.editState.phase == editPhaseDone && !(m.colPicker && m.pane == paneEvents) {
+		switch msg.String() {
+		case "/":
+			m.openSearch(m.pane)
+			return nil
+		case "n", "N":
+			if m.surface(m.pane) != nil {
+				m.searchStep(m.pane, msg.String() == "n")
+				return nil
+			}
+		}
 	}
 
 	// `?` opens the overlay from any pane, with two exceptions. While a
@@ -436,29 +459,10 @@ func (m *model) handleKey(msg tea.KeyMsg) tea.Cmd {
 		return m.handleEditKey(msg)
 	}
 
-	// The search prompt consumes every key while it is open — see searchKey.
-	if m.searching {
-		return m.searchKey(msg)
-	}
-
 	switch msg.String() {
 	case "ctrl+c", "q":
 		m.cancel()
 		return tea.Quit
-
-	case "/":
-		// Only where there is something to search: openSearch does nothing on a pane with no
-		// search surface.
-		m.openSearch(m.pane)
-		return nil
-
-	case "n", "N":
-		// The search's next and previous match. Elsewhere the keys fall through to the pane's
-		// component, which binds neither.
-		if m.surface(m.pane) != nil {
-			m.searchStep(m.pane, msg.String() == "n")
-			return nil
-		}
 
 	case "p":
 		m.paused = !m.paused
@@ -1097,9 +1101,9 @@ func (m *model) helpView() string {
 	switch m.pane {
 	case paneNamespaces:
 		return "[↑↓/jk] nav  [↵] open  [l] " + shortHost(m.localEndpointOr()) +
-			"  [r] reload  [?] keys  [q] quit"
+			"  [r] reload  " + m.searchHints(m.pane) + "  [?] keys  [q] quit"
 	case panePods:
-		return "[↑↓/jk] nav  [↵] connect  [Esc] back  [r] reload  [?] keys  [q] quit"
+		return "[↑↓/jk] nav  [↵] connect  [Esc] back  [r] reload  " + m.searchHints(m.pane) + "  [?] keys  [q] quit"
 	case paneSessions:
 		// THE PER-SESSION SCOPE IS NOT SAID HERE. It was, as a leading notice; then the pane's
 		// title carried it as " · lifetime totals"; now neither does. See paneView's sessions
@@ -1208,7 +1212,7 @@ func (m *model) helpView() string {
 			base = fmt.Sprintf("%s  ·  %d plugin%s with unmet deps",
 				base, n, plural(n))
 		}
-		return base + "  [?] keys  [q] quit"
+		return base + "  " + m.searchHints(m.pane) + "  [?] keys  [q] quit"
 	case panePluginDetail:
 		return "[↑↓] scroll  [esc] back  [?] keys  [q] quit"
 	case paneUsage:
@@ -1240,7 +1244,7 @@ func (m *model) helpView() string {
 		if m.catalog == nil {
 			return "loading catalog…  [esc] back  [?] keys  [q] quit"
 		}
-		return "[↑↓] nav  [↵] plugin detail  [r] refresh  [esc] back  [?] keys  [q] quit"
+		return "[↑↓] nav  [↵] plugin detail  [r] refresh  [esc] back  " + m.searchHints(m.pane) + "  [?] keys  [q] quit"
 	case paneAgents:
 		// [↵] LABELLED BY WHAT IT WILL SHOW: the highlighted agent, or every agent on the All
 		// agents row.
@@ -1265,7 +1269,7 @@ func (m *model) helpView() string {
 		if m.serverKeyOffered() {
 			serverHint = "  [S] server"
 		}
-		return "[↑↓] nav" + enterHint + escHint + serverHint + "  [?] keys  [q] quit"
+		return "[↑↓] nav" + enterHint + escHint + serverHint + "  " + m.searchHints(m.pane) + "  [?] keys  [q] quit"
 	}
 	return "[?] keys  [q] quit"
 }

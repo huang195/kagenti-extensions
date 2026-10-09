@@ -2277,6 +2277,12 @@ func (m *model) paneView() string {
 		if m.pickerErr != "" {
 			footer = "error: " + m.pickerErr + "    " + footer
 		}
+		if m.searching && m.searchPane != targetHelp {
+			body = m.searchInput.View() + "\n" + body
+		}
+		if st := m.searchStatus(m.pane); st != "" {
+			footer = st + "  " + footer
+		}
 		// Fitted like the session-view footer: an error prefix can push even a
 		// short picker hint past the terminal width, and a wrapped footer costs a
 		// row of the table above it.
@@ -2297,6 +2303,12 @@ func (m *model) paneView() string {
 		footer := m.helpView()
 		if m.pickerErr != "" {
 			footer = "error: " + m.pickerErr + "    " + footer
+		}
+		if m.searching && m.searchPane != targetHelp {
+			body = m.searchInput.View() + "\n" + body
+		}
+		if st := m.searchStatus(m.pane); st != "" {
+			footer = st + "  " + footer
 		}
 		// Fitted like the session-view footer: an error prefix can push even a
 		// short picker hint past the terminal width, and a wrapped footer costs a

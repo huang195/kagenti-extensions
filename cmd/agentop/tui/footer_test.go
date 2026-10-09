@@ -109,35 +109,24 @@ func TestFooterShowsActiveSort(t *testing.T) {
 	}
 }
 
-// The search indicator shows only on the two panes that search, which is the defect the
-// sort indicator above was fixed for: the filter it replaced was model-global, so it
-// survived onto panes that filter nothing — the Usage pane fetches an aggregate it never
-// reached. Every pane is given a search here, so a pane that showed one would be caught.
-func TestFooterShowsSearchOnlyWhereItApplies(t *testing.T) {
+// TestFooterShowsSearchOnEveryPane: every pane searches what it shows, so a committed search
+// is on every pane's status row. (It used to be on sessions and events only, because only
+// those two had a search.) TestSearch_SlashOpensOnEveryPane is what says every pane has one.
+func TestFooterShowsSearchOnEveryPane(t *testing.T) {
 	orig := lipgloss.ColorProfile()
 	lipgloss.SetColorProfile(termenv.ANSI256)
 	t.Cleanup(func() { lipgloss.SetColorProfile(orig) })
 
-	for _, tc := range []struct {
-		name string
-		pane paneID
-		want bool
-	}{
-		{name: "sessions searches its list", pane: paneSessions, want: true},
-		{name: "events searches its table", pane: paneEvents, want: true},
-		{name: "usage plots an aggregate", pane: paneUsage, want: false},
-		{name: "pipeline has nothing to search", pane: panePipeline, want: false},
-		{name: "catalog has nothing to search", pane: paneCatalog, want: false},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			m := &model{
-				pane: tc.pane, width: 200, eventColumns: defaultColumnSelection(),
-				search: map[paneID]string{tc.pane: "github-tool"},
-			}
-			got := stripANSI(statusRow(m.footerView()))
-			if has := strings.Contains(got, "[/github-tool"); has != tc.want {
-				t.Errorf("status row = %q; indicator present=%v, want %v", got, has, tc.want)
-			}
-		})
+	for p := paneID(0); p <= lastPaneID; p++ {
+		m := &model{
+			pane: p, width: 200, eventColumns: defaultColumnSelection(),
+			search: map[paneID]string{p: "github-tool"},
+		}
+		if m.surface(p) == nil {
+			continue
+		}
+		if got := stripANSI(statusRow(m.footerView())); !strings.Contains(got, "[/github-tool") {
+			t.Errorf("pane %v: status row = %q, want the search", p, got)
+		}
 	}
 }

@@ -19,9 +19,12 @@
 // cursor back. Every way of moving the cursor goes through UpdateViewport, so every one
 // keeps the cursor on screen and scrolls only when the cursor crosses an edge.
 //
-// WHAT WAS ADDED: marked rows (SetMarked, Styles.Marked), which agentop's search draws its
-// matches with. Cells are plain text, so a row-wide style applied after truncation is the
-// only highlight that cannot be cut into a lone "…".
+// WHAT WAS ADDED: search (SetSearch, Matches, Styles.Match, CurrentMatch and Marked), which
+// agentop's `/` is drawn with. Cells are plain text and are truncated before they are
+// styled, so a highlight is applied to the truncated text — and a match the truncation cut
+// off is shown by highlighting the "…" that replaced it. Every piece of a row carries the
+// row's style itself, rather than the row being wrapped in it once: a highlight ends in a
+// reset, and a reset inside a wrapped row ends the row's style with it.
 package table
 
 import (
@@ -29,11 +32,14 @@ import (
 
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
+	"github.com/charmbracelet/x/ansi"
 	"github.com/mattn/go-runewidth"
 
 	"github.com/charmbracelet/bubbles/help"
 	"github.com/charmbracelet/bubbles/key"
 	"github.com/charmbracelet/bubbles/viewport"
+
+	"github.com/rossoctl/cortex/cmd/agentop/tui/find"
 )
 
 // Model defines a state for the table widget.
@@ -47,9 +53,13 @@ type Model struct {
 	focus  bool
 	styles Styles
 
-	// marked is the row indices drawn in Styles.Marked — a search's matches. Indices, not
-	// rows: the caller rebuilds the rows on every refresh and re-marks them with them.
-	marked map[int]bool
+	// query is the search the rows are matched against, full the pane's full cell values
+	// for it (nil when the rows hold them already), and hits the rows that matched, by
+	// row. Recomputed when the rows or the search change, never on a cursor move.
+	query   string
+	full    []SearchRow
+	matches []int
+	hits    []bool
 
 	// The viewport renders exactly the rows on screen and never scrolls: its offset stays
 	// 0, and start is the scroll position. Rows [start, end) are what the screen shows.
@@ -60,6 +70,15 @@ type Model struct {
 
 // Row represents one line in the table.
 type Row []string
+
+// SearchRow is one row's full text for a search. Cells is parallel to the row's cells: an
+// entry is the cell's value as it would read with unlimited room, for a cell the pane cut
+// before handing it over, and "" for a cell that is already whole. Dropped is the full
+// values of columns the pane had no room to show.
+type SearchRow struct {
+	Cells   []string
+	Dropped []string
+}
 
 // Column defines the table structure.
 type Column struct {
@@ -138,16 +157,22 @@ type Styles struct {
 	Header   lipgloss.Style
 	Cell     lipgloss.Style
 	Selected lipgloss.Style
-	// Marked draws the rows SetMarked names. Not upstream: see the package doc.
-	Marked lipgloss.Style
+	// Match draws the characters a search matched, CurrentMatch those on the cursor's row.
+	// Marked draws a row whose only match is somewhere no cell on screen shows it. Not
+	// upstream: see the package doc.
+	Match        lipgloss.Style
+	CurrentMatch lipgloss.Style
+	Marked       lipgloss.Style
 }
 
 // DefaultStyles returns a set of default style definitions for this table.
 func DefaultStyles() Styles {
 	return Styles{
-		Selected: lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("212")),
-		Header:   lipgloss.NewStyle().Bold(true).Padding(0, 1),
-		Cell:     lipgloss.NewStyle().Padding(0, 1),
+		Selected:     lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("212")),
+		Match:        lipgloss.NewStyle().Reverse(true),
+		CurrentMatch: lipgloss.NewStyle().Reverse(true).Bold(true),
+		Header:       lipgloss.NewStyle().Bold(true).Padding(0, 1),
+		Cell:         lipgloss.NewStyle().Padding(0, 1),
 	}
 }
 
@@ -340,9 +365,12 @@ func (m Model) Columns() []Column {
 	return m.cols
 }
 
-// SetRows sets a new rows state.
+// SetRows sets a new rows state. The search is kept and matched against the new rows; full
+// values set for the old rows are dropped, since they describe rows that are gone.
 func (m *Model) SetRows(r []Row) {
 	m.rows = r
+	m.full = nil
+	m.match()
 
 	if m.cursor > len(m.rows)-1 {
 		m.cursor = len(m.rows) - 1
@@ -351,18 +379,90 @@ func (m *Model) SetRows(r []Row) {
 	m.UpdateViewport()
 }
 
-// SetMarked draws the given rows in Styles.Marked, replacing any earlier marks; nil clears
-// them. The cursor's row is drawn in Selected whether it is marked or not. Indices outside
-// the rows are ignored. Not upstream: see the package doc.
-func (m *Model) SetMarked(rows []int) {
-	m.marked = nil
-	for _, r := range rows {
-		if m.marked == nil {
-			m.marked = make(map[int]bool, len(rows))
-		}
-		m.marked[r] = true
+// SetSearch matches the rows against q, reading each cell's full value from full where the
+// pane supplied one. full is parallel to the rows; one of another length is ignored. An
+// empty q clears the search. Not upstream: see the package doc.
+func (m *Model) SetSearch(q string, full []SearchRow) {
+	m.query = q
+	m.full = nil
+	if len(full) == len(m.rows) {
+		m.full = full
 	}
+	m.match()
 	m.UpdateViewport()
+}
+
+// Matches is the rows the search matched, ascending; nil without a search.
+func (m Model) Matches() []int { return m.matches }
+
+func (m *Model) match() {
+	m.matches, m.hits = nil, nil
+	if m.query == "" {
+		return
+	}
+	m.hits = make([]bool, len(m.rows))
+	for r := range m.rows {
+		if m.rowMatches(r) {
+			m.hits[r] = true
+			m.matches = append(m.matches, r)
+		}
+	}
+}
+
+// fullCell is cell i of row r as it would read with unlimited room.
+func (m *Model) fullCell(r, i int) string {
+	if r < len(m.full) && i < len(m.full[r].Cells) && m.full[r].Cells[i] != "" {
+		return m.full[r].Cells[i]
+	}
+	return m.rows[r][i]
+}
+
+func (m *Model) rowMatches(r int) bool {
+	for i := range m.rows[r] {
+		if find.Contains(m.fullCell(r, i), m.query) {
+			return true
+		}
+	}
+	if r < len(m.full) {
+		for _, v := range m.full[r].Dropped {
+			if find.Contains(v, m.query) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// cellSpans is where to highlight cell i of row r, drawn as text: each occurrence of the
+// query in it, or, when only the full value holds one, the "…" that stands for the rest.
+func (m *Model) cellSpans(r, i int, text string) []find.Range {
+	if spans := find.Ranges(text, m.query); len(spans) > 0 {
+		return spans
+	}
+	if find.Contains(m.fullCell(r, i), m.query) {
+		return find.Ranges(text, "…")
+	}
+	return nil
+}
+
+// paint draws text in style, with each span in match.
+func paint(text string, spans []find.Range, style, match lipgloss.Style) string {
+	if len(spans) == 0 {
+		return style.Render(text)
+	}
+	var b strings.Builder
+	at := 0
+	for _, sp := range spans {
+		if sp.Start > at {
+			b.WriteString(style.Render(ansi.Cut(text, at, sp.Start)))
+		}
+		b.WriteString(match.Render(ansi.Cut(text, sp.Start, sp.End)))
+		at = sp.End
+	}
+	if w := ansi.StringWidth(text); at < w {
+		b.WriteString(style.Render(ansi.Cut(text, at, w)))
+	}
+	return b.String()
 }
 
 // SetColumns sets a new columns state.
@@ -458,26 +558,45 @@ func (m Model) headersView() string {
 }
 
 func (m *Model) renderRow(r int) string {
-	s := make([]string, 0, len(m.cols))
+	texts := make([]string, len(m.rows[r]))
+	var spans [][]find.Range
+	if r < len(m.hits) && m.hits[r] {
+		spans = make([][]find.Range, len(m.rows[r]))
+	}
+	lit := false
 	for i, value := range m.rows[r] {
 		if m.cols[i].Width <= 0 {
 			continue
 		}
-		style := lipgloss.NewStyle().Width(m.cols[i].Width).MaxWidth(m.cols[i].Width).Inline(true)
-		renderedCell := m.styles.Cell.Render(style.Render(runewidth.Truncate(value, m.cols[i].Width, "…")))
-		s = append(s, renderedCell)
+		texts[i] = runewidth.Truncate(value, m.cols[i].Width, "…")
+		if spans != nil {
+			spans[i] = m.cellSpans(r, i, texts[i])
+			lit = lit || len(spans[i]) > 0
+		}
 	}
 
-	row := lipgloss.JoinHorizontal(lipgloss.Top, s...)
-
-	if r == m.cursor {
-		return m.styles.Selected.Render(row)
+	row, match := lipgloss.NewStyle(), m.styles.Match
+	switch {
+	case r == m.cursor:
+		row, match = m.styles.Selected, m.styles.CurrentMatch
+	case spans != nil && !lit:
+		row = m.styles.Marked
 	}
-	if m.marked[r] {
-		return m.styles.Marked.Render(row)
-	}
+	match = match.Inherit(row)
 
-	return row
+	s := make([]string, 0, len(m.cols))
+	for i := range m.rows[r] {
+		if m.cols[i].Width <= 0 {
+			continue
+		}
+		var sp []find.Range
+		if spans != nil {
+			sp = spans[i]
+		}
+		box := lipgloss.NewStyle().Width(m.cols[i].Width).MaxWidth(m.cols[i].Width).Inline(true).Inherit(row)
+		s = append(s, m.styles.Cell.Inherit(row).Render(box.Render(paint(texts[i], sp, row, match))))
+	}
+	return lipgloss.JoinHorizontal(lipgloss.Top, s...)
 }
 
 func clamp(v, low, high int) int {

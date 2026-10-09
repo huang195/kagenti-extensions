@@ -411,7 +411,7 @@ func (m *model) rebuildSessionsTable() {
 		m.sessionsTbl.SetColumns(want)
 	}
 	m.sessionsTbl.SetRows(rows)
-	m.sessionsTbl.SetMarked(matches)
+	m.sessionsTbl.SetSearch(q, nil)
 	// Published with the rows they describe, never separately.
 	m.sessionRowIDs = ids
 	m.sessionMatches = matches

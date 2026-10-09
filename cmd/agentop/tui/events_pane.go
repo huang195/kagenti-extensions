@@ -270,7 +270,7 @@ func (m *model) rebuildEventsTable() {
 		m.eventsTbl.SetColumns(newCols)
 		m.eventsTbl.SetRows(rows)
 	}
-	m.eventsTbl.SetMarked(matches)
+	m.eventsTbl.SetSearch(m.searchQuery(paneEvents), nil)
 	m.eventMatches = matches
 
 	// Auto-follow: if user was at the bottom, stay at the bottom. Otherwise

@@ -3,6 +3,7 @@ package pricing
 import (
 	"fmt"
 	"strings"
+	"time"
 
 	"github.com/gobwas/glob"
 )
@@ -38,6 +39,8 @@ type Table struct {
 	// pair: one rule scales every model that gateway serves, including ones no row
 	// names explicitly.
 	mults []multRule
+
+	listFetchedAt time.Time
 }
 
 type multRule struct {

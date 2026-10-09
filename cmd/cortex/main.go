@@ -475,6 +475,9 @@ func main() {
 	// disagree with the plugins about what a request cost. The table is swapped in
 	// place instead; the pointer never changes. See pricing.Registry.
 	pricingRegistry := pricing.NewRegistry(nil)
+	// Every table goes into the registry through live, which also applies a downloaded price
+	// list on a local install (runPriceList) without undoing a config reload, or the reverse.
+	live := &livePricing{reg: pricingRegistry}
 
 	// This binary is hardcoded to proxy-sidecar. Rejecting other modes
 	// early gives operators a clear boot-time error instead of silently
@@ -503,7 +506,7 @@ func main() {
 		// built so a plugin's Configure sees the new table, and swapped in place so
 		// the usage aggregator — which holds this same registry from before the
 		// reload — sees it too.
-		tab, err := pricing.Build(c.Pricing)
+		tab, err := live.build(c.Pricing)
 		if err != nil {
 			return nil, nil, nil, fmt.Errorf("pricing: %w", err)
 		}
@@ -542,10 +545,10 @@ func main() {
 	// applyPricing puts a prepared table into effect. Called on the reload goroutine, which is
 	// serialised, so the single pending slot needs no lock.
 	applyPricing := func(c *config.Config) {
-		if pendingPricing != nil {
-			pricingRegistry.Swap(pendingPricing)
-			pendingPricing = nil
+		if pendingPricing != nil && c != nil {
+			live.Swap(c.Pricing, pendingPricing)
 		}
+		pendingPricing = nil
 		if c != nil {
 			c.Pricing.WarnIfUnpinned(slog.Default())
 		}
@@ -590,6 +593,10 @@ func main() {
 		reloader.WithOnCommit(applyPricing))
 	if err := rld.Start(ctx); err != nil {
 		log.Fatalf("reloader: %v", err)
+	}
+	// After the first config is applied, so the list is combined with it from the start.
+	if localInstall && cfg.Pricing.BundledEnabled() {
+		go runPriceList(ctx, live)
 	}
 
 	var sessions *session.Store

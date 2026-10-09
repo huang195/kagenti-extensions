@@ -56,6 +56,15 @@ Generated, not hand-written: `core/cost/pricing/bundled.go` carries
 `model_prices_and_context_window.json`, pinned to one commit that `agentop pricing --json`
 reports as `upstreamCommit`.
 
+**A local install does not stay on that commit.** It downloads the same file at startup and
+then hourly. An unchanged file answers `304` with no body, so checking costs nothing. The
+last good download is kept in `~/.cortex/price-list.json`, so a restart, or a laptop with no
+network, prices from it. A download that fails, or is not a usable price map, changes
+nothing. `agentop pricing` then reports `rates from litellm's price list, downloaded <time>`,
+and `--json` carries it as `listFetchedAt`. `bundled: false` turns the download off with the
+rest of the shipped table. Sidecars in a cluster make no such call and keep the compiled-in
+table.
+
 **33 entries: 28 exact model ids plus 5 family globs.** The globs matter most, because
 they are what catches a model released after the pinned commit:
 
@@ -457,7 +466,10 @@ family, the glob **overstates** it, and nothing looks wrong. For example, a new 
 priced at 4 / 5 / 0.2 / 20 would be matched by `*claude-*opus-*` and billed at
 5 / 6.25 / 0.5 / 25.
 
-Two ways out: refresh the bundled table, or pin that one model:
+On a local install the downloaded list closes this for any model LiteLLM has listed, which
+for `claude-opus-5-5` was a week before its first request reached the proxy. What remains is
+the gap between a launch and LiteLLM listing it, and every install that is not local. For
+those, two ways out: refresh the bundled table, or pin that one model:
 
 ```yaml
 pricing:
@@ -591,7 +603,7 @@ pattern that sorts first — never by a model name.
 | Requests in `unpricedBy` | No rate for that `(endpoint, model)` | Add a `models` entry; the key names the pair |
 | Totals look ~1.3x high | Gateway bills below list, nothing pinned | Set `multiplier` |
 | Totals look low after pinning rates | Expected — a bundled multiplier will not scale configured rates | Nothing; or set your own multiplier if you meant one |
-| A new model prices at its family's old rate | Family glob matched it | Pin the exact model id, or refresh the bundled table |
+| A new model prices at its family's old rate | Family glob matched it: LiteLLM has not listed it yet, or this is not a local install | Pin the exact model id, or refresh the bundled table |
 | Startup fails naming a tier | Both `_per_million` and `_per_token` set for it | Remove one |
 | Startup fails on a multiplier | Factor above 10 | You probably meant a fraction: `0.76`, not `76` |
 | A rate change had no effect | Another entry outranks it | `agentop pricing --host <gateway>` and read `provenance` |
@@ -611,8 +623,11 @@ This rewrites `core/cost/pricing/bundled.go` and the test snapshot, and reruns
 against live gateways rather than generated, and are kept in a separate file precisely so
 the generator cannot clobber them.
 
-Rates on a gateway change on the order of months, which is why this is a static table
-rather than something fetched. Asking the gateway via LiteLLM's `GET /model/info` was
+A local install does not need this: it downloads the list itself (see
+[The bundled rate table](#the-bundled-rate-table)). Refreshing still matters for the sidecar
+images, and for a local install's first start with no network.
+
+Asking the gateway for its own rates is a different matter. Via LiteLLM's `GET /model/info` it was
 designed, prototyped and dropped: it needed a virtual key minted and mounted, an outbound
 dependency and a refresh loop, to save transcribing three numbers. `discovered` remains in
 the resolution order with no producer so any later mechanism has a defined precedence.

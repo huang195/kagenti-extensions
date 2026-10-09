@@ -211,28 +211,7 @@ func (c *Config) BundledEnabled() bool {
 // Configured rows are emitted at ProvConfigured so they outrank anything bundled
 // at equal specificity: an override is an override.
 func Build(cfg *Config) (*Table, error) {
-	var entries []Entry
-	var mults []MultiplierRule
-	if cfg.BundledEnabled() {
-		entries = append(entries, Bundled()...)
-		// So do the free models' zero rates, kept out of Bundled() because that is the
-		// generated table its golden test pins to the LiteLLM snapshot.
-		entries = append(entries, bundledFreeRates()...)
-		// Shipped gateway discounts travel with the shipped rates: the rates are
-		// vendor list, and for the gateways named here list is a third too high.
-		// Disabling the bundled table disables both, which is the right pairing —
-		// a multiplier on rates you did not ship scales somebody else's numbers.
-		mults = append(mults, bundledMultipliers()...)
-	}
-	if cfg != nil {
-		configured, err := cfg.entries()
-		if err != nil {
-			return nil, err
-		}
-		entries = append(entries, configured...)
-		mults = append(mults, cfg.multipliers()...)
-	}
-	return NewTable(entries, mults...)
+	return BuildWithList(cfg, nil)
 }
 
 // multipliers converts the config's endpoint blocks into multiplier rules.

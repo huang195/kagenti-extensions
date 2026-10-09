@@ -1,10 +1,11 @@
 // Package pricegen turns LiteLLM's public model_prices_and_context_window.json
 // into pricing.Entry rows and renders them as Go source.
 //
-// It lives in internal/ because it is build tooling, not runtime code, and it is
-// a library rather than living inside the generator command so the golden test can
-// run the exact same transform against a committed snapshot. A generator whose
-// transform only exists inside a main package cannot be tested without a network.
+// It is a library rather than living inside the generator command so the golden test
+// can run the exact same transform against a committed snapshot — a generator whose
+// transform only exists inside a main package cannot be tested without a network — and
+// so pricelist can run it on a list downloaded at runtime. It stays in internal/ because
+// only those two callers should depend on its output shape.
 package pricegen
 
 import (

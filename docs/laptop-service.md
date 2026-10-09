@@ -386,6 +386,17 @@ session:
 That stops new writes and leaves what is on disk; clear first with `X` if you want it gone, or
 `rm -rf ~/.cortex/sessions` with the proxy stopped.
 
+## Plugin state is kept in `~/.cortex/plugin-state.json`
+
+Plugins that need state to outlive a restart keep it here. Today that is the inference router:
+which server each session is on, as its session id, its agent's name and the server's name. It
+holds no prompts and no keys. A session's entry expires 29 to 30 days after its last request; `X`
+does not clear it. The proxy saves changes within two seconds and on stop, and sets aside a file it
+cannot read as `plugin-state.json.corrupt` and starts empty. Deleting the file with the proxy
+stopped makes every running session look new to the router on its next request; a Claude Code
+conversation then stays where Claude Code sends it, and only new conversations follow the server
+you chose.
+
 ## `agentop: command not found`
 
 Setup puts both binaries in `~/.local/bin`. If that is not on your PATH, adding it to

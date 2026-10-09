@@ -716,10 +716,9 @@ func TestServerRemove_WithNoProxyRunningCountsNothing(t *testing.T) {
 }
 
 // A session resumed after a restart that has sent no inference since lists its history's host,
-// but the router's pins did not survive the restart: nothing holds it to ete, so its next request
-// goes to its agent's current server and gets no error. It is left out of the count; the session
-// whose own request this proxy saw is not.
-func TestServerRemove_LeavesOutASessionNoPinHolds(t *testing.T) {
+// and its pin survived the restart in the plugin store: it is held where it was, as the session
+// whose own request this proxy saw is, so both are counted.
+func TestServerRemove_CountsASessionResumedAfterARestart(t *testing.T) {
 	earlier := session.NewSummaryFold()
 	e := inferenceTo("ete.example.com")
 	earlier.Add("resumed", &e)
@@ -729,7 +728,7 @@ func TestServerRemove_LeavesOutASessionNoPinHolds(t *testing.T) {
 	store.Append("seen", inferenceTo("ete.example.com"))
 	path := serverEnvWithSessions(t, newFakeStats(t, 0).addr(), serveSessions(t, store), routerBlock)
 	code, out, errOut := runServerCmd(t, "", "remove", "ete", "--config", path)
-	if code != 0 || !strings.Contains(errOut, "warning: 1 running session ") {
+	if code != 0 || !strings.Contains(errOut, "warning: 2 running sessions ") {
 		t.Errorf("exit %d, stdout:\n%s\nstderr:\n%s", code, out, errOut)
 	}
 }

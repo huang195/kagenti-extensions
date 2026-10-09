@@ -4,8 +4,11 @@
 //
 // The choice is plugin config — servers by name, and agents by name to a server —
 // changed by editing it and letting the proxy hot-reload. Sessions are pinned in the
-// process-scoped store (pctx.Shared), which a reload does not replace, so changing
-// an agent's server moves only the sessions it has not started yet.
+// process's durable store (storage.StoreConsumer) — on a local install a file under
+// ~/.cortex — which neither a reload nor a restart loses, so changing an agent's
+// server moves only the sessions it has not started yet. A process with no durable
+// store pins in its process-scoped store (pctx.Shared), which a reload keeps and a
+// restart empties.
 //
 // Place it last in the outbound chain, which is where agentop puts it. A redirect
 // moves pctx.Host, so the plugins before it decide on the host the client asked for
@@ -55,15 +58,18 @@
 // main conversation carries its tool manifest: an opening turn has no assistant
 // message yet and goes to the agent's current server, and a continuation has some,
 // so the router did not see it begin — it started before routing was set up, or
-// before a restart that forgot its pin — and it is not routed and pinned so, rather
-// than taken for new and moved mid-conversation. The one-shots Claude Code
-// interleaves with a conversation carry no tools, and a subagent's requests are its
-// own conversation's; neither says whether the session began, so neither decides:
-// each goes where Claude Code sent it and leaves the session unpinned. Only Claude
-// Code is read this way, because no other agent states its role, and one that
-// switches providers, as OpenCode does, sends earlier turns that went elsewhere. A
-// session routed to a server keeps it only by its pin, so a restart, which forgets
-// the pins, sends such a conversation back to where Claude Code sends it.
+// lost its pin to a restart of a process that keeps pins only in memory — and it is
+// not routed and pinned so, rather than taken for new and moved mid-conversation.
+// The one-shots Claude Code interleaves with a conversation carry no tools, and a
+// subagent's requests are its own conversation's; neither says whether the session
+// began, so neither decides: each goes where Claude Code sent it and leaves the
+// session unpinned. Only Claude Code is read this way, because no other agent
+// states its role, and one that switches providers, as OpenCode does, sends earlier
+// turns that went elsewhere. A session routed to a server keeps it by its pin
+// alone, so where pins are kept only in memory a restart sends such a conversation
+// back to where Claude Code sends it. So does a move to a new session id — Claude
+// Code's continued-in hand-off, or a background job forked from a conversation —
+// which no pin follows.
 //
 // A pin is its agent's. The session id is the listener's answer, and another
 // agent's request can be filed under it — by process attribution, which files a
@@ -114,6 +120,7 @@ import (
 	"github.com/rossoctl/cortex/core/plugins"
 	"github.com/rossoctl/cortex/core/plugins/inferencerouter/routerconfig"
 	"github.com/rossoctl/cortex/core/session"
+	"github.com/rossoctl/cortex/core/storage"
 	"github.com/tidwall/gjson"
 )
 
@@ -179,13 +186,23 @@ type Router struct {
 	byHost  map[string]string // every server's Endpoint.Hostname, to its name
 	agents  map[string]string // agent name to server name
 
+	// store is the process's durable store (storage.StoreConsumer), where pins are
+	// kept when there is one; nil keeps them in pctx.Shared.
+	store storage.Store
+	// now is the clock a stored pin's renewal is judged by.
+	now func() time.Time
+
 	// noStore makes the "pins are off" warning once per instance rather than once
 	// per request.
 	noStore sync.Once
 }
 
 // New constructs an unconfigured plugin.
-func New() *Router { return &Router{} }
+func New() *Router { return &Router{now: time.Now} }
+
+// SetStore implements storage.StoreConsumer: the router keeps its pins in st, so a
+// restart forgets none.
+func (p *Router) SetStore(st storage.Store) { p.store = st }
 
 func init() {
 	plugins.RegisterPlugin(Name, func() pipeline.Plugin { return New() })
@@ -398,8 +415,8 @@ func (p *Router) OnResponse(_ context.Context, _ *pipeline.Context) pipeline.Act
 	return pipeline.Action{Type: pipeline.Continue}
 }
 
-// pin is a session's pin as the shared store holds it: the agent whose session it
-// is, and the server the session is on, "" for not routed.
+// pin is a session's pin: the agent whose session it is, and the server the session
+// is on, "" for not routed. See pins for where it is kept.
 type pin struct {
 	agent  string
 	server string
@@ -409,7 +426,7 @@ type pin struct {
 // session's first request where to store the outcome once OnRequest knows it.
 type pinning struct {
 	state string // pinNew, pinExisting or pinNone
-	store pipeline.SharedStore
+	store pins
 	key   string
 	agent string
 	// turn is turnContinuation or turnAside when the request's own turn left an
@@ -422,7 +439,7 @@ type pinning struct {
 // session already pinned keeps its pin, which serverFor renewed.
 func (pn *pinning) settle(server string) {
 	if pn.state == pinNew {
-		pn.store.Put(pn.key, pin{agent: pn.agent, server: server}, pinTTL)
+		pn.store.save(pn.key, pin{agent: pn.agent, server: server})
 	}
 }
 
@@ -456,7 +473,8 @@ func (p *Router) serverFor(pctx *pipeline.Context) (string, pinning) {
 	if pctx.Session == nil || pctx.Session.ID == "" || synthetic(pctx.Session.ID) {
 		return choice, pinning{state: pinNone}
 	}
-	if pctx.Shared == nil {
+	store := p.pinsFor(pctx)
+	if store == nil {
 		p.noStore.Do(func() {
 			slog.Warn("inference-router: this binary wires no process store, so sessions are not pinned: " +
 				"each request follows its agent's current server, and changing it moves running sessions")
@@ -464,21 +482,19 @@ func (p *Router) serverFor(pctx *pipeline.Context) (string, pinning) {
 		return choice, pinning{state: pinNone}
 	}
 	key := pinPrefix + pctx.Session.ID
-	if v, ok := pctx.Shared.Get(key); ok {
-		if pn, ok := v.(pin); ok {
-			if pn.agent != agent {
-				server, _, _ := p.unpinned(pctx, agent, choice)
-				return server, pinning{state: pinNone}
-			}
-			pctx.Shared.Put(key, pn, pinTTL)
-			return pn.server, pinning{state: pinExisting}
+	if pn, ok := store.load(key); ok {
+		if pn.agent != agent {
+			server, _, _ := p.unpinned(pctx, agent, choice)
+			return server, pinning{state: pinNone}
 		}
+		store.keep(key, pn)
+		return pn.server, pinning{state: pinExisting}
 	}
 	server, turn, decides := p.unpinned(pctx, agent, choice)
 	if !decides {
 		return server, pinning{state: pinNone, turn: turn}
 	}
-	return server, pinning{state: pinNew, store: pctx.Shared, key: key, agent: agent, turn: turn}
+	return server, pinning{state: pinNew, store: store, key: key, agent: agent, turn: turn}
 }
 
 // unpinned is the server for a request in a session its agent holds no pin on, and
@@ -600,4 +616,5 @@ var (
 	_ pipeline.Plugin         = (*Router)(nil)
 	_ pipeline.Configurable   = (*Router)(nil)
 	_ pipeline.SchemaProvider = (*Router)(nil)
+	_ storage.StoreConsumer   = (*Router)(nil)
 )

@@ -298,10 +298,11 @@ func serverRemove(args []string, stdout, stderr io.Writer) int {
 // agent's current server, which cannot be name, since remove refuses a server an agent is
 // routed to. None of them can get the error, whatever host it last sent to.
 //
-// IN MEMORY, NOT IN THE ARCHIVE, AND BY A REQUEST THIS PROXY SAW: the router pins a session by
-// the first request it routes and keeps the pin in memory, so a session only the archive holds
-// has no pin left to break, and neither has a resident one whose host is only its history's.
-// SessionSummary.Active would not do — it marks the one most recently updated session.
+// IN MEMORY, NOT IN THE ARCHIVE: running means a session this proxy has seen a request from.
+// One resumed after a restart counts, its host its history's: the router keeps its pins in the
+// plugin store, so its pin survived. One only the archive holds has sent nothing since and is
+// not running. SessionSummary.Active would not do — it marks the one most recently updated
+// session.
 //
 // 0 when the proxy does not answer, which is the quiet side for a warning: the remove itself
 // is what matters, and it goes ahead either way.
@@ -317,9 +318,7 @@ func runningOn(sessionsURL string, c routerconfig.Config, name string) int {
 	}
 	n := 0
 	for _, s := range list {
-		// Its host only its history's: resumed after a restart, nothing sent since, so no pin
-		// survived to hold it to name (see SessionSummary.InferenceHostFromHistory).
-		if s.InferenceHostFromHistory || s.ID == session.DefaultSessionID || strings.HasPrefix(s.ID, session.PendingPrefix) {
+		if s.ID == session.DefaultSessionID || strings.HasPrefix(s.ID, session.PendingPrefix) {
 			continue
 		}
 		if on, ok := servers.ForHost(c, s.InferenceHost); ok && on == name {

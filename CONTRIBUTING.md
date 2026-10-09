@@ -246,9 +246,11 @@ Two things worth knowing before reading it:
 - **`release-smoke-linux.yaml` is in those numbers.** It installs the way a user
   does, `curl | sh` from GitHub Releases, which is the point of it — so it cannot
   be told apart from a real Linux user by behaviour. The page subtracts it by
-  *count* instead: one job, no matrix, so each successful run is one install's
-  worth of downloads. Change how many assets that workflow fetches per run and the
-  Linux estimate drifts until `scripts/collect-install-stats.sh` is updated to match.
+  *count* instead: it is an install/upgrade test, so each successful run consumes
+  **two** installs — a fresh install of the newest stable tag, then an upgrade to
+  the tag under test, each leg fetching its own `checksums.txt`. Change that
+  structure, and the estimate drifts until `CI_INSTALLS_PER_RUN` in
+  `docs/install-stats/index.html` is updated to match.
 - **The figures include us.** At the current scale, maintainers running the
   installer are a large share of the total. Do not read a daily number as new users.
 

@@ -42,11 +42,9 @@ jobs:
     steps:
       - name: Check out main
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
-        with:
-          # The collector script and the page template live on main; the data
-          # lives on gh-pages. Both are needed, so check out main here and fetch
-          # gh-pages into a worktree below.
-          fetch-depth: 0
+        # Default depth is enough: this job reads main's tip for the collector and
+        # the page template, and fetches gh-pages separately at --depth=1. No step
+        # here walks main's history.
 
       - name: Collect snapshot and publish
         env:

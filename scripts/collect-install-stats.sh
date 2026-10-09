@@ -17,26 +17,26 @@
 # by behaviour. Treating linux_amd64 as "CI" would therefore erase every real
 # Linux user -- confidently wrong rather than merely noisy.
 #
-# What the smoke test IS, is countable: one job, ubuntu-latest, no matrix, so one
-# successful run fetches one install's worth of assets. Hence CI subtraction:
+# What the smoke test IS, is countable -- but NOT as one install per run. It is an
+# install/upgrade/uninstall test: it fresh-installs the newest stable tag, then
+# upgrades to the tag under test, and each leg fetches its own checksums.txt. So a
+# tag-push run consumes TWO installs.
 #
-#   linux humans ~= linux downloads - successful smoke runs
+#   CI installs per run = 2 (fresh install of latest stable, then upgrade)
+#
+# The upgrade leg of a main-push run lands on main-latest, which is excluded from
+# .totals below because --clobber resets its download_count on every push; its
+# share of the change in totals.checksums is noise around zero and can go negative
+# when a real --ref=main install is erased. The upgrade leg of a TAG-push run does
+# land on a real release and is counted.
 #
 # Only `success` counts. Of 64 runs in the first sampled window, 18 were
 # `skipped` and downloaded nothing, so counting runs naively overstates CI by
-# ~28%. The subtraction can still land slightly negative when a run falls
-# between two snapshots; the page shows that as ~0 with a footnote rather than
-# hiding it, because a negative estimate is a signal the CI model needs
-# recalibrating, not noise to suppress.
+# ~28%.
 #
-# Neither platform can separate maintainers from strangers -- at a base of ~12, a
-# few contributors on a few machines each could account for all of it. Label any
+# Nothing here separates maintainers from strangers -- at a base of ~16, a few
+# contributors on a few machines each could account for all of it. Label any
 # rendering accordingly; see the <h1> and the caveat block in index.html.
-#
-# Smoke runs are recorded per DAY, not per release: every run so far has
-# head_branch=main and attributes to whichever tag was newest at run time, so
-# per-release CI attribution would be approximate in a way the daily series is
-# not.
 #
 # Usage:
 #   scripts/collect-install-stats.sh [--out PATH] [--repo OWNER/NAME]
@@ -61,7 +61,11 @@ while [ $# -gt 0 ]; do
 		shift 2
 		;;
 	-h | --help)
-		sed -n '2,28p' "$0" | sed 's/^# \{0,1\}//'
+		# The whole leading comment block, not a line range: a hardcoded range
+		# silently stops matching when the header grows, which is how --help came
+		# to end mid-sentence and never reach Usage. This stops at the first line
+		# that is not a comment.
+		sed -n '2,/^[^#]/p' "$0" | sed '/^[^#]/d; s/^# \{0,1\}//'
 		exit 0
 		;;
 	*)
@@ -77,45 +81,64 @@ command -v gh >/dev/null 2>&1 || { echo "gh is required" >&2; exit 1; }
 command -v jq >/dev/null 2>&1 || { echo "jq is required" >&2; exit 1; }
 
 today=$(date -u +%Y-%m-%d)
+taken_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)
 tmp=$(mktemp)
 snap=$(mktemp)
 runs=$(mktemp)
-trap 'rm -f "${tmp}" "${snap}" "${runs}"' EXIT INT TERM
+latest=$(mktemp)
+trap 'rm -f "${tmp}" "${snap}" "${runs}" "${latest}"' EXIT INT TERM
 
 # --paginate to cover every release, not just the first page: lifetime totals on
 # older tags still move (mirrors, stragglers) and dropping them would silently
 # understate the all-time figure.
 gh api "repos/${REPO}/releases" --paginate >"${tmp}"
 
-# Successful smoke runs per day, for the CI subtraction.
+# Successful smoke runs, as {id, created_at} rather than per-day counts.
+#
+# Timestamps, not calendar dates, because a snapshot interval is not a day. The
+# cron fires at 03:17 UTC, so a row covers (previous 03:17, this 03:17] -- and
+# only 6 of 50 historical runs started before 03:17. Bucketing by calendar date
+# therefore put ~88% of each row's runs in the wrong row, an error larger than the
+# ~2.5 installs/day the row reports. Recording the timestamp lets the page bucket
+# into the interval it actually drew its downloads from.
+#
+# ids, because snapshots are MERGED rather than replaced (see the jq below). The
+# query returns the last 100 runs, which at ~10/day is about ten days, so a run
+# visible today is gone within a fortnight -- and a page that read only the newest
+# snapshot would see 0 for older intervals and subtract nothing, silently. Merging
+# on id keeps each run exactly once, for as long as the series is kept.
 #
 # Queried by workflow FILE rather than by filtering every run in the repo: the
 # repo-wide /actions/runs endpoint needs --paginate over thousands of runs and
 # takes minutes, while this one returns the workflow's own runs in a single page.
-#
-# The window is the last 100 RUNS, not a fixed number of days: the request has no
-# date filter, so its reach in days is 100 divided by the current run rate. At the
-# observed ~6/day that is around two weeks, and a busier release period shortens
-# it. That is enough for the only thing the window has to do -- cover the gap
-# between two snapshots -- but it is not a 30-day guarantee, and a sustained rate
-# above ~14/day would start dropping days the series has not yet recorded.
-#
-# Old days keep whatever was recorded at the time, so shrinking reach does not
-# rewrite history; it only limits how far back a correction can reach.
 SMOKE_WORKFLOW="release-smoke-linux.yaml"
 if ! gh api \
 	"repos/${REPO}/actions/workflows/${SMOKE_WORKFLOW}/runs?per_page=100" \
 	--jq '[.workflow_runs[]
 	       | select(.conclusion == "success")
-	       | .created_at[0:10]]
-	      | group_by(.)
-	      | map({key: .[0], value: length})
-	      | from_entries' >"${runs}" 2>/dev/null; then
+	       | {id: .id, created_at: .created_at}]' >"${runs}" 2>/dev/null; then
 	# A missing or renamed workflow must not take the whole snapshot down: the
-	# download series is the primary signal and stands on its own. Record an
-	# empty object, which renders as "CI unknown" rather than as "CI was zero".
-	warn "could not read ${SMOKE_WORKFLOW} runs; recording no CI data for today"
-	echo '{}' >"${runs}"
+	# download series is the primary signal and stands on its own.
+	#
+	# null, NOT []: an empty list is a measurement ("no runs"), and a failed query
+	# is not one. The page renders null as "—" and a list as a number, so the two
+	# stay distinguishable instead of both reading as zero.
+	warn "could not read ${SMOKE_WORKFLOW} runs; recording CI as unknown for today"
+	echo 'null' >"${runs}"
+fi
+
+# GitHub's own answer to "which release does the plain installer take", recorded
+# rather than derived. /releases/latest is the contract the installer follows, and
+# it is the only thing that gets it right: sorting tags lexically puts v0.9.0 above
+# v0.10.0, and sorting by date marks a v0.7.x backport published after v0.8.1 as
+# current (release-0.6 and release-0.7 are both still live, so that is a real case
+# here, not a hypothetical).
+#
+# `--jq .tag_name` would print a BARE string, which is not valid JSON for
+# --slurpfile; `{tag_name}` keeps it an object the jq below can index.
+if ! gh api "repos/${REPO}/releases/latest" --jq '{tag_name}' >"${latest}" 2>/dev/null; then
+	warn "could not read the latest release; the page will mark no release current"
+	echo 'null' >"${latest}"
 fi
 
 # Per-asset counts are collapsed into per-platform sums here rather than stored
@@ -138,7 +161,10 @@ fi
 # (An earlier version of this comment claimed checksums EQUALLED the platform sum
 # on v0.8.1. That was a mid-release snapshot read as a validating identity; it is
 # 1:2, not 1:1.)
-jq --arg date "${today}" --slurpfile smoke "${runs}" '
+jq --arg date "${today}" \
+   --arg taken_at "${taken_at}" \
+   --slurpfile smoke "${runs}" \
+   --slurpfile latest "${latest}" '
   def platform_of($name):
     if   $name | test("darwin_arm64") then "darwin_arm64"
     elif $name | test("darwin_amd64") then "darwin_amd64"
@@ -150,29 +176,35 @@ jq --arg date "${today}" --slurpfile smoke "${runs}" '
 
   {
     date: $date,
-    # Successful smoke runs keyed by date. Carried on every snapshot rather than
-    # only for today: the window is retrospective, so a later snapshot corrects
-    # an earlier day whose runs had not all finished when it was taken.
-    smoke_runs_by_day: ($smoke[0] // {}),
 
-    # Total successful runs across the whole queried window, and the release they
-    # are attributed to.
-    #
-    # Attribution is coarse ON PURPOSE. A run reports head_branch=main, never a
-    # tag, so nothing in the API says which release it installed -- only that it
-    # installed whichever one was newest at the time. Every run in the window
-    # therefore gets attributed to the release that is current NOW, which is right
-    # while one release stays current across the window and wrong for the rest.
-    #
-    # The page shows this on the row for the current release only and leaves every
-    # other row blank, because blank is honest and a zero would not be. Once the
-    # daily series is long enough to say which release was current on each day, CI
-    # can be attributed per release properly and this field becomes redundant.
-    smoke_runs_total: ($smoke[0] // {} | [.[]] | add // 0),
+    # The instant this snapshot was taken. The downloads in it accrued over
+    # (previous taken_at, this taken_at], so this is what the page buckets CI runs
+    # into. A calendar date cannot stand in for it: the cron fires at 03:17 UTC,
+    # and almost every run lands after that.
+    taken_at: $taken_at,
+
+    # Successful smoke runs as {id, created_at}, or null when the query failed.
+    # The page merges these across snapshots on id, so a run stays counted after it
+    # falls out of the last-100 window the API returns.
+    smoke_runs: $smoke[0],
+
+    # The tag GitHub serves as /releases/latest -- the release the plain installer
+    # takes, and so the one CI installs. Recorded rather than derived: see the
+    # query above for why neither tag sort nor date sort gets this right.
+    latest_release: ($latest[0].tag_name // null),
+
     # Released tags only. A draft has no public download path, so counting it
     # would add a row that can never move.
+    #
+    # main-latest is dropped. release-binaries.yaml re-uploads it with --clobber on
+    # every push to main, which RESETS download_count, so its counts mean "since the
+    # last push" rather than lifetime. Summed into .totals it contributes noise
+    # around zero that can go negative when a real --ref=main install is erased.
     releases: [
-      .[] | select(.draft | not) | {
+      .[]
+      | select(.draft | not)
+      | select(.tag_name != "main-latest")
+      | {
         tag: .tag_name,
         published_at: .published_at,
         prerelease: .prerelease,
@@ -211,8 +243,11 @@ rm -f "${merged}"
 
 days=$(jq '.snapshots | length' "${OUT}")
 echo "recorded ${today} in ${OUT} (${days} day(s) of history)"
-jq -r --arg d "${today}" '.snapshots[-1]
+jq -r '.snapshots[-1]
        | "  cumulative: darwin_arm64=\(.totals.darwin_arm64 // 0)"
        + " linux_amd64=\(.totals.linux_amd64 // 0)"
        + " checksums=\(.totals.checksums // 0)",
-         "  smoke runs today (success): \(.smoke_runs_by_day[$d] // 0)"' "${OUT}"
+         "  latest release: \(.latest_release // "unknown")",
+         "  smoke runs in window: \(
+            if .smoke_runs == null then "unknown (query failed)"
+            else (.smoke_runs | length | tostring) end)"' "${OUT}"

@@ -3,12 +3,15 @@ package plugins
 import (
 	"context"
 	"encoding/json"
+	"path/filepath"
 	"strings"
 	"testing"
 
 	"github.com/rossoctl/cortex/core/config"
 	"github.com/rossoctl/cortex/core/cost/pricing"
 	"github.com/rossoctl/cortex/core/pipeline"
+	"github.com/rossoctl/cortex/core/storage"
+	"github.com/rossoctl/cortex/core/storage/filestore"
 )
 
 // pricedPlugin records what was injected and when, so the tests can assert the
@@ -82,6 +85,56 @@ func TestBuildWithDeps_NoResolverLeavesConsumerUncalled(t *testing.T) {
 	}
 	if p.resolver != nil {
 		t.Errorf("resolver = %v, want nil when no Deps.Pricing was supplied", p.resolver)
+	}
+}
+
+// storedPlugin records the store it was handed and whether it had it at Configure.
+type storedPlugin struct {
+	pricedPlugin
+	store          storage.Store
+	hadAtConfigure bool
+}
+
+func (p *storedPlugin) SetStore(s storage.Store) { p.store = s }
+func (p *storedPlugin) Configure(json.RawMessage) error {
+	p.hadAtConfigure = p.store != nil
+	return nil
+}
+
+func registerStored(t *testing.T, name string) *storedPlugin {
+	t.Helper()
+	p := &storedPlugin{pricedPlugin: pricedPlugin{name: name}}
+	RegisterPlugin(name, func() pipeline.Plugin { return p })
+	t.Cleanup(func() { UnregisterPlugin(name) })
+	return p
+}
+
+func TestBuildWithDeps_InjectsTheStoreBeforeConfigure(t *testing.T) {
+	p := registerStored(t, "test-stored-order")
+	st, err := filestore.Open(filepath.Join(t.TempDir(), "s.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = st.Close() })
+
+	if _, err := BuildWithDeps(entriesFor("test-stored-order"), Deps{Store: st}); err != nil {
+		t.Fatalf("BuildWithDeps: %v", err)
+	}
+	if p.store != storage.Store(st) {
+		t.Errorf("store = %v, want the Deps store", p.store)
+	}
+	if !p.hadAtConfigure {
+		t.Error("the store was not injected before Configure ran")
+	}
+}
+
+func TestBuildWithDeps_NoStoreLeavesConsumerUncalled(t *testing.T) {
+	p := registerStored(t, "test-stored-none")
+	if _, err := BuildWithDeps(entriesFor("test-stored-none"), Deps{}); err != nil {
+		t.Fatalf("BuildWithDeps: %v", err)
+	}
+	if p.store != nil {
+		t.Errorf("store = %v, want nil when no Deps.Store was supplied", p.store)
 	}
 }
 

@@ -731,11 +731,13 @@ Plugins that need to rewrite request or response bodies declare
 helpers. The framework propagates the rewrite to the wire, emits a
 `modify`-action Invocation, and publishes a `body-mutation/event`
 entry in `pctx.Extensions.Custom` with length delta + sha256
-before/after (never the raw body). With several request mutators there is one
-entry for the chain: `before` is the bytes the client sent, `after` the bytes
-sent upstream, and `plugins` the writers whose writes took effect, in order
-(`plugin` is the last of them) — or, while none has, the observed writer whose
-would-be rewrite the entry describes (its invocation carries `shadow: true`).
+before/after (never the raw body). With several mutators in one direction there
+is one entry for that direction's chain. For a request, `before` is the bytes
+the client sent and `after` the bytes sent upstream. For a response, `before` is
+the upstream's bytes and `after` the bytes the client receives. `plugins` lists
+the writers whose writes took effect, in the order they ran (`plugin` is the
+last of them) — or, while none has, the observed writer whose would-be rewrite
+the entry describes (its invocation carries `shadow: true`).
 
 > For the full lifecycle — per-listener wire behavior, content-encoding
 > policy, ordering rules, body-size limits — see
@@ -771,7 +773,6 @@ nothing about how the response may be relayed.
 | Plugin shape | Declares | Streams responses? |
 |---|---|---|
 | request-only mutator (`tool-prune`, `context-guru`, `inference-router`) | `WritesRequestBody` | yes |
-| response mutator | `WritesResponseBody` | no — buffered |
 | response mutator (`sparc`) | `WritesResponseBody` | no — buffered |
 | both (`cpex`) | both | no — buffered |
 | pure reader (parsers) | `ReadsBody` | yes |
@@ -793,23 +794,23 @@ nothing about how the response may be relayed.
     bytes took effect it is true, including for a later writer whose own call
     was a shadow under `on_error: observe`. A writer that reports a saving as
     applied or only measured, or counts it, reads its own result.
-- At most **one** response mutator per pipeline. Nothing needs more, and the
-  response pass has an ordering gap of its own (below); `New` rejects a second
-  with an error naming both plugins. A request mutator and a response mutator
-  coexist.
+- Response mutators **chain** too. The response pass runs in reverse, so the
+  mutator placed last in the chain sees the upstream's bytes first. Each one
+  sees `pctx.ResponseBody` as the one that ran before it left it, and the
+  listener sends what the last to run left. A request mutator and a response
+  mutator coexist, and one plugin may be both (`cpex`).
 - A mutator of **either** direction cannot precede a `ReadsBody`-only plugin.
   The reader must see the bytes the client sent, however many mutators follow it.
 
-> **Reader-ordering is validated in request order only.** `RunResponse` iterates
-> the chain in reverse, so on the response pass the rule inverts — a reader needs
-> to sit *after* a `WritesResponseBody` plugin to see original response bytes.
-> The two rules conflict for a both-direction mutator whenever a body reader is
-> present, so no single ordering satisfies both. In practice this is invisible
-> in-tree: `RunResponse` skips `StreamingResponder`s and every body-reading
-> parser is one. A non-streaming reader (`opa`, `ibac`) placed before a response
-> mutator would see rewritten bytes. Not enforced, because the check would reject
-> chains that validate today; closing it needs direction-specific *read*
-> capabilities.
+> **Readers see what the agent saw.** Every reader precedes every mutator, so
+> a reader sees the request as the client sent it and the response as the
+> client receives it. The response pass runs in reverse, so every response
+> mutator has run before any reader does, and the parsers' per-frame pass runs
+> after it. Parser output, the session events agentop shows, and the cost
+> settled from them therefore describe what the agent saw. The flip side: a
+> response mutator cannot use what the parsers found in this response, because
+> they have not seen it yet. It parses `pctx.ResponseBody` itself, as `cpex`
+> does.
 >
 > **Declaring is a contract, not an enforcement.** `SetBody` flips
 > `bodyMutated` unconditionally outside observe mode and the listeners gate

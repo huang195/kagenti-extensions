@@ -635,19 +635,18 @@ func (p *Pipeline) dispatchFinish(parent context.Context, name string, f Finishe
 }
 
 // validateCapabilities enforces body-mutation ordering rules and the destination rule:
-//   - Any number of WritesRequestBody plugins may share a pipeline. They run in chain
-//     order, each seeing pctx.Body as the one before it left it, and the listener
-//     sends the last one's bytes.
-//   - At most one WritesResponseBody plugin per pipeline. Nothing needs more, and the
-//     response pass has its own ordering gap (see the KNOWN GAP note below).
-//   - A body reader (ReadsBody) must not follow a body mutator of either direction —
-//     the reader would silently see mutated bytes instead of the originals. This is
-//     what the old one-request-mutator rule protected, and it holds unchanged with
-//     any number of request mutators after the readers.
+//   - Any number of body mutators of either direction may share a pipeline. Request
+//     mutators run in chain order, each seeing pctx.Body as the one before it left it.
+//     Response mutators run in reverse, as the whole response pass does, each seeing
+//     pctx.ResponseBody as the one after it in the chain left it. In both directions
+//     the listener sends what the last to run left.
+//   - A body reader (ReadsBody) must not follow a body mutator of either direction, so
+//     readers see what the agent saw: the request the client sent, and the response
+//     the client receives.
 //   - At most one WritesDestination plugin per pipeline — a request goes to one
 //     place, and a second redirect would silently override the first.
 func validateCapabilities(plugins []Plugin) error {
-	var responseMutator, destinationWriter string
+	var destinationWriter string
 	var firstMutator, readerAfterMutator string
 	for _, plugin := range plugins {
 		caps := plugin.Capabilities().Normalize()
@@ -657,87 +656,30 @@ func validateCapabilities(plugins []Plugin) error {
 			}
 			destinationWriter = plugin.Name()
 		}
-		if caps.WritesResponseBody {
-			if responseMutator != "" {
-				return fmt.Errorf("pipeline: two plugins declare WritesResponseBody: %q and %q — mutation ordering would be ambiguous; at most one response-body mutator per pipeline is allowed", responseMutator, plugin.Name())
-			}
-			responseMutator = plugin.Name()
-		}
 		if caps.WritesRequestBody || caps.WritesResponseBody {
 			if firstMutator == "" {
 				firstMutator = plugin.Name()
 			}
 			continue
 		}
-		// Reader-ordering is triggered by either write flag: a reader placed
-		// after any mutator would no longer see the original bytes.
+		// A reader after any mutator would no longer see what the agent saw. A request
+		// mutator before it changes the request it reads. A response mutator before it
+		// runs AFTER it on the reverse response pass, so the reader would see the
+		// upstream's bytes instead of the client's.
 		//
-		// KNOWN GAP, response direction. This check is in list order, which is
-		// request order. RunResponse iterates in reverse, so on the response
-		// pass the rule inverts: a reader must appear AFTER a
-		// WritesResponseBody plugin to see original response bytes. The two
-		// rules therefore conflict for a plugin that writes both directions
-		// (sparc, cpex) whenever a body reader is in the chain — no single
-		// ordering satisfies both.
-		//
-		// It does not bite in-tree today because RunResponse skips
-		// StreamingResponders, and every body-reading parser (inference-,
-		// a2a-, mcp-parser) is one. A non-streaming reader (opa, ibac) placed
-		// before a response mutator would genuinely see rewritten bytes.
-		//
-		// Deliberately not enforced here: adding the reverse-order check would
-		// reject chains that validate today (e.g. [opa, sparc]), and the
-		// directional-capability change promised that no working configuration
-		// starts failing. Closing it needs direction-specific READ capabilities
-		// so the two passes can be validated independently, which is its own
-		// compatibility review.
+		// With every reader ahead of every mutator, the response pass runs each response
+		// mutator before any reader. That holds for the parsers too: every listener runs
+		// their per-frame pass after RunResponse on a buffered response. Parser output,
+		// the session event built from it and the cost settled from it therefore
+		// describe the response the client received. The price: a response mutator
+		// cannot use what the parsers found in this response, and parses
+		// pctx.ResponseBody itself.
 		if caps.ReadsBody && firstMutator != "" && readerAfterMutator == "" {
 			readerAfterMutator = plugin.Name()
 		}
 	}
-	warnResponseReaderOrdering(plugins)
 	if readerAfterMutator != "" {
 		return fmt.Errorf("pipeline: plugin %q reads body after mutator %q — body readers must precede every mutator so they see the original bytes", readerAfterMutator, firstMutator)
 	}
 	return nil
-}
-
-// warnResponseReaderOrdering logs the chain shape that the documented
-// reverse-order gap makes unsafe: a non-streaming body reader placed BEFORE a
-// response mutator. RunResponse iterates in reverse, so the mutator runs first
-// and the reader sees rewritten response bytes — for a policy plugin that means
-// authorizing against content it did not receive.
-//
-// A warning rather than a rejection: enforcing it would fail chains that
-// validate today (see the gap comment in validateCapabilities), and this change
-// promised no working configuration starts failing. But the deferral should not
-// be invisible — until now its only record was a code comment, which an operator
-// running the shape would never read.
-//
-// Only a reader with a response mutator AFTER it is warned about: with none
-// there, the response pass hands every reader the bytes the upstream sent. And
-// a reader here is a plugin that declares ReadsBody itself — the raw
-// capability, as NeedsResponseBody reads it. Normalize also counts a
-// request-only writer such as tool-prune or the inference-router as a reader,
-// but it reads no response, and counting it made both warn on every build and
-// reload of a chain with no response mutator at all.
-func warnResponseReaderOrdering(plugins []Plugin) {
-	last := -1 // the last response mutator; New admits one
-	for i, p := range plugins {
-		if p.Capabilities().WritesResponseBody {
-			last = i
-		}
-	}
-	for _, p := range plugins[:max(last, 0)] {
-		caps := p.Capabilities()
-		if caps.WritesResponseBody || !caps.ReadsBody {
-			continue
-		}
-		if _, streaming := p.(StreamingResponder); streaming {
-			continue // RunResponse skips these entirely
-		}
-		slog.Warn("pipeline: body reader precedes a response mutator — on the response pass the mutator runs first, so this reader sees rewritten bytes",
-			"reader", p.Name(),
-			"hint", "place the reader after the response mutator, or confirm it does not read pctx.ResponseBody")
-	}
 }

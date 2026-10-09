@@ -239,12 +239,12 @@ for `SetResponseBody`) with a correct `Content-Length` and a cleared
 (never the raw body content).
 
 **Rules enforced by `pipeline.New`:**
-- Request mutators chain: any number may share a pipeline, each seeing the body
-  as the one before it left it. At most one **response** mutator: a second fails
-  the build at startup. One of each is fine.
+- Mutators chain in both directions: any number may share a pipeline. A request
+  mutator sees the body as the one before it in the chain left it. The response
+  side runs in reverse, so a response mutator sees it as the one after it left it.
 - A mutator must run **after** any `ReadsBody`-only plugin, whichever direction
-  it writes. Readers see the original bytes; a mutator in front would silently
-  feed them post-rewrite content.
+  it writes. Readers then see what the agent saw: the request the client sent,
+  and the response the client receives.
 
 Don't assign `pctx.Body = newBytes` directly — the listener won't
 propagate the mutation and no Invocation fires. Always use `SetBody`.

@@ -609,8 +609,8 @@ mutator now keeps incremental relay.
 
 `pipeline.New` enforces two rules at build time:
 
-1. **Request mutators chain; at most one response mutator.** Any number of `WritesRequestBody` plugins may share a pipeline: they run in chain order, each seeing `pctx.Body` as the one before it left it, and the listener sends the last one's bytes. A second `WritesResponseBody` plugin is refused with an error naming both — nothing needs two, and the response pass runs in reverse with an ordering gap of its own. A request mutator and a response mutator coexist fine.
-2. **A mutator of either direction cannot precede a `ReadsBody`-only plugin.** A reader expects to see the original bytes; putting a mutator before it would silently feed the reader the post-rewrite content.
+1. **Mutators chain in both directions.** Any number of `WritesRequestBody` plugins may share a pipeline: they run in chain order, each seeing `pctx.Body` as the one before it left it, and the listener sends the last one's bytes. Any number of `WritesResponseBody` plugins may too: the response pass runs in reverse, so each sees `pctx.ResponseBody` as the one after it in the chain left it, and the listener sends what the last to run left. One plugin may write both directions.
+2. **A mutator of either direction cannot precede a `ReadsBody`-only plugin.** Readers see what the agent saw: the request as the client sent it and — because the response pass runs in reverse and the parsers' per-frame pass runs after it — the response as the client receives it.
 
 **Mutation helpers.** `SetBody` / `SetResponseBody` replace the byte slice and flip an internal `bodyMutated` / `responseBodyMutated` flag that listeners read via `pctx.BodyMutated()` / `pctx.ResponseBodyMutated()`. Each returns whether *its own* write took effect — `false` for a shadow write under `on_error: observe` or a call dropped in `OnFinish` — because the flag is direction-wide: once one writer's bytes took effect it is true for every later writer too, shadow or not. They also auto-emit:
 

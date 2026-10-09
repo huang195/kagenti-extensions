@@ -1,0 +1,94 @@
+# Daily install-stats snapshot.
+#
+# Records per-platform release-asset download counts to a time series on the
+# gh-pages branch, where the static page in docs/install-stats/ renders it.
+#
+# GitHub reports download_count as a lifetime total, so a daily figure only
+# exists as the difference between two snapshots -- hence the daily cron and the
+# committed history. There is no way to backfill: the series starts at the first
+# successful run.
+#
+# Publishes to gh-pages rather than committing to main so the daily commits do
+# not churn main's history or trigger CI on every snapshot.
+name: Install Stats
+
+on:
+  schedule:
+    # 03:17 UTC. Off the hour deliberately: GitHub drops scheduled runs when the
+    # whole fleet piles onto :00, and a missed run here is a permanent hole in
+    # the series rather than something the next run can recover.
+    - cron: '17 3 * * *'
+  workflow_dispatch:
+
+# Snapshots are idempotent per date, but two concurrent runs would still race on
+# the gh-pages push. Queue them instead.
+concurrency:
+  group: install-stats
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  snapshot:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write # commit the snapshot to gh-pages
+    steps:
+      - name: Check out main
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          # The collector script and the page template live on main; the data
+          # lives on gh-pages. Both are needed, so check out main here and fetch
+          # gh-pages into a worktree below.
+          fetch-depth: 0
+
+      - name: Collect snapshot and publish
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -eu
+
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          # Materialise gh-pages in a worktree. The branch is created as an
+          # orphan on first run so it carries only the published page, not a
+          # copy of main's history.
+          if git ls-remote --exit-code --heads origin gh-pages >/dev/null 2>&1; then
+            git fetch --depth=1 origin gh-pages
+            git worktree add .pages FETCH_HEAD
+            git -C .pages switch -c gh-pages 2>/dev/null \
+              || git -C .pages switch gh-pages
+          else
+            echo "gh-pages does not exist yet; creating it"
+            git worktree add --detach .pages
+            git -C .pages switch --orphan gh-pages
+            git -C .pages rm -rqf . 2>/dev/null || true
+          fi
+
+          mkdir -p .pages/install-stats
+
+          # Refresh the page template on every run so edits to index.html on
+          # main reach the published site without a separate deploy step.
+          cp docs/install-stats/index.html .pages/install-stats/index.html
+
+          # Jekyll would otherwise skip directories it considers special and can
+          # reject the build outright; this page is already static.
+          touch .pages/.nojekyll
+
+          ./scripts/collect-install-stats.sh \
+            --out .pages/install-stats/data.json
+
+          cd .pages
+          git add install-stats/data.json install-stats/index.html .nojekyll
+
+          # Nothing to commit is the normal outcome of a same-day re-run, not a
+          # failure: the snapshot replaced an identical one.
+          if git diff --cached --quiet; then
+            echo "no change to publish"
+            exit 0
+          fi
+
+          git commit -m "chore(stats): install snapshot $(date -u +%Y-%m-%d)"
+          git push origin gh-pages

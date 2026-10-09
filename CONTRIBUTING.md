@@ -234,6 +234,29 @@ Things to know:
 - **Container images are not gated.** A candidate's tag pushes its images under that
   tag and also moves `latest`, as every `v*` tag and every merge to `main` already does.
 
+## Install stats
+
+[rossoctl.github.io/cortex/install-stats](https://rossoctl.github.io/cortex/install-stats/)
+estimates how many people install each release, from GitHub's release-asset download
+counts. Cortex collects nothing from a user's machine, so downloads are the only
+signal there is — and the page is explicit about what that does and does not support.
+
+Two things worth knowing before reading it:
+
+- **`release-smoke-linux.yaml` is in those numbers.** It installs the way a user
+  does, `curl | sh` from GitHub Releases, which is the point of it — so it cannot
+  be told apart from a real Linux user by behaviour. The page subtracts it by
+  *count* instead: one job, no matrix, so each successful run is one install's
+  worth of downloads. Change how many assets that workflow fetches per run and the
+  Linux estimate drifts until `scripts/collect-install-stats.sh` is updated to match.
+- **The figures include us.** At the current scale, maintainers running the
+  installer are a large share of the total. Do not read a daily number as new users.
+
+`.github/workflows/install-stats.yaml` snapshots the counts daily and commits them
+to `gh-pages`; a lifetime total is all GitHub reports, so a daily figure only
+exists as the difference between two snapshots, and the series cannot be
+backfilled.
+
 ## Issues
 
 Prioritization for pull requests is given to those that address and resolve existing GitHub issues. Utilize the available issue labels to identify meaningful and relevant issues to work on.

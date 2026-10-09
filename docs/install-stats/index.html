@@ -1,0 +1,350 @@
+<!DOCTYPE html>
+<!--
+  Renders the daily install series collected by scripts/collect-install-stats.sh.
+
+  Deltas are computed here, at render time, rather than stored in data.json.
+  GitHub reports download_count as a lifetime total, so "installs today" is a
+  difference between consecutive snapshots; deriving it on read means a
+  corrected or backfilled snapshot cannot leave a stale delta behind it.
+
+  Plain HTML with no build step and no dependencies: it is served from the same
+  gh-pages branch the collector commits to, and a chart library would add a
+  supply-chain surface to a page that shows two columns of numbers.
+-->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Cortex install stats</title>
+<style>
+  :root {
+    color-scheme: light dark;
+    --fg: #1a1a1a;
+    --bg: #fff;
+    --muted: #666;
+    --rule: #e3e3e3;
+    --mac: #3730a3;
+    --ci: #9a3412;
+    --flat: #f7f7f8;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --fg: #e8e8e8; --bg: #141416; --muted: #9b9ba3;
+      --rule: #2e2e33; --mac: #a5b4fc; --ci: #fdba74; --flat: #1d1d21;
+    }
+  }
+  body {
+    font: 15px/1.55 ui-sans-serif, system-ui, -apple-system, sans-serif;
+    color: var(--fg); background: var(--bg);
+    margin: 0 auto; padding: 2.5rem 1.25rem 4rem; max-width: 54rem;
+  }
+  h1 { font-size: 1.4rem; margin: 0 0 .2rem; }
+  h2 { font-size: 1.05rem; margin: 2.5rem 0 .6rem; }
+  .sub { color: var(--muted); margin: 0 0 1.75rem; font-size: .9rem; }
+  table { border-collapse: collapse; width: 100%; font-variant-numeric: tabular-nums; }
+  th, td { text-align: right; padding: .4rem .55rem; border-bottom: 1px solid var(--rule); }
+  th:first-child, td:first-child { text-align: left; }
+  thead th { font-weight: 600; font-size: .78rem; color: var(--muted);
+             text-transform: uppercase; letter-spacing: .04em; }
+  tbody tr:hover { background: var(--flat); }
+  .mac { color: var(--mac); font-weight: 600; }
+  .ci  { color: var(--ci); }
+  .delta { font-size: .85rem; color: var(--muted); }
+  .delta.up { color: var(--mac); }
+  .bar { display: inline-block; height: .62rem; border-radius: 2px;
+         background: var(--mac); vertical-align: middle; min-width: 1px; }
+  .caveat {
+    border-left: 3px solid var(--rule); padding: .1rem 0 .1rem 1rem;
+    margin: 2rem 0; color: var(--muted); font-size: .88rem;
+  }
+  .caveat strong { color: var(--fg); }
+  code { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: .88em; }
+  .empty { color: var(--muted); font-style: italic; padding: 1.5rem 0; }
+  .pre  { color: var(--muted); font-size: .8rem; }
+</style>
+</head>
+<body>
+
+<h1>Cortex install stats</h1>
+<p class="sub">
+  Estimated installs per day by platform, with CI subtracted out.
+  Updated daily by <code>.github/workflows/install-stats.yaml</code>.
+</p>
+
+<div class="caveat">
+  <strong>How the estimate works.</strong>
+  Every install fetches <code>checksums.txt</code> exactly once, so counting those
+  fetches counts installs — on every platform, without double-counting the two
+  binaries each install downloads.
+  The release smoke test installs <em>exactly as a real user would</em>
+  (<code>curl | sh</code> from GitHub Releases), so it lands in that number too and
+  cannot be filtered out by behaviour. It can be subtracted by <em>count</em>: one
+  job, no matrix, so each successful run is one install's worth.
+  <br><br>
+  <strong>What it still cannot tell you.</strong> <em>Cortex Installs</em> means
+  "not CI" — it <strong>still includes maintainers and contributors</strong>, and at
+  this scale a few of us on a few machines could account for most of it. Nothing
+  here separates us from new users. And installs cannot show whether anyone kept
+  using Cortex afterwards: it collects nothing from the workstation by design, so
+  retention is deliberately unmeasurable from here.
+</div>
+
+<h2>Daily totals</h2>
+<div id="daily"></div>
+
+<h2>By release</h2>
+<p class="sub" id="by-release-sub"></p>
+<div id="releases"></div>
+
+<script>
+// ---------------------------------------------------------------------------
+// Rendering helpers
+// ---------------------------------------------------------------------------
+
+// Every per-platform key, for the tarballs-per-install ratio check. Excludes
+// "checksums" and "other" -- those are not tarballs.
+//
+// Platform is deliberately not a column anywhere: the release smoke test installs
+// the same way a user does, so a per-platform split cannot separate CI from people
+// and reading linux_amd64 as "CI" would erase real Linux users. Subtracting by
+// count does not have that failure mode.
+const PLATFORMS = ["darwin_arm64", "darwin_amd64", "linux_amd64", "linux_arm64"];
+
+const esc = (s) =>
+  String(s).replace(/[&<>"']/g, (c) =>
+    ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+
+const at = (obj, key) => (obj && obj[key]) || 0;
+
+// A delta needs a previous snapshot to subtract. The first row has none, and a
+// gap in the series (a failed cron run) means the next delta spans more than
+// one day -- shown as-is rather than averaged, since inventing a daily rate
+// from a multi-day gap would misrepresent the data.
+function deltaCell(curr, prev) {
+  if (prev === null) return '<span class="delta">—</span>';
+  const d = curr - prev;
+  if (d === 0) return '<span class="delta">0</span>';
+  const cls = d > 0 ? "delta up" : "delta";
+  return `<span class="${cls}">${d > 0 ? "+" : ""}${d}</span>`;
+}
+
+// People = installs - CI. Clamped at zero for display, but whether it WANTED to
+// go negative is returned too: that means more CI runs were counted than installs
+// observed, which is a timing artefact when small (a run landing between two
+// snapshots) and a broken CI model when persistent. Showing "~0" with a marker
+// beats silently rendering a plausible-looking 0.
+function people(installs, ciTests) {
+  const raw = installs - ciTests;
+  return { value: Math.max(0, raw), underflow: raw < 0, raw };
+}
+
+function renderDaily(snapshots) {
+  const el = document.getElementById("daily");
+  if (snapshots.length < 2) {
+    el.innerHTML = '<p class="empty">Not enough history yet — a daily figure is '
+      + 'the difference between two snapshots, so the first one records only a '
+      + 'baseline and the first real row appears the day after.</p>';
+    return;
+  }
+
+  // Each row is a transition from the previous snapshot, so there is one fewer
+  // row than there are snapshots. The baseline snapshot has no row of its own.
+  //
+  // CI counts come from the LATEST snapshot's map, not the one recorded on the
+  // day itself: the collector's window is retrospective, so a later snapshot
+  // carries the corrected count for a day whose runs were still finishing when
+  // it was first recorded.
+  const latestRuns = snapshots[snapshots.length - 1].smoke_runs_by_day || {};
+  const hasCI = Object.keys(latestRuns).length > 0;
+
+  const rows = [];
+  let maxPeople = 1;
+
+  for (let i = 1; i < snapshots.length; i++) {
+    const prev = snapshots[i - 1].totals;
+    const curr = snapshots[i].totals;
+
+    // checksums is the install count: the installer fetches two tarballs per
+    // install but verifies both against one checksums file, so the platform sum
+    // double-counts and this does not.
+    const installs = at(curr, "checksums") - at(prev, "checksums");
+    const ciTests = at(latestRuns, snapshots[i].date);
+    const est = people(installs, ciTests);
+    if (est.value > maxPeople) maxPeople = est.value;
+
+    rows.push({ date: snapshots[i].date, installs, ciTests, est });
+  }
+
+  const html = rows.map((r) => {
+    const w = r.est.value > 0
+      ? Math.max(1, Math.round((r.est.value / maxPeople) * 90)) : 0;
+
+    // The measured total is not given a column -- it is the sum of the two that
+    // are -- but it stays on hover: when the subtraction underflows, the total is
+    // the number that explains why this cell reads ~0.
+    const peopleCell = !hasCI
+      ? '<span class="delta" title="CI run count unavailable — not the same as zero">?</span>'
+      : r.est.underflow
+        ? `<span class="delta" title="${r.installs} total installs recorded against ${r.ciTests} CI runs, so this would be ${r.est.raw}: more CI counted than installed, most likely a run landing between two snapshots">~0</span>`
+        : `<strong class="mac">${r.est.value}</strong>`;
+
+    return `<tr>
+      <td>${esc(r.date)}</td>
+      <td>${peopleCell}</td>
+      <td style="text-align:left">${w ? `<span class="bar" style="width:${w}px"></span>` : ""}</td>
+      <td class="ci">${hasCI ? r.ciTests : "?"}</td>
+    </tr>`;
+  }).reverse().join("");
+
+  el.innerHTML = `<table>
+    <thead><tr>
+      <th>Date</th>
+      <th>Cortex Installs</th><th></th>
+      <th>Cortex CI Tests</th>
+    </tr></thead>
+    <tbody>${html}</tbody>
+  </table>
+  <p class="sub" style="margin-top:.7rem">
+    <strong>Cortex Installs</strong> is installs that were not CI. It is derived,
+    not measured: GitHub reports one combined figure — fetches of
+    <code>checksums.txt</code>, one per install on every platform — and this column
+    is that figure minus the CI runs beside it. Add the two columns back together to
+    recover it.
+    <strong>Cortex CI Tests</strong> is successful runs of the release smoke test,
+    which installs exactly the way a person does and so has to be subtracted rather
+    than filtered out.
+    <code>~0</code> marks a day where CI was counted higher than installs (hover for
+    the figures), and <code>?</code> means the CI count was unavailable, which is not
+    the same as zero.
+  </p>`;
+}
+
+// Per-release view: which versions are actually being fetched. Sorted by install
+// count rather than by date, because the question this answers is "what is in
+// use", not "what shipped when".
+//
+// No per-release CI column: runs are recorded per DAY, and every one so far has
+// head_branch=main, attributing to whichever tag was newest at run time. Splitting
+// a day's runs across releases would be a guess, so this table shows the combined
+// total and names the one release CI is currently installing. Per-release subtraction
+// is still available by hand for the current release, which is where it is
+// meaningful -- both sides are large enough there to survive it.
+function renderReleases(snapshots) {
+  const el = document.getElementById("releases");
+  const sub = document.getElementById("by-release-sub");
+  if (!snapshots.length) {
+    el.innerHTML = '<p class="empty">No data yet.</p>';
+    return;
+  }
+
+  const latest = snapshots[snapshots.length - 1];
+  sub.textContent = `Lifetime installs per release, as of ${latest.date}. `
+    + "Includes CI: the release smoke test installs the newest non-prerelease tag, "
+    + "so that row runs high.";
+
+  // Releases with no downloads at all are dropped: the asset matrix publishes
+  // builds that have never been fetched, and listing dozens of zero rows would
+  // bury the handful that matter.
+  // Platform figures are halved to put them on the same scale as the install
+  // count. Each install pulls TWO tarballs of one platform (cortex + agentop)
+  // against one checksums file, so a raw tarball count double-counts. Halving is
+  // exact for anything installed normally; a hand-downloaded single binary makes
+  // a platform column land on .5, which is rounded and so may not sum to the
+  // Installs column. The total is the figure to trust if they disagree.
+  const perInstall = 2;
+  const half = (n) => Math.round(n / perInstall);
+
+  const rels = (latest.releases || [])
+    .map((r) => ({
+      tag: r.tag,
+      prerelease: r.prerelease,
+      installs: at(r.platforms, "checksums"),
+      linux: half(at(r.platforms, "linux_amd64") + at(r.platforms, "linux_arm64")),
+      mac: half(at(r.platforms, "darwin_arm64") + at(r.platforms, "darwin_amd64")),
+      tarballs: PLATFORMS.reduce((n, p) => n + at(r.platforms, p), 0),
+    }))
+    .filter((r) => r.installs || r.tarballs)
+    .sort((a, b) => b.installs - a.installs || b.tarballs - a.tarballs);
+
+  if (!rels.length) {
+    el.innerHTML = '<p class="empty">No releases with downloads yet.</p>';
+    return;
+  }
+
+  // Which release CI is hitting: the newest stable one, same rule the installer
+  // and the smoke test both follow (GitHub's Latest badge never goes to a
+  // prerelease). Marked rather than subtracted, for the reason above.
+  const current = rels.filter((r) => !r.prerelease)
+    .map((r) => r.tag)
+    .sort()
+    .pop();
+
+  // CI is attributed to the current release only, and is Linux-only, so it comes
+  // off the Linux column of that one row. Every other row's CI is unknown rather
+  // than zero -- see smoke_runs_total in the collector for why -- and renders "—".
+  const ciTotal = latest.smoke_runs_total;
+  const haveCI = typeof ciTotal === "number";
+
+  const rows = rels.map((r) => {
+    const isCurrent = !r.prerelease && r.tag === current;
+    const ci = isCurrent && haveCI ? ciTotal : null;
+    // Clamped: the attribution window and the install history do not line up
+    // exactly, so the subtraction can undershoot.
+    const linux = ci === null ? r.linux : Math.max(0, r.linux - ci);
+    const underflow = ci !== null && r.linux - ci < 0;
+
+    return `<tr>
+      <td><code>${esc(r.tag)}</code>${
+        r.prerelease ? ' <span class="pre">pre-release</span>'
+          : isCurrent ? ' <span class="pre">current</span>' : ""
+      }</td>
+      <td class="ci"${underflow
+        ? ` title="${r.linux} Linux downloads against ${ci} CI runs — CI is attributed to this release in full, so the subtraction undershoots"`
+        : ""}>${underflow ? "~0" : linux}</td>
+      <td class="mac">${r.mac}</td>
+      <td class="delta">${ci === null ? "—" : ci}</td>
+    </tr>`;
+  }).join("");
+
+  el.innerHTML = `<table>
+    <thead><tr>
+      <th>Release</th>
+      <th>Linux Installs</th><th>Mac Installs</th>
+      <th>CI Tests</th>
+    </tr></thead>
+    <tbody>${rows}</tbody>
+  </table>
+  <p class="sub" style="margin-top:.7rem">
+    <strong>Linux</strong> and <strong>Mac Installs</strong> exclude CI and are
+    derived from tarball downloads, halved because each install fetches two binaries
+    of one platform. Mac needs no subtraction — the release smoke test runs only on
+    Linux.
+    <strong>CI Tests</strong> is filled for the current release only:
+    a run reports no tag, so all that is known is that it installed whichever
+    release was newest at the time. <code>—</code> means CI for that period is
+    <em>unknown</em>, not zero. Once the daily series above is long enough to say
+    which release was current on each day, every row can be adjusted properly.
+  </p>`;
+}
+
+// Cache-bust: gh-pages is served through a CDN that will otherwise hand back
+// yesterday's data.json for minutes after the daily commit lands.
+fetch(`data.json?t=${Date.now()}`)
+  .then((r) => {
+    if (!r.ok) throw new Error(`data.json: HTTP ${r.status}`);
+    return r.json();
+  })
+  .then((data) => {
+    const snapshots = (data.snapshots || []).slice().sort((a, b) =>
+      a.date < b.date ? -1 : a.date > b.date ? 1 : 0);
+    renderDaily(snapshots);
+    renderReleases(snapshots);
+  })
+  .catch((err) => {
+    document.getElementById("daily").innerHTML =
+      `<p class="empty">Could not load data.json — ${esc(err.message)}</p>`;
+  });
+</script>
+
+</body>
+</html>

@@ -99,6 +99,10 @@ binaries. [Remove it](./docs/laptop-service.md#remove-it) has the details.
 - [Full install guide](https://www.rossoctl.dev/docs/dev/get-started/laptop) —
   prerequisites and a walkthrough. Ending the install command in `sh -s -- --help`
   lists the installer's options.
+- [Install stats](https://rossoctl.github.io/cortex/install-stats/) — how many
+  people install Cortex, estimated from release downloads with CI subtracted. No
+  telemetry: the figures come from GitHub's own download counts, never from your
+  machine.
 
 ## Beyond the laptop
 

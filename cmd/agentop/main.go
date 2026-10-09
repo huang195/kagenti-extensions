@@ -62,8 +62,8 @@ Usage:
   agentop uninstall            remove Cortex from this machine (--help)
   agentop service <action>     run Cortex as a service: install, uninstall,
                                status, stop, start, restart
-  agentop configure <agent>    point a coding agent at Cortex: claude-code, bob,
-                               bobshell, codex, opencode
+  agentop configure <agent>    point a coding agent (claude-code, bob, bobshell,
+                               codex, opencode) at Cortex: enable, disable, status
   agentop exec -- CMD [ARG...] run CMD with Cortex's proxy and CA in its
                                environment, for tools with no settings file
   agentop server [<action>]    the inference server each agent's new sessions

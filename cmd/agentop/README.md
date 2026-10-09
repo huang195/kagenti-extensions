@@ -685,7 +685,7 @@ The listing after `use` reads:
 
 **Models.** A routed request goes with the model the agent asked for, so an agent
 keeps choosing its own models wherever the server serves them. Only when the
-server refuses the name — LiteLLM's `403 team_model_access_denied` — is the
+server refuses the name is the
 request sent again, once and before the agent sees the refusal, with one of the
 server's own models: the one `--main` names for a request with tools, the agent's
 main work, and the one `--helper` names for a request without, such as a title.

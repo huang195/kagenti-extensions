@@ -36,9 +36,12 @@ const (
 	// resolves to a model the server added since.
 	catalogEvery = time.Hour
 
-	// refusedType is LiteLLM's error type for a model the key's team may not use,
-	// which is also its answer to a model it does not serve at all.
+	// refusedType is LiteLLM's error type for a model the key's team may not use.
 	refusedType = "team_model_access_denied"
+
+	// invalidModel is in LiteLLM's 400 for a model it has no route for, which a key
+	// that may use every model gets in place of refusedType.
+	invalidModel = "Invalid model name passed in model="
 )
 
 // capturedPaths are the paths a captured request is sent to, by how the path the
@@ -159,7 +162,7 @@ func (p *Router) chooseModel(pctx *pipeline.Context, server string) {
 // anything. A request already sent with a substitute is never sent again, so a
 // refused substitute reaches the agent as the server answered it.
 func (p *Router) Resend(_ context.Context, pctx *pipeline.Context, status int, body []byte) bool {
-	if status != http.StatusForbidden || gjson.GetBytes(body, "error.type").String() != refusedType || !pctx.Redirected() {
+	if !refusesModel(status, body) || !pctx.Redirected() {
 		return false
 	}
 	server, ok := p.byHost[routerconfig.Hostname(pctx.Host)]
@@ -186,6 +189,23 @@ func (p *Router) Resend(_ context.Context, pctx *pipeline.Context, status int, b
 	details["substitute"] = sub
 	pctx.Record(pipeline.Invocation{Action: pipeline.ActionModify, Reason: "resent", Details: details})
 	return true
+}
+
+// refusesModel reports whether a server's answer refuses the model a request named:
+// a 403 with refusedType, or a 400 whose error, a string or an object's message,
+// contains invalidModel.
+func refusesModel(status int, body []byte) bool {
+	switch status {
+	case http.StatusForbidden:
+		return gjson.GetBytes(body, "error.type").String() == refusedType
+	case http.StatusBadRequest:
+		e := gjson.GetBytes(body, "error")
+		if e.IsObject() {
+			e = e.Get("message")
+		}
+		return e.Type == gjson.String && strings.Contains(e.String(), invalidModel)
+	}
+	return false
 }
 
 // isRefused reports whether server refused model within refusedFor.

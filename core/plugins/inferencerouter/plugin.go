@@ -68,8 +68,7 @@
 // it is not routed and pinned so, rather than taken for new and moved
 // mid-conversation. The one-shots Claude Code interleaves with a conversation carry
 // no tools, and a subagent's requests are its own conversation's; neither says
-// whether the session began, so neither decides: each goes where Claude Code sent it
-// and leaves the session unpinned. Only Claude Code is read this way, because no
+// whether the session began, so neither decides: each leaves the session unpinned. Only Claude Code is read this way, because no
 // other agent states its role, and one that switches providers, as OpenCode does,
 // sends earlier turns that went elsewhere. A session routed to a server keeps it by
 // its pin and its history, so a restart that keeps neither sends such a conversation
@@ -94,7 +93,7 @@
 // The model is the agent's to choose and the server's to answer, and the router does
 // not read a model list to judge it: a server serves aliases it does not list. A
 // routed request goes with the model the agent asked for. When the server refuses
-// that model — LiteLLM's 403 team_model_access_denied — the refusal is recorded for
+// that model, the refusal is recorded for
 // an hour and the request is sent again, once, before the agent sees anything, with
 // the server's substitute: its main model for a request with tools, its helper for one
 // without, each the newest model on the server's list whose name contains the word
@@ -286,7 +285,7 @@ func (p *Router) OnRequest(_ context.Context, pctx *pipeline.Context) pipeline.A
 		captured = path
 	}
 
-	name, pin := p.serverFor(pctx)
+	name, pin := p.serverFor(pctx, captured != "")
 	if name == "" {
 		// Not routed: the request, its key included, stays exactly as the client sent it.
 		pin.settle("")
@@ -412,7 +411,7 @@ func (pn *pinning) forgo() {
 // Two first requests of one session racing can both miss and both store; they store
 // the same outcome unless a reload lands between them, which is the case the pin
 // cannot rule out and does not need to.
-func (p *Router) serverFor(pctx *pipeline.Context) (string, pinning) {
+func (p *Router) serverFor(pctx *pipeline.Context, captured bool) (string, pinning) {
 	agent := agentOf(pctx)
 	choice := p.agents[agent]
 	if pctx.Session == nil || pctx.Session.ID == "" || synthetic(pctx.Session.ID) {
@@ -429,13 +428,13 @@ func (p *Router) serverFor(pctx *pipeline.Context) (string, pinning) {
 	key := pinPrefix + pctx.Session.ID
 	if pn, ok := store.load(key); ok {
 		if pn.agent != agent {
-			server, _, _ := p.unpinned(pctx, agent, choice)
+			server, _, _ := p.unpinned(pctx, agent, choice, captured)
 			return server, pinning{state: pinNone}
 		}
 		store.keep(key, pn)
 		return pn.server, pinning{state: pinExisting}
 	}
-	server, turn, decides := p.unpinned(pctx, agent, choice)
+	server, turn, decides := p.unpinned(pctx, agent, choice, captured)
 	if !decides {
 		return server, pinning{state: pinNone, turn: turn}
 	}
@@ -464,10 +463,10 @@ func (p *Router) pinnedToServer(pctx *pipeline.Context) bool {
 //     decides nothing.
 //  4. A Claude Code request's own turn (see turnOf): a conversation's opening turn
 //     goes to the agent's current choice; a continuation, a conversation the router
-//     did not see begin, is not routed; a side request is not routed and decides
-//     nothing. turn names the last two, for the record.
+//     did not see begin, is not routed; a side request decides nothing. turn names
+//     the last two, for the record.
 //  5. The agent's current choice.
-func (p *Router) unpinned(pctx *pipeline.Context, agent, choice string) (server, turn string, decides bool) {
+func (p *Router) unpinned(pctx *pipeline.Context, agent, choice string, captured bool) (server, turn string, decides bool) {
 	if choice == "" {
 		return "", "", true
 	}
@@ -481,6 +480,9 @@ func (p *Router) unpinned(pctx *pipeline.Context, agent, choice string) (server,
 	case turnContinuation:
 		return "", turnContinuation, true
 	case turnAside:
+		if captured {
+			return choice, turnAside, false
+		}
 		return "", turnAside, false
 	}
 	return choice, "", true

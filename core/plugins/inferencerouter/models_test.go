@@ -561,3 +561,67 @@ func TestRouter_ASessionKeepsASubstituteForEachKindOfRequest(t *testing.T) {
 		}
 	}
 }
+
+// A Claude Code side request captured from its provider in a session the router has
+// not pinned goes to the agent's server and decides nothing: left where Claude Code
+// sent it, a title or a subagent's request would reach the provider the agent was
+// routed away from, with the user's own credential. A captured continuation, a
+// conversation already running on the provider, still stays there.
+func TestRouter_ACapturedSideRequestGoesToTheAgentsServer(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		role  pipeline.AgentRole
+		tools int
+	}{
+		{"a title or classifier call", pipeline.AgentRoleMain, 0},
+		{"a subagent's request", pipeline.AgentRoleSubagent, 3},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			store := newStore(t)
+			_, p := buildRouter(t, wordConfig(`"claude-code": "glm"`))
+			pctx := claudeCode(request(store, "api.anthropic.com", claudeUA, "s1"), tc.role, tc.tools, 0)
+			pctx.Body = []byte(`{"model":"claude-haiku-4-5","messages":[]}`)
+			run(t, p, pctx)
+			assertRouted(t, pctx, glmHost, "glm-key")
+			if _, ok := pinOf(t, store, "s1"); ok {
+				t.Error("a side request pinned its session")
+			}
+		})
+	}
+	t.Run("a continuation stays on the provider", func(t *testing.T) {
+		store := newStore(t)
+		_, p := buildRouter(t, wordConfig(`"claude-code": "glm"`))
+		pctx := claudeCode(request(store, "api.anthropic.com", claudeUA, "s1"), pipeline.AgentRoleMain, 3, 2)
+		run(t, p, pctx)
+		assertUntouched(t, pctx, "api.anthropic.com")
+		if pin, ok := pinOf(t, store, "s1"); !ok || pin != "" {
+			t.Errorf("pin = %q, %v; want the session pinned as not routed", pin, ok)
+		}
+	})
+}
+
+// An unrestricted LiteLLM key's answer to a model the server lacks is a 400 naming it
+// invalid, as a team-restricted key's is a 403: either is a refusal of the model.
+func TestResend_TreatsAnUnrestrictedKeysInvalidModelAsARefusal(t *testing.T) {
+	for _, body := range []string{
+		"{\"error\":\"/v1/messages: Invalid model name passed in model=exo-free. Call `/v1/models` to view available models for your key.\"}",
+		"{\"error\":{\"message\":\"/chat/completions: Invalid model name passed in model=exo-free. Call `/v1/models` to view available models for your key.\"}}",
+	} {
+		_, p := buildRouter(t, wordConfig(`"opencode": "glm"`))
+		pctx := chat(newStore(t), "opencode.ai", "/zen/v1/chat/completions", opencodeUA, "s1", "exo-free", true)
+		run(t, p, pctx)
+		if !resend(p, pctx, http.StatusBadRequest, body) {
+			t.Errorf("Resend = false for %s", body)
+			continue
+		}
+		if got := sentModel(t, pctx); got != glmMain {
+			t.Errorf("model = %q, want %s", got, glmMain)
+		}
+	}
+	_, p := buildRouter(t, wordConfig(`"opencode": "glm"`))
+	pctx := chat(newStore(t), "opencode.ai", "/zen/v1/chat/completions", opencodeUA, "s1", "exo-free", true)
+	run(t, p, pctx)
+	if resend(p, pctx, http.StatusBadRequest, `{"error":{"message":"max_tokens is too large"}}`) {
+		t.Error("Resend = true for a 400 of another kind")
+	}
+}

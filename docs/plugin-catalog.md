@@ -226,7 +226,7 @@ decides:
   3. A Claude Code request's own turn: an opening turn, with no assistant reply
      yet, goes to its agent's current server; a continuation, a conversation the
      router did not see begin, is not routed, and is pinned so; a one-shot with no
-     tools, or a subagent's request, is not routed and pins nothing.
+     tools, or a subagent's request, pins nothing.
   4. Otherwise its agent's current server.
 
   The router reads the `inference` record `inference-parser` puts on each request,
@@ -262,8 +262,7 @@ decides:
   `server` and `pin` (`new`, `existing` or `none`).
 - **Models.** A routed request goes with the model the agent asked for: the router
   does not read the server's list to judge it, because a LiteLLM server serves
-  aliases it does not list. When the server refuses the model — `403` with
-  `error.type` `team_model_access_denied` — the router records the refusal for an
+  aliases it does not list. When the server refuses the model, the router records the refusal for an
   hour and, through `pipeline.Resender`, has the forward proxy send the request
   again, once and before the agent sees anything, with the server's substitute:
   `main` for a request with tools, `helper` for one without, as the server's list

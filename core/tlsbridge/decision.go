@@ -200,10 +200,11 @@ const (
 	// skipTTL is the ceiling it doubles up to. Both matter, for opposite cases.
 	//
 	// The window is collateral: it suppresses interception for every client of that
-	// host, not just the one that rejected us — the set is keyed by host, and there is
-	// no durable client identity to key it by (a source port changes per connection,
-	// and peer-PID has no portable API over TCP). So on a machine where one agent
-	// holds a stale CA and the rest are fine, a long window costs the healthy ones all
+	// host, not just the one that rejected us, because the set is keyed by host. Where
+	// the forward proxy can name the client's program it records against a second set
+	// keyed by program instead (NewProgramSkipSet), so this collateral now falls only on
+	// clients it cannot name. Before that existed, on a machine where one agent
+	// held a stale CA and the rest were fine, a long window cost the healthy ones all
 	// their observability. Ten minutes of it, re-armed on every attempt, is how a
 	// laptop lost 99% of the visibility on one host for two hours.
 	//
@@ -231,7 +232,7 @@ const (
 // rejected). Concurrent-safe; augments the static skip list. A window lasts at
 // most skipTTL, but its entry, and with it the rejection count, stays until a
 // success clears it or the set fills to skipMax (expired entries go first, then
-// the oldest expiry).
+// the oldest expiry, and a stopped entry only after every one that will expire).
 type SkipSet struct {
 	mu sync.RWMutex
 	// base is the first window and ttl the ceiling it doubles up to. base is a field
@@ -241,7 +242,11 @@ type SkipSet struct {
 	base time.Duration
 	ttl  time.Duration
 	max  int
-	m    map[string]skipEntry
+	// stopAfter is how many consecutive rejections stop the retries: on that one the
+	// entry stops expiring. Zero never stops, which is the host set's behaviour — a host
+	// is shared by every client, and the next one may trust the CA. See NewProgramSkipSet.
+	stopAfter int
+	m         map[string]skipEntry
 }
 
 // skipEntry is one skipped host: when the window ends, and how many consecutive
@@ -249,10 +254,40 @@ type SkipSet struct {
 type skipEntry struct {
 	expiry   time.Time
 	failures int
+	// stopped marks an entry that has stopped expiring: its key is passed through until
+	// a success clears it or the process restarts. Only a set with stopAfter set has any.
+	stopped bool
 }
 
 func NewSkipSet() *SkipSet {
 	return &SkipSet{base: skipBackoffBase, ttl: skipTTL, max: skipMax, m: map[string]skipEntry{}}
+}
+
+// programStopAfter is how many rejections in a row stop a program being retried.
+// Three, each after a window in which the program could have been fixed, is enough to
+// say it will not change during this run; retrying forever is what made one refusing
+// client fail again every ten minutes (#912).
+const programStopAfter = 3
+
+// NewProgramSkipSet is the skip set the forward proxy keys by client program
+// (Program.Key) rather than host. It has NewSkipSet's windows, and one difference: a
+// program that rejects the leaf programStopAfter times in a row is passed through
+// until a success clears it or the process restarts, instead of being retried every
+// time a window ends. A program upgrade moves its executable's path, and so its key,
+// which is the other way back.
+func NewProgramSkipSet() *SkipSet {
+	s := NewSkipSet()
+	s.stopAfter = programStopAfter
+	return s
+}
+
+// evictsBefore orders entries for eviction from a full set: one that will expire goes
+// before one that has stopped, and otherwise the one expiring soonest goes first.
+func evictsBefore(a, b skipEntry) bool {
+	if a.stopped != b.stopped {
+		return !a.stopped
+	}
+	return a.expiry.Before(b.expiry)
 }
 
 // backoffFor is the window after n consecutive failures: base, doubling, capped at ttl.
@@ -297,14 +332,14 @@ func (s *SkipSet) fail(host string, escalate bool) {
 		// Fail is cold (only fires when a minted leaf is rejected), so an O(n)
 		// sweep here is cheap.
 		var oldestK string
-		var oldestT time.Time
+		var oldest skipEntry
 		for k, e := range s.m {
-			if !e.expiry.After(now) {
+			if !e.stopped && !e.expiry.After(now) {
 				delete(s.m, k)
 				continue
 			}
-			if oldestK == "" || e.expiry.Before(oldestT) {
-				oldestK, oldestT = k, e.expiry
+			if oldestK == "" || evictsBefore(e, oldest) {
+				oldestK, oldest = k, e
 			}
 		}
 		if len(s.m) >= s.max && oldestK != "" {
@@ -335,11 +370,20 @@ func (s *SkipSet) fail(host string, escalate bool) {
 			}
 		}
 	}
+	// A stopped entry stays stopped, and a rejection that reaches stopAfter stops it. A
+	// transient failure never does: it is not evidence about trust.
+	stopped := false
+	if e, ok := s.m[host]; ok && e.stopped {
+		stopped = true
+	}
+	if escalate && s.stopAfter > 0 && n >= s.stopAfter {
+		stopped = true
+	}
 	// .Round(0) strips the monotonic reading so the expiry is a pure wall-clock
 	// time. Contains compares it against time.Now() via the wall clock, so an
 	// entry expires after its window of real time even across a suspend (where the
 	// monotonic clock freezes and would otherwise keep the host skipped longer).
-	s.m[host] = skipEntry{expiry: expiry.Round(0), failures: n}
+	s.m[host] = skipEntry{expiry: expiry.Round(0), failures: n, stopped: stopped}
 }
 
 // Succeed records that a client completed the forged handshake for this host, which
@@ -360,5 +404,6 @@ func (s *SkipSet) Contains(host string) bool {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	e, ok := s.m[host]
-	return ok && time.Now().Before(e.expiry) // expired entries read as absent; Fail reclaims them
+	// Expired entries read as absent; Fail reclaims them. A stopped one never expires.
+	return ok && (e.stopped || time.Now().Before(e.expiry))
 }

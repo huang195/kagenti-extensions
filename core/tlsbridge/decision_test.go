@@ -472,3 +472,95 @@ func TestDefaultPassthrough_ClaudeCodeUpdater(t *testing.T) {
 		t.Errorf("api.anthropic.com: got %v, want %v (must stay bridged)", v, Terminate)
 	}
 }
+
+// TestProgramSkipSet_StopsAfterThreeRejections: a program that keeps refusing the
+// leaf is evidence it will not change during this run, so the third consecutive
+// rejection stops the retries. The window would otherwise re-arm forever (#912).
+func TestProgramSkipSet_StopsAfterThreeRejections(t *testing.T) {
+	s := NewProgramSkipSet()
+	s.base, s.ttl = time.Millisecond, 4*time.Millisecond
+
+	s.Fail("p")
+	s.Fail("p")
+	time.Sleep(10 * time.Millisecond) // past any window two rejections earn
+	if s.Contains("p") {
+		t.Fatal("two rejections stopped the retries; three are required")
+	}
+	s.Fail("p")
+	time.Sleep(10 * time.Millisecond) // past the ceiling
+	if !s.Contains("p") {
+		t.Fatal("three rejections in a row did not stop the retries: the program will fail again when the window ends")
+	}
+}
+
+// A transient failure is not evidence about trust, so it must not walk a program
+// toward being passed through for the rest of the run.
+func TestProgramSkipSet_TransientFailuresDoNotCountTowardStopping(t *testing.T) {
+	s := NewProgramSkipSet()
+	s.base, s.ttl = time.Millisecond, 4*time.Millisecond
+
+	s.Fail("p")
+	for i := 0; i < 5; i++ {
+		s.FailTransient("p")
+	}
+	time.Sleep(10 * time.Millisecond)
+	if s.Contains("p") {
+		t.Fatal("transient failures stopped the retries")
+	}
+}
+
+func TestProgramSkipSet_SucceedClearsAStop(t *testing.T) {
+	s := NewProgramSkipSet()
+	for i := 0; i < programStopAfter; i++ {
+		s.Fail("p")
+	}
+	if !s.Contains("p") {
+		t.Fatal("precondition: the program is not stopped")
+	}
+	s.Succeed("p")
+	if s.Contains("p") {
+		t.Fatal("a completed handshake did not clear a stopped program")
+	}
+}
+
+// The host set keeps today's behaviour: it never stops, because a host is shared by
+// every client and the next one may well trust the CA.
+func TestSkipSet_HostSetNeverStops(t *testing.T) {
+	s := NewSkipSet()
+	s.base, s.ttl = time.Millisecond, 4*time.Millisecond
+	for i := 0; i < 10; i++ {
+		s.Fail("h")
+	}
+	time.Sleep(10 * time.Millisecond)
+	if s.Contains("h") {
+		t.Fatal("the host set stopped retrying; only the program set may")
+	}
+}
+
+// Review focus 5: when the set is full, a stopped program must not be the one evicted
+// while entries that will expire anyway remain — eviction would make it fail again.
+func TestSkipSet_StoppedEntriesAreEvictedLast(t *testing.T) {
+	s := NewProgramSkipSet()
+	s.max = 2
+	// The stopped entry earns a window that has ended by the time the set fills, so it
+	// is both the one expiring soonest and one the sweep would purge as expired. Left at
+	// the default windows its three rejections outlast live's one, and ordering by
+	// expiry alone would pass.
+	s.base, s.ttl = time.Millisecond, time.Millisecond
+	for i := 0; i < programStopAfter; i++ {
+		s.Fail("stopped")
+	}
+	time.Sleep(5 * time.Millisecond)
+	s.base, s.ttl = skipBackoffBase, skipTTL
+	s.Fail("live")
+	s.Fail("newcomer") // full: one entry must go
+	if !s.Contains("stopped") {
+		t.Error("the stopped entry was evicted while a live window remained")
+	}
+	if s.Contains("live") {
+		t.Error("the live window was kept and something else evicted")
+	}
+	if !s.Contains("newcomer") {
+		t.Error("the new entry was not recorded")
+	}
+}

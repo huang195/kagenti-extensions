@@ -103,18 +103,29 @@ func TestSearchDoc_TheCurrentRowSurvivesARedrawOfTheSameText(t *testing.T) {
 
 // TestSearchDoc_RenderIsLinearInALongLine: rowStarts measured each wrapped row's prefix from
 // column 0 again, so one 225KB string cost 2.2s per keystroke at 200 columns — more on a
-// narrower terminal, and Update is synchronous, so the whole TUI froze. The bound is loose on
-// purpose: linear is tens of milliseconds, quadratic is seconds.
+// narrower terminal, and Update is synchronous, so the whole TUI froze.
+//
+// GROWTH, NOT A TIME: CI runs under -race, which makes this ~20x slower than a laptop, so no one
+// bound fits both. Four times the line is about four times the work when the render is linear and
+// about sixteen when it is quadratic, on any machine.
 func TestSearchDoc_RenderIsLinearInALongLine(t *testing.T) {
-	line := `  "completion": "` + strings.Repeat("filler words here ", 12500) + `",`
-	var d searchDoc
-	d.setLines([]string{line}, 200)
-	start := time.Now()
-	d.render("words")
-	if dt := time.Since(start); dt > 500*time.Millisecond {
-		t.Errorf("render of one %dKB line took %v", len(line)/1024, dt)
+	render := func(n int) time.Duration {
+		line := `  "completion": "` + strings.Repeat("filler words here ", n) + `",`
+		best := time.Duration(1<<63 - 1)
+		for range 3 {
+			var d searchDoc
+			d.setLines([]string{line}, 200)
+			start := time.Now()
+			d.render("words")
+			best = min(best, time.Since(start))
+			if len(d.matches) == 0 {
+				t.Fatal("no matches")
+			}
+		}
+		return best
 	}
-	if len(d.matches) == 0 {
-		t.Error("no matches")
+	small, large := render(3000), render(12000)
+	if growth := float64(large) / float64(small); growth > 8 {
+		t.Errorf("4x the line took %.1fx the time (%v → %v): render is not linear", growth, small, large)
 	}
 }

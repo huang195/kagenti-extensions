@@ -82,27 +82,38 @@ func TestHighlight_KeepsTheColorsEitherSide(t *testing.T) {
 
 // TestHighlight_IsLinearInTheLine: one JSON string value is one line, and a common word can
 // occur in it thousands of times. lipgloss.StyleRanges re-cut the string from its start for
-// every range, which took 1.5s on this line — per keystroke, in message detail. The bound is
-// loose on purpose: linear is milliseconds, quadratic is seconds.
+// every range, which took 1.5s on a 36KB line — per keystroke, in message detail.
+//
+// GROWTH, NOT A TIME, for the reason TestSearchDoc_RenderIsLinearInALongLine gives: CI's -race
+// is ~20x slower than a laptop. Four times the line is about four times the work when Highlight
+// is linear, about sixteen when it is quadratic.
 func TestHighlight_IsLinearInTheLine(t *testing.T) {
 	restore := lipgloss.ColorProfile()
 	lipgloss.SetColorProfile(termenv.TrueColor)
 	t.Cleanup(func() { lipgloss.SetColorProfile(restore) })
 
-	plain := strings.Repeat("filler words here ", 2000)
-	line := lipgloss.NewStyle().Foreground(lipgloss.Color("#ff0000")).Render(plain)
 	hl := lipgloss.NewStyle().Background(lipgloss.Color("#00ff00"))
-	var spans []find.Styled
-	for _, r := range find.Ranges(plain, "filler") {
-		spans = append(spans, find.Styled{Range: r, Style: hl})
+	highlight := func(n int) time.Duration {
+		plain := strings.Repeat("filler words here ", n)
+		line := lipgloss.NewStyle().Foreground(lipgloss.Color("#ff0000")).Render(plain)
+		var spans []find.Styled
+		for _, r := range find.Ranges(plain, "filler") {
+			spans = append(spans, find.Styled{Range: r, Style: hl})
+		}
+		best := time.Duration(1<<63 - 1)
+		for range 3 {
+			start := time.Now()
+			out := find.Highlight(line, spans)
+			best = min(best, time.Since(start))
+			if ansi.Strip(out) != plain {
+				t.Fatal("the text changed")
+			}
+		}
+		return best
 	}
-	start := time.Now()
-	out := find.Highlight(line, spans)
-	if d := time.Since(start); d > 200*time.Millisecond {
-		t.Errorf("%d spans over %d bytes took %v", len(spans), len(line), d)
-	}
-	if got := ansi.Strip(out); got != plain {
-		t.Errorf("the text changed")
+	small, large := highlight(500), highlight(2000)
+	if growth := float64(large) / float64(small); growth > 8 {
+		t.Errorf("4x the line took %.1fx the time (%v → %v): Highlight is not linear", growth, small, large)
 	}
 }
 

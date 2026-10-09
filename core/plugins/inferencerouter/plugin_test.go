@@ -567,6 +567,15 @@ func sent(host, ua string) pipeline.SessionEvent {
 	}
 }
 
+// recorded is the request row the forward proxy records for pctx once the pipeline
+// has run: where it went, and the parse it carried.
+func recorded(pctx *pipeline.Context) pipeline.SessionEvent {
+	return pipeline.SessionEvent{
+		Direction: pipeline.Outbound, Phase: pipeline.SessionRequest, Host: pctx.Host,
+		Inference: pctx.Extensions.Inference, Client: pipeline.ParseUserAgent(pctx.Headers.Get("User-Agent")),
+	}
+}
+
 // withHistory gives pctx's session the events the store recorded before it.
 func withHistory(pctx *pipeline.Context, events ...pipeline.SessionEvent) *pipeline.Context {
 	pctx.Session.Events = events
@@ -854,8 +863,11 @@ func TestRouter_AfterASideRequestTheConversationDecides(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			store := newStore(t)
 			p := build(t, routerConfig(`"claude-code": "glm"`))
-			run(t, p, claudeCode(request(store, eteHost, claudeUA, "s1"), pipeline.AgentRoleMain, 0, 0))
-			pctx := claudeCode(request(store, eteHost, claudeUA, "s1"), pipeline.AgentRoleMain, 26, tc.turns)
+			side := claudeCode(request(store, eteHost, claudeUA, "s1"), pipeline.AgentRoleMain, 0, 0)
+			run(t, p, side)
+			// The forward proxy records the side request's row, which the next request sees.
+			pctx := withHistory(claudeCode(request(store, eteHost, claudeUA, "s1"), pipeline.AgentRoleMain, 26, tc.turns),
+				recorded(side))
 			run(t, p, pctx)
 
 			if pctx.Host != tc.host {

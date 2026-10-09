@@ -199,13 +199,14 @@ transparently redirected connection is dialed where the client chose, and is
   store, which a restart empties.
 - A request in a session its agent has not pinned is decided in this order, for a
   routed agent:
-  1. The session's history: the latest earlier inference request that agent sent
-     in the session to a server's host keeps the session on that server, from then
-     with that server's key. The history is the session store's and, where the
-     proxy keeps a session archive, up to 2000 of the archive's events from before
-     the oldest the store holds. A request to any other host is no evidence, since
-     the router never routes one: an OpenCode session that used another provider
-     first is new when it addresses a server.
+  1. The session's history: the latest earlier inference request, other than a
+     side request (3), that agent sent in the session to a server's host keeps
+     the session on that server, from then with that server's key. The history
+     is the session store's and, where the proxy keeps a session archive, up to
+     2000 of the archive's events from before the oldest the store holds. A
+     request to any other host is no evidence, since the router never routes
+     one: an OpenCode session that used another provider first is new when it
+     addresses a server.
   2. A request `inference-parser` did not read as inference — `count_tokens`,
      `/v1/models` — goes to its agent's current server and pins nothing.
   3. A Claude Code request's own turn: an opening turn, with no assistant reply

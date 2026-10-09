@@ -221,3 +221,41 @@ func TestRouter_RequiresInferenceParserBeforeIt(t *testing.T) {
 		t.Fatalf("err = %v, want the router refused for want of inference-parser", err)
 	}
 }
+
+// A side request decides nothing, and so its row is no evidence of where the session
+// is, in memory or in the archive: the conversation's own requests decide. A row of
+// the conversation's own, older than the side requests, still does.
+func TestRouter_ASideRequestsRowIsNoEvidence(t *testing.T) {
+	oneShot := claudeCode(request(nil, eteHost, claudeUA, "s1"), pipeline.AgentRoleMain, 0, 0)
+	subagent := claudeCode(request(nil, eteHost, claudeUA, "s1"), pipeline.AgentRoleSubagent, 11, 2)
+	turn := claudeCode(request(nil, glmHost, claudeUA, "s1"), pipeline.AgentRoleMain, 26, 1)
+	for _, tc := range []struct {
+		name            string
+		memory, archive []pipeline.SessionEvent
+		turns           int    // assistant turns in the request
+		host            string // where it goes
+		pin             string
+	}{
+		{"opening turn after side rows in memory", []pipeline.SessionEvent{recorded(oneShot), recorded(subagent)}, nil, 0, glmHost, "glm"},
+		{"opening turn after side rows in the archive", nil, []pipeline.SessionEvent{recorded(oneShot), recorded(subagent)}, 0, glmHost, "glm"},
+		{"continuation after side rows only", nil, []pipeline.SessionEvent{recorded(subagent), recorded(oneShot)}, 3, eteHost, ""},
+		{"continuation whose own turn is older than the side rows", nil,
+			[]pipeline.SessionEvent{recorded(turn), recorded(oneShot), recorded(subagent)}, 3, glmHost, "glm"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			store := newStore(t)
+			h := &fakeHistory{events: map[string][]pipeline.SessionEvent{"s1": archived(tc.archive...)}}
+			p := buildWithHistory(t, routerConfig(`"claude-code": "glm"`), h)
+			pctx := withHistory(claudeCode(request(store, eteHost, claudeUA, "s1"), pipeline.AgentRoleMain, 26, tc.turns),
+				tc.memory...)
+			run(t, p, pctx)
+
+			if pctx.Host != tc.host {
+				t.Errorf("Host = %q, want %q", pctx.Host, tc.host)
+			}
+			if pin, pinned := pinOf(t, store, "s1"); !pinned || pin != tc.pin {
+				t.Errorf("pin = %q (pinned %v), want %q", pin, pinned, tc.pin)
+			}
+		})
+	}
+}

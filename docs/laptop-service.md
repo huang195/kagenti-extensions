@@ -346,9 +346,9 @@ first by the time they were last written:
 A full disk does not stop the proxy. The archive stops writing until its next hourly pass,
 and requests are served as before; only the history has a gap.
 
-**What it does not promise.** Writing happens off the request path, so a request never waits
-on the disk — and the cost of that is that a burst the writer cannot keep up with is dropped
-*from the archive*, never from memory. An unclean kill loses at most the last second.
+**What it does not promise.** Writing happens off the request path — and the cost of that is
+that a burst the writer cannot keep up with is dropped *from the archive*, never from memory. An
+unclean kill loses at most the last second.
 `GET /v1/sessions?archived=true` reports both the archive's size and what it lost, under
 `archive` (`bytes`, `maxBytes`, `retentionDays`, and `droppedEvents`, `writeErrors`,
 `droppedRenames`, `paused` when any is nonzero); nonzero means what you are reading has gaps.

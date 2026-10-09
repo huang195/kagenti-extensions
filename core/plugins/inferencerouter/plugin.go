@@ -41,8 +41,8 @@
 // already running when routing is first configured, quiet while it was, has no pin,
 // and neither has one whose pin lapsed. The session's history tells such a
 // session from a new one: on a pin miss for a routed agent, the latest earlier
-// inference request that agent sent in the session to a server's host keeps the
-// session on that server, and only a session with no such request is new and goes
+// inference request, not a side request, that agent sent in the session to a
+// server's host keeps the session on that server, and only a session with no such request is new and goes
 // to its agent's current server. Without this, the documented first setup — add
 // the servers, then route Claude Code — would move every conversation that sent
 // nothing between the router's arrival and the route to the new server on its next
@@ -578,8 +578,8 @@ func turnOf(ext *pipeline.InferenceExtension) string {
 //
 // Only an outbound request row a parser read as inference counts, and only one that
 // reached a server. A tunnel row, a count_tokens or a /v1/models request no parser
-// claimed, and a denied request, which went nowhere, say nothing about where the
-// conversation is; nor does a request to any other host, which the router never
+// claimed, a side request (see turnOf), which decides nothing, and a denied request,
+// which went nowhere, say nothing about where the conversation is; nor does a request to any other host, which the router never
 // routes (see the package doc). Another agent's row says nothing about this agent's
 // conversation, and following it would hand this request that agent's server and
 // key. A row's Host is where the bytes went, the server's host for a routed request,
@@ -619,7 +619,7 @@ func (p *Router) wentTo(view *pipeline.SessionView, agent string) (server string
 // false when e is no evidence.
 func (p *Router) serverOf(e *pipeline.SessionEvent, agent string) (server string, ok bool) {
 	if e.Direction != pipeline.Outbound || e.Phase != pipeline.SessionRequest || e.Inference == nil ||
-		pipeline.AgentName(e.Client.Label()) != agent {
+		turnOf(e.Inference) == turnAside || pipeline.AgentName(e.Client.Label()) != agent {
 		return "", false
 	}
 	server, ok = p.byHost[routerconfig.Hostname(e.Host)]

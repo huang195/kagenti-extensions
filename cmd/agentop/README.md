@@ -658,8 +658,7 @@ With several LiteLLM servers, each with its own URL and key, `agentop server`
 chooses which one an agent's **new** sessions use, through the
 [`inference-router`](../../docs/plugin-catalog.md#inference-router) plugin. A
 session stays on the server it started on, including one already running when its
-agent is first routed, until the proxy restarts: a restarted proxy treats every
-session it sees as a new one. Routing is opt-in per agent: until an agent is given
+agent is first routed. Routing is opt-in per agent: until an agent is given
 a server, its traffic goes where the agent sends it.
 
 ```sh
@@ -746,8 +745,7 @@ the same way, says the proxy stopped answering, and exits 1. A file someone edit
 while the proxy was reloading is not put back but left as found, with an error
 saying so. If the proxy reports neither a reload nor a refusal within 30 seconds,
 the command exits 1 and leaves the file as written. With no proxy running the file is still written, and the change applies at
-the next start, to every session from then: a proxy that starts knows where no
-session is. Nothing is written unless the result loads as a Cortex config and
+the next start. Nothing is written unless the result loads as a Cortex config and
 passes the router's own rules; what only the running proxy can check, such as
 whether its build includes the router, is what a refused reload reports. A change
 that changes nothing writes nothing. `--config PATH` points every form at another

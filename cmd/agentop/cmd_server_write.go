@@ -422,21 +422,15 @@ func serverReset(args []string, stdout, stderr io.Writer) int {
 
 // runningSessionsStay is what use and reset mean for sessions already running,
 // said once the running proxy has the change. It holds a session by its pin or by
-// the request to a server its history records. One that has sent nothing since the
-// proxy started has neither, and a quiet one the store has evicted (session.max_sessions,
-// least recently used first, or a configured session.ttl) has no history, so either
-// looks new unless the router pinned it; hence "can be".
-const runningSessionsStay = "Sessions already running stay where they are, except one that has sent nothing " +
-	"since the proxy last started, or that the proxy has dropped from memory (it keeps the most recently used, " +
-	"100 by default), which can be treated as a new one."
+// the request to a server its history records.
+const runningSessionsStay = "Sessions already running stay where they are."
 
 // writeReport is what runServerWrite says about a change, by how it landed.
 type writeReport struct {
 	// done is the change, said once the proxy has it or will load it at start.
 	done string
 	// live is what the change means for sessions already running. Said only when
-	// the running proxy reloaded it: that proxy's pins and history are what hold a
-	// running session where it is, and a proxy that starts later has neither.
+	// the running proxy reloaded it.
 	live string
 	// unchanged is said when there was nothing to write.
 	unchanged string
@@ -469,11 +463,6 @@ func runServerWrite(stdout, stderr io.Writer, path, statsURL string, ch edit.Con
 		say(r.done, r.live, r.note)
 	case edit.WriteNotRunning:
 		next := fmt.Sprintf("Written to %s. No Cortex answered at its stats address, so this applies when the proxy next starts.", shown)
-		if r.live != "" {
-			// Not r.live: a proxy that starts holds no pins and no history.
-			next += " A proxy that starts knows where no session is, so it treats every session it sees as a new one, " +
-				"the ones running now included."
-		}
 		say(r.done, next, r.note)
 	case edit.WriteReloadFailed:
 		// WritePluginConfig has put the file back, so it does not hold the change;

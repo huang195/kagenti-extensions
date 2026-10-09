@@ -3,6 +3,8 @@ package tui
 import (
 	"slices"
 
+	"github.com/charmbracelet/bubbles/viewport"
+
 	"github.com/rossoctl/cortex/cmd/agentop/tui/table"
 )
 
@@ -23,6 +25,8 @@ func (m *model) surface(t paneID) searchSurface {
 		return tableSurface{m, t, &m.namespacesTbl}
 	case panePods:
 		return tableSurface{m, t, &m.podsTbl}
+	case paneDetail, panePluginDetail:
+		return docSurface{m, t, &m.detailVp, &m.detailDoc}
 	}
 	return nil
 }
@@ -108,3 +112,42 @@ func (s eventsSurface) restore(sp searchSpot) {
 }
 
 func (s eventsSurface) redraw() { s.m.rebuildEventsTable() }
+
+// docSurface is a scrolling text view: its place is the current match when that is on
+// screen, else the top of the view.
+type docSurface struct {
+	m   *model
+	t   paneID
+	vp  *viewport.Model
+	doc *searchDoc
+}
+
+func (s docSurface) matchLines() []int { return s.doc.matches }
+
+func (s docSurface) spot() searchSpot {
+	sp := searchSpot{row: s.vp.YOffset, yOffset: s.vp.YOffset}
+	if c, ok := s.doc.currentRow(); ok && c >= s.vp.YOffset && c < s.vp.YOffset+s.vp.Height {
+		sp.row = c
+	}
+	return sp
+}
+
+func (s docSurface) lineOf(sp searchSpot) int { return sp.row }
+
+// reveal makes row current and scrolls to it only when it is off screen, putting it a third
+// of the way down so what follows the match is in view. SetYOffset clamps.
+func (s docSurface) reveal(row int) {
+	s.doc.setCurrent(row)
+	s.redraw()
+	if row < s.vp.YOffset || row >= s.vp.YOffset+s.vp.Height {
+		s.vp.SetYOffset(row - s.vp.Height/3)
+	}
+}
+
+func (s docSurface) restore(sp searchSpot) {
+	s.doc.clearCurrent()
+	s.redraw()
+	s.vp.SetYOffset(sp.yOffset)
+}
+
+func (s docSurface) redraw() { s.vp.SetContent(s.doc.render(s.m.searchQuery(s.t))) }

@@ -654,9 +654,10 @@ func (m *model) handleKey(msg tea.KeyMsg) tea.Cmd {
 				// Clear only on an actual session change, so
 				// re-entering the same session keeps the pin.
 				m.selectedEventKey = eventKey{}
-				// And the events search, for the same reason: it was typed for that
-				// session's events, and re-entering it keeps it.
+				// And the events and message-detail searches, for the same reason: they were
+				// typed for that session's events, and re-entering it keeps them.
 				delete(m.search, paneEvents)
+				delete(m.search, paneDetail)
 			}
 			m.selectedSess = id
 			m.pane = paneEvents

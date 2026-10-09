@@ -681,7 +681,10 @@ type model struct {
 	pipelineTbl   table.Model
 	catalogTbl    table.Model
 	detailVp      viewport.Model
-	detailEvent   *pipeline.SessionEvent
+	// detailDoc is detailVp's text, searched — see searchdoc.go. Shared by message detail
+	// and plugin detail, as the viewport is.
+	detailDoc   searchDoc
+	detailEvent *pipeline.SessionEvent
 	// detailRow is the full events-pane row (event + any folded CONNECT
 	// tunnel) the detail view was opened on. Kept so layout() can re-render
 	// the detail pane on resize without re-deriving the tunnel fold.

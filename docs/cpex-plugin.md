@@ -286,9 +286,10 @@ writes it back into the body by position — message text for inference and A2A 
 or, for MCP, replaces the call's arguments or URI whole. After a writer that
 changed those messages, a changed message count is a drift error (fail-closed
 unless `fail_open`), and an edit that kept the count is overwritten with the
-client's text. Writers after cpex start from its output and are unaffected. A
-second *response* mutator (`sparc`, say) still fails at boot: at most one plugin
-per pipeline rewrites responses.
+client's text. Writers after cpex start from its output and are unaffected.
+Response writers chain too, so cpex can share a chain with `sparc`. The response
+side runs in reverse: with cpex placed first, it runs last among them and
+redacts the response the client will receive.
 
 A typical inbound chain:
 

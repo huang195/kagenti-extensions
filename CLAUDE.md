@@ -426,10 +426,12 @@ and `WritesResponseBody` (calls `pctx.SetResponseBody`). `WritesResponseBody` is
 SSE streaming predicate — both proxy listeners fall back from incremental relay
 to the buffered path only when some plugin declares it. A request-only mutator
 (`tool-prune`, `context-guru`) therefore keeps streaming, because requests are
-never streamed in the first place. `pipeline.New` lets any number of request
-mutators chain — each sees `pctx.Body` as the one before it left it — allows at
-most one response mutator, and lets no mutator of either direction precede a
-`ReadsBody`-only plugin. A writer learns whether its own write applied from
+never streamed in the first place. `pipeline.New` lets any number of mutators
+chain in each direction — a request mutator sees `pctx.Body` as the one before
+it left it, and the response side runs in reverse — and lets no mutator of
+either direction precede a `ReadsBody`-only plugin. Readers, parsers included,
+therefore see what the agent saw: the request the client sent and the response
+it receives. A writer learns whether its own write applied from
 `SetBody`'s result (false under `on_error: observe`), not from
 `pctx.BodyMutated()`, which is true once any writer's bytes took effect. See
 [`docs/plugin-reference.md`](docs/plugin-reference.md#capability-fields).

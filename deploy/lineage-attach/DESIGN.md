@@ -119,6 +119,33 @@ logs; propagation is then off and the trace shows it (`none` on the pod's
 outbound hops), which is the
 honest failure mode. Read the hook's docstring for the full contract.
 
+The hook also bridges one gap auto-instrumentation leaves open on the mcp 1.x
+line. The MCP Python SDK's streamable-HTTP client POSTs every message from a
+background task started when the session was opened; a task copies its
+contextvars at creation, so for a session an app holds across requests the
+OTel context in that task is the empty one from startup, and the httpx
+instrumentor there starts a fresh trace per tool call. mcp 2.x carries the
+sender's context through its streams itself (`mcp.shared._context_streams`,
+every release from 2.0.0); the 1.x line does not, and the agent frameworks
+that matter here pin below 2 (openai-agents `mcp<2`, langchain-mcp-adapters
+`<2.0.0`, google-adk `<2`; the sample images carry 1.28.1). On a 1.x the hook
+stamps the caller's OTel context on each `SessionMessage` as it is built and
+re-attaches it around the POST, so the tool call carries the turn's
+`traceparent`; a stamp that carries nothing is not attached, so a message
+built outside any context leaves the post task's own context alone. On a 2.x
+it does nothing. Only the OTel context crosses. The stamp is installed
+wherever `mcp` is importable, a tool server's process included, and is inert
+there: no client transport runs. If a 1.x lacks either seam the bridge
+stays out and is logged once; propagation is otherwise unaffected, and
+such a tool call roots a trace of its own (`parent.source=none` on the tool's
+inbound hop) — the shape the kit produced before the bridge. Two things stay
+outside it: a resumed request (the SDK's `_handle_resumption_request`, a GET
+with `Last-Event-ID`) is not bridged, and the SSE client transport, which has
+the same background POST and no per-message seam, is not either (the MCP
+specification deprecated it in 2025-03-26). Checking for the seams imports the
+SDK's client module, so every gated interpreter in the image pays that import
+once at start, beside the auto-instrumentation it already loads.
+
 ### An app that already configures OpenTelemetry itself
 
 That app is outside the shim's envelope, and the bake interlock cannot see it

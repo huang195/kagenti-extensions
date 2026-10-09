@@ -60,9 +60,13 @@ type PluginCapabilities struct {
 	// some plugin in the chain declares this. See
 	// Pipeline.WritesResponseBody.
 	//
-	// Pipeline.New rejects more than one WritesResponseBody plugin per
-	// pipeline: nothing needs more, and the response pass, which runs in
-	// reverse, has an ordering gap of its own (see validateCapabilities).
+	// Any number of WritesResponseBody plugins may share a pipeline. The
+	// response pass runs in reverse, so each sees pctx.ResponseBody as the
+	// writer after it in the chain left it, and the listener sends what the
+	// last to run left. Pipeline.New rejects one placed before a
+	// ReadsBody-only plugin, so readers — the parsers included — see the
+	// response the client receives. A writer therefore cannot use what the
+	// parsers found in this response; it parses pctx.ResponseBody itself.
 	WritesResponseBody bool
 
 	// WritesDestination: the plugin may call pctx.Redirect to send the request to a

@@ -91,15 +91,141 @@ func TestNew_AnObservedMutatorLeavesTheNextOneTheUnmodifiedBody(t *testing.T) {
 	}
 }
 
-// At most one response mutator still: nothing needs more, and the response pass
-// has its own ordering gap.
-func TestNew_StillRejectsTwoResponseMutators(t *testing.T) {
-	_, err := New([]Plugin{
-		&stubPlugin{name: "a", caps: PluginCapabilities{WritesResponseBody: true}},
-		&stubPlugin{name: "b", caps: PluginCapabilities{WritesResponseBody: true}},
-	})
-	if err == nil || !strings.Contains(err.Error(), "WritesResponseBody") {
-		t.Fatalf("err = %v, want two response mutators refused", err)
+// responseAppender is a response-body mutator that appends suffix to whatever
+// response it is handed, so a test can tell from the final bytes which writers
+// ran and in what order.
+func responseAppender(name, suffix string) *stubPlugin {
+	return &stubPlugin{
+		name: name,
+		caps: PluginCapabilities{WritesResponseBody: true},
+		onResp: func(_ context.Context, pctx *Context) Action {
+			pctx.SetResponseBody(append(append([]byte{}, pctx.ResponseBody...), suffix...))
+			return Action{Type: Continue}
+		},
+	}
+}
+
+// runResponseLikeAListener dispatches the response pass the way every listener's
+// buffered path does: RunResponse, then the parsers' terminal frame carrying the
+// body as the writers left it.
+func runResponseLikeAListener(t *testing.T, p *Pipeline, pctx *Context) {
+	t.Helper()
+	if a := p.RunResponse(context.Background(), pctx); a.Type != Continue {
+		t.Fatalf("RunResponse = %v, want Continue", a.Type)
+	}
+	if a := p.RunResponseFrame(context.Background(), pctx, pctx.ResponseBody, true); a.Type != Continue {
+		t.Fatalf("RunResponseFrame = %v, want Continue", a.Type)
+	}
+}
+
+// Response mutators chain. The response pass runs in reverse, so the writer
+// placed last runs first and the one before it sees its output. Readers placed
+// ahead of both — a whole-body reader and a per-frame one, as the parsers are —
+// see the response the client receives, and the record names both writers in
+// the order they ran.
+func TestNew_ChainsResponseMutators(t *testing.T) {
+	var seenByFirst, seenByReader, seenByParser string
+	first := responseAppender("first", "+a")
+	inner := first.onResp
+	first.onResp = func(ctx context.Context, pctx *Context) Action {
+		seenByFirst = string(pctx.ResponseBody)
+		return inner(ctx, pctx)
+	}
+	reader := &stubPlugin{
+		name: "reader",
+		caps: PluginCapabilities{ReadsBody: true},
+		onResp: func(_ context.Context, pctx *Context) Action {
+			seenByReader = string(pctx.ResponseBody)
+			return Action{Type: Continue}
+		},
+	}
+	parser := &streamingStubPlugin{
+		stubPlugin: stubPlugin{name: "parser", caps: PluginCapabilities{ReadsBody: true}},
+		onFrame: func(_ context.Context, _ *Context, frame []byte, _ bool) Action {
+			seenByParser = string(frame)
+			return Action{Type: Continue}
+		},
+	}
+	p, err := New([]Plugin{parser, reader, first, responseAppender("second", "+b")})
+	if err != nil {
+		t.Fatalf("New refused two response mutators after the readers: %v", err)
+	}
+	pctx := &Context{Direction: Outbound, ResponseBody: []byte("x")}
+	runResponseLikeAListener(t, p, pctx)
+
+	if seenByFirst != "x+b" {
+		t.Errorf("first saw %q, want second's output x+b — the response pass runs in reverse", seenByFirst)
+	}
+	if string(pctx.ResponseBody) != "x+b+a" || !pctx.ResponseBodyMutated() {
+		t.Errorf("ResponseBody = %q, ResponseBodyMutated = %v; want x+b+a, true", pctx.ResponseBody, pctx.ResponseBodyMutated())
+	}
+	if seenByReader != "x+b+a" || seenByParser != "x+b+a" {
+		t.Errorf("reader saw %q, parser saw %q; want both to see the response the client receives, x+b+a", seenByReader, seenByParser)
+	}
+	assertMutation(t, bodyMutation(t, pctx), "response", "x", "x+b+a", "second", "first")
+}
+
+// Under observe a response mutator's write is a no-op: the writer that runs after
+// it sees the response as it was, and the record names only the writers whose
+// writes took effect.
+func TestNew_AnObservedResponseMutatorLeavesTheNextOneTheBody(t *testing.T) {
+	var seenByFirst string
+	first := responseAppender("first", "+a")
+	inner := first.onResp
+	first.onResp = func(ctx context.Context, pctx *Context) Action {
+		seenByFirst = string(pctx.ResponseBody)
+		return inner(ctx, pctx)
+	}
+	p, err := New(
+		[]Plugin{first, responseAppender("observed", "+m"), responseAppender("second", "+b")},
+		WithPolicies(ErrorPolicyEnforce, ErrorPolicyObserve, ErrorPolicyEnforce),
+	)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	pctx := &Context{Direction: Outbound, ResponseBody: []byte("x")}
+	runResponseLikeAListener(t, p, pctx)
+
+	if seenByFirst != "x+b" {
+		t.Errorf("first saw %q, want x+b — the observed write must change nothing", seenByFirst)
+	}
+	if string(pctx.ResponseBody) != "x+b+a" {
+		t.Errorf("ResponseBody = %q, want x+b+a", pctx.ResponseBody)
+	}
+	assertMutation(t, bodyMutation(t, pctx), "response", "x", "x+b+a", "second", "first")
+}
+
+// A plugin may write both bodies — cpex does — and share a chain with a
+// response-only writer such as sparc. Each direction chains on its own.
+func TestNew_ChainsABothDirectionWriterWithAResponseWriter(t *testing.T) {
+	both := &stubPlugin{
+		name: "cpex",
+		caps: PluginCapabilities{WritesRequestBody: true, WritesResponseBody: true},
+		onReq: func(_ context.Context, pctx *Context) Action {
+			pctx.SetBody(append(append([]byte{}, pctx.Body...), "+A"...))
+			return Action{Type: Continue}
+		},
+		onResp: func(_ context.Context, pctx *Context) Action {
+			pctx.SetResponseBody(append(append([]byte{}, pctx.ResponseBody...), "+a"...))
+			return Action{Type: Continue}
+		},
+	}
+	p, err := New([]Plugin{both, responseAppender("sparc", "+b")})
+	if err != nil {
+		t.Fatalf("New refused [cpex, sparc]: %v", err)
+	}
+	pctx := &Context{Direction: Outbound, Body: []byte("q")}
+	if a := p.Run(context.Background(), pctx); a.Type != Continue {
+		t.Fatalf("Run = %v, want Continue", a.Type)
+	}
+	pctx.ResponseBody = []byte("r")
+	runResponseLikeAListener(t, p, pctx)
+
+	if string(pctx.Body) != "q+A" {
+		t.Errorf("Body = %q, want q+A", pctx.Body)
+	}
+	if string(pctx.ResponseBody) != "r+b+a" {
+		t.Errorf("ResponseBody = %q, want r+b+a — sparc runs first on the response", pctx.ResponseBody)
 	}
 }
 

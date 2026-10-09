@@ -92,9 +92,9 @@ func TestPipeline_BodyWritePredicates_TruthTable(t *testing.T) {
 	}
 }
 
-// TestValidateCapabilities_Directional: request mutators chain, a response
-// mutator is still exclusive, and reader-ordering is triggered by either write
-// flag. Every combination that validated before chaining still does.
+// TestValidateCapabilities_Directional: mutators of either direction chain, and
+// reader-ordering is triggered by either write flag. Every combination that
+// validated before chaining still does.
 func TestValidateCapabilities_Directional(t *testing.T) {
 	req := PluginCapabilities{WritesRequestBody: true}
 	resp := PluginCapabilities{WritesResponseBody: true}
@@ -111,18 +111,16 @@ func TestValidateCapabilities_Directional(t *testing.T) {
 			plugins: []Plugin{&stubPlugin{name: "a", caps: req}, &stubPlugin{name: "b", caps: req}},
 		},
 		{
-			name:    "two response writers rejected",
+			name:    "two response writers chain",
 			plugins: []Plugin{&stubPlugin{name: "a", caps: resp}, &stubPlugin{name: "b", caps: resp}},
-			wantErr: "WritesResponseBody",
 		},
 		{
 			name:    "one of each direction is fine — they never collide",
 			plugins: []Plugin{&stubPlugin{name: "a", caps: req}, &stubPlugin{name: "b", caps: resp}},
 		},
 		{
-			name:    "two both-direction writers rejected on the response rule",
+			name:    "two both-direction writers chain",
 			plugins: []Plugin{&stubPlugin{name: "a", caps: both}, &stubPlugin{name: "b", caps: both}},
-			wantErr: "WritesResponseBody",
 		},
 		{
 			name:    "reader before mutator is fine",
@@ -176,12 +174,13 @@ func TestValidateCapabilities_ResponseAndRequestMutatorsCoexist(t *testing.T) {
 	if err != nil {
 		t.Errorf("[parser, sparc, tool-prune] should build: %v", err)
 	}
-	// Two RESPONSE mutators are still rejected; request mutators chain.
+	// Response mutators chain too: cpex, which writes both bodies, shares a chain
+	// with sparc.
 	if err := validateCapabilities([]Plugin{
+		&stubPlugin{name: "cpex", caps: PluginCapabilities{WritesRequestBody: true, WritesResponseBody: true}},
 		&stubPlugin{name: "sparc", caps: PluginCapabilities{WritesResponseBody: true}},
-		&stubPlugin{name: "cpex", caps: PluginCapabilities{WritesResponseBody: true}},
-	}); err == nil {
-		t.Error("two response mutators must still be rejected")
+	}); err != nil {
+		t.Errorf("[cpex, sparc] should build: %v", err)
 	}
 }
 

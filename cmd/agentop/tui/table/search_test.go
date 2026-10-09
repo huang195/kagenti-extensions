@@ -105,7 +105,9 @@ func TestSetSearch_TheCursorRowKeepsItsStyleAfterAHighlight(t *testing.T) {
 	if !strings.Contains(l, s.CurrentMatch.Inherit(s.Selected).Render("000")) {
 		t.Errorf("the cursor row's match is not in CurrentMatch: %q", l)
 	}
-	for _, piece := range []string{"-tail", "after"} {
+	// Each piece runs on through its cell's padding: "x000-tail" fills a 10-column cell, "after"
+	// a 6-column one.
+	for _, piece := range []string{"-tail ", "after "} {
 		if !strings.Contains(l, s.Selected.Render(piece)) {
 			t.Errorf("%q after the highlight lost the Selected style: %q", piece, l)
 		}
@@ -198,4 +200,23 @@ func TestSetSearch_OnAnEmptyTable(t *testing.T) {
 		t.Errorf("Matches = %v, want none", got)
 	}
 	_ = tb.View()
+}
+
+// TestRenderRow_TheCursorRowDrawsACellAndItsPaddingAsOneRun: a styled row's cell text and the
+// padding that fills its column are one styled run, as they were when the row style wrapped the
+// whole row. The README demo's generator relies on it: it canonicalises an UPDATED age together
+// with the padding after it, so "9s ago" and "45s ago" leave the columns after them in place —
+// and an age split from its padding escaped that, which made the committed asset depend on the
+// second the capture ran.
+func TestRenderRow_TheCursorRowDrawsACellAndItsPaddingAsOneRun(t *testing.T) {
+	s := searchStyles(t)
+	tb := twoColTable([]table.Row{{"43s ago", "x"}, {"zz", "y"}}, 12, 3)
+	tb.SetStyles(s)
+	if l := lineFor(t, tb, "43s ago"); !strings.Contains(l, s.Selected.Render("43s ago     ")) {
+		t.Errorf("the cell's text and its padding are separate runs: %q", l)
+	}
+	tb.SetSearch("43", nil)
+	if l := lineFor(t, tb, "43s ago"); !strings.Contains(l, s.Selected.Render("s ago     ")) {
+		t.Errorf("after a highlight, the rest of the cell and its padding are separate runs: %q", l)
+	}
 }

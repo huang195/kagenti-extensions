@@ -594,7 +594,10 @@ func (m *Model) renderRow(r int) string {
 			sp = spans[i]
 		}
 		box := lipgloss.NewStyle().Width(m.cols[i].Width).MaxWidth(m.cols[i].Width).Inline(true).Inherit(row)
-		s = append(s, m.styles.Cell.Inherit(row).Render(box.Render(paint(texts[i], sp, row, match))))
+		// Filled to the column before it is painted, so the text and the padding after it are
+		// one run in the row's style rather than a run and a pad lipgloss styles apart.
+		filled := runewidth.FillRight(texts[i], m.cols[i].Width)
+		s = append(s, m.styles.Cell.Inherit(row).Render(box.Render(paint(filled, sp, row, match))))
 	}
 	return lipgloss.JoinHorizontal(lipgloss.Top, s...)
 }

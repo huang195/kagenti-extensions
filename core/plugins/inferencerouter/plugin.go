@@ -48,10 +48,22 @@
 // would leave an agent that switches providers inside a session, as OpenCode does,
 // unrouted for good once its first request went elsewhere, still sending its own
 // key to the server it then addresses. Only a non-empty history is evidence: a
-// view is empty for a session the store has recorded nothing of yet. After a
-// restart the store holds nothing from before it, and the pins, which live in
-// memory, are gone too, so a running session's next request then looks new and can
-// move; so can a quiet one the store has evicted before the router pinned it.
+// view is empty for a session the store has recorded nothing of yet.
+//
+// With no pin and no history, a Claude Code request says itself whether the router
+// is seeing its conversation begin. Its system prompt states the caller, and the
+// main conversation carries its tool manifest: an opening turn has no assistant
+// message yet and goes to the agent's current server, and a continuation has some,
+// so the router did not see it begin — it started before routing was set up, or
+// before a restart that forgot its pin — and it is not routed and pinned so, rather
+// than taken for new and moved mid-conversation. The one-shots Claude Code
+// interleaves with a conversation carry no tools, and a subagent's requests are its
+// own conversation's; neither says whether the session began, so neither decides:
+// each goes where Claude Code sent it and leaves the session unpinned. Only Claude
+// Code is read this way, because no other agent states its role, and one that
+// switches providers, as OpenCode does, sends earlier turns that went elsewhere. A
+// session routed to a server keeps it only by its pin, so a restart, which forgets
+// the pins, sends such a conversation back to where Claude Code sends it.
 //
 // A pin is its agent's. The session id is the listener's answer, and another
 // agent's request can be filed under it — by process attribution, which files a
@@ -136,7 +148,14 @@ const (
 const (
 	pinNew      = "new"      // this request pinned the session
 	pinExisting = "existing" // the session was already pinned
-	pinNone     = "none"     // nothing was pinned: no session, a synthetic one, no store, a failed redirect, a refused model, or another agent's pin
+	pinNone     = "none"     // nothing was pinned: no session, a synthetic one, no store, a failed redirect, a refused model, another agent's pin, or a side request
+)
+
+// The turn detail on a not-routed record, where the request's own turn decided an
+// unpinned Claude Code session.
+const (
+	turnContinuation = "continuation" // a conversation the router did not see begin
+	turnAside        = "aside"        // a one-shot or a subagent's request, which decides nothing
 )
 
 // route is one configured server, ready to redirect to.
@@ -244,8 +263,11 @@ func (p *Router) OnRequest(_ context.Context, pctx *pipeline.Context) pipeline.A
 	if name == "" {
 		// Not routed: the request, its key included, stays exactly as the client sent it.
 		pin.settle("")
-		pctx.Record(pipeline.Invocation{Action: pipeline.ActionSkip, Reason: "not_routed",
-			Details: map[string]string{"pin": pin.state}})
+		details := map[string]string{"pin": pin.state}
+		if pin.turn != "" {
+			details["turn"] = pin.turn
+		}
+		pctx.Record(pipeline.Invocation{Action: pipeline.ActionSkip, Reason: "not_routed", Details: details})
 		return cont
 	}
 	// Built where each record is made, since a failed redirect changes the pin.
@@ -390,6 +412,9 @@ type pinning struct {
 	store pipeline.SharedStore
 	key   string
 	agent string
+	// turn is turnContinuation or turnAside when the request's own turn left an
+	// unpinned session unrouted, "" otherwise.
+	turn string
 }
 
 // settle pins a session on its first request to where that request went: server
@@ -417,7 +442,8 @@ func (pn *pinning) forgo() {
 // renews the pin. Otherwise the session is decided by unpinned, and the pin comes
 // back pinNew for OnRequest to settle by where the request went (see the package
 // doc) — except when the pin is another agent's, which this request must neither
-// follow nor overwrite, so it comes back pinNone. Without a session to pin, whether
+// follow nor overwrite, or when the request is a side request that decides nothing,
+// and then it comes back pinNone. Without a session to pin, whether
 // none, a synthetic one or no store, the agent's choice applies and nothing is
 // pinned: a synthetic session's history is many conversations', not this one's.
 //
@@ -441,27 +467,72 @@ func (p *Router) serverFor(pctx *pipeline.Context) (string, pinning) {
 	if v, ok := pctx.Shared.Get(key); ok {
 		if pn, ok := v.(pin); ok {
 			if pn.agent != agent {
-				return p.unpinned(pctx.Session, agent, choice), pinning{state: pinNone}
+				server, _, _ := p.unpinned(pctx, agent, choice)
+				return server, pinning{state: pinNone}
 			}
 			pctx.Shared.Put(key, pn, pinTTL)
 			return pn.server, pinning{state: pinExisting}
 		}
 	}
-	return p.unpinned(pctx.Session, agent, choice), pinning{state: pinNew, store: pctx.Shared, key: key, agent: agent}
+	server, turn, decides := p.unpinned(pctx, agent, choice)
+	if !decides {
+		return server, pinning{state: pinNone, turn: turn}
+	}
+	return server, pinning{state: pinNew, store: pctx.Shared, key: key, agent: agent, turn: turn}
 }
 
-// unpinned is the server for a request in a session its agent holds no pin on: the
-// server the session's history shows it already uses, or for a new session — no
-// earlier request to any server — the agent's current choice. An agent that is not
-// routed is left alone, whatever its history.
-func (p *Router) unpinned(s *pipeline.SessionView, agent, choice string) string {
+// unpinned is the server for a request in a session its agent holds no pin on, and
+// whether the request decides the session's pin. In order:
+//
+//  1. An agent that is not routed is left alone, whatever its history.
+//  2. The server the session's history shows the agent already uses.
+//  3. A Claude Code request's own turn (see turnOf): a conversation's opening turn
+//     goes to the agent's current choice; a continuation, a conversation the router
+//     did not see begin, is not routed; a side request is not routed and decides
+//     nothing. turn names the last two, for the record.
+//  4. The agent's current choice.
+func (p *Router) unpinned(pctx *pipeline.Context, agent, choice string) (server, turn string, decides bool) {
 	if choice == "" {
+		return "", "", true
+	}
+	if server, ok := p.wentTo(pctx.Session.Events, agent); ok {
+		return server, "", true
+	}
+	switch turnOf(pctx.Extensions.Inference) {
+	case turnContinuation:
+		return "", turnContinuation, true
+	case turnAside:
+		return "", turnAside, false
+	}
+	return choice, "", true
+}
+
+// turnOf is a Claude Code request's place in its session's conversation, read from
+// inference-parser's parse: turnContinuation for the main conversation with earlier
+// assistant turns, turnAside for any other request, and "" for the main
+// conversation's opening turn or a request that states no role.
+//
+// The role is stated only by Claude Code's system prompt (see
+// pipeline.InferenceExtension.AgentRole), and only Claude Code is read this way:
+// another agent's earlier turns may have gone to another provider — OpenCode starts
+// on Zen and addresses a server later — so its turns say nothing about whether its
+// use of the servers began before this request. The main conversation carries its
+// tool manifest; the one-shots Claude Code interleaves with it, its title request,
+// auto mode's classifier and the permission monitor, carry none, and neither they
+// nor a subagent's requests say whether the session began now.
+func turnOf(ext *pipeline.InferenceExtension) string {
+	if ext == nil || ext.AgentRole == "" {
 		return ""
 	}
-	if server, ok := p.wentTo(s.Events, agent); ok {
-		return server
+	if ext.AgentRole != pipeline.AgentRoleMain || len(ext.Tools) == 0 {
+		return turnAside
 	}
-	return choice
+	for _, m := range ext.Messages {
+		if m.Role == "assistant" {
+			return turnContinuation
+		}
+	}
+	return ""
 }
 
 // wentTo is the server the latest earlier inference request agent sent in events

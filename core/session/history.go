@@ -114,6 +114,22 @@ type PriorKeeper interface {
 	Prior(sessionID string, after uint64) (Prior, bool)
 }
 
+// History is the events a session recorded on disk, the session archive's, for a plugin that
+// needs the events from before this process: a store entry starts empty after a restart.
+type History interface {
+	// Earlier calls fn, newest first, for the events recorded under sessionID numbered below
+	// before, every one when before is 0, until fn returns false or none are left. It reads
+	// from disk.
+	Earlier(sessionID string, before uint64, fn func(*pipeline.SessionEvent) bool) error
+}
+
+// HistoryConsumer is implemented by plugins that read a session's archived events.
+// plugins.BuildWithDeps injects the process's History before Configure runs; a process with no
+// session archive passes nothing.
+type HistoryConsumer interface {
+	SetHistory(History)
+}
+
 // priorLocked is the first PriorKeeper's answer for id's entry numbered after `after`. s.mu held.
 func (s *Store) priorLocked(id string, after uint64) (Prior, bool) {
 	for _, r := range s.recorders {

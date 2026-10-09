@@ -10,6 +10,7 @@ import (
 	"github.com/rossoctl/cortex/core/config"
 	"github.com/rossoctl/cortex/core/cost/pricing"
 	"github.com/rossoctl/cortex/core/pipeline"
+	"github.com/rossoctl/cortex/core/session"
 	"github.com/rossoctl/cortex/core/storage"
 	"github.com/rossoctl/cortex/core/storage/filestore"
 )
@@ -274,5 +275,38 @@ func TestBuildWithDeps_DoesNotCheckAnEntryThatIsOff(t *testing.T) {
 	entries[0].OnError = pipeline.ErrorPolicyOff
 	if _, err := BuildWithDeps(entries, Deps{}); err != nil {
 		t.Fatalf("BuildWithDeps checked an entry that is off: %v", err)
+	}
+}
+
+// historyPlugin records the history it was handed and whether it had it at Configure.
+type historyPlugin struct {
+	pricedPlugin
+	history        session.History
+	hadAtConfigure bool
+}
+
+func (p *historyPlugin) SetHistory(h session.History) { p.history = h }
+func (p *historyPlugin) Configure(json.RawMessage) error {
+	p.hadAtConfigure = p.history != nil
+	return nil
+}
+
+type noHistory struct{}
+
+func (noHistory) Earlier(string, uint64, func(*pipeline.SessionEvent) bool) error { return nil }
+
+func TestBuildWithDeps_InjectsTheHistoryBeforeConfigure(t *testing.T) {
+	p := &historyPlugin{pricedPlugin: pricedPlugin{name: "test-history-order"}}
+	RegisterPlugin(p.name, func() pipeline.Plugin { return p })
+	t.Cleanup(func() { UnregisterPlugin(p.name) })
+
+	if _, err := BuildWithDeps(entriesFor(p.name), Deps{History: noHistory{}}); err != nil {
+		t.Fatalf("BuildWithDeps: %v", err)
+	}
+	if p.history != session.History(noHistory{}) {
+		t.Errorf("history = %v, want the Deps history", p.history)
+	}
+	if !p.hadAtConfigure {
+		t.Error("the history was not injected before Configure ran")
 	}
 }

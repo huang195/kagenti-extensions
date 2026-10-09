@@ -60,7 +60,7 @@ func newStore(t *testing.T) *memstore.Store {
 
 // request is a context the forward proxy would build for a decrypted request to
 // host from an agent with User-Agent ua, in session (none when ""), carrying the
-// client's own key as a bearer token.
+// client's own key as a bearer token, that inference-parser read as inference.
 func request(store pipeline.SharedStore, host, ua, session string) *pipeline.Context {
 	pctx := &pipeline.Context{
 		Direction: pipeline.Outbound,
@@ -76,6 +76,7 @@ func request(store pipeline.SharedStore, host, ua, session string) *pipeline.Con
 	if session != "" {
 		pctx.Session = &pipeline.SessionView{ID: session}
 	}
+	pctx.Extensions.Inference = &pipeline.InferenceExtension{}
 	pctx.ResolveClient()
 	pctx.MarkRedirectable()
 	return pctx
@@ -223,7 +224,7 @@ func TestRouter_RoutesAListedAgentsSessionToItsServer(t *testing.T) {
 func TestRouter_RoutesEveryPathOnAServersHost(t *testing.T) {
 	p := build(t, routerConfig(`"claude-code": "glm"`))
 	pctx := request(newStore(t), eteHost, claudeUA, "s1")
-	pctx.Method, pctx.Path = http.MethodGet, "/v1/models"
+	pctx.Method, pctx.Path, pctx.Extensions.Inference = http.MethodGet, "/v1/models", nil
 	run(t, p, pctx)
 
 	assertRouted(t, pctx, glmHost, "glm-key")

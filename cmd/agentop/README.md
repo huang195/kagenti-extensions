@@ -703,9 +703,7 @@ With Claude Code's `ANTHROPIC_BASE_URL` at `ete`, the listing after `use` reads:
 - **`use <name> --agent <agent>`** routes the agent's new sessions to the server,
   including an agent that has not run yet. **`reset --agent <agent>`** stops
   routing it. Either way a session already running stays where it is: its pin holds
-  it, kept in `~/.cortex/plugin-state.json` so a proxy restart forgets none, and a
-  Claude Code conversation the router did not see begin stays where Claude Code
-  sends it.
+  it, kept in `~/.cortex/plugin-state.json` so a proxy restart forgets none.
 - **`remove <name>`** refuses while an agent is routed to the server, and names
   the command that takes the agent off it; it also refuses the last server. A
   session that started on a removed server gets a 503 asking for a new session

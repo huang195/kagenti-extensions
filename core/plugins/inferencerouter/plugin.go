@@ -28,8 +28,8 @@
 // nothing, so a key set on the strength of that nil would go to the host the client
 // named.
 //
-// A session is pinned by where its first request went, not by the choice made for
-// it: to the server when the request was redirected there; to "not routed" when it
+// A session is pinned by where the request that decides it went, not by the choice
+// made for it: to the server when the request was redirected there; to "not routed" when it
 // stayed where the client sent it, because the agent is not routed or because the
 // router runs under on_error: observe; and not at all when the redirect failed or
 // the request was refused for its model, so the session's next request decides
@@ -39,7 +39,7 @@
 //
 // The first request the router sees is not always a session's first. A session
 // already running when routing is first configured, quiet while it was, has no pin,
-// and neither has one whose pin lapsed. The session store's history tells such a
+// and neither has one whose pin lapsed. The session's history tells such a
 // session from a new one: on a pin miss for a routed agent, the latest earlier
 // inference request that agent sent in the session to a server's host keeps the
 // session on that server, and only a session with no such request is new and goes
@@ -53,23 +53,23 @@
 // key to the server it then addresses. Only a non-empty history is evidence: a
 // view is empty for a session the store has recorded nothing of yet.
 //
-// With no pin and no history, a Claude Code request says itself whether the router
-// is seeing its conversation begin. Its system prompt states the caller, and the
-// main conversation carries its tool manifest: an opening turn has no assistant
-// message yet and goes to the agent's current server, and a continuation has some,
-// so the router did not see it begin — it started before routing was set up, or
-// lost its pin to a restart of a process that keeps pins only in memory — and it is
-// not routed and pinned so, rather than taken for new and moved mid-conversation.
-// The one-shots Claude Code interleaves with a conversation carry no tools, and a
-// subagent's requests are its own conversation's; neither says whether the session
-// began, so neither decides: each goes where Claude Code sent it and leaves the
-// session unpinned. Only Claude Code is read this way, because no other agent
-// states its role, and one that switches providers, as OpenCode does, sends earlier
-// turns that went elsewhere. A session routed to a server keeps it by its pin
-// alone, so where pins are kept only in memory a restart sends such a conversation
+// With no pin and no history, a Claude Code inference request says itself whether
+// the router is seeing its conversation begin. Its system prompt states the caller,
+// and the main conversation carries its tool manifest: an opening turn has no
+// assistant message yet and goes to the agent's current server, and a continuation
+// has some, so the router did not see it begin — it started before routing was set
+// up, or lost its pin to a restart of a process that keeps pins only in memory — and
+// it is not routed and pinned so, rather than taken for new and moved
+// mid-conversation. The one-shots Claude Code interleaves with a conversation carry
+// no tools, and a subagent's requests are its own conversation's; neither says
+// whether the session began, so neither decides: each goes where Claude Code sent it
+// and leaves the session unpinned. Only Claude Code is read this way, because no
+// other agent states its role, and one that switches providers, as OpenCode does,
+// sends earlier turns that went elsewhere. A session routed to a server keeps it by
+// its pin and its history, so a restart that keeps neither sends such a conversation
 // back to where Claude Code sends it. So does a move to a new session id — Claude
 // Code's continued-in hand-off, or a background job forked from a conversation —
-// which no pin follows.
+// which neither follows.
 //
 // A pin is its agent's. The session id is the listener's answer, and another
 // agent's request can be filed under it — by process attribution, which files a
@@ -135,6 +135,11 @@ const (
 	// request renews it, so only a session idle this long forgets its server.
 	pinTTL = 30 * 24 * time.Hour
 
+	// historyLimit is how many of a session's archived events wentTo reads, newest
+	// first, before it stops looking: the archive is read from disk on the request
+	// path.
+	historyLimit = 2000
+
 	// codeUnavailable maps to 503 in pipeline's code table. A session whose server
 	// cannot be reached through the router is the server being unavailable to it,
 	// not the client's mistake.
@@ -155,7 +160,7 @@ const (
 const (
 	pinNew      = "new"      // this request pinned the session
 	pinExisting = "existing" // the session was already pinned
-	pinNone     = "none"     // nothing was pinned: no session, a synthetic one, no store, a failed redirect, a refused model, another agent's pin, or a side request
+	pinNone     = "none"     // nothing was pinned: no session, a synthetic one, no store, a failed redirect, a refused model, another agent's pin, a side request, or an unparsed request
 )
 
 // The turn detail on a not-routed record, where the request's own turn decided an
@@ -189,6 +194,9 @@ type Router struct {
 	// store is the process's durable store (storage.StoreConsumer), where pins are
 	// kept when there is one; nil keeps them in pctx.Shared.
 	store storage.Store
+	// history is the session archive (session.HistoryConsumer), nil in a process with
+	// none.
+	history session.History
 	// now is the clock a stored pin's renewal is judged by.
 	now func() time.Time
 
@@ -204,6 +212,10 @@ func New() *Router { return &Router{now: time.Now} }
 // restart forgets none.
 func (p *Router) SetStore(st storage.Store) { p.store = st }
 
+// SetHistory implements session.HistoryConsumer: the router reads a session's archived
+// events for where it went before this process (see wentTo).
+func (p *Router) SetHistory(h session.History) { p.history = h }
+
 func init() {
 	plugins.RegisterPlugin(Name, func() pipeline.Plugin { return New() })
 }
@@ -214,6 +226,7 @@ func (p *Router) Capabilities() pipeline.PluginCapabilities {
 	return pipeline.PluginCapabilities{
 		WritesDestination: true,
 		WritesRequestBody: true, // SetRequestModel, for a server with models of its own
+		Requires:          []string{"inference-parser"},
 		Description:       "Sends each agent's new sessions to its chosen inference server.",
 	}
 }
@@ -459,8 +472,8 @@ func (pn *pinning) forgo() {
 // renews the pin. Otherwise the session is decided by unpinned, and the pin comes
 // back pinNew for OnRequest to settle by where the request went (see the package
 // doc) — except when the pin is another agent's, which this request must neither
-// follow nor overwrite, or when the request is a side request that decides nothing,
-// and then it comes back pinNone. Without a session to pin, whether
+// follow nor overwrite, or when the request decides nothing, and then it comes back
+// pinNone. Without a session to pin, whether
 // none, a synthetic one or no store, the agent's choice applies and nothing is
 // pinned: a synthetic session's history is many conversations', not this one's.
 //
@@ -502,17 +515,22 @@ func (p *Router) serverFor(pctx *pipeline.Context) (string, pinning) {
 //
 //  1. An agent that is not routed is left alone, whatever its history.
 //  2. The server the session's history shows the agent already uses.
-//  3. A Claude Code request's own turn (see turnOf): a conversation's opening turn
+//  3. A request no parser read as inference goes to the agent's current choice and
+//     decides nothing.
+//  4. A Claude Code request's own turn (see turnOf): a conversation's opening turn
 //     goes to the agent's current choice; a continuation, a conversation the router
 //     did not see begin, is not routed; a side request is not routed and decides
 //     nothing. turn names the last two, for the record.
-//  4. The agent's current choice.
+//  5. The agent's current choice.
 func (p *Router) unpinned(pctx *pipeline.Context, agent, choice string) (server, turn string, decides bool) {
 	if choice == "" {
 		return "", "", true
 	}
-	if server, ok := p.wentTo(pctx.Session.Events, agent); ok {
+	if server, ok := p.wentTo(pctx.Session, agent); ok {
 		return server, "", true
+	}
+	if pctx.Extensions.Inference == nil {
+		return choice, "", false
 	}
 	switch turnOf(pctx.Extensions.Inference) {
 	case turnContinuation:
@@ -551,9 +569,12 @@ func turnOf(ext *pipeline.InferenceExtension) string {
 	return ""
 }
 
-// wentTo is the server the latest earlier inference request agent sent in events
-// to a server's host went to; ok is false when there is no such request, which is
-// what makes a session new.
+// wentTo is the server the latest earlier inference request agent sent in the
+// session to a server's host went to; ok is false when there is no such request,
+// which is what makes a session new. The session's events in memory are read first,
+// then, where the process has a session archive, its archived events below the
+// oldest one memory holds, up to historyLimit of them; an archive read that fails is
+// no evidence.
 //
 // Only an outbound request row a parser read as inference counts, and only one that
 // reached a server. A tunnel row, a count_tokens or a /v1/models request no parser
@@ -564,18 +585,45 @@ func turnOf(ext *pipeline.InferenceExtension) string {
 // key. A row's Host is where the bytes went, the server's host for a routed request,
 // because the listener records it after the redirect; RequestedHost, where the
 // client asked to go, is not where the session is.
-func (p *Router) wentTo(events []pipeline.SessionEvent, agent string) (server string, ok bool) {
+func (p *Router) wentTo(view *pipeline.SessionView, agent string) (server string, ok bool) {
+	events := view.Events
 	for i := len(events) - 1; i >= 0; i-- {
-		e := &events[i]
-		if e.Direction != pipeline.Outbound || e.Phase != pipeline.SessionRequest || e.Inference == nil ||
-			pipeline.AgentName(e.Client.Label()) != agent {
-			continue
-		}
-		if server, ok := p.byHost[routerconfig.Hostname(e.Host)]; ok {
+		if server, ok := p.serverOf(&events[i], agent); ok {
 			return server, true
 		}
 	}
+	if p.history == nil {
+		return "", false
+	}
+	var before uint64
+	if len(events) > 0 {
+		before = events[0].Seq
+	}
+	read := 0
+	err := p.history.Earlier(view.ID, before, func(e *pipeline.SessionEvent) bool {
+		read++
+		server, ok = p.serverOf(e, agent)
+		return !ok && read < historyLimit
+	})
+	if ok {
+		return server, true
+	}
+	if err != nil {
+		slog.Warn("inference-router: could not read the session's archived events; deciding it without them",
+			"session", view.ID, "error", err)
+	}
 	return "", false
+}
+
+// serverOf is the server e shows agent's session on, by the rule wentTo gives; ok is
+// false when e is no evidence.
+func (p *Router) serverOf(e *pipeline.SessionEvent, agent string) (server string, ok bool) {
+	if e.Direction != pipeline.Outbound || e.Phase != pipeline.SessionRequest || e.Inference == nil ||
+		pipeline.AgentName(e.Client.Label()) != agent {
+		return "", false
+	}
+	server, ok = p.byHost[routerconfig.Hostname(e.Host)]
+	return server, ok
 }
 
 // synthetic reports a session id the listener files traffic under when it knows no
@@ -617,4 +665,5 @@ var (
 	_ pipeline.Configurable   = (*Router)(nil)
 	_ pipeline.SchemaProvider = (*Router)(nil)
 	_ storage.StoreConsumer   = (*Router)(nil)
+	_ session.HistoryConsumer = (*Router)(nil)
 )

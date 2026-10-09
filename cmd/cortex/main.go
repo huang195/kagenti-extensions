@@ -415,6 +415,7 @@ func main() {
 	// build, the initial one and each reload's, injects this same store, so what a
 	// plugin saves survives a reload as well as a restart. Nil off a local install.
 	pluginStore := openPluginStore(*configPath)
+	history := &archiveHistory{}
 
 	// Build the SPIFFE Provider when the spiffe block is configured. The
 	// Provider drives both mTLS (via X509Source) and token-exchange's
@@ -518,8 +519,8 @@ func main() {
 		// cannot honor fails here — on startup and on every reload — instead of
 		// running to no effect. The reverse proxy honors no redirect, which is what
 		// keeps a WritesDestination plugin off the inbound chain.
-		inDeps := plugins.Deps{SPIFFE: provider, Pricing: pricingRegistry, Store: pluginStore, Listener: reverseproxy.Support()}
-		outDeps := plugins.Deps{SPIFFE: provider, Pricing: pricingRegistry, Store: pluginStore, Listener: forwardproxy.Support(c.MTLS != nil)}
+		inDeps := plugins.Deps{SPIFFE: provider, Pricing: pricingRegistry, Store: pluginStore, History: history, Listener: reverseproxy.Support()}
+		outDeps := plugins.Deps{SPIFFE: provider, Pricing: pricingRegistry, Store: pluginStore, History: history, Listener: forwardproxy.Support(c.MTLS != nil)}
 		in, err := plugins.BuildWithDeps(c.Pipeline.Inbound.Plugins, inDeps)
 		if err != nil {
 			return nil, nil, nil, fmt.Errorf("inbound: %w", err)
@@ -704,6 +705,7 @@ func main() {
 		// sessions survive a restart and the store's eviction. See core/session/archive.
 		sessArchive = openSessionArchive(cfg, *configPath, sessions)
 		if sessArchive != nil {
+			history.open(sessArchive)
 			// Before any listener starts: see replayUsage for why that is the whole design.
 			replayUsageAtStartup(sessArchive, usageAgg)
 		}

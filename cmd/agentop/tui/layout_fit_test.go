@@ -221,7 +221,7 @@ func TestLayout_EveryPaneFitsTheTerminal(t *testing.T) {
 				continue
 			}
 			for _, searching := range []bool{false, true} {
-				if searching && !searchable(p) {
+				if searching && (&model{}).surface(p) == nil {
 					continue
 				}
 				m := fitModel(t, p, dim[0], dim[1], cursorRowsFixture(60))

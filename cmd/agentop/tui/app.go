@@ -563,6 +563,8 @@ type model struct {
 	pane paneID
 	// usage is the Usage pane's view state (metric, window, scope, snapshot).
 	usage usageState
+	// usageDoc is the usage pane's drawn lines, searched — see usageBody.
+	usageDoc searchDoc
 
 	// spend backs the always-on spend strip. Separate from usage on purpose —
 	// see spendState, which records why sharing one poll chain would blank the
@@ -602,21 +604,16 @@ type model struct {
 	sortCol      eventColumnID
 	sortDesc     bool
 	selectedSess string
-	// search is each pane's committed `/` query — only paneSessions and paneEvents have one —
-	// and searching is whether the prompt is open, on searchPane. Never saved, and cleared by
+	// search is each target's committed `/` query, keyed by pane or targetHelp, and searching
+	// is whether the prompt is open, on searchPane. Never saved, and cleared by
 	// backToPodsPane. See search.go.
 	search     map[paneID]string
 	searching  bool
 	searchPane paneID
-	// searchOrigin is where the cursor was when `/` was pressed: the row typing searches from,
-	// and the row Esc puts the cursor back on.
+	// searchOrigin is where the target was when `/` was pressed: the place typing searches
+	// from, and the place Esc puts it back.
 	searchOrigin searchSpot
-	// sessionMatches and eventMatches are the rows of the sessions and events tables the
-	// pane's search matches, ascending. Each is published by its table's rebuild together with
-	// the rows, so it is index-aligned with sessionRowIDs and visibleRows.
-	sessionMatches []int
-	eventMatches   []int
-	paused         bool
+	paused       bool
 	// hideInactive toggles whether passthrough / skip-only messages are
 	// hidden from the events table. False (default) shows every message —
 	// the operator asked to see all network traffic, processed or not.
@@ -686,7 +683,10 @@ type model struct {
 	pipelineTbl   table.Model
 	catalogTbl    table.Model
 	detailVp      viewport.Model
-	detailEvent   *pipeline.SessionEvent
+	// detailDoc is detailVp's text, searched — see searchdoc.go. Shared by message detail
+	// and plugin detail, as the viewport is.
+	detailDoc   searchDoc
+	detailEvent *pipeline.SessionEvent
 	// detailRow is the full events-pane row (event + any folded CONNECT
 	// tunnel) the detail view was opened on. Kept so layout() can re-render
 	// the detail pane on resize without re-deriving the tunnel fold.
@@ -723,6 +723,8 @@ type model struct {
 	// a shared one because the overlay can open over the detail panes,
 	// which would otherwise have their scroll position clobbered.
 	helpVp viewport.Model
+	// helpDoc is the help overlay's drawn lines, searched — see syncHelpViewport.
+	helpDoc searchDoc
 
 	// catalog is the registered-plugin catalog from /v1/plugins,
 	// fetched lazily when the user first opens the catalog pane via
@@ -1074,13 +1076,23 @@ func (m *model) backToPodsPane() {
 	m.detailPlugin = nil
 	m.selectedSess = ""
 	m.selectedEventKey = eventKey{}
-	// A search names rows of the connection being left, so it goes with it.
-	m.search = nil
+	// A search names rows of the connection being left, so it goes with it — except on the two
+	// pickers, which list the cluster rather than the connection, and on the help overlay,
+	// whose search lasts until agentop exits.
+	for t := range m.search {
+		if t != paneNamespaces && t != panePods && t != targetHelp {
+			delete(m.search, t)
+		}
+	}
 	m.searching = false
 	m.searchInput.SetValue("")
 	// The prompt's line comes off the height budget while it is open, so dropping the flag
 	// has to give it back — see layout().
 	m.layout()
+	// Every table keeps its own copy of its query, and only some panes rebuild here, so each
+	// target is redrawn against what is left: a query deleted from the map under a table left
+	// its highlights on screen and n moving between them.
+	m.redrawSearches()
 	m.visibleRows = nil
 	m.connState = connStateInfo{phase: connConnecting}
 
@@ -1115,7 +1127,10 @@ func (m *model) syncHelpViewport(resetScroll bool) {
 	w, h := helpViewportSize(m.width, m.height, helpBodyWidth(body))
 	m.helpVp.Width = w
 	m.helpVp.Height = h
-	m.helpVp.SetContent(body)
+	// The overlay lays itself out — each group wraps its descriptions under a hanging indent —
+	// so its drawn lines are what search reads; there is no unwrapped form to match.
+	m.helpDoc.setLines(strings.Split(body, "\n"), 0)
+	m.helpVp.SetContent(m.helpDoc.render(m.searchQuery(targetHelp)))
 	if resetScroll {
 		m.helpVp.GotoTop()
 		return
@@ -2226,13 +2241,21 @@ func (m *model) flushSessionsTable() {
 	m.rebuildSessionsTable()
 }
 
+// helpPrompt is the search prompt when it is open on the help overlay, else "".
+func (m *model) helpPrompt() string {
+	if m.searching && m.searchPane == targetHelp {
+		return m.searchInput.View()
+	}
+	return ""
+}
+
 // View composes the full screen. The [?] key-help overlay is layered on
 // top of whatever the pane rendered, so it works over the picker and the
 // session views alike.
 func (m *model) View() string {
 	base := m.paneView()
 	if m.helpVisible {
-		return overlayCenter(base, renderHelpOverlay(m.helpVp, m.width, m.height), m.width, m.height)
+		return overlayCenter(base, renderHelpOverlay(m.helpVp, m.width, m.height, m.helpPrompt(), m.searchStatus(targetHelp)), m.width, m.height)
 	}
 	if m.clearConfirm != nil {
 		return overlayCenter(base, renderClearConfirm(m.clearConfirm, m.width), m.width, m.height)
@@ -2282,6 +2305,12 @@ func (m *model) paneView() string {
 		if m.pickerErr != "" {
 			footer = "error: " + m.pickerErr + "    " + footer
 		}
+		if m.searching && m.searchPane != targetHelp {
+			body = m.searchInput.View() + "\n" + body
+		}
+		if st := m.searchStatus(m.pane); st != "" {
+			footer = st + "  " + footer
+		}
 		// Fitted like the session-view footer: an error prefix can push even a
 		// short picker hint past the terminal width, and a wrapped footer costs a
 		// row of the table above it.
@@ -2302,6 +2331,12 @@ func (m *model) paneView() string {
 		footer := m.helpView()
 		if m.pickerErr != "" {
 			footer = "error: " + m.pickerErr + "    " + footer
+		}
+		if m.searching && m.searchPane != targetHelp {
+			body = m.searchInput.View() + "\n" + body
+		}
+		if st := m.searchStatus(m.pane); st != "" {
+			footer = st + "  " + footer
 		}
 		// Fitted like the session-view footer: an error prefix can push even a
 		// short picker hint past the terminal width, and a wrapped footer costs a
@@ -2387,7 +2422,7 @@ func (m *model) paneView() string {
 		if m.agentScope != "" {
 			title += " · agent=" + sanitizeLabel(m.agentScope)
 		}
-		body = m.renderUsage(m.width, m.bodyHeight)
+		body = m.usageBody()
 	case paneAgents:
 		// The window is in the title because the figures are a day's, not a lifetime's, and
 		// this pane has no window cycle of its own to make that discoverable.
@@ -2433,7 +2468,7 @@ func (m *model) paneView() string {
 		title += " · agent=" + sanitizeLabel(m.agentScope)
 	}
 	header := styleTitle.Render(title)
-	if m.searching {
+	if m.searching && m.searchPane != targetHelp {
 		body = m.searchInput.View() + "\n" + body
 	}
 	// A row slice rather than a fixed JoinVertical, so the strip's row can be absent

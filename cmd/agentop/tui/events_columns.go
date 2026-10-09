@@ -92,6 +92,9 @@ type eventColumn struct {
 	// render below, so a cell function cannot align itself in a way its header does
 	// not know about. That is what went wrong — see rightAlign.
 	cell func(cellContext) string
+	// full is the cell with unlimited room, for a column whose cell cuts itself to the
+	// column (PLUGIN, METHOD, HOST); nil where the cell is already whole. Search reads it.
+	full func(cellContext) string
 	// rightAlign presses this column's values, and its heading, against the column's
 	// right edge. For the numeric columns: figures are compared down a column, which
 	// needs their last digits in one place.
@@ -246,6 +249,7 @@ var eventColumns = []eventColumn{
 			p := c.plugin
 			return truncStr(p, c.width)
 		},
+		full:    func(c cellContext) string { return c.plugin },
 		sortKey: func(c cellContext) sortValue { return strKey(c.plugin) }},
 	// methodColWidth rather than 22: the widest realistic value is a model name
 	// ("claude-opus-5"), and the columns freed pay for splitting TOKENS and COST
@@ -253,6 +257,7 @@ var eventColumns = []eventColumn{
 	{id: colMethod, width: methodColWidth, defaultOn: true, keep: keepNormal,
 		desc: "protocol operation: model name, MCP or A2A method",
 		cell: func(c cellContext) string { return eventMethod(*c.row.event) },
+		full: func(c cellContext) string { return eventMethodValue(*c.row.event) },
 		// eventMethodValue, not eventMethod: the latter is the former truncated to
 		// methodColWidth, and two long model names sharing a prefix must not tie.
 		sortKey: func(c cellContext) sortValue { return strKey(eventMethodValue(*c.row.event)) }},
@@ -326,6 +331,7 @@ var eventColumns = []eventColumn{
 	{id: colHost, width: 20, defaultOn: true, keep: keepHigh,
 		desc: "host the message was sent to",
 		cell: func(c cellContext) string { return truncStr(c.row.event.Host, c.width) },
+		full: func(c cellContext) string { return c.row.event.Host },
 		// hostOnly, so "api.example.com:443" and "api.example.com" sort together
 		// rather than the port deciding. Full host, not the truncated cell, for the
 		// same reason PLUGIN uses the full name.
@@ -550,6 +556,41 @@ func sizedColumns(cols []eventColumn, widths map[eventColumnID]int) []eventColum
 func layoutColumns(sel map[eventColumnID]bool, widths map[eventColumnID]int,
 	termWidth int) (fitted []eventColumn, dropped int) {
 	return fitColumns(sizedColumns(selectedColumns(sel), widths), termWidth)
+}
+
+// whole is c's cell with unlimited room.
+func (c eventColumn) whole(cc cellContext) string {
+	if c.full != nil {
+		return c.full(cc)
+	}
+	return c.cell(cc)
+}
+
+// droppedColumns is the selected columns the terminal had no room for: in selected and not
+// in shown.
+func droppedColumns(selected, shown []eventColumn) []eventColumn {
+	var out []eventColumn
+	for _, c := range selected {
+		if !slices.ContainsFunc(shown, func(s eventColumn) bool { return s.id == c.id }) {
+			out = append(out, c)
+		}
+	}
+	return out
+}
+
+// eventSearchRow is one row's full text: each shown column that cuts its cell, in full, and
+// each dropped column's whole cell.
+func eventSearchRow(shown, dropped []eventColumn, cc cellContext) table.SearchRow {
+	sr := table.SearchRow{Cells: make([]string, len(shown))}
+	for i, c := range shown {
+		if c.full != nil {
+			sr.Cells[i] = c.full(cc)
+		}
+	}
+	for _, c := range dropped {
+		sr.Dropped = append(sr.Dropped, c.whole(cc))
+	}
+	return sr
 }
 
 // cellPadding is what bubbles adds to every cell's declared width.

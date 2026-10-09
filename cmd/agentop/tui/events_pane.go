@@ -176,6 +176,12 @@ func (m *model) rebuildEventsTable() {
 			}
 		}
 	}
+	q := m.searchQuery(paneEvents)
+	var full []table.SearchRow
+	var droppedCols []eventColumn
+	if q != "" {
+		droppedCols = droppedColumns(selectedColumns(m.eventColumns), cols)
+	}
 	for j, cc := range ctxs {
 		// hideInactive (the `s` toggle) is off by default — every message is
 		// shown, including passthrough/skip-only ones, per "I should see all
@@ -215,6 +221,9 @@ func (m *model) rebuildEventsTable() {
 		}
 		rows = append(rows, row)
 		m.visibleRows = append(m.visibleRows, cc.row)
+		if q != "" {
+			full = append(full, eventSearchRow(cols, droppedCols, cc))
+		}
 		// Keyed from the SAME cellContext that just rendered the row, so the value
 		// sorted on and the value displayed cannot come apart. cc.width stays zero
 		// here — render takes its own copy — and no sortKey reads it.
@@ -228,17 +237,7 @@ func (m *model) rebuildEventsTable() {
 	// time we get here — so reordering the finished rows leaves the exchange
 	// numbering and the paired figures exactly as they were.
 	if sortCol != nil {
-		sortEventRows(rows, m.visibleRows, keys, m.sortDesc)
-	}
-	// The search's matches, read off the rows in their final order so the marks land on the
-	// rows they describe however the sort permuted them.
-	var matches []int
-	if q := m.searchQuery(paneEvents); q != "" {
-		for i, r := range m.visibleRows {
-			if matchEventRow(r, q) {
-				matches = append(matches, i)
-			}
-		}
+		sortEventRows(rows, m.visibleRows, full, keys, m.sortDesc)
 	}
 	// Columns are re-set only when they actually differ, and in an order that keeps
 	// every intermediate state renderable.
@@ -270,8 +269,7 @@ func (m *model) rebuildEventsTable() {
 		m.eventsTbl.SetColumns(newCols)
 		m.eventsTbl.SetRows(rows)
 	}
-	m.eventsTbl.SetMarked(matches)
-	m.eventMatches = matches
+	m.eventsTbl.SetSearch(q, full)
 
 	// Auto-follow: if user was at the bottom, stay at the bottom. Otherwise
 	// preserve position so reading isn't disturbed by new events.
@@ -382,7 +380,7 @@ func (m *model) rebuildEventsTable() {
 // Sorts an index permutation rather than swapping three slices in the comparator,
 // so each row's key travels with it without the comparator having to reorder keys
 // as it reads them.
-func sortEventRows(rows []table.Row, visible []eventRow, keys []sortValue, desc bool) {
+func sortEventRows(rows []table.Row, visible []eventRow, full []table.SearchRow, keys []sortValue, desc bool) {
 	if len(rows) != len(keys) || len(rows) != len(visible) {
 		// Defensive: a length mismatch means the loop above stopped appending to one
 		// of the three in step. Sorting on a short key slice would panic; leaving the
@@ -409,6 +407,15 @@ func sortEventRows(rows []table.Row, visible []eventRow, keys []sortValue, desc 
 	}
 	copy(rows, outRows)
 	copy(visible, outVis)
+	// The search's full values move with their rows, or they would describe the rows that
+	// now sit where theirs were.
+	if len(full) == len(rows) {
+		outFull := make([]table.SearchRow, len(full))
+		for newPos, oldPos := range idx {
+			outFull[newPos] = full[oldPos]
+		}
+		copy(full, outFull)
+	}
 }
 
 // selectedEventOn returns the event at an arbitrary row of the rows just built, or
@@ -1045,94 +1052,6 @@ func computeEventPairs(rows []eventRow) (map[*pipeline.SessionEvent]int, map[int
 		ids[e] = next
 	}
 	return ids, partner
-}
-
-// matchEventRow does a case-insensitive substring match across every string
-// field the operator might reasonably search for — the event's host/method,
-// the fields of every plugin invocation on it, and its protocol extensions.
-// A folded tunnel's fields are searched too, so searching for a bridged
-// origin's host still finds the collapsed row. Two prefix shortcuts:
-//
-//   - `deny` alone matches a SessionDenied event and any invocation whose
-//     Action == ActionDeny — the one-word "find the failures" search.
-//   - `plugin:<name>` matches rows whose escape-hatch Plugins map has <name>
-//     as a key.
-func matchEventRow(r eventRow, q string) bool {
-	q = strings.ToLower(q)
-
-	if q == "deny" {
-		return eventMatchesDeny(r.event) || (r.tunnel != nil && eventMatchesDeny(r.tunnel))
-	}
-
-	if after, ok := strings.CutPrefix(q, "plugin:"); ok {
-		if _, present := r.event.Plugins[after]; present {
-			return true
-		}
-		if r.tunnel != nil {
-			_, present := r.tunnel.Plugins[after]
-			return present
-		}
-		return false
-	}
-
-	hay := eventHaystack(r.event)
-	if r.tunnel != nil {
-		hay = append(hay, eventHaystack(r.tunnel)...)
-	}
-	for _, s := range hay {
-		if strings.Contains(strings.ToLower(s), q) {
-			return true
-		}
-	}
-	return false
-}
-
-// eventMatchesDeny reports whether e is a deny — either the terminal
-// SessionDenied phase or any invocation with ActionDeny.
-func eventMatchesDeny(e *pipeline.SessionEvent) bool {
-	if e.Phase == pipeline.SessionDenied {
-		return true
-	}
-	for _, iv := range allInvocations(e) {
-		if iv.Action == pipeline.ActionDeny {
-			return true
-		}
-	}
-	return false
-}
-
-// eventHaystack collects every searchable string on an event: host, method,
-// each invocation's plugin/action/reason/path and detail key=values, the
-// caller identity, and protocol-specific content (A2A parts, MCP error, the
-// inference completion / finish reason).
-func eventHaystack(e *pipeline.SessionEvent) []string {
-	hay := []string{e.Host, eventMethodValue(*e)}
-	for _, iv := range allInvocations(e) {
-		hay = append(hay, iv.Plugin, string(iv.Action), iv.Reason, iv.Path)
-		// Plugin-specific diagnostic context — iterate keys + values so
-		// search text matches on e.g. "target_audience" / the target
-		// audience value without the UI having to know which keys each
-		// plugin writes.
-		for k, v := range iv.Details {
-			hay = append(hay, k, v)
-		}
-	}
-	if e.Identity != nil {
-		hay = append(hay, e.Identity.Subject, e.Identity.ClientID)
-	}
-	if e.A2A != nil {
-		hay = append(hay, e.A2A.SessionID, e.A2A.MessageID, e.A2A.Role)
-		for _, p := range e.A2A.Parts {
-			hay = append(hay, p.Content)
-		}
-	}
-	if e.MCP != nil && e.MCP.Err != nil {
-		hay = append(hay, e.MCP.Err.Message)
-	}
-	if e.Inference != nil {
-		hay = append(hay, e.Inference.Completion, e.Inference.FinishReason)
-	}
-	return hay
 }
 
 // identityBannerStyle renders the small bordered box above the events

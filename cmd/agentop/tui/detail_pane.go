@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"strings"
 
-	"github.com/charmbracelet/x/ansi"
 	"github.com/rossoctl/cortex/core/cost/event"
 	"github.com/rossoctl/cortex/core/cost/usage"
 	"github.com/rossoctl/cortex/core/pipeline"
@@ -18,7 +17,7 @@ import (
 // resetScroll follows showPluginDetail and syncHelpViewport: true when the pane is
 // being OPENED, false when layout() re-renders what it already shows. The re-render
 // exists to re-wrap the JSON for a new width, and it used to GotoTop as well — so
-// resizing the terminal, or merely pressing "/" to open the filter, threw a reader
+// resizing the terminal, or merely pressing "/" to search, threw a reader
 // back to the top of a long event.
 //
 // Marshal with SessionEvent.MarshalJSON first (readable wire form — string
@@ -40,28 +39,29 @@ func (m *model) showDetail(r eventRow, resetScroll bool) {
 	e := r.event
 	m.detailRow = r
 	m.detailEvent = e
-	data, err := json.Marshal(e)
-	if err != nil {
-		m.detailVp.SetContent("error marshaling event: " + err.Error())
-		return
+	var lines []string
+	if data, err := json.Marshal(e); err != nil {
+		lines = []string{"error marshaling event: " + err.Error()}
+	} else {
+		// The header blocks first, each followed by a blank line, in the order they have
+		// always had: TLS, what plugins rewrote, then the folded tunnel. Lines like the JSON
+		// below them, so a search reads them too.
+		var tunnel string
+		if r.tunnel != nil {
+			tunnel = tunnelHeader(r.tunnel)
+		}
+		for _, h := range []string{tlsHeader(e.TLS), rewriteHeader(e), tunnel} {
+			if h != "" {
+				lines = append(lines, strings.Split(h, "\n")...)
+				lines = append(lines, "")
+			}
+		}
+		lines = append(lines, strings.Split(ColorizeJSONBytes(filterForDetail(data, e.Phase)), "\n")...)
 	}
-	content := ColorizeJSONBytes(filterForDetail(data, e.Phase))
-	if w := m.detailVp.Width; w > 0 {
-		// Word-wrap on spaces/hyphens, fall back to hard break for long tokens.
-		// ansi.Wrap preserves the JSON colorizer's escape codes so wrapped
-		// content keeps its highlighting.
-		content = ansi.Wrap(content, w, " -")
-	}
-	if r.tunnel != nil {
-		content = tunnelHeader(r.tunnel) + "\n\n" + content
-	}
-	if header := rewriteHeader(e); header != "" {
-		content = header + "\n\n" + content
-	}
-	if header := tlsHeader(e.TLS); header != "" {
-		content = header + "\n\n" + content
-	}
-	m.detailVp.SetContent(content)
+	// Wrapped to the viewport, on spaces and hyphens with a hard break for a long token, by
+	// the document: it has to match before the wrap and place each match after it.
+	m.detailDoc.setLines(lines, m.detailVp.Width)
+	m.detailVp.SetContent(m.detailDoc.render(m.searchQuery(paneDetail)))
 	if resetScroll {
 		m.detailVp.GotoTop()
 		return

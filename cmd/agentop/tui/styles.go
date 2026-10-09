@@ -45,6 +45,14 @@ var (
 	styleMuted  = lipgloss.NewStyle().Foreground(colorMuted)
 	styleBorder = lipgloss.NewStyle().Border(lipgloss.RoundedBorder()).BorderForeground(colorMuted)
 
+	// styleMatch and styleCurrentMatch draw the characters a search matched: a background,
+	// so a match reads the same whatever ink the text under it has (the JSON colorizer's,
+	// a table cell's), and colorOnSeries on it for the reason that colour exists — the warn
+	// and accent grounds are mid-tone in both themes. The current one, the row or line `n`
+	// moved to, is the accent, so it stands out from the rest.
+	styleMatch        = lipgloss.NewStyle().Foreground(colorOnSeries).Background(colorWarn)
+	styleCurrentMatch = lipgloss.NewStyle().Foreground(colorOnSeries).Background(colorAccent).Bold(true)
+
 	// PER-PROTOCOL CELL COLOURING USED TO LIVE HERE — styleProtoA2A / MCP / Inference / Blocked
 	// and a protoStyle() dispatcher — and is deleted rather than kept for later. It had no
 	// callers anywhere outside this file (events_pane.go records the change that removed the
@@ -92,10 +100,12 @@ func tableStyles() table.Styles {
 		BorderForeground(colorMuted).
 		Bold(true)
 	s.Selected = lipgloss.NewStyle().Bold(true).Background(colorSelectedBg)
-	// A search's matches. Ink rather than a background, so a match never reads as the cursor,
-	// and the warn colour the footer's search status is drawn in, so the two read as one thing.
-	// Recolouring ink is safe for the context gauge, unlike inverting it: the gauge's value is
-	// which cells are filled, and a colour change leaves that where it was.
+	// A search's matched characters, and a row whose only match is somewhere no cell shows.
+	// The mark is ink rather than a background, so a marked row never reads as the cursor,
+	// in the warn colour the footer's search status is drawn in. Recolouring ink is safe for
+	// the context gauge, unlike inverting it: the gauge's value is which cells are filled.
+	s.Match = styleMatch
+	s.CurrentMatch = styleCurrentMatch
 	s.Marked = lipgloss.NewStyle().Foreground(colorWarn)
 	return s
 }

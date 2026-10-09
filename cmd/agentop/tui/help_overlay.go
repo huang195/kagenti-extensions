@@ -7,6 +7,7 @@ import (
 
 	"github.com/charmbracelet/bubbles/viewport"
 	"github.com/charmbracelet/lipgloss"
+	"github.com/charmbracelet/x/ansi"
 )
 
 // keyBinding is one row in the help overlay: the key(s) and what they do.
@@ -65,6 +66,8 @@ var anywhereKeys = keyGroup{
 	title: anywhereTitle,
 	bindings: []keyBinding{
 		{"?", "this help"},
+		{"/", "search what this pane shows (enter keeps, esc cancels)"},
+		{"n / N", "next / previous match"},
 		{"p", "pause / resume the stream"},
 		{"q · ctrl+c", "quit"},
 	},
@@ -299,8 +302,6 @@ var paneKeys = map[paneID]keyGroup{
 		bindings: []keyBinding{
 			{"↑↓ / jk", "navigate"},
 			{"↵ / → / l", "drill into session"},
-			{"/", "search SESSION, TITLE and AGENT (enter keeps, esc cancels)"},
-			{"n / N", "next / previous match"},
 			{"X", "clear all history, in memory and on disk (asks first; the cost ledger is kept)"},
 			{"esc", "back to the agents picker, else pods picker"},
 		},
@@ -311,8 +312,6 @@ var paneKeys = map[paneID]keyGroup{
 		bindings: []keyBinding{
 			{"↑↓ / jk", "navigate"},
 			{"↵ / → / l", "event detail"},
-			{"/", "search (deny, plugin:<name>, or any text); enter keeps, esc cancels"},
-			{"n / N", "next / previous match"},
 			{"s", "toggle passthru/skip rows"},
 			{"c", "column picker (checkboxes + descriptions)"},
 			{"c then s", "sort by a column: desc → asc → chronological"},
@@ -782,7 +781,7 @@ const helpPadX = 2
 //
 // Returns the panel only — placement over the underlying view is the
 // caller's job (see overlayCenter).
-func renderHelpOverlay(vp viewport.Model, width, height int) string {
+func renderHelpOverlay(vp viewport.Model, width, height int, prompt, status string) string {
 	// Scroll affordance: only shown when the body doesn't fit, so a
 	// terminal tall enough for the whole reference stays uncluttered.
 	// Degrades to the bare close hint when the viewport is too narrow for
@@ -796,8 +795,20 @@ func renderHelpOverlay(vp viewport.Model, width, height int) string {
 			hint = annotated
 		}
 	}
+	// The overlay is drawn over the footer, so its search is drawn here: the prompt in place
+	// of the hint while it is open, else the search's status ahead of the hint.
+	switch {
+	case prompt != "":
+		hint = prompt
+	case status != "":
+		hint = status + "  ·  " + hint
+	}
 	if lipgloss.Width(hint) > vp.Width {
-		hint = truncToWidth(hint, vp.Width)
+		if prompt != "" {
+			hint = ansi.Truncate(hint, vp.Width, "")
+		} else {
+			hint = truncToWidth(hint, vp.Width)
+		}
 	}
 
 	inner := vp.View() + "\n" + styleHint.Render(hint)

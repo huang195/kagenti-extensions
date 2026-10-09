@@ -131,7 +131,7 @@ func TestSessionRowIDs_MatchTheRowsOneForOne(t *testing.T) {
 					width, search, len(m.sessionRowIDs), len(rows))
 			}
 			marked := map[int]bool{}
-			for _, i := range m.sessionMatches {
+			for _, i := range m.sessionsTbl.Matches() {
 				marked[i] = true
 			}
 			for i, id := range m.sessionRowIDs {

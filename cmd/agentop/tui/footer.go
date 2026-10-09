@@ -80,7 +80,7 @@ func (m *model) footerView() string {
 	// there are none — see searchStatus. Here rather than in the hint line because it is
 	// state, not a keybinding — the same reason [paused] sits above. Only the sessions and
 	// events panes search, and each its own, so no other pane shows one.
-	if s := m.searchStatus(); s != "" {
+	if s := m.searchStatus(m.pane); s != "" {
 		status.WriteString(styleWarn.Render("   " + s))
 	}
 	if m.pane == paneSessions && m.agentScope != "" && m.sessionsScope() == "" {

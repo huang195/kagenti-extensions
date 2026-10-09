@@ -8,213 +8,190 @@ import (
 	tea "github.com/charmbracelet/bubbletea"
 )
 
-// `/` SEARCHES, AS IN A TEXT EDITOR (#1339): every row stays on screen, the matching rows are
-// marked, and the cursor jumps between them. It replaced a filter that hid every row it did not
-// match. That filter was saved to the config file, so one forgotten in an earlier run made
-// sessions look missing in the next; and the sessions and events panes shared it, so a filter
-// typed on one matched nothing on the other it followed the operator into. A search is neither
-// saved nor shared: the sessions and events panes each keep their own, and nothing else
-// searches. The events pane's is for one session's events, so opening another session's drops
-// it (see the drill-in in keys.go); backing out and re-entering the same session keeps it.
+// `/` SEARCHES WHAT A PANE SHOWS, ON EVERY PANE (#1339, and the report that followed it): every
+// row stays on screen, the matched characters are highlighted, and the cursor jumps between
+// them. It replaced a filter that hid every row it did not match, and that filter's matching
+// outlived it here for a while: each searchable pane had its own matcher, written apart from
+// the code that drew the pane, over a hand-kept list of fields. The events pane's read hidden
+// fields and not PHASE, so `/req` marked rows for a "request" buried in a plugin's details and
+// skipped the rows whose PHASE said req. Every other pane had no matcher, and so no search.
 //
-// What a row matches is unchanged from the filter: sessionMatchesSearch on the sessions pane,
-// matchEventRow on the events pane — including its `deny` and `plugin:<name>` forms.
+// So a pane no longer says what matches; it says what it draws. Tables hand the table copy
+// each row's full cell values, built by the same cell functions that draw them (see
+// rowBuilder), and the table matches and highlights. Text views and usage hand a searchDoc
+// their lines. This file is what is common: the prompt, each target's query, where `/` was
+// pressed, Esc, n and N, and the footer's count. It reaches a pane only through
+// searchSurface.
+//
+// A search is neither saved nor shared. Each pane keeps its own, as does the help overlay
+// (targetHelp). The events pane's and message detail's are about one session, so opening
+// another session's drops both (see the drill-in in keys.go); message detail keeps its query
+// from one message to the next, so the operator can look for one string message by message.
+
+// targetHelp is the help overlay's search, kept beside the panes'. Outside 0..lastPaneID, as
+// paneNone is, so nothing that walks the panes takes it for one.
+const targetHelp paneID = -2
 
 // newSearchInput is the `/` prompt both constructors build.
 func newSearchInput() textinput.Model {
 	ti := textinput.New()
 	ti.Prompt = "/ "
+	ti.Placeholder = "search…"
 	return ti
 }
 
-// searchable reports whether pane p has a search: the two panes whose rows the match functions
-// know how to read.
-func searchable(p paneID) bool { return p == paneSessions || p == paneEvents }
-
-// searchPlaceholder names what `/` matches on pane p (#867).
-func searchPlaceholder(p paneID) string {
-	switch p {
-	case paneSessions:
-		return "search SESSION, TITLE, or AGENT…"
-	case paneEvents:
-		return "search PLUGIN, METHOD, HOST, etc.…"
-	}
-	return "search…"
-}
-
-// searchSpot is a row by identity — a session id, or an event's key — with the row number it
-// had, for when that identity is gone. Rows move under a held position: the sessions list
-// re-sorts every second and the events pane evicts its oldest rows, so a bare row number would
-// put Esc somewhere other than where `/` was pressed.
+// searchSpot is a place in a pane: a row number, or a scroll offset, plus the identity a row
+// had where rows move under a held position. The sessions list re-sorts every second and the
+// events pane evicts its oldest rows, so a bare row number would put Esc somewhere other than
+// where `/` was pressed.
 //
-// tail is an events cursor that was following new events: on the newest row of a chronological
-// table, the predicate rebuildEventsTable tail-follows on. That cursor's place is "the newest
-// row" rather than the event that was newest at `/` — events keep streaming while the prompt
-// is open, and putting it back on that event would stop it following them.
+// tail is an events cursor that was following new events: on the newest row of a
+// chronological table, the predicate rebuildEventsTable tail-follows on. That cursor's place
+// is "the newest row" rather than the event that was newest at `/` — events keep streaming
+// while the prompt is open, and putting it back on that event would stop it following them.
 type searchSpot struct {
-	row   int
-	sess  string
-	event eventKey
-	tail  bool
+	row     int
+	sess    string
+	event   eventKey
+	tail    bool
+	yOffset int
 }
 
-// searchQuery is the query pane p's rows are matched against: what is in the prompt while it is
-// open on p, which is what makes the search incremental, and the committed one otherwise.
-func (m *model) searchQuery(p paneID) string {
-	if m.searching && p == m.searchPane {
+// searchSurface is how the search reaches a pane. A line is a table row, or a drawn line of
+// a text view; row numbers in, row numbers out.
+type searchSurface interface {
+	// matchLines is the lines the last redraw matched, ascending.
+	matchLines() []int
+	// spot is where the pane is now: its cursor, or its current match and scroll offset.
+	spot() searchSpot
+	// lineOf is the line a spot is on after a redraw.
+	lineOf(searchSpot) int
+	// reveal puts the cursor on line i, or scrolls a text view to it.
+	reveal(i int)
+	// restore puts the pane back where a spot was.
+	restore(searchSpot)
+	// redraw rebuilds the pane against its current query.
+	redraw()
+}
+
+// searchTarget is what `/`, n and N act on: the help overlay while it is up, else the pane.
+func (m *model) searchTarget() paneID {
+	if m.helpVisible {
+		return targetHelp
+	}
+	return m.pane
+}
+
+// searchQuery is the query target t is matched against: what is in the prompt while it is
+// open on t, which is what makes the search incremental, and the committed one otherwise.
+func (m *model) searchQuery(t paneID) string {
+	if m.searching && t == m.searchPane {
 		return m.searchInput.Value()
 	}
-	return m.search[p]
+	return m.search[t]
 }
 
-// searchMatches is pane p's matching rows, ascending, as the last rebuild found them.
-func (m *model) searchMatches(p paneID) []int {
-	switch p {
-	case paneSessions:
-		return m.sessionMatches
-	case paneEvents:
-		return m.eventMatches
+// openSearch is `/` on target t. The prompt opens empty, and where t is now is remembered:
+// it is the place typing searches from, and the place Esc returns to.
+func (m *model) openSearch(t paneID) {
+	s := m.surface(t)
+	if s == nil {
+		return
 	}
-	return nil
-}
-
-// searchCursor is where pane p's cursor is.
-func (m *model) searchCursor(p paneID) searchSpot {
-	switch p {
-	case paneSessions:
-		c := m.sessionsTbl.Cursor()
-		s := searchSpot{row: c}
-		if c >= 0 && c < len(m.sessionRowIDs) {
-			s.sess = m.sessionRowIDs[c]
-		}
-		return s
-	case paneEvents:
-		c := m.eventsTbl.Cursor()
-		return searchSpot{
-			row: c, event: keyOf(m.selectedEvent()),
-			tail: m.sortCol == "" && c >= len(m.eventsTbl.Rows())-1,
-		}
-	}
-	return searchSpot{}
-}
-
-// searchRow is the row s is on now: its identity's row if that is still listed, and the row
-// number it had otherwise. setCursorVisible clamps a row number the rows have shrunk past.
-func (m *model) searchRow(p paneID, s searchSpot) int {
-	switch p {
-	case paneSessions:
-		if s.sess != "" {
-			if i := slices.Index(m.sessionRowIDs, s.sess); i >= 0 {
-				return i
-			}
-		}
-	case paneEvents:
-		if s.event != (eventKey{}) {
-			if i := findByKey(m.visibleRows, s.event); i >= 0 {
-				return i
-			}
-		}
-	}
-	return s.row
-}
-
-// searchHome is where the cursor goes when the search does not place it — Esc, an empty box, a
-// query that matches nothing: the row s is on, or the newest row when s was following new
-// events, so that it goes on following them.
-func (m *model) searchHome(p paneID, s searchSpot) int {
-	if s.tail {
-		return len(m.visibleRows) - 1
-	}
-	return m.searchRow(p, s)
-}
-
-// moveSearchCursor puts pane p's cursor on row i. On the events pane the event is pinned as well,
-// as every other cursor move there does, so the next rebuild keeps the cursor on it — through an
-// eviction or a re-sort — instead of on its old row number.
-func (m *model) moveSearchCursor(p paneID, i int) {
-	switch p {
-	case paneSessions:
-		setCursorVisible(&m.sessionsTbl, i)
-	case paneEvents:
-		setCursorVisible(&m.eventsTbl, i)
-		m.selectedEventKey = keyOf(m.selectedEvent())
-	}
-}
-
-// rebuildSearched rebuilds pane p's table, which is what re-matches and re-marks its rows.
-func (m *model) rebuildSearched(p paneID) {
-	switch p {
-	case paneSessions:
-		m.rebuildSessionsTable()
-	case paneEvents:
-		m.rebuildEventsTable()
-	}
-}
-
-// openSearch is `/`. The prompt opens empty, and the row the cursor is on is remembered: it is
-// the row typing searches from, and the row Esc returns to.
-func (m *model) openSearch() {
 	m.searching = true
-	m.searchPane = m.pane
-	m.searchOrigin = m.searchCursor(m.pane)
+	m.searchPane = t
+	m.searchOrigin = s.spot()
 	m.searchInput.SetValue("")
-	m.searchInput.Placeholder = searchPlaceholder(m.pane)
 	m.searchInput.Focus()
-	// The prompt takes a body line, so the height budget changes — see layout(). layout also
-	// rebuilds both tables, which clears the committed search's marks while the box is empty.
-	m.layout()
+	if t == targetHelp {
+		// Drawn on the overlay's bottom line, so sized to it; layout() puts the width back
+		// for a pane's prompt the next time one opens.
+		m.searchInput.Width = max(m.helpVp.Width-4, 1)
+	}
+	m.searchLayout()
 }
 
-// closeSearch closes the prompt. layout gives the body back the prompt's line and rebuilds both
-// tables, so the rows are marked for the committed search again.
+// redrawSearches redraws every target against its query, for a change to more than one of
+// them at once.
+func (m *model) redrawSearches() {
+	for t := paneID(0); t <= lastPaneID; t++ {
+		if s := m.surface(t); s != nil {
+			s.redraw()
+		}
+	}
+	if s := m.surface(targetHelp); s != nil {
+		s.redraw()
+	}
+}
+
+// closeSearch closes the prompt; the target is redrawn for the committed search.
 func (m *model) closeSearch() {
 	m.searching = false
 	m.searchInput.Blur()
-	m.layout()
+	m.searchLayout()
 }
 
-// searchKey handles a key while the prompt is open. Enter keeps the cursor where the search put
-// it and commits the query; an empty one clears the search. Esc puts back the cursor and the
-// search as they were at `/`. Anything else edits the query, and the cursor jumps to the first
-// match at or after the row `/` was pressed on, wrapping past the last row — or back to that
-// row when nothing matches. "Back" is searchHome, so a cursor that was following new events
-// is still following them.
+// searchLayout lays the screen out again for the prompt opening or closing — it takes a body
+// line — and redraws the target, so its highlights are for the query now in force. The help
+// overlay draws its prompt on its own bottom line, so the body does not change for it.
+func (m *model) searchLayout() {
+	if m.searchPane != targetHelp {
+		m.layout()
+	}
+	if s := m.surface(m.searchPane); s != nil {
+		s.redraw()
+	}
+}
+
+// searchKey handles a key while the prompt is open. Enter commits the query, and an empty one
+// clears the search. Esc puts the place and the search back as they were at `/`. Anything
+// else edits the query, and the target moves to the first match at or after where `/` was
+// pressed, wrapping past the end — or back there when nothing matches.
 func (m *model) searchKey(msg tea.KeyMsg) tea.Cmd {
-	p := m.searchPane
+	t := m.searchPane
 	switch msg.String() {
 	case "enter":
 		if m.search == nil {
-			m.search = make(map[paneID]string, 2)
+			m.search = make(map[paneID]string)
 		}
-		m.search[p] = m.searchInput.Value()
+		m.search[t] = m.searchInput.Value()
 		m.closeSearch()
 		return nil
 	case "esc":
 		m.closeSearch()
-		m.moveSearchCursor(p, m.searchHome(p, m.searchOrigin))
+		if s := m.surface(t); s != nil {
+			s.restore(m.searchOrigin)
+		}
 		return nil
 	}
 	var cmd tea.Cmd
 	m.searchInput, cmd = m.searchInput.Update(msg)
-	m.rebuildSearched(p)
-	target := m.searchHome(p, m.searchOrigin)
+	s := m.surface(t)
+	if s == nil {
+		return cmd
+	}
+	s.redraw()
 	if m.searchInput.Value() != "" {
-		// Counted from the event `/` was pressed on even when following: what streamed in since
-		// is after it, and is searched first.
-		if i, ok := nextMatch(m.searchMatches(p), m.searchRow(p, m.searchOrigin), true, true); ok {
-			target = i
+		// Counted from where `/` was pressed even when following: what streamed in since is
+		// after it, and is searched first.
+		if i, ok := nextMatch(s.matchLines(), s.lineOf(m.searchOrigin), true, true); ok {
+			s.reveal(i)
+			return cmd
 		}
 	}
-	m.moveSearchCursor(p, target)
+	s.restore(m.searchOrigin)
 	return cmd
 }
 
-// searchStep is n (forward) and N: the next match past the cursor, wrapping. Nothing happens
-// with no match, which includes having no search: an empty query matches no row.
-func (m *model) searchStep(forward bool) {
-	p := m.pane
-	if i, ok := nextMatch(m.searchMatches(p), m.searchCursor(p).row, forward, false); ok {
-		m.moveSearchCursor(p, i)
+// searchStep is n (forward) and N on target t: the next match past where it is, wrapping.
+// Nothing happens with no match, which includes having no search.
+func (m *model) searchStep(t paneID, forward bool) {
+	s := m.surface(t)
+	if s == nil {
+		return
+	}
+	if i, ok := nextMatch(s.matchLines(), s.spot().row, forward, false); ok {
+		s.reveal(i)
 	}
 }
 
@@ -240,24 +217,19 @@ func nextMatch(matches []int, from int, forward, inclusive bool) (int, bool) {
 	return matches[len(matches)-1], true
 }
 
-// searchStatus is the footer's account of the active pane's search: which match the cursor is
-// on, how many there are when it is on none, or that there are none. Live while the prompt is
-// open, so a query that matches nothing says so as it is typed rather than after Enter. Empty
-// without a search.
-func (m *model) searchStatus() string {
-	p := m.pane
-	if !searchable(p) {
+// searchStatus is the account of target t's search: which match it is on, how many there
+// are when it is on none, or that there are none. Live while the prompt is open, so a query
+// that matches nothing says so as it is typed. Empty without a search.
+func (m *model) searchStatus(t paneID) string {
+	s, q := m.surface(t), m.searchQuery(t)
+	if s == nil || q == "" {
 		return ""
 	}
-	q := m.searchQuery(p)
-	if q == "" {
-		return ""
-	}
-	matches := m.searchMatches(p)
+	matches := s.matchLines()
 	if len(matches) == 0 {
 		return fmt.Sprintf("[/%s: no match]", q)
 	}
-	if k, ok := slices.BinarySearch(matches, m.searchCursor(p).row); ok {
+	if k, ok := slices.BinarySearch(matches, s.spot().row); ok {
 		return fmt.Sprintf("[/%s %d/%d]", q, k+1, len(matches))
 	}
 	if len(matches) == 1 {
@@ -266,10 +238,10 @@ func (m *model) searchStatus() string {
 	return fmt.Sprintf("[/%s %d matches]", q, len(matches))
 }
 
-// searchHints is the hint line's `/`, with n/N beside it only while the active pane has a
-// committed search: they do nothing without one, and the line is short of room.
-func (m *model) searchHints() string {
-	if m.search[m.pane] != "" {
+// searchHints is a hint line's `/`, with n/N beside it only while t has a committed search:
+// they do nothing without one, and hint lines are short of room.
+func (m *model) searchHints(t paneID) string {
+	if m.search[t] != "" {
 		return "[/] search  [n/N] next/prev"
 	}
 	return "[/] search"

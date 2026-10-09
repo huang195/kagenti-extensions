@@ -46,7 +46,7 @@ func TestSessionsSearch_MatchesSessionTitleAndAgent(t *testing.T) {
 			t.Errorf("search %q listed %v, want every session %v", tc.search, m.sessionRowIDs, all)
 		}
 		got := []string{}
-		for _, i := range m.sessionMatches {
+		for _, i := range m.sessionsTbl.Matches() {
 			got = append(got, m.sessionRowIDs[i])
 		}
 		if !slices.Equal(got, tc.want) {

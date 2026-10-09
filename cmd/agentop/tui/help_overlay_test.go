@@ -155,7 +155,7 @@ func TestHelpOverlayTinyTerminal(t *testing.T) {
 	for _, dim := range [][2]int{{0, 0}, {1, 1}, {20, 5}, {40, 10}} {
 		m := &model{pane: paneSessions, width: dim[0], height: dim[1], helpVp: viewport.New(0, 0)}
 		m.syncHelpViewport(true)
-		out := renderHelpOverlay(m.helpVp, dim[0], dim[1])
+		out := renderHelpOverlay(m.helpVp, dim[0], dim[1], "", "")
 		if out == "" {
 			t.Errorf("renderHelpOverlay(%d,%d) returned empty", dim[0], dim[1])
 		}

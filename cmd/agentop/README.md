@@ -1379,8 +1379,8 @@ Layered on top of all of them:
 | `Enter` / `→` / `l` | sessions, events | drill into selection |
 | `Esc` / `←` / `h` | detail, events | back out |
 | `Esc` | sessions | back to the agents picker when the list was reached by picking an agent there; otherwise (picker mode) tear down port-forward and back to pods. Sessions and the agents picker above it are the only panes that tear down — every key-opened surface returns to its caller instead |
-| `/` | sessions, events | search, as in a text editor: every row stays, the matching rows are highlighted, and the cursor jumps to the first match at or after where you pressed `/`, wrapping past the end, as you type. Case-insensitive substring of SESSION, TITLE or AGENT on sessions; on events, of the host, method, plugin fields, identity, A2A text, MCP errors and completion text, plus `deny` (denied events) and `plugin:<name>`. `Enter` keeps the cursor on the match; `Esc` puts the cursor and the previous search back; `Enter` on an empty box clears the search. Each pane keeps its own search, the events pane's only while you stay with one session, and none is saved |
-| `n` / `N` | sessions, events | next / previous match of the search, wrapping at both ends |
+| `/` | any pane, and the key help | search what the pane shows, as in a text editor: every row stays, the matched characters are highlighted, and the cursor (or, in a text view, the view) jumps to the first match at or after where you pressed `/`, wrapping past the end, as you type. Case-insensitive substring of the text the pane displays: a table's columns that are turned on, at full width (a value cut to `…` matches in full, and so does a column the terminal had no room for); a message's or plugin's detail line by line, before it is wrapped; the key help's and the usage chart's lines as drawn. `deny` finds denied events because ACTION shows it. `Enter` keeps the place; `Esc` puts the place and the previous search back; `Enter` on an empty box clears the search. Each pane keeps its own search; the events pane's and a message's detail's last while you stay with one session (the detail's carries from message to message), and none is saved |
+| `n` / `N` | any pane with a search, and the key help | next / previous match, wrapping at both ends; in a text view an off-screen match is scrolled to a third of the way down |
 | `X` | sessions | clear all history: every session this Cortex holds, in memory and on disk. Asks first, with the count and the size on disk; `y` erases, `n`/`esc` keeps. The cost ledger is kept. Refused — with the proxy's reason — anywhere but a loopback-only laptop install. Not in the footer, like `A`: a destructive key should not be advertised on the always-visible line |
 | `s` | events | toggle skip-row visibility (default: hidden; the events footer shows the hidden count) |
 | `c` | events | open the column picker (`↑↓`/`jk` move, `space`/`x` toggle, `s` sort, `r` reset, `Esc`/`Enter`/`c` close); the selection and sort are saved on close |
@@ -1540,7 +1540,8 @@ pane's view in `~/.cortex/agentop-config.yaml`. Columns and the sort are saved w
 column picker closes with `Esc`/`Enter`/`c` (`q` quits without saving). There is no
 explicit save step.
 
-A `/` search is not saved: it lasts until you clear it or leave the connection. Older
+A `/` search is not saved: it lasts until you clear it or leave the connection — except on
+the namespaces and pods pickers and the key help, whose searches last until agentop exits. Older
 agentops filtered with `/` and saved the filter as `filter:`; this one ignores that key
 and drops it the next time it saves.
 
@@ -1637,14 +1638,13 @@ were reading instead.
 
 The events table renders no message body, so it does not ask for one. Each fetch
 sends `?view=summary`, which drops the conversation payloads and keeps everything
-the table shows **or its search matches** — measured at ~163x smaller, and the
+the table shows — measured at ~163x smaller, and the
 difference between a session that opens in milliseconds and one that takes seconds.
 
-The search is the part worth spelling out, because it is easy to assume otherwise:
-`/some text` still matches completion and A2A message text, and `plugin:<name>`
-still works, because those fields are searched and so are kept. Dropping them would
-have been ~299x instead of ~163x — both about a megabyte for a 1000-event session,
-so the search is worth far more than the difference.
+The summary keeps completion and A2A message text, which the table does not show,
+because the events search used to match them. It no longer does: `/` matches what a
+pane displays, and a message's text is searched in its detail, which fetches the
+whole event. Dropping those fields as well would be ~299x instead of ~163x.
 
 The consequence is worth knowing: the first `↵` on a row fetches that one event in
 full from `/v1/sessions/{id}/events/{seq}`. The detail pane renders the summary

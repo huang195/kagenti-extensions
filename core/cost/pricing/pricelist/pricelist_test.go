@@ -1,0 +1,218 @@
+package pricelist
+
+import (
+	"context"
+	"net/http"
+	"net/http/httptest"
+	"os"
+	"path/filepath"
+	"strings"
+	"sync"
+	"testing"
+	"time"
+
+	"github.com/rossoctl/cortex/core/cost/pricing"
+)
+
+// priceMap is LiteLLM's shape in miniature: a non-model row, a first-party Anthropic model
+// and the same model through Bedrock, which carries its own rates and must not be read.
+const priceMap = `{
+  "sample_spec": {"input_cost_per_token": 0},
+  "claude-opus-5-5": {"litellm_provider": "anthropic", "input_cost_per_token": 4e-06,
+    "cache_creation_input_token_cost": 5e-06, "cache_read_input_token_cost": 2e-07,
+    "output_cost_per_token": 2e-05},
+  "us.anthropic.claude-opus-5-5": {"litellm_provider": "bedrock_converse",
+    "input_cost_per_token": 4.4e-06, "output_cost_per_token": 2.2e-05}
+}`
+
+var fetchTime = time.Date(2026, 10, 8, 21, 0, 0, 0, time.UTC)
+
+// server serves body under etag and answers 304 to a request carrying it.
+type server struct {
+	mu    sync.Mutex
+	body  string
+	etag  string
+	code  int
+	calls int
+	sent  []string // If-None-Match of each request
+}
+
+func (s *server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.calls++
+	s.sent = append(s.sent, r.Header.Get("If-None-Match"))
+	if s.code != 0 {
+		w.WriteHeader(s.code)
+		return
+	}
+	if s.etag != "" && r.Header.Get("If-None-Match") == s.etag {
+		w.WriteHeader(http.StatusNotModified)
+		return
+	}
+	w.Header().Set("ETag", s.etag)
+	_, _ = w.Write([]byte(s.body))
+}
+
+func newFetcher(t *testing.T, s *server) (*Fetcher, string) {
+	t.Helper()
+	ts := httptest.NewServer(s)
+	t.Cleanup(ts.Close)
+	cache := filepath.Join(t.TempDir(), "price-list.json")
+	return &Fetcher{URL: ts.URL, CacheFile: cache, Now: func() time.Time { return fetchTime }}, cache
+}
+
+func inputPerMillion(t *testing.T, l *pricing.List, model string) float64 {
+	t.Helper()
+	tab, err := pricing.BuildWithList(nil, l)
+	if err != nil {
+		t.Fatalf("BuildWithList: %v", err)
+	}
+	r, p := tab.Resolve("api.anthropic.com", model, 0)
+	if p == pricing.ProvNone {
+		t.Fatalf("%s is not priced by the downloaded list", model)
+	}
+	return r.Base[pricing.TierInput] * 1e6
+}
+
+func TestFetch_ReturnsTheAnthropicRates(t *testing.T) {
+	f, _ := newFetcher(t, &server{body: priceMap, etag: `"v1"`})
+	l, err := f.Fetch(context.Background())
+	if err != nil {
+		t.Fatalf("Fetch: %v", err)
+	}
+	if l == nil {
+		t.Fatal("Fetch returned no list for a 200")
+	}
+	if got := inputPerMillion(t, l, "claude-opus-5-5"); got < 3.999 || got > 4.001 {
+		t.Errorf("input rate = %v, want 4.00 from the first-party row, not Bedrock's 4.40", got)
+	}
+	if !l.FetchedAt.Equal(fetchTime) {
+		t.Errorf("FetchedAt = %v, want %v", l.FetchedAt, fetchTime)
+	}
+}
+
+func TestFetch_AnUnchangedListIsNotDownloadedAgain(t *testing.T) {
+	s := &server{body: priceMap, etag: `"v1"`}
+	f, _ := newFetcher(t, s)
+	if _, err := f.Fetch(context.Background()); err != nil {
+		t.Fatalf("first Fetch: %v", err)
+	}
+	l, err := f.Fetch(context.Background())
+	if err != nil {
+		t.Fatalf("second Fetch: %v", err)
+	}
+	if l != nil {
+		t.Error("second Fetch returned a list, want nil: the server said 304")
+	}
+	if s.sent[1] != `"v1"` {
+		t.Errorf("second request sent If-None-Match %q, want the ETag from the first", s.sent[1])
+	}
+}
+
+func TestFetch_RefusesAListItCannotUse(t *testing.T) {
+	for name, s := range map[string]*server{
+		"server error":     {code: http.StatusInternalServerError},
+		"not json":         {body: "<html>rate limited</html>"},
+		"no anthropic row": {body: `{"gpt-9": {"litellm_provider": "openai", "input_cost_per_token": 1e-06}}`},
+		"too large":        {body: `{"x": "` + strings.Repeat("a", maxBytes) + `"}`},
+	} {
+		t.Run(name, func(t *testing.T) {
+			f, cache := newFetcher(t, s)
+			l, err := f.Fetch(context.Background())
+			if err == nil {
+				t.Fatalf("Fetch returned %v and no error", l)
+			}
+			if _, statErr := os.Stat(cache); !os.IsNotExist(statErr) {
+				t.Errorf("a refused list was written to the cache (stat: %v)", statErr)
+			}
+		})
+	}
+}
+
+func TestCached_ARestartStartsFromTheLastDownload(t *testing.T) {
+	s := &server{body: priceMap, etag: `"v1"`}
+	f, cache := newFetcher(t, s)
+	if _, err := f.Fetch(context.Background()); err != nil {
+		t.Fatalf("Fetch: %v", err)
+	}
+
+	restarted := &Fetcher{URL: f.URL, CacheFile: cache}
+	l, err := restarted.Cached()
+	if err != nil {
+		t.Fatalf("Cached: %v", err)
+	}
+	if l == nil {
+		t.Fatal("Cached returned no list after a successful download")
+	}
+	if got := inputPerMillion(t, l, "claude-opus-5-5"); got < 3.999 || got > 4.001 {
+		t.Errorf("cached input rate = %v, want 4.00", got)
+	}
+	if !l.FetchedAt.Equal(fetchTime) {
+		t.Errorf("cached FetchedAt = %v, want the original download's %v", l.FetchedAt, fetchTime)
+	}
+	// The saved ETag goes out with the first request, so a restart costs a 304, not a download.
+	if l, err := restarted.Fetch(context.Background()); err != nil || l != nil {
+		t.Errorf("Fetch after restart = %v, %v; want nil, nil (304)", l, err)
+	}
+}
+
+func TestCached_NoFileIsNoList(t *testing.T) {
+	f := &Fetcher{CacheFile: filepath.Join(t.TempDir(), "absent.json")}
+	l, err := f.Cached()
+	if l != nil || err != nil {
+		t.Errorf("Cached = %v, %v; want nil, nil", l, err)
+	}
+}
+
+func TestCached_ACorruptFileIsAnError(t *testing.T) {
+	cache := filepath.Join(t.TempDir(), "price-list.json")
+	if err := os.WriteFile(cache, []byte("{not json"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	f := &Fetcher{CacheFile: cache}
+	if l, err := f.Cached(); err == nil {
+		t.Errorf("Cached = %v and no error for a corrupt file", l)
+	}
+}
+
+func TestRun_AppliesTheCacheThenEachChange(t *testing.T) {
+	s := &server{body: priceMap, etag: `"v1"`}
+	f, cache := newFetcher(t, s)
+	if _, err := f.Fetch(context.Background()); err != nil {
+		t.Fatalf("seeding the cache: %v", err)
+	}
+
+	// Upstream changes while the proxy is down.
+	s.mu.Lock()
+	s.body = strings.Replace(priceMap, `"input_cost_per_token": 4e-06`, `"input_cost_per_token": 3e-06`, 1)
+	s.etag = `"v2"`
+	s.mu.Unlock()
+
+	var mu sync.Mutex
+	var applied []float64
+	done := make(chan struct{})
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	restarted := &Fetcher{URL: f.URL, CacheFile: cache, Now: f.Now}
+	go func() {
+		restarted.Run(ctx, time.Hour, func(l *pricing.List) {
+			mu.Lock()
+			defer mu.Unlock()
+			applied = append(applied, inputPerMillion(t, l, "claude-opus-5-5"))
+			if len(applied) == 2 {
+				close(done)
+			}
+		})
+	}()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("Run did not apply the cached list and then the changed one")
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if applied[0] < 3.999 || applied[0] > 4.001 || applied[1] < 2.999 || applied[1] > 3.001 {
+		t.Errorf("applied input rates = %v, want [4 3]: the cached list first, then the change", applied)
+	}
+}

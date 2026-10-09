@@ -6,6 +6,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/rossoctl/cortex/core/cost/pricing"
 )
@@ -124,6 +125,38 @@ func TestRunPricing_TableViewListsRowsAndDiscounts(t *testing.T) {
 		if !strings.Contains(got, want) {
 			t.Errorf("output missing %q", want)
 		}
+	}
+}
+
+// A local install prices from a downloaded list, and the header must say so: naming the
+// shipped commit would send a reader to rates the table no longer holds.
+func TestRunPricing_TableViewSaysWhenTheListWasDownloaded(t *testing.T) {
+	all := [pricing.NumTiers]bool{}
+	for i := range all {
+		all[i] = true
+	}
+	tab, err := pricing.BuildWithList(nil, &pricing.List{
+		Entries: []pricing.Entry{{Host: "*", Model: "claude-opus-5-5", Prov: pricing.ProvBundled,
+			Rates: pricing.Rates{Base: [pricing.NumTiers]float64{pricing.TierInput: 4e-06, pricing.TierCacheWrite: 5e-06,
+				pricing.TierCacheRead: 2e-07, pricing.TierOutput: 2e-05}, Set: all}}},
+		FetchedAt: time.Date(2026, 10, 8, 21, 0, 0, 0, time.UTC),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	srv := httptest.NewServer(pricing.NewRegistry(tab).Handler())
+	t.Cleanup(srv.Close)
+
+	var out, errb bytes.Buffer
+	if code := runPricing([]string{"--stats-url", srv.URL}, &out, &errb); code != 0 {
+		t.Fatalf("exit %d: %s", code, errb.String())
+	}
+	got := out.String()
+	if !strings.Contains(got, "rates from litellm's price list, downloaded 2026-10-08 21:00 UTC") {
+		t.Errorf("output does not say when the list was downloaded:\n%s", got)
+	}
+	if strings.Contains(got, "generated from litellm") {
+		t.Errorf("output names the shipped commit for a downloaded list:\n%s", got)
 	}
 }
 

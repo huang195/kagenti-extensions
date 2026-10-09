@@ -3,6 +3,7 @@ package pricing
 import (
 	"sort"
 	"strings"
+	"time"
 )
 
 // This file exists because a config file cannot answer the question operators
@@ -67,8 +68,10 @@ type MultiplierView struct {
 // Description is the whole table, unresolved.
 type Description struct {
 	// UpstreamCommit is the LiteLLM commit the bundled rates were generated from, so a
-	// figure can be traced to its source without reading the binary.
+	// figure can be traced to its source without reading the binary. Empty when the rates
+	// came from a downloaded list instead; ListFetchedAt says when that was.
 	UpstreamCommit string           `json:"upstreamCommit,omitempty"`
+	ListFetchedAt  time.Time        `json:"listFetchedAt,omitzero"`
 	Rows           []RowView        `json:"rows"`
 	Multipliers    []MultiplierView `json:"multipliers,omitempty"`
 }
@@ -135,6 +138,9 @@ func (t *Table) Describe() Description {
 	out := Description{UpstreamCommit: BundledUpstreamCommit}
 	if t == nil {
 		return out
+	}
+	if !t.listFetchedAt.IsZero() {
+		out.UpstreamCommit, out.ListFetchedAt = "", t.listFetchedAt
 	}
 	for i := range t.rows {
 		r := &t.rows[i]

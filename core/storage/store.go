@@ -7,8 +7,9 @@ import (
 
 // Store provides key-value and hash operations for plugins that need
 // persistent, cross-pod state (budget counters, session data, caches,
-// rate limiting). Implementations live in separate modules to isolate
-// their dependencies.
+// rate limiting). Implementations with dependencies live in separate
+// modules to isolate them, as redis does; filestore, a single process's
+// store saved to one file, has none and lives in core.
 type Store interface {
 	// Get returns the value for a simple key. Returns "" and nil if the key does not exist.
 	Get(ctx context.Context, key string) (string, error)

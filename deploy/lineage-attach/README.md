@@ -162,6 +162,17 @@ it. A Deployment whose env you cannot touch at all has one lever left, the
 image reference: `SELF_ACTIVATE=1 ./build-otel-shim.sh <your-app>:latest` bakes
 the switch in (the image argument is required).
 
+The shim covers every HTTP and gRPC server and client the OpenTelemetry
+contrib catalog instruments (`starlette`, `fastapi`, `aiohttp`, `flask`,
+`django`, `falcon`, `pyramid`, `tornado`, `grpc`; `httpx`, `requests`,
+`aiohttp`, `urllib3`, `urllib`) plus thread hand-off. An instrumentor whose
+library is not installed in the image is inert; one whose library is
+installed activates whether or not the app uses it. `test/propagation/run.sh`
+proves each one against a real exchange, on a laptop, no cluster. Outside the
+list — a hand-built `http.client` connection, raw sockets, `websockets`, a
+CLI `subprocess`, `multiprocessing` workers, non-Python runtimes — the hop
+leaves unstamped and the trace fragments there, visibly.
+
 ### Enrolled workloads: the namespace-ConfigMap route
 
 When the platform injects its own AuthBridge sidecar (an `AgentRuntime` CR),
@@ -322,6 +333,7 @@ BAKE — once per app image                 ATTACH — once per Deployment
 | `build-otel-shim.sh` | bakes, attests (gate off: nothing OTel-shaped loads; gate on: a `traceparent` is injected), kind-loads; refuses images it cannot safely wrap |
 | `lineage-propagate-hook.py` | the env-gated site hook the Dockerfile installs (`.pth` + module); read its docstring for the contract |
 | `container-runtime.sh` | sourced helper: docker vs podman, kind load either way |
+| `test/propagation/` | the propagation matrix: one probe image per instrumented library, baked with the real script, four verdicts each (base / inert / on / carried) |
 
 ---
 

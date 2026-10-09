@@ -1,8 +1,8 @@
 # Propagate-only OpenTelemetry shim for an uninstrumented Python app image.
 #
 # Auto-instrumentation is layered ON TOP of the app image so the app carries
-# the W3C traceparent through itself: extract on the inbound ASGI/Starlette/
-# FastAPI request, inject on the outbound httpx/requests/aiohttp call. Nothing
+# the W3C traceparent through itself: extract on the inbound request (any
+# server framework below), inject on the outbound call (any client). Nothing
 # is exported (the hook pins every exporter to `none`); the sidecar does the
 # capture. Neither the app's source nor its command is touched.
 #
@@ -52,15 +52,25 @@ COPY --from=ghcr.io/astral-sh/uv:0.9.24@sha256:816fdce3387ed2142e37d2e56e1b1b97c
 # the core, and the check below decides. (1.34.0 pairs with contrib 0.55b0:
 # earlier releases instrument only starlette<0.15, and before 0.52b0 they lack
 # the initialize() the hook calls.)
-# -distro is the SDK; the eight others — server (starlette/asgi/fastapi),
-# client (httpx/requests/aiohttp/urllib3) and -threading — are the
-# instrumentors build-otel-shim.sh's interlock probes for; keep the two lists
-# in sync.
+# -distro is the SDK; the rest are instrumentors: every HTTP and RPC server
+# and client the contrib catalog instruments, plus -threading. The list is
+# the whole family, not the libraries the sample apps happen to use: an
+# instrumentor whose library is not installed in the image is inert (stock
+# auto-instrumentation activates only those whose library is present), and
+# one whose library is present but unused patches entry points the app never
+# calls; a missing one is an unstamped hop and a trace that fragments at this
+# pod. Stores and queues (redis, sqlalchemy, celery, kafka, ...) stay out: the
+# sidecar sees none of those hops. Every entry here is also a line in
+# build-otel-shim.sh's interlock probe; keep the two lists in sync, and
+# test/propagation/ proves each one against a real exchange.
+# -asgi and -wsgi are the middleware the framework instrumentors build on,
+# not activators of their own.
 # `-urllib3` covers clients that bypass `requests`: boto3/botocore (S3 and
 # every AWS-style store) drive urllib3 directly. Without it an object read
 # lands in a trace of its own (seen live: a MinIO GetObject escaping into a
 # trace of its own). Inside a `requests` call urllib3 is suppressed, so
-# the two never stack.
+# the two never stack. `-urllib` is the standard-library client, which goes
+# through http.client and is seen by neither.
 # `-threading` is load-bearing: OTel context is contextvars-based and does not
 # cross run_in_executor / ThreadPoolExecutor on its own; without it the LLM or
 # tool call made from a worker thread fragments out of its caller's trace.
@@ -75,13 +85,22 @@ RUN pin="$("${VENV_PYTHON}" -c 'from importlib.metadata import version; import s
     echo "the bake is pinned to ${pin}"; \
     uv pip install --no-cache --python "${VENV_PYTHON}" --system --break-system-packages "${pin}" \
       opentelemetry-distro \
-      opentelemetry-instrumentation-starlette \
       opentelemetry-instrumentation-asgi \
+      opentelemetry-instrumentation-wsgi \
+      opentelemetry-instrumentation-starlette \
       opentelemetry-instrumentation-fastapi \
+      opentelemetry-instrumentation-aiohttp-server \
+      opentelemetry-instrumentation-flask \
+      opentelemetry-instrumentation-django \
+      opentelemetry-instrumentation-falcon \
+      opentelemetry-instrumentation-pyramid \
+      opentelemetry-instrumentation-tornado \
+      opentelemetry-instrumentation-grpc \
       opentelemetry-instrumentation-httpx \
       opentelemetry-instrumentation-requests \
       opentelemetry-instrumentation-aiohttp-client \
       opentelemetry-instrumentation-urllib3 \
+      opentelemetry-instrumentation-urllib \
       opentelemetry-instrumentation-threading \
       || { echo "REFUSING: the shim could not be installed alongside ${pin} (uv's error is above; RECIPE step 2 reads it)" >&2; exit 1; }
 # The install resolves into the app's OWN environment, so it may move a package

@@ -26,7 +26,7 @@ const (
 	refusedFor = time.Hour
 
 	// substitutePrefix namespaces a session's substitutes, by session, agent and
-	// server: the model each refused name in the session was sent as.
+	// server.
 	substitutePrefix = Name + "/substitute/"
 
 	// catalogPrefix namespaces each server's last good model list.
@@ -102,10 +102,31 @@ func (c *catalogs) set(server string, ids []string) {
 func (p *Router) substitute(server string, ext *pipeline.InferenceExtension) string {
 	srv := p.servers[server]
 	word := srv.helper
-	if ext != nil && len(ext.Tools) > 0 {
+	if kindOf(ext) == kindMain {
 		word = srv.main
 	}
 	return routerconfig.Resolve(word, p.catalogs.get(server))
+}
+
+// The kinds of substitute: a request with tools gets the server's main model, one
+// without its helper.
+const (
+	kindMain   = "main"
+	kindHelper = "helper"
+)
+
+// kindOf is the kind of substitute a request with parse ext gets.
+func kindOf(ext *pipeline.InferenceExtension) string {
+	if ext != nil && len(ext.Tools) > 0 {
+		return kindMain
+	}
+	return kindHelper
+}
+
+// substituteEntry is where a session's substitutes keep the one for requested, sent by
+// a request with parse ext: one for each kind, so each kind of request keeps its own.
+func substituteEntry(ext *pipeline.InferenceExtension, requested string) string {
+	return kindOf(ext) + " " + requested
 }
 
 // chooseModel decides the model a request routed to server is sent with, by the
@@ -205,7 +226,7 @@ func substituteKey(pctx *pipeline.Context, server string) string {
 	return substitutePrefix + pctx.Session.ID + "/" + agentOf(pctx) + "/" + server
 }
 
-// substitutes is the session's substitutes kept at key, by the name each replaced.
+// substitutes is the session's substitutes kept at key.
 func (p *Router) substitutes(pctx *pipeline.Context, key string) map[string]string {
 	if p.store != nil {
 		raw, err := p.store.Get(context.Background(), key)
@@ -231,7 +252,7 @@ func (p *Router) sessionSubstitute(pctx *pipeline.Context, server, requested str
 	if key == "" {
 		return ""
 	}
-	return p.substitutes(pctx, key)[requested]
+	return p.substitutes(pctx, key)[substituteEntry(pctx.Extensions.Inference, requested)]
 }
 
 // keepSubstitute keeps sub as the model the session sends requested as on server,
@@ -246,7 +267,7 @@ func (p *Router) keepSubstitute(pctx *pipeline.Context, server, requested, sub s
 	for k, v := range p.substitutes(pctx, key) {
 		subs[k] = v
 	}
-	subs[requested] = sub
+	subs[substituteEntry(pctx.Extensions.Inference, requested)] = sub
 	if p.store != nil {
 		b, _ := json.Marshal(subs)
 		if err := p.store.Set(context.Background(), key, string(b), pinTTL); err != nil {

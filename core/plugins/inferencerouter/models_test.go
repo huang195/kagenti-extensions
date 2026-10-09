@@ -515,3 +515,57 @@ func TestRouter_ARequestRoutedToAnotherServerLeavesTheFirstServersCredentials(t 
 		t.Errorf("Anthropic-Version = %q, want it kept", got)
 	}
 }
+
+// A session pinned to a server stays on it when its agent is unrouted, captured or
+// not, as one addressed to a server's host does. A session of an unrouted agent that
+// holds no pin is left where the agent sent it, and is not pinned.
+func TestRouter_UnroutingAnAgentDoesNotMoveItsCapturedSessions(t *testing.T) {
+	store := newStore(t)
+	_, routed := buildRouter(t, wordConfig(`"opencode": "glm"`))
+	first := chat(store, "opencode.ai", "/zen/v1/chat/completions", opencodeUA, "s1", "exo-free", true)
+	run(t, routed, first)
+	assertRouted(t, first, glmHost, "glm-key")
+
+	_, unrouted := buildRouter(t, wordConfig(``)) // agentop server reset --agent opencode
+	next := chat(store, "opencode.ai", "/zen/v1/chat/completions", opencodeUA, "s1", "exo-free", true)
+	run(t, unrouted, next)
+	assertRouted(t, next, glmHost, "glm-key")
+	assertRecord(t, next, pipeline.ActionModify, "routed", map[string]string{"server": "glm", "pin": pinExisting})
+
+	other := chat(store, "opencode.ai", "/zen/v1/chat/completions", opencodeUA, "s2", "exo-free", true)
+	other.Headers.Set("Authorization", "Bearer client-key")
+	run(t, unrouted, other)
+	assertUntouched(t, other, "opencode.ai")
+	if _, ok := pinOf(t, store, "s2"); ok {
+		t.Error("an unrouted agent's session was pinned")
+	}
+}
+
+// Each request's kind decides its substitute, main with tools and helper without, and
+// a session keeps one for each: whichever kind is refused first, the other still gets
+// its own.
+func TestRouter_ASessionKeepsASubstituteForEachKindOfRequest(t *testing.T) {
+	for _, order := range [][]bool{{false, true}, {true, false}} {
+		store := newStore(t)
+		_, p := buildRouter(t, wordConfig(`"opencode": "glm"`))
+		want := map[bool]string{true: glmMain, false: glmHelper}
+		for _, tools := range order {
+			pctx := chat(store, "opencode.ai", "/zen/v1/chat/completions", opencodeUA, "s1", "exo-free", tools)
+			run(t, p, pctx)
+			if sentModel(t, pctx) == "exo-free" {
+				resend(p, pctx, http.StatusForbidden, refusal)
+			}
+			if got := sentModel(t, pctx); got != want[tools] {
+				t.Errorf("order %v: a request with tools=%v is sent as %q, want %q", order, tools, got, want[tools])
+			}
+		}
+		// And again, from the session's own record.
+		for _, tools := range order {
+			pctx := chat(store, "opencode.ai", "/zen/v1/chat/completions", opencodeUA, "s1", "exo-free", tools)
+			run(t, p, pctx)
+			if got := sentModel(t, pctx); got != want[tools] {
+				t.Errorf("order %v, later: a request with tools=%v is sent as %q, want %q", order, tools, got, want[tools])
+			}
+		}
+	}
+}

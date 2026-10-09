@@ -279,7 +279,7 @@ func (p *Router) OnRequest(_ context.Context, pctx *pipeline.Context) pipeline.A
 	addressed := p.byHost[routerconfig.Hostname(pctx.Host)] // the server the request named, "" for none
 	if _, ok := p.byHost[routerconfig.Hostname(pctx.Host)]; !ok {
 		path, ok := capture(pctx)
-		if !ok || p.agents[agentOf(pctx)] == "" {
+		if !ok || (p.agents[agentOf(pctx)] == "" && !p.pinnedToServer(pctx)) {
 			pctx.Skip("not_an_inference_server")
 			return cont
 		}
@@ -440,6 +440,19 @@ func (p *Router) serverFor(pctx *pipeline.Context) (string, pinning) {
 		return server, pinning{state: pinNone, turn: turn}
 	}
 	return server, pinning{state: pinNew, store: store, key: key, agent: agent, turn: turn}
+}
+
+// pinnedToServer reports whether pctx's session holds its agent's pin to a server.
+func (p *Router) pinnedToServer(pctx *pipeline.Context) bool {
+	if pctx.Session == nil || pctx.Session.ID == "" || synthetic(pctx.Session.ID) {
+		return false
+	}
+	store := p.pinsFor(pctx)
+	if store == nil {
+		return false
+	}
+	pn, ok := store.load(pinPrefix + pctx.Session.ID)
+	return ok && pn.agent == agentOf(pctx) && pn.server != ""
 }
 
 // unpinned is the server for a request in a session its agent holds no pin on, and

@@ -3,6 +3,7 @@ package usage
 import (
 	"encoding/json"
 	"reflect"
+	"strings"
 	"testing"
 	"time"
 
@@ -67,5 +68,32 @@ func TestReplayCopy_RecordsWhatTheEventDoes(t *testing.T) {
 		if !reflect.DeepEqual(f, s) {
 			t.Errorf("group %s: the copies record differently:\nfull %+v\nslim %+v", g, f, s)
 		}
+	}
+}
+
+// A copy is one size however long the conversation was: two events that differ only in how much
+// conversation they carry, in every field that grows with it, leave copies of the same length.
+func TestReplayCopy_DoesNotGrowWithTheConversation(t *testing.T) {
+	now := time.Date(2026, 10, 5, 12, 0, 0, 0, time.UTC)
+	size := func(turns int) int {
+		e := richTurn(t, now, "m1", "claude-code", "api.anthropic.com", 40)[0]
+		text := strings.Repeat("x", 1024*turns)
+		for range turns {
+			e.Inference.Messages = append(e.Inference.Messages, pipeline.InferenceMessage{Role: "user", Content: text})
+			e.Inference.Tools = append(e.Inference.Tools, pipeline.InferenceTool{Name: "Read", Description: text})
+			e.Inference.ToolCalls = append(e.Inference.ToolCalls, pipeline.InferenceToolCall{ID: "toolu_1", Name: "Read", Arguments: text})
+			e.Inference.ToolResults = append(e.Inference.ToolResults, pipeline.InferenceToolResult{ToolUseID: "toolu_1", Content: text})
+		}
+		e.Inference.ToolChoice = map[string]any{"type": "tool", "name": text}
+		e.Inference.Completion = text
+		c := ReplayCopy(e)
+		raw, err := json.Marshal(&c)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return len(raw)
+	}
+	if one, many := size(1), size(50); many != one {
+		t.Fatalf("a copy grew with the conversation: %d bytes after one turn, %d after fifty", one, many)
 	}
 }

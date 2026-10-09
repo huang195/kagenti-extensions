@@ -231,7 +231,7 @@ func filterForDetail(data []byte, phase pipeline.SessionPhase) []byte {
 var (
 	inferenceReqKeys = []string{
 		"model", "requestedModel", "messages", "temperature", "maxTokens", "topP",
-		"stream", "tools", "toolChoice",
+		"stream", "tools", "toolChoice", "toolResults",
 	}
 	// reasoningTokens is a SUBSET of completionTokens, not a sibling: it is the share
 	// of the generated tokens the model spent reasoning, billed at the output rate.

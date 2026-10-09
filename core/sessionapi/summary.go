@@ -37,7 +37,7 @@ import "github.com/rossoctl/cortex/core/pipeline"
 //   - Error fields and IsAction. Small; a failure is what an operator scans a
 //     timeline for, and IsAction says whether a row is an action or mechanics.
 //
-// WHAT GOES: Inference.Messages / Tools / ToolCalls, A2A.Artifact, and
+// WHAT GOES: Inference.Messages / Tools / ToolCalls / ToolResults, A2A.Artifact, and
 // MCP.Params / Result. Those are read by the detail pane alone, which fetches the
 // full event for the row under the cursor. Messages is the one that matters —
 // every inference request carries the whole conversation, and it is essentially
@@ -76,6 +76,7 @@ func summarizeEvent(e *pipeline.SessionEvent) *pipeline.SessionEvent {
 		inf.Messages = nil
 		inf.Tools = nil
 		inf.ToolCalls = nil
+		inf.ToolResults = nil // re-sent whole on every request, like Messages
 		// Completion is NOT dropped: the free-text filter searches it.
 		s.Inference = &inf
 	}

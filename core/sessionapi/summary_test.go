@@ -43,6 +43,7 @@ func fullEvent() pipeline.SessionEvent {
 			// fixture with those two the same size makes the projection look 3x
 			// rather than the ~163x it measures against a live proxy.
 			Messages:         bigConversation(24, 8192),
+			ToolResults:      []pipeline.InferenceToolResult{{ToolUseID: "toolu_1", Content: strings.Repeat("r", 4096)}},
 			Tools:            []pipeline.InferenceTool{{Name: "search"}},
 			AgentRole:        pipeline.AgentRoleMain,
 			Completion:       strings.Repeat("y", 2048),
@@ -96,6 +97,11 @@ func TestSummarizeEvent_DropsPayloadsKeepsTimelineFields(t *testing.T) {
 	}
 	if got.Inference.ToolCalls != nil {
 		t.Error("Inference.ToolCalls survived")
+	}
+	// Tool results grow with the conversation exactly as Messages does — every request
+	// re-sends all of them — and only the detail pane reads them.
+	if got.Inference.ToolResults != nil {
+		t.Error("Inference.ToolResults survived")
 	}
 	// …but their LENGTHS are stated in their place. A third category beside dropped and kept:
 	// derived from a payload that goes, and the only thing left that says what it was.
@@ -333,7 +339,8 @@ func TestSummarizeEvent_ShapeIsGuarded(t *testing.T) {
 		// slices whose lengths had to be recorded before they were dropped.
 		// 26 since RequestedModel, which is kept as RequestedHost is: agentop's detail pane
 		// draws its model: line from the projected event. A scalar; asserted above.
-		{"InferenceExtension", reflect.TypeOf(pipeline.InferenceExtension{}), 26},
+		// 27 since ToolResults, which is DETAIL data: dropped, asserted above.
+		{"InferenceExtension", reflect.TypeOf(pipeline.InferenceExtension{}), 27},
 		{"A2AExtension", reflect.TypeOf(pipeline.A2AExtension{}), 11},
 		{"MCPExtension", reflect.TypeOf(pipeline.MCPExtension{}), 6},
 	} {

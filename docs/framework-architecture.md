@@ -323,6 +323,8 @@ type InferenceExtension struct {
     Stream      bool
     Tools       []InferenceTool  // full definition incl. parameters schema
     ToolChoice  any
+    ToolResults []InferenceToolResult // Anthropic tool_result blocks: toolUseId, text, isError.
+                                      // For the session store only — no plugin reads them.
     // Response side:
     Completion       string
     FinishReason     string

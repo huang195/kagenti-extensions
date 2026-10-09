@@ -165,6 +165,17 @@ type InferenceExtension struct {
 	// Set only by SetRequestModel, never by a parser.
 	RequestedModel string `json:"requestedModel,omitempty"`
 
+	// ToolResults are the tool_result blocks of an Anthropic request — what each earlier tool
+	// call returned, as the client sent it back. Message Content keeps only text blocks, so
+	// without this a tool result left nothing behind but its size in ContentBytes.
+	//
+	// KEPT OUT OF MESSAGES ON PURPOSE. Plugins read Messages — IBAC as the user's intent,
+	// OPA/SPARC/CPEX as policy input, lineage as an exported span — and tool output reaches
+	// none of them unless a plugin opts in to this field. It is for the session store and its
+	// readers. OpenAI-format clients already carry tool output as role "tool" messages, so
+	// their requests leave this empty.
+	ToolResults []InferenceToolResult `json:"toolResults,omitempty"`
+
 	// MessageCount and ToolCount are how many Messages and Tools this event HAD, for readers of
 	// a copy that no longer carries them. Set only by sessionapi.summarizeEvent, immediately
 	// before it nils both slices; zero everywhere else, including on every event the store keeps.
@@ -397,6 +408,16 @@ type InferenceToolCall struct {
 	ID        string `json:"id,omitempty"`
 	Name      string `json:"name"`
 	Arguments string `json:"arguments,omitempty"`
+}
+
+// InferenceToolResult is one tool_result block from an Anthropic request. ToolUseID is the
+// id of the call it answers — InferenceToolCall.ID on an earlier response. Content is the
+// result's text: a string as sent, or its text blocks joined by newlines. Non-text blocks
+// (an image a Read returned) are not recorded.
+type InferenceToolResult struct {
+	ToolUseID string `json:"toolUseId,omitempty"`
+	Content   string `json:"content,omitempty"`
+	IsError   bool   `json:"isError,omitempty"`
 }
 
 // SecurityExtension carries guardrail output.

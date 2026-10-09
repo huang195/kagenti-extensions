@@ -135,6 +135,26 @@ func TestFilterForDetail_ShowsOneCostRecord(t *testing.T) {
 	}
 }
 
+// Tool results are request-side, like messages: shown on the request row, which is where an
+// operator looks for what a tool returned, and hidden on the response row, which carries the
+// same array by reference.
+func TestFilterForDetail_ToolResultsOnTheRequestRowOnly(t *testing.T) {
+	wire := []byte(`{"inference":{"model":"m","toolResults":[{"toolUseId":"toolu_1","content":"Exit code 1","isError":true}]}}`)
+	for _, c := range []struct {
+		phase pipeline.SessionPhase
+		want  bool
+	}{{pipeline.SessionRequest, true}, {pipeline.SessionResponse, false}} {
+		var got map[string]any
+		if err := json.Unmarshal(filterForDetail(wire, c.phase), &got); err != nil {
+			t.Fatal(err)
+		}
+		inf, _ := got["inference"].(map[string]any)
+		if _, ok := inf["toolResults"]; ok != c.want {
+			t.Errorf("phase %s: toolResults shown = %v, want %v (%v)", c.phase, ok, c.want, inf)
+		}
+	}
+}
+
 // A proxy older than the rename writes ONLY the legacy key, and its cost must still render.
 func TestFilterForDetail_KeepsALoneLegacyRecord(t *testing.T) {
 	wire := []byte(`{"phase":"response","plugins":{"` + event.PluginName + `":{"cost_usd":0.25}}}`)

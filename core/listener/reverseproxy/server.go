@@ -19,6 +19,7 @@ import (
 	"time"
 
 	"github.com/rossoctl/cortex/core/listener/httpx"
+	"github.com/rossoctl/cortex/core/listener/internal/bodycount"
 	"github.com/rossoctl/cortex/core/listener/internal/bodyread"
 	"github.com/rossoctl/cortex/core/listener/internal/sessionevent"
 	"github.com/rossoctl/cortex/core/listener/internal/sseframe"
@@ -459,6 +460,7 @@ func (s *Server) handleRequest(w http.ResponseWriter, r *http.Request) {
 			Direction:   pipeline.Inbound,
 			Phase:       pipeline.SessionRequest,
 			RequestID:   pctx.RequestID(),
+			BytesUp:     int64(len(pctx.Body)),
 			A2A:         pipeline.SnapshotA2A(pctx.Extensions.A2A),
 			Inference:   pipeline.SnapshotInference(pctx.Extensions.Inference),
 			Invocations: pipeline.SnapshotInvocations(pctx.Extensions.Invocations, pipeline.InvocationPhaseRequest),
@@ -484,6 +486,21 @@ func (s *Server) modifyResponse(resp *http.Response) error {
 
 	pctx.StatusCode = resp.StatusCode
 	pctx.ResponseHeaders = resp.Header.Clone()
+
+	// BytesDown for the response row (#1309), counted HERE and nowhere else — at
+	// the wire, before either arm below gets at the body. The streaming arm sees
+	// sseframe payloads with the `data: ` framing already stripped, which is short
+	// of what extproc reports for the same response, and the buffered arm never
+	// runs on a streamed one; one wrapper here is the only place both are the same
+	// bytes. The buffered arm's replacement of resp.Body with a reader over what it
+	// already read means nothing is counted twice. See bodycount.
+	//
+	// What this does NOT reach is the fully-unbuffered relay: ReverseProxy copies
+	// that body after modifyResponse returns, which is after the response row is
+	// appended below, so it stays at zero and renders blank rather than wrong.
+	if resp.Body != nil {
+		resp.Body = bodycount.Wrap(resp.Body, &pctx.ResponseBytes)
+	}
 
 	// Branch on Content-Type per response. Streaming-aware pipelines on
 	// text/event-stream responses (A2A message/stream, MCP tools/call
@@ -618,6 +635,7 @@ func (s *Server) modifyResponse(resp *http.Response) error {
 			Direction:   pipeline.Inbound,
 			Phase:       pipeline.SessionResponse,
 			RequestID:   pctx.RequestID(),
+			BytesDown:   pctx.ResponseBytes,
 			A2A:         pipeline.SnapshotA2A(pctx.Extensions.A2A),
 			Inference:   pipeline.SnapshotInference(pctx.Extensions.Inference),
 			Invocations: pipeline.SnapshotInvocations(pctx.Extensions.Invocations, pipeline.InvocationPhaseResponse),
@@ -808,6 +826,7 @@ func (s *Server) recordInboundResponseEvent(pctx *pipeline.Context, statusCode i
 		Direction:   pipeline.Inbound,
 		Phase:       pipeline.SessionResponse,
 		RequestID:   pctx.RequestID(),
+		BytesDown:   pctx.ResponseBytes,
 		A2A:         pipeline.SnapshotA2A(pctx.Extensions.A2A),
 		Inference:   pipeline.SnapshotInference(pctx.Extensions.Inference),
 		Invocations: pipeline.SnapshotInvocations(pctx.Extensions.Invocations, pipeline.InvocationPhaseResponse),

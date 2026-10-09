@@ -384,7 +384,7 @@ clipPath rect{width:100000px}
 <text y="598.0"></text>
 <text y="616.0"></text>
 <text y="634.0"><tspan x="16.0" textLength="92.4" lengthAdjust="spacingAndGlyphs" fill="#6ee7b7">● connected</tspan><tspan x="125.2" textLength="117.6" lengthAdjust="spacingAndGlyphs" fill="#9ca3af">0.0 events/sec</tspan><tspan x="242.8" textLength="546.0" lengthAdjust="spacingAndGlyphs" fill="#9ca3af">   feedback: https://github.com/rossoctl/cortex/issues/new/choose</tspan></text>
-<text y="652.0"><tspan x="16.0" textLength="974.4" lengthAdjust="spacingAndGlyphs" fill="#9ca3af">… [s] hide passthru/skip  [p] pause  [/] search  [esc] back  ·  → 3 more columns ([c] to choose)  [?] keys  [q] quit</tspan></text>
+<text y="652.0"><tspan x="16.0" textLength="974.4" lengthAdjust="spacingAndGlyphs" fill="#9ca3af">… [s] hide passthru/skip  [p] pause  [/] search  [esc] back  ·  → 4 more columns ([c] to choose)  [?] keys  [q] quit</tspan></text>
 </g>
 <g class="st st6 lbl-detail">
 <text y="58.0"><tspan x="16.0" textLength="420.0" lengthAdjust="spacingAndGlyphs" fill="#a5b3fc" font-weight="600">agentop · fix the retry handler (api-7f3c) · event</tspan></text>

@@ -158,13 +158,15 @@ func TestDurationCell_MinutesAndHours(t *testing.T) {
 	}
 }
 
-func TestBytesCell(t *testing.T) {
+// A tunnel's close row reports both directions, and keeps doing so where one of them
+// is a real zero.
+func TestBytesCell_TunnelReportsBothWays(t *testing.T) {
 	for _, tc := range []struct {
 		name     string
 		up, down int64
 		want     string
 	}{
-		{"not a tunnel close", 0, 0, ""},
+		{"nothing counted", 0, 0, ""},
 		{"both ways", 4210, 18230, "↑4.2kB ↓18.2kB"},
 		{"small counts stay exact", 5, 7, "↑5B ↓7B"},
 		// Counts are absent on the wire when zero, so one side at zero is shown as 0
@@ -175,16 +177,45 @@ func TestBytesCell(t *testing.T) {
 		{"carries at the tier boundary", 999_950, 999_949, "↑1.0MB ↓999.9kB"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			if got := bytesCell(pipeline.SessionEvent{BytesUp: tc.up, BytesDown: tc.down}); got != tc.want {
+			ev := pipeline.SessionEvent{Tunnel: true, BytesUp: tc.up, BytesDown: tc.down}
+			if got := bytesCell(ev); got != tc.want {
 				t.Errorf("bytesCell(up=%d, down=%d) = %q, want %q", tc.up, tc.down, got, tc.want)
 			}
 		})
 	}
 }
 
-// Off by default: only opaque tunnels' close rows have a figure, so on by default it
-// would spend columns of every terminal on a mostly blank column.
-func TestBytesColumn_IsOptInAndSortsByTotal(t *testing.T) {
+// An ordinary row knows one side — a request what it forwarded, a response what came
+// back (#1309) — so it reports that side alone. The pair rendering would put a
+// fabricated "↓0B" beside every request size, which is the opposite of the tunnel
+// case above: there a zero is a measured zero, here it is an absence.
+func TestBytesCell_OrdinaryRowReportsOneSide(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		up, down int64
+		want     string
+	}{
+		{"request only", 121_406, 0, "↑121.4kB"},
+		{"response only", 0, 2310, "↓2.3kB"},
+		// Nothing counted on either side — an unbuffered body, or a body-less GET.
+		// Blank and not "↑0B ↓0B", and not "0B": the proxy does not know.
+		{"neither counted", 0, 0, ""},
+		// Both sides is not a shape the listeners produce on one row, but the renderer
+		// must not drop half of one if they ever did.
+		{"both, defensively", 10, 20, "↑10B ↓20B"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ev := pipeline.SessionEvent{BytesUp: tc.up, BytesDown: tc.down}
+			if got := bytesCell(ev); got != tc.want {
+				t.Errorf("bytesCell(up=%d, down=%d) = %q, want %q", tc.up, tc.down, got, tc.want)
+			}
+		})
+	}
+}
+
+// On by default since #1309: ordinary request and response rows carry a figure now, so
+// the reason it shipped opt-in — only tunnel close rows had one — is gone.
+func TestBytesColumn_IsOnByDefaultAndSortsByTotal(t *testing.T) {
 	var col *eventColumn
 	for i := range eventColumns {
 		if eventColumns[i].id == colBytes {
@@ -194,8 +225,8 @@ func TestBytesColumn_IsOptInAndSortsByTotal(t *testing.T) {
 	if col == nil {
 		t.Fatal("no BYTES column")
 	}
-	if col.defaultOn {
-		t.Error("BYTES is on by default; it should be opt-in")
+	if !col.defaultOn {
+		t.Error("BYTES is opt-in; it should be on by default")
 	}
 	if col.sortKey == nil {
 		t.Fatal("BYTES has no sort key")

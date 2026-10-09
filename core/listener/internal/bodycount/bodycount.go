@@ -1,0 +1,44 @@
+// Package bodycount counts the bytes a listener reads off an upstream response
+// body, so every listener reports the same figure for the same response (#1309).
+//
+// It exists because the proxies read a response body through four different arms
+// — buffered whole, re-framed as SSE, relayed chunk by chunk, or copied straight
+// through — and three of those have a natural-looking number to count that is NOT
+// the body: the SSE arm sees sseframe payloads with the `data: ` prefixes and
+// blank-line separators already stripped, and a buffered read stops at the
+// listener's cap. extproc has no such ambiguity (Envoy hands it the raw chunks),
+// so counting at the one place where the raw bytes enter the proxy is what makes
+// the three listeners agree. Wrap once, as early as the body is in hand, and let
+// every arm downstream read through the wrapper.
+package bodycount
+
+import "io"
+
+// Wrap returns rc with the length of every successful read added to *n. The
+// pointer is a pipeline.Context field at both call sites: the arms that consume
+// the body are several frames below the wrap, and the record site is above it
+// again, so there is nowhere to thread a return value through.
+//
+// Not safe for concurrent reads, which is not a constraint in practice: a
+// response body is read by the one goroutine serving its request, and that is the
+// goroutine that records the row.
+func Wrap(rc io.ReadCloser, n *int64) io.ReadCloser {
+	return &countingBody{rc: rc, n: n}
+}
+
+type countingBody struct {
+	rc io.ReadCloser
+	n  *int64
+}
+
+// Read counts what it hands back, including bytes returned alongside an error:
+// io.Reader may do both, and those bytes did arrive. A body that breaks off
+// mid-read therefore reports what was received before it broke rather than zero,
+// which is the figure the 502 it produces is worth reading next to.
+func (c *countingBody) Read(p []byte) (int, error) {
+	n, err := c.rc.Read(p)
+	*c.n += int64(n)
+	return n, err
+}
+
+func (c *countingBody) Close() error { return c.rc.Close() }

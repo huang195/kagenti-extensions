@@ -191,11 +191,39 @@ type SessionEvent struct {
 	// carried no request at all.
 	Tunnel bool
 
-	// BytesUp and BytesDown are how many bytes an opaque tunnel carried each way:
-	// up is client to destination, down is destination to client. Set only on a
-	// tunnel's close row, which is when the counts are known. Zero — and absent on
-	// the wire — everywhere else, including a bridged tunnel's close, whose bytes
-	// were TLS the bridge terminated rather than counted.
+	// BytesUp and BytesDown are how many bytes went each way: up is client to
+	// destination, down is destination to client. A row carries whichever side it
+	// is in a position to know, so the two never collide on one row:
+	//
+	//   request row        BytesUp   — the request body as FORWARDED, which is
+	//                                  len(pctx.Body) at record time and so
+	//                                  reflects any plugin that rewrote it
+	//   response row       BytesDown — the response body the listener observed
+	//                                  FROM THE DESTINATION, read from
+	//                                  pctx.ResponseBytes
+	//   tunnel close row   both      — the opaque bytes the tunnel carried
+	//
+	// The two sides differ on where the pipeline sits, and not by preference: the
+	// request figure is read at record time, after any rewrite, because that is
+	// when pctx.Body is what will be forwarded; the response figure is summed as
+	// the bytes arrive, because on a streamed response there is no later moment
+	// at which the whole body exists. A response mutator's rewrite is therefore
+	// not reflected — extproc records the row before it even emits the
+	// replacement — so BytesDown is what the destination sent.
+	//
+	// ZERO MEANS NOT COUNTED, NOT ZERO BYTES, and the field is absent from the
+	// wire when zero. Body buffering is gated on a pipeline capability in all
+	// three listeners, so a request no plugin wanted the body of is relayed
+	// without ever being measured — and a body-less GET is indistinguishable from
+	// it, which is why neither may render as a real 0 B. A bridged tunnel's close
+	// reports zero for the same reason: its bytes were TLS the bridge terminated
+	// rather than counted, and its decrypted inner requests carry their own
+	// figures. Consumers render zero as blank (agentop's bytesCell).
+	//
+	// Headers are deliberately not counted. The question these answer is how big
+	// a payload was — a prompt that overran a model's context window is the case
+	// they exist for — and a kilobyte of constant header noise on every row
+	// obscures it. They are therefore NOT a wire-cost figure.
 	BytesUp   int64
 	BytesDown int64
 
@@ -431,8 +459,10 @@ type sessionEventWire struct {
 	// key, and a new agentop against an old proxy sees "" and renders exactly what it
 	// renders today.
 	TunnelReason TunnelReason `json:"tunnelReason,omitempty"`
-	// omitempty for the same skew reason, and because only a tunnel's close row
-	// has a count to report.
+	// omitempty for the same skew reason, and because a row reports only the side
+	// it knows: a request row has no BytesDown and a response row no BytesUp. The
+	// absent key and a counted zero are therefore the same wire bytes, which is
+	// intended — both mean "no figure", per SessionEvent.BytesUp.
 	BytesUp   int64 `json:"bytesUp,omitempty"`
 	BytesDown int64 `json:"bytesDown,omitempty"`
 	// omitempty for the same skew reason as TunnelReason above: an old agentop

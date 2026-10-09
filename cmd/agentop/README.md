@@ -1082,7 +1082,7 @@ agentop is for, and the other three are surfaces you visit and leave.
   100% of rows. Avoided spend now lives per session in the sessions table and per
   series in the `$` breakdown; volume readings live in the Usage pane.
 - **Events**: per-session event table. `c` opens a column picker — a popup with
-  a checkbox and a one-line description per column, since twelve abbreviated
+  a checkbox and a one-line description per column, since thirteen abbreviated
   headers are not self-describing.
 
   The picker is also where sorting lives: `s` orders the table by the column
@@ -1100,47 +1100,59 @@ agentop is for, and the other three are surfaces you visit and leave.
   toward. Sorting never changes the `#` exchange pairing or the per-row token and
   cost figures; it reorders the finished rows only.
 
-  The twelve default columns together need ~168 terminal columns, so the table
+  The thirteen default columns together need ~185 terminal columns, so the table
   drops what does not fit and the footer says how many (`→ N more columns`). Columns carry a
   keep rank rather than being equally expendable: DIR, DURATION, TOKENS and COST
   give way first, while `#` and HOST survive longest. That is what makes HOST
   usable at 80 columns despite being last in display order — it is the column
   most people open this pane for.
 
-  Twelve of the thirteen are on by default: `#` (exchange number, shared by a
-  request and its response), TIME, DIR, PHASE, ACTION, PLUGIN, METHOD, STATUS,
-  DURATION, TOKENS, COST, HOST. The thirteenth, BYTES, is opt-in through the
-  picker (`c`), because only an opaque tunnel's close row has a figure for it.
-  On a narrow terminal the low-ranked ones are hidden rather than turned off,
-  so widening the window brings them back without touching the picker.
+  All thirteen are on by default: `#` (exchange number, shared by a request and
+  its response), TIME, DIR, PHASE, ACTION, PLUGIN, METHOD, STATUS, DURATION,
+  BYTES, TOKENS, COST, HOST. On a narrow terminal the low-ranked ones are hidden
+  rather than turned off, so widening the window brings them back without
+  touching the picker.
+
+  BYTES was the one opt-in column until recently, on the grounds that only an
+  opaque tunnel's close row had a figure for it. Ordinary rows now carry one too
+  — a request row the body size it forwarded, a response row the body size that
+  came back — so the reason for hiding it is gone and the picker is where you go
+  to turn it *off*. A blank cell means the proxy counted nothing, which is not
+  the same as a body of zero bytes: a body no plugin asked to buffer is relayed
+  unmeasured and reads exactly as a body-less GET does.
 
   Live-updates while in view — if the cursor is on the last row, it
   auto-follows new events.
 
-  All twelve columns, on a terminal wide enough for them. Each `#` appears
+  All thirteen columns, on a terminal wide enough for them. Each `#` appears
   twice — once for the request, once for its response — which is how a row
   with no STATUS is read as "still in flight" rather than "failed":
 
   ```
   agentop · ctx-abc-1234…
 
-   #     TIME          DIR   PHASE    ACTION    PLUGIN              METHOD              STATUS   DURATION    TOKENS             COST                 HOST
-   1     14:23:07.41   in    req      allow     jwt-validation                                                                                       weather-agent
-   1     14:23:07.52   in    resp     —         —                                       200      118ms                                               weather-agent
-   2     14:23:07.71   out   req      observe   inference-parser    claude-sonnet-5                                            681,300(−9.9k)   $0.2546(−$0.0037)   api.anthropic.com
-   2     14:23:08.91   out   resp     —         —                   claude-sonnet-5     200      1.20s       412                                     api.anthropic.com
-   3     14:23:09.01   out   req      modify    token-exchange      tools/call                                                                       github-tool-mcp
-   3     14:23:09.10   out   resp     —         —                   tools/call          503      96ms                                                github-tool-mcp
+   #     TIME          DIR   PHASE    ACTION    PLUGIN              METHOD              STATUS   DURATION    BYTES              TOKENS             COST                 HOST
+   1     14:23:07.41   in    req      allow     jwt-validation                                               ↑1.4kB                                                     weather-agent
+   1     14:23:07.52   in    resp     —         —                                       200      118ms       ↓842B                                                      weather-agent
+   2     14:23:07.71   out   req      observe   inference-parser    claude-sonnet-5                          ↑118.6kB                             681,300(−9.9k)   $0.2546(−$0.0037)   api.anthropic.com
+   2     14:23:08.91   out   resp     —         —                   claude-sonnet-5     200      1.20s       ↓12.4kB            412                                     api.anthropic.com
+   3     14:23:09.01   out   req      modify    token-exchange      tools/call                               ↑318B                                                      github-tool-mcp
+   3     14:23:09.10   out   resp     —         —                   tools/call          503      96ms                                                                   github-tool-mcp
 
   ● connected   2.1 events/sec   [/anthropic 2 matches]   [sort: DURATION▼]
-  [↑↓] nav  [b/f] page  [↵] detail  [c] columns  [u] usage  [s] hide passthru/skip  [p] pause  [/] search  [n/N] next/prev  [esc] back  ·  → 4 more columns ([c] to choose)  [?] keys  [q] quit
+  [↑↓] nav  [b/f] page  [↵] detail  [c] columns  [u] usage  [s] hide passthru/skip  [p] pause  [/] search  [n/N] next/prev  [esc] back  ·  [?] keys  [q] quit
   ```
+
+  Exchange 3's response has no BYTES figure because there was nothing to count:
+  token-exchange could not reach the IdP, so the 503 is the proxy's own and no
+  upstream body ever arrived.
 
   `—` in ACTION and PLUGIN means no plugin acted on that message; a `tunnel`
   there is an opaque CONNECT, where METHOD is blank because opaque bytes carry
   no request line. The tunnel's STATUS arrives on its `resp` row when it closes,
   with DURATION for how long it stayed open and, in BYTES, what it carried each
-  way. That STATUS is the
+  way — the one row that reports both directions at once, since opaque bytes
+  have no body-and-headers split to separate. That STATUS is the
   CONNECT's own (200, or 502 when the destination could not be reached), never
   the destination's, which travels inside the client's TLS. The TOKENS and COST figures on a request
   row carry what `tool-prune` saved in parentheses — `−` for a counted saving,
@@ -1562,7 +1574,7 @@ events:
 | `usage.window` | string | `10m0s` | usage-pane window: `10m0s`, `1h0m0s` or `6h0m0s` |
 | `usage.group` | string | `none` | usage-pane breakdown. `[b]` cycles `none`, `status`, `method`, `plugin`, `host`; a hand-edited file may also use `model`, `endpoint`, `session` or `agent` |
 
-List a column only to change it — the twelve are all visible until you hide one, and
+List a column only to change it — the thirteen are all visible until you hide one, and
 an unrecognised name or sort column is ignored. Inside an entry, always write
 `visible:` explicitly: it is optional to the parser but reads as `false`, so
 `- name: COST` on its own hides COST rather than showing it.
@@ -1588,7 +1600,7 @@ Column ids, in display order — the same headers the picker shows:
 | `METHOD` | protocol operation: model name, MCP or A2A method |
 | `STATUS` | HTTP status of the response |
 | `DURATION` | how long the exchange took |
-| `BYTES` | bytes an opaque tunnel carried: ↑ sent, ↓ received — off by default |
+| `BYTES` | body bytes: ↑ request sent, ↓ response received (tunnels show both); blank when the proxy counted nothing |
 | `TOKENS` | tokens used, and what `tool-prune` saved |
 | `COST` | estimated cost, and what `tool-prune` saved |
 | `HOST` | host the message was sent to |

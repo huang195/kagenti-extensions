@@ -276,11 +276,20 @@ var eventColumns = []eventColumn{
 		desc:    "how long the exchange took",
 		cell:    func(c cellContext) string { return durationCell(*c.row.event) },
 		sortKey: durationSortKey},
-	// Off by default: only an opaque tunnel's close row has a figure, so a column on for
-	// everyone would spend columns of every terminal on a mostly blank one. The total is
-	// the sort key, so a descending sort finds the tunnel that carried the most.
-	{id: colBytes, width: 17, defaultOn: false, keep: keepLow, rightAlign: true,
-		desc:    "bytes an opaque tunnel carried: ↑ sent, ↓ received",
+	// On by default since #1309. It was off because only an opaque tunnel's close row had
+	// a figure, so the column cost every terminal 17 columns of mostly blank — and an
+	// operator asking how big the request that overran a model's context window was found
+	// it blank on every row and resorted to measuring the yanked event's JSON, which is
+	// not the body. Ordinary request and response rows now carry a figure, so the reason
+	// for opt-in is gone.
+	//
+	// 17 is the tunnel close row's pair at its widest ("↑999.9GB ↓999.9GB"); an ordinary
+	// row reports one side and is strictly narrower. keepLow stays — it is still the
+	// first column a narrow terminal drops. The total is the sort key, which is also
+	// right for a one-sided row, so a descending sort finds the biggest payload either
+	// way.
+	{id: colBytes, width: 17, defaultOn: true, keep: keepLow, rightAlign: true,
+		desc:    "body bytes: ↑ request sent, ↓ response received (tunnels show both)",
 		cell:    func(c cellContext) string { return bytesCell(*c.row.event) },
 		sortKey: func(c cellContext) sortValue { return numKey(c.row.event.BytesUp + c.row.event.BytesDown) }},
 	// 18: sized for a SEVEN-digit prompt with a counted saving, "1,048,576(−12,300)".

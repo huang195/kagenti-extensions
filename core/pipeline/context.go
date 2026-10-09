@@ -216,6 +216,32 @@ type Context struct {
 	ResponseHeaders http.Header
 	ResponseBody    []byte
 
+	// ResponseBytes is how many response-body bytes the listener observed on the
+	// wire, summed across every chunk. SessionEvent.BytesDown is recorded from it,
+	// and it is authoritative over len(ResponseBody) — which is a BUFFER, not a
+	// tally, and is wrong on three separate paths: extproc REPLACES it per chunk
+	// on the SSE arm (so it holds only the trailing chunk), extproc truncates it
+	// at the listener's cap, and neither proxy's streaming relay fills it at all.
+	// Reading the buffer's length at a record site would report a confident wrong
+	// number on exactly the streamed inference traffic the count is wanted for.
+	//
+	// ON THE WIRE is the part that makes the three listeners agree, and it is not
+	// the obvious reading: the proxies' SSE arms handle sseframe PAYLOADS, with
+	// the `data: ` prefixes and blank-line separators already stripped, while
+	// extproc counts the raw chunks Envoy hands it. Counting what each arm has in
+	// hand put the two 32 bytes apart on a four-event fixture. So the proxies
+	// count at one choke point per listener (see listener/internal/bodycount) and
+	// extproc sums its chunks, and all three report the body the destination sent.
+	//
+	// Zero means the listener counted nothing — no plugin asked for the body, so
+	// it was relayed without passing through a counted path — and NOT that the
+	// body was empty. Consumers render that as unknown rather than as 0 B; see
+	// SessionEvent.BytesDown.
+	//
+	// Written only by the listener, on the one goroutine serving the request,
+	// before the response row is recorded. Plugins do not write to it.
+	ResponseBytes int64
+
 	Extensions Extensions
 
 	// responseDelivered says the response has already reached the client, so a refusal

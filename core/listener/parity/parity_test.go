@@ -222,6 +222,118 @@ func TestParity_ReadsBodySSE(t *testing.T) {
 	assertParity(t, f, pipeline.SessionResponse, inboundListeners)
 }
 
+// TestBytesParity_CountsAreTheWholeBody pins what the BYTES column says, as an
+// absolute figure on every listener (#1309). The pairwise diff is a weak check for
+// this one field: zero is the default, so three listeners that all count nothing
+// agree — which is exactly the state the column was in before this change.
+//
+// What each case pins:
+//
+//   - the buffered pair, both directions: the request row reports the body as
+//     FORWARDED and the response row the body as RECEIVED, each on its own row and
+//     neither on the other's. A listener that set both on one row would read as a
+//     round trip that never happened.
+//   - SSE: the WIRE bytes, so 137 and not the 105 bytes of payload the pipeline
+//     sees after sseframe strips the framing — and not the trailing chunk either,
+//     which is all extproc's response buffer holds by the time the row is
+//     recorded. The two wrong answers available here differ from the right one by
+//     specific numbers, which is why this is stated absolutely.
+//   - the body-less GET: zero on both sides, which agentop renders blank. Pinned
+//     because "nothing was counted" and "the body was empty" have to stay the same
+//     state as far as the event is concerned — there is no third value for
+//     "unknown", and a listener inventing a length for a request that carried none
+//     would be worse than the blank.
+func TestBytesParity_CountsAreTheWholeBody(t *testing.T) {
+	reqBody := []byte(`{"prompt":"hello"}`)
+	respBody := []byte(`{"reply":"ok"}`)
+
+	// One shape, run four times: each direction × each phase. The counts are
+	// per-phase, so a fixture cannot assert both halves at once.
+	//
+	// The two Record flags are load-bearing and not boilerplate: extproc appends a
+	// session event only when the pipeline left something worth recording on pctx
+	// (A2A, an Invocation, or a plugin-public Custom entry — recordInboundSession's
+	// gate), while the proxies record unconditionally. A spy with ReadsBody alone
+	// publishes nothing, so the extproc leg produces no row at all and the fixture
+	// fails on presence rather than on the figures it is here to pin. Giving the
+	// spy something to publish is the cheapest way to get both legs recording; it
+	// does not touch the byte counts, which the listener takes off the wire.
+	buffered := func(name string, dir pipeline.Direction, want *bytesSummary) fixture {
+		return fixture{
+			name:      "bytes-buffered-" + name,
+			direction: dir,
+			entries: []config.PluginEntry{spyEntry(spyPluginAStreaming, spyConfig{
+				ReadsBody:            true,
+				RecordRequestBody:    true,
+				RecordResponseFrames: true,
+			})},
+			method:         "POST",
+			path:           "/parity/echo",
+			reqBody:        reqBody,
+			upstreamStatus: 200,
+			upstreamBody:   respBody,
+			expectedBytes:  want,
+		}
+	}
+	for _, tc := range []struct {
+		name      string
+		dir       pipeline.Direction
+		listeners []listenerRun
+	}{
+		{"inbound", pipeline.Inbound, inboundListeners},
+		{"outbound", pipeline.Outbound, outboundListeners},
+	} {
+		assertParity(t, buffered(tc.name+"-request", tc.dir,
+			&bytesSummary{Up: int64(len(reqBody))}), pipeline.SessionRequest, tc.listeners)
+		assertParity(t, buffered(tc.name+"-response", tc.dir,
+			&bytesSummary{Down: int64(len(respBody))}), pipeline.SessionResponse, tc.listeners)
+	}
+
+	// Same four events as TestParity_ReadsBodySSE, re-framed here rather than
+	// shared: that fixture's anchor is the payload the PLUGIN sees, this one's is
+	// the wire, and the whole point of the case is that the two differ.
+	var sse strings.Builder
+	for _, e := range []string{
+		`{"type":"message_start"}`,
+		`{"type":"message_delta","usage":{"output_tokens":7}}`,
+		`{"type":"message_stop"}`,
+		`[DONE]`,
+	} {
+		sse.WriteString("data: ")
+		sse.WriteString(e)
+		sse.WriteString("\n\n")
+	}
+	assertParity(t, fixture{
+		name:      "bytes-sse",
+		direction: pipeline.Inbound,
+		entries: []config.PluginEntry{spyEntry(spyPluginAStreaming, spyConfig{
+			ReadsBody:            true,
+			RecordResponseFrames: true,
+		})},
+		method:              "POST",
+		path:                "/parity/sse",
+		upstreamStatus:      200,
+		upstreamBody:        []byte(sse.String()),
+		upstreamContentType: "text/event-stream",
+		expectedBytes:       &bytesSummary{Down: int64(sse.Len())},
+	}, pipeline.SessionResponse, inboundListeners)
+
+	// A GET with no body on either side. ReadsBody still set, so the zero is the
+	// absence of bytes and not the absence of a reader.
+	assertParity(t, fixture{
+		name:      "bytes-none",
+		direction: pipeline.Inbound,
+		entries: []config.PluginEntry{spyEntry(spyPluginAStreaming, spyConfig{
+			ReadsBody:         true,
+			RecordRequestBody: true,
+		})},
+		method:         "GET",
+		path:           "/parity/empty",
+		upstreamStatus: 204,
+		expectedBytes:  &bytesSummary{},
+	}, pipeline.SessionRequest, inboundListeners)
+}
+
 // TestParity_HeaderOnlyResponse is the shape this suite could not express
 // until the synthetic-body gate in runExtproc was fixed, and the one it
 // existed to catch.
@@ -862,6 +974,12 @@ func assertParity(t *testing.T, f fixture, wantPhase pipeline.SessionPhase, list
 		if f.expectedInvocations != nil && !reflect.DeepEqual(g.observed.Invocations, f.expectedInvocations) {
 			t.Errorf("fixture %q listener %s: Invocations (exact, ordered)\n  got:  %s\n  want: %s", f.name, g.listener, jsonPretty(g.observed.Invocations), jsonPretty(f.expectedInvocations))
 		}
+		if f.expectedBytes != nil {
+			got := bytesSummary{Up: g.observed.BytesUp, Down: g.observed.BytesDown}
+			if got != *f.expectedBytes {
+				t.Errorf("fixture %q listener %s: bytes counted\n  got:  %+v\n  want: %+v", f.name, g.listener, got, *f.expectedBytes)
+			}
+		}
 		if f.expectedUpstream != nil {
 			switch {
 			case g.observed.Upstream == nil:
@@ -921,6 +1039,19 @@ func observationDiff(a, b *observation) string {
 	}
 	if a.HasDuration != b.HasDuration {
 		return fmt.Sprintf("HasDuration: %v vs %v", a.HasDuration, b.HasDuration)
+	}
+	// One listener reporting a body size the next one disagrees with. Values, not
+	// presence — see the observation fields. The same caveat as Inference below
+	// applies and is why TestBytesParity_CountsAreTheWholeBody states the figures
+	// absolutely as well: two listeners that both count nothing agree here, so a gap
+	// shared by every leg of a fixture passes this check. What it catches is the
+	// split, which is the likelier failure given that each listener counts from
+	// different machinery.
+	if a.BytesUp != b.BytesUp {
+		return fmt.Sprintf("BytesUp: %d vs %d", a.BytesUp, b.BytesUp)
+	}
+	if a.BytesDown != b.BytesDown {
+		return fmt.Sprintf("BytesDown: %d vs %d", a.BytesDown, b.BytesDown)
 	}
 	// One listener putting a plugin's rewrite on the wire while the other
 	// forwards the original bytes — the split case of the gap

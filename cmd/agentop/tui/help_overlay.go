@@ -66,6 +66,8 @@ var anywhereKeys = keyGroup{
 	title: anywhereTitle,
 	bindings: []keyBinding{
 		{"?", "this help"},
+		{"/", "search what this pane shows (enter keeps, esc cancels)"},
+		{"n / N", "next / previous match"},
 		{"p", "pause / resume the stream"},
 		{"q · ctrl+c", "quit"},
 	},
@@ -300,8 +302,6 @@ var paneKeys = map[paneID]keyGroup{
 		bindings: []keyBinding{
 			{"↑↓ / jk", "navigate"},
 			{"↵ / → / l", "drill into session"},
-			{"/", "search SESSION, TITLE and AGENT (enter keeps, esc cancels)"},
-			{"n / N", "next / previous match"},
 			{"X", "clear all history, in memory and on disk (asks first; the cost ledger is kept)"},
 			{"esc", "back to the agents picker, else pods picker"},
 		},
@@ -312,8 +312,6 @@ var paneKeys = map[paneID]keyGroup{
 		bindings: []keyBinding{
 			{"↑↓ / jk", "navigate"},
 			{"↵ / → / l", "event detail"},
-			{"/", "search (deny, plugin:<name>, or any text); enter keeps, esc cancels"},
-			{"n / N", "next / previous match"},
 			{"s", "toggle passthru/skip rows"},
 			{"c", "column picker (checkboxes + descriptions)"},
 			{"c then s", "sort by a column: desc → asc → chronological"},

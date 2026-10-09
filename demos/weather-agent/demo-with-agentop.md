@@ -245,12 +245,11 @@ The bottom-footer rate indicator (`3.2 events/sec`) is a live events-per-second 
 
 ## 8. Search
 
-Press `/` in Sessions or Events to search, as in a text editor. Every row stays on screen: as you type, the matching rows are highlighted and the cursor jumps to the first match at or after where you pressed `/`. A search matches any part of, ignoring case:
+Press `/` on any pane to search what it shows, as in a text editor. Every row stays on screen: as you type, the matched characters are highlighted and the cursor jumps to the first match at or after where you pressed `/`. A search matches any part of the text on screen, ignoring case — a cell cut short with `…` matches in full. Typing `req` on the events pane, for example, finds every request row by its PHASE column, and `deny` finds the denied events by their ACTION.
 
-- **Sessions pane**: the session ID, title, or agent.
-- **Events pane**: `host`, `method`, each plugin's name, action, reason and details, `A2A parts content`, `LLM completion`, `MCP error message`, caller `subject` / `clientId`. Two special searches: `deny` finds the denied events, and `plugin:<name>` the events that plugin ran on.
+In the **Detail** pane `/` searches the event's JSON, which is where the long text is: an LLM completion or the A2A message parts. The view scrolls to each match, and the search carries over to the next message you open in the same session.
 
-`Enter` keeps the cursor on the match; `Esc` cancels and puts the cursor back. `n` / `N` jump to the next / previous match, and the footer shows where you are — for example `[/weather 2/5]`. Press `/` then `Enter` on the empty box to clear the search. Nothing about a search is saved, and opening a different session's events starts with no search.
+`Enter` keeps your place on the match; `Esc` cancels and puts it back. `n` / `N` jump to the next / previous match, and the footer shows where you are — for example `[/weather 2/5]`. Press `/` then `Enter` on the empty box to clear the search. Nothing about a search is saved, and opening a different session's events starts with no search.
 
 ## 9. Pause / resume
 

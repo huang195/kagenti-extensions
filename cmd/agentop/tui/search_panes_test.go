@@ -135,3 +135,48 @@ func TestSearch_NextAndPreviousOnAnotherTable(t *testing.T) {
 		t.Errorf("Matches = %v, want [0]", got)
 	}
 }
+
+// TestSearch_SlashOpensOnEveryPane walks every pane, as TestPaneKeysCoverAllPanes does, so a
+// pane added later cannot ship without a search.
+func TestSearch_SlashOpensOnEveryPane(t *testing.T) {
+	m := newPanesModel(t)
+	for p := paneID(0); p <= lastPaneID; p++ {
+		m.pane = p
+		if m.surface(p) == nil {
+			t.Errorf("pane %v has no search surface", p)
+			continue
+		}
+		m.Update(keyRune('/'))
+		if !m.searching || m.searchPane != p {
+			t.Errorf("pane %v: `/` did not open the prompt on it", p)
+		}
+		press(m, tea.KeyEsc)
+	}
+	m.pane = paneSessions
+	m.Update(keyRune('?'))
+	m.Update(keyRune('/'))
+	if !m.searching || m.searchPane != targetHelp {
+		t.Error("help overlay: `/` did not open the prompt on it")
+	}
+}
+
+// TestHelp_SearchIsAnAnywhereKey: every pane searches, so the overlay names `/` once, with
+// the keys that work everywhere, and no pane names it again.
+func TestHelp_SearchIsAnAnywhereKey(t *testing.T) {
+	has := func(g keyGroup, key string) bool {
+		for _, b := range g.bindings {
+			if b.keys == key {
+				return true
+			}
+		}
+		return false
+	}
+	if !has(anywhereKeys, "/") || !has(anywhereKeys, "n / N") {
+		t.Error("anywhereKeys does not name / and n / N")
+	}
+	for p, g := range paneKeys {
+		if has(g, "/") || has(g, "n / N") {
+			t.Errorf("pane %v names / or n / N itself", p)
+		}
+	}
+}

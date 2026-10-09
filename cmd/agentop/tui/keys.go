@@ -1203,7 +1203,7 @@ func (m *model) helpView() string {
 		}
 		return base + "  [?] keys  [q] quit"
 	case paneDetail:
-		return "[↑↓] scroll  [y] yank  [u] usage  [esc] back  [?] keys  [q] quit"
+		return "[↑↓] scroll  [y] yank  [u] usage  " + m.searchHints(m.pane) + "  [esc] back  [?] keys  [q] quit"
 	case panePipeline:
 		// ONE SPELLING NOW, where there used to be two. The picker/bypass split
 		// existed only because esc meant different things in the two modes — "back
@@ -1221,7 +1221,7 @@ func (m *model) helpView() string {
 		}
 		return base + "  " + m.searchHints(m.pane) + "  [?] keys  [q] quit"
 	case panePluginDetail:
-		return "[↑↓] scroll  [esc] back  [?] keys  [q] quit"
+		return "[↑↓] scroll  " + m.searchHints(m.pane) + "  [esc] back  [?] keys  [q] quit"
 	case paneUsage:
 		// [s] only appears when there is a session to scope to, so the footer
 		// never advertises a key that would do nothing.
@@ -1246,7 +1246,7 @@ func (m *model) helpView() string {
 		// No [r]: the pane polls every 20s on its own, so a manual refresh key
 		// bought nothing but a line of footer.
 		return "[m] metric  [w] window" + breakdownHint + scopeHint +
-			"  [esc] back  [?] keys  [q] quit"
+			"  " + m.searchHints(m.pane) + "  [esc] back  [?] keys  [q] quit"
 	case paneCatalog:
 		if m.catalog == nil {
 			return "loading catalog…  [esc] back  [?] keys  [q] quit"

@@ -435,6 +435,13 @@ func (s *Server) serveOutbound(w http.ResponseWriter, r *http.Request, tl *tunne
 		if scheme, host, ok := pctx.RedirectTarget(); ok {
 			pctx.Scheme, pctx.Host = scheme, host
 			r.URL.Scheme, r.URL.Host, r.Host = scheme, host, host
+			// The path, when the plugin gave one, from the copy SetRedirectPath
+			// validated, for the reason RedirectTarget is read rather than Host. The
+			// query string is the client's and stays.
+			if path, ok := pctx.RedirectPath(); ok {
+				pctx.Path = path
+				r.URL.Path, r.URL.RawPath = path, ""
+			}
 		}
 
 		if action.Type == pipeline.Reject {
@@ -478,36 +485,13 @@ func (s *Server) serveOutbound(w http.ResponseWriter, r *http.Request, tl *tunne
 	// x-api-key). Content-Length / Content-Encoding are managed by the
 	// body-rewrite block below and the transport, so leave them untouched.
 	// Mirrors reverseproxy's forwarded-request header sync.
-	skip := func(k string) bool {
-		return strings.EqualFold(k, "Content-Length") || strings.EqualFold(k, "Content-Encoding")
-	}
-	for k := range r.Header {
-		if skip(k) {
-			continue
-		}
-		if _, ok := pctx.Headers[k]; !ok {
-			r.Header.Del(k) // plugin removed it
-		}
-	}
-	for k, vv := range pctx.Headers {
-		if skip(k) {
-			continue
-		}
-		if len(vv) == 0 {
-			r.Header.Del(k) // pctx.Headers[k] = nil is a delete, same as Del(k)
-			continue
-		}
-		r.Header[k] = append([]string(nil), vv...) // set / overwrite
-	}
+	syncHeaders(r, pctx.Headers)
 
 	// If a WritesRequestBody plugin rewrote pctx.Body, ship the new bytes
 	// upstream and clear Content-Encoding (see forwardproxy response
 	// path for the rationale).
 	if pctx.BodyMutated() {
-		r.Body = io.NopCloser(bytes.NewReader(pctx.Body))
-		r.ContentLength = int64(len(pctx.Body))
-		r.Header.Set("Content-Length", fmt.Sprintf("%d", len(pctx.Body)))
-		r.Header.Del("Content-Encoding")
+		setBody(r, pctx.Body)
 	}
 
 	// Remove hop-by-hop headers
@@ -557,6 +541,9 @@ func (s *Server) serveOutbound(w http.ResponseWriter, r *http.Request, tl *tunne
 		client = s.TLSBridge.Upstream
 	}
 	resp, err := client.Do(r)
+	if err == nil && !skipped {
+		resp, err = s.resendIfAsked(r, pctx, client, resp, tl)
+	}
 	if err != nil {
 		// A 502 with the cause, or a 499 when the client hung up first — which,
 		// with no timeout on this client, is how a hung upstream usually ends.
@@ -957,6 +944,83 @@ func (s *Server) recordingSessionID(resolved string, clientHeaders http.Header, 
 // recordOutboundRequestEvent records pctx's request row under sid. Its pair is
 // recordOutboundResponseEvent, which files under pctx.OutboundSessionID, so the
 // caller pins that to sid first.
+// syncHeaders makes r's headers the pipeline's: pctx.Headers started as a clone of
+// r.Header, so a plugin's set, replace and delete on it are the upstream-facing
+// header set. Content-Length and Content-Encoding are left to setBody and the
+// transport.
+func syncHeaders(r *http.Request, h http.Header) {
+	skip := func(k string) bool {
+		return strings.EqualFold(k, "Content-Length") || strings.EqualFold(k, "Content-Encoding")
+	}
+	for k := range r.Header {
+		if skip(k) {
+			continue
+		}
+		if _, ok := h[k]; !ok {
+			r.Header.Del(k) // plugin removed it
+		}
+	}
+	for k, vv := range h {
+		if skip(k) {
+			continue
+		}
+		if len(vv) == 0 {
+			r.Header.Del(k) // pctx.Headers[k] = nil is a delete, same as Del(k)
+			continue
+		}
+		r.Header[k] = append([]string(nil), vv...) // set / overwrite
+	}
+}
+
+// setBody gives r the body a plugin wrote, and clears Content-Encoding, since the
+// bytes are the plugin's and carry none.
+func setBody(r *http.Request, body []byte) {
+	r.Body = io.NopCloser(bytes.NewReader(body))
+	r.ContentLength = int64(len(body))
+	r.Header.Set("Content-Length", fmt.Sprintf("%d", len(body)))
+	r.Header.Del("Content-Encoding")
+}
+
+// resendIfAsked gives the outbound pipeline's Resenders the one look at a refused
+// answer that pipeline.Resender promises, and sends the request again when one asks.
+// It returns the answer to relay: resp itself, or the second send's.
+//
+// Only a request whose body the pipeline buffered can be sent again, and only a
+// Resender's request could need it, so nothing is read from an answer unless a
+// Resender is in the chain. A refused answer that is sent again is recorded on its own
+// response row, and the second send on a request row of its own under a new request
+// id, so the timeline shows both attempts and each pairs with its own answer. A
+// refused answer that is not sent again goes to the client byte for byte, the bytes
+// read for the Resender included.
+func (s *Server) resendIfAsked(r *http.Request, pctx *pipeline.Context, client *http.Client, resp *http.Response, tl *tunnelLog) (*http.Response, error) {
+	if resp.StatusCode/100 == 2 || !s.OutboundPipeline.HasResenders() || !s.OutboundPipeline.NeedsRequestBody() {
+		return resp, nil
+	}
+	head, _ := io.ReadAll(io.LimitReader(resp.Body, pipeline.ResendPeekLimit))
+	if !s.OutboundPipeline.Resend(r.Context(), pctx, resp.StatusCode, head) {
+		resp.Body = struct {
+			io.Reader
+			io.Closer
+		}{io.MultiReader(bytes.NewReader(head), resp.Body), resp.Body}
+		return resp, nil
+	}
+	_ = resp.Body.Close()
+	if s.Sessions != nil {
+		// The refused answer's row: its status and error, from the bytes read. Put back
+		// at once, because the status of the answer the client gets is the one
+		// OutcomeFromContext must read.
+		pctx.StatusCode, pctx.ResponseBody = resp.StatusCode, head
+		s.recordOutboundResponseEvent(pctx, resp.StatusCode, nil)
+		pctx.StatusCode, pctx.ResponseBody = 0, nil
+		pctx.RenewRequestID()
+		s.recordOutboundRequestEvent(tl, pctx, pctx.OutboundSessionID)
+	}
+	again := r.Clone(r.Context())
+	syncHeaders(again, pctx.Headers)
+	setBody(again, pctx.Body)
+	return client.Do(again)
+}
+
 func (s *Server) recordOutboundRequestEvent(tl *tunnelLog, pctx *pipeline.Context, sid string) {
 	// Snapshot-copy the protocol extension so the request event
 	// doesn't see response-phase mutations on the same MCP/Inference

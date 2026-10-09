@@ -68,8 +68,7 @@ type MultiplierView struct {
 // Description is the whole table, unresolved.
 type Description struct {
 	// UpstreamCommit is the LiteLLM commit the bundled rates were generated from, so a
-	// figure can be traced to its source without reading the binary. Empty when the rates
-	// came from a downloaded list instead; ListFetchedAt says when that was.
+	// figure can be traced to its source without reading the binary.
 	UpstreamCommit string           `json:"upstreamCommit,omitempty"`
 	ListFetchedAt  time.Time        `json:"listFetchedAt,omitzero"`
 	Rows           []RowView        `json:"rows"`
@@ -139,9 +138,7 @@ func (t *Table) Describe() Description {
 	if t == nil {
 		return out
 	}
-	if !t.listFetchedAt.IsZero() {
-		out.UpstreamCommit, out.ListFetchedAt = "", t.listFetchedAt
-	}
+	out.ListFetchedAt = t.listFetchedAt
 	for i := range t.rows {
 		r := &t.rows[i]
 		row := RowView{

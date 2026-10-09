@@ -1,6 +1,9 @@
 package pricing
 
-import "time"
+import (
+	"strings"
+	"time"
+)
 
 // List is a set of vendor list prices obtained at runtime: LiteLLM's public price map,
 // downloaded rather than compiled in. See core/cost/pricing/pricelist.
@@ -11,21 +14,17 @@ import "time"
 // claude-opus-5-5 was charged at claude-opus-5's rates for nine days, 1.68x what the gateway
 // billed, although LiteLLM had listed its price a week before the first request.
 type List struct {
-	// Entries replace the shipped table's model rows. Produced by the same transform as
-	// bundled.go, so the two are interchangeable row for row.
+	// Produced by the same transform as bundled.go, so the two are interchangeable row for row.
 	Entries []Entry
-	// FetchedAt is when the list was downloaded, reported by Describe in place of the
-	// shipped table's upstream commit.
+	// FetchedAt is when the list was downloaded, reported by Describe.
 	FetchedAt time.Time
 }
 
-// BuildWithList is Build with list's rows in place of the shipped table's.
+// BuildWithList is Build with list's rows.
 //
-// REPLACED, NOT MERGED: the list is the newer table and stands alone. Merged, the shipped
-// family rows would sit beside the list's at the same provenance, and a model the list does
-// not name could be priced from a build months old. Everything else Build ships still
-// applies — the gateway discounts and the free rates are hand-maintained and the list
-// carries neither — and so does `bundled: false`, which turns the list off with the rest.
+// Everything else Build ships still applies — the gateway discounts and the free rates are
+// hand-maintained and the list carries neither — and so does `bundled: false`, which turns the
+// list off with the rest.
 //
 // A nil list is the shipped table: Build(cfg) is BuildWithList(cfg, nil).
 func BuildWithList(cfg *Config, list *List) (*Table, error) {
@@ -33,10 +32,17 @@ func BuildWithList(cfg *Config, list *List) (*Table, error) {
 	var mults []MultiplierRule
 	bundled := cfg.BundledEnabled()
 	if bundled {
+		listed := map[string]bool{}
 		if list != nil {
 			entries = append(entries, list.Entries...)
-		} else {
-			entries = append(entries, Bundled()...)
+			for _, e := range list.Entries {
+				listed[rowKey(e)] = true
+			}
+		}
+		for _, e := range Bundled() {
+			if !listed[rowKey(e)] {
+				entries = append(entries, e)
+			}
 		}
 		// So do the free models' zero rates, kept out of Bundled() because that is the
 		// generated table its golden test pins to the LiteLLM snapshot.
@@ -63,4 +69,8 @@ func BuildWithList(cfg *Config, list *List) (*Table, error) {
 		tab.listFetchedAt = list.FetchedAt
 	}
 	return tab, nil
+}
+
+func rowKey(e Entry) string {
+	return strings.ToLower(e.Host) + "\x00" + strings.ToLower(e.Model)
 }

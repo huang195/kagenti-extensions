@@ -20,7 +20,7 @@ import (
 //
 // This exists because no config file can answer the question. `pricing:` shows what the
 // operator wrote; the figures a request is charged come from that PLUS a rate table
-// compiled into the binary, or on a local install downloaded from LiteLLM, PLUS any
+// compiled into the binary, and on a local install downloaded from LiteLLM, PLUS any
 // shipped gateway discount. Storing the table in the
 // config instead would freeze every install at the rates current on its install date,
 // silently, because that file is written once and never refreshed — which is the exact
@@ -44,8 +44,8 @@ Usage:
   agentop pricing --json              raw JSON
 
 The rates come from a table built into the binary (vendor list), your `+"`pricing:`"+`
-config, and any gateway discount Cortex ships. A local install replaces the built-in table
-with LiteLLM's price list, downloaded hourly, so a new model is priced without a new
+config, and any gateway discount Cortex ships. A local install updates the built-in table
+from LiteLLM's price list, downloaded hourly, so a new model is priced without a new
 release. --host is the useful form: it resolves all of it the way a request would.
 
 Flags:
@@ -250,11 +250,11 @@ func renderTable(body []byte, stdout, stderr io.Writer) int {
 		return 1
 	}
 	fmt.Fprintf(stdout, "Pricing table (%d rows)\n", len(d.Rows))
-	switch {
-	case !d.ListFetchedAt.IsZero():
-		fmt.Fprintf(stdout, "  rates from litellm's price list, downloaded %s\n", d.ListFetchedAt.UTC().Format("2006-01-02 15:04 MST"))
-	case d.UpstreamCommit != "":
+	if d.UpstreamCommit != "" {
 		fmt.Fprintf(stdout, "  bundled rates generated from litellm %s\n", short(d.UpstreamCommit))
+	}
+	if !d.ListFetchedAt.IsZero() {
+		fmt.Fprintf(stdout, "  rates from litellm's price list, downloaded %s\n", d.ListFetchedAt.UTC().Format("2006-01-02 15:04 MST"))
 	}
 	fmt.Fprintf(stdout, "\n  %-22s %-30s %9s %9s %9s %9s  %s\n",
 		"endpoint", "model", "input", "cache-wr", "cache-rd", "output", "from")

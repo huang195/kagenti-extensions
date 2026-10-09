@@ -128,8 +128,7 @@ func TestRunPricing_TableViewListsRowsAndDiscounts(t *testing.T) {
 	}
 }
 
-// A local install prices from a downloaded list, and the header must say so: naming the
-// shipped commit would send a reader to rates the table no longer holds.
+// A local install prices from a downloaded list, and the header must say so.
 func TestRunPricing_TableViewSaysWhenTheListWasDownloaded(t *testing.T) {
 	all := [pricing.NumTiers]bool{}
 	for i := range all {
@@ -155,8 +154,8 @@ func TestRunPricing_TableViewSaysWhenTheListWasDownloaded(t *testing.T) {
 	if !strings.Contains(got, "rates from litellm's price list, downloaded 2026-10-08 21:00 UTC") {
 		t.Errorf("output does not say when the list was downloaded:\n%s", got)
 	}
-	if strings.Contains(got, "generated from litellm") {
-		t.Errorf("output names the shipped commit for a downloaded list:\n%s", got)
+	if !strings.Contains(got, "bundled rates generated from litellm "+short(pricing.BundledUpstreamCommit)) {
+		t.Errorf("output does not name the shipped commit, whose rows the list does not name are still in the table:\n%s", got)
 	}
 }
 

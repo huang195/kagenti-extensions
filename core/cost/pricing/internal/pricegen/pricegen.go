@@ -4,9 +4,8 @@
 // It is a library rather than living inside the generator command so the golden test
 // can run the exact same transform against a committed snapshot — a generator whose
 // transform only exists inside a main package cannot be tested without a network — and
-// so pricelist can run it on a list downloaded at runtime. That shared transform is what
-// makes a downloaded list a drop-in replacement for the generated table. It stays in
-// internal/ because only those two callers should depend on its output shape.
+// so pricelist can run it on a list downloaded at runtime. It stays in internal/ because
+// only those two callers should depend on its output shape.
 package pricegen
 
 import (

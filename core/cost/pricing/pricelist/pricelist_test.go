@@ -115,6 +115,8 @@ func TestFetch_RefusesAListItCannotUse(t *testing.T) {
 		"server error":     {code: http.StatusInternalServerError},
 		"not json":         {body: "<html>rate limited</html>"},
 		"no anthropic row": {body: `{"gpt-9": {"litellm_provider": "openai", "input_cost_per_token": 1e-06}}`},
+		"no rate":          {body: rateless},
+		"renamed rate":     {body: `{"claude-opus-9": {"litellm_provider": "anthropic", "input_cost_per_token_v2": 4e-06}}`},
 		"too large":        {body: `{"x": "` + strings.Repeat("a", maxBytes) + `"}`},
 	} {
 		t.Run(name, func(t *testing.T) {
@@ -127,6 +129,54 @@ func TestFetch_RefusesAListItCannotUse(t *testing.T) {
 				t.Errorf("a refused list was written to the cache (stat: %v)", statErr)
 			}
 		})
+	}
+}
+
+// rateless is an Anthropic row that decodes but carries no rate the table reads.
+const rateless = `{"claude-opus-9": {"litellm_provider": "anthropic", "input_cost_per_token": 0}}`
+
+func TestFetch_AListWithNoRateLeavesTheSavedCopyAlone(t *testing.T) {
+	s := &server{body: priceMap, etag: `"v1"`}
+	f, cache := newFetcher(t, s)
+	if _, err := f.Fetch(context.Background()); err != nil {
+		t.Fatalf("first Fetch: %v", err)
+	}
+	s.mu.Lock()
+	s.body, s.etag = rateless, `"v2"`
+	s.mu.Unlock()
+	if l, err := f.Fetch(context.Background()); err == nil {
+		t.Fatalf("Fetch returned %v and no error for a list with no rate", l)
+	}
+	if _, err := f.Fetch(context.Background()); err == nil {
+		t.Fatal("third Fetch returned no error")
+	}
+	if s.sent[2] != `"v1"` {
+		t.Errorf("third request sent If-None-Match %q, want %q: the refused list's ETag was kept", s.sent[2], `"v1"`)
+	}
+	l, err := (&Fetcher{CacheFile: cache}).Cached()
+	if err != nil || l == nil {
+		t.Fatalf("Cached = %v, %v; want the first download", l, err)
+	}
+	if got := inputPerMillion(t, l, "claude-opus-5-5"); got < 3.999 || got > 4.001 {
+		t.Errorf("cached input rate = %v, want 4.00 from the first download", got)
+	}
+}
+
+func TestCached_ASavedListWithNoRateIsAnError(t *testing.T) {
+	cache := filepath.Join(t.TempDir(), "price-list.json")
+	saved := `{"etag": "\"v1\"", "fetchedAt": "2026-10-08T21:00:00Z", "prices": ` + rateless + `}`
+	if err := os.WriteFile(cache, []byte(saved), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	s := &server{body: priceMap, etag: `"v1"`}
+	f, _ := newFetcher(t, s)
+	f.CacheFile = cache
+	if l, err := f.Cached(); err == nil {
+		t.Fatalf("Cached = %v and no error for a saved list with no rate", l)
+	}
+	l, err := f.Fetch(context.Background())
+	if err != nil || l == nil {
+		t.Fatalf("Fetch = %v, %v; want a download: the refused copy's ETag must not answer 304", l, err)
 	}
 }
 

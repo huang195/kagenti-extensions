@@ -57,15 +57,13 @@ Generated, not hand-written: `core/cost/pricing/bundled.go` carries
 reports as `upstreamCommit`.
 
 **A local install does not stay on that commit.** It downloads the same file at startup and
-then hourly, and replaces the compiled-in rows with what the download produces — the same
-transform, so the same shape of table, from newer data. An unchanged file answers `304` with
-no body, so checking costs nothing. The last good download is kept in
-`~/.cortex/price-list.json`, so a restart, or a laptop with no network, prices from it rather
-than from the build. A download that fails, or is not a usable price map, changes nothing.
-`agentop pricing` then reports `rates from litellm's price list, downloaded <time>` in place
-of the commit, and `--json` carries it as `listFetchedAt`. `bundled: false` turns the
-download off with the rest of the shipped table. Sidecars in a cluster make no such call and
-keep the compiled-in table.
+then hourly. An unchanged file answers `304` with no body, so checking costs nothing. The
+last good download is kept in `~/.cortex/price-list.json`, so a restart, or a laptop with no
+network, prices from it. A download that fails, or is not a usable price map, changes
+nothing. `agentop pricing` then reports `rates from litellm's price list, downloaded <time>`,
+and `--json` carries it as `listFetchedAt`. `bundled: false` turns the download off with the
+rest of the shipped table. Sidecars in a cluster make no such call and keep the compiled-in
+table.
 
 **33 entries: 28 exact model ids plus 5 family globs.** The globs matter most, because
 they are what catches a model released after the pinned commit:

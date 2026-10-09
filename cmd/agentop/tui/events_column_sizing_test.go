@@ -204,7 +204,7 @@ func TestMeasureColumns_IgnoreTheSearchAndTheInactiveToggle(t *testing.T) {
 			if got := len(m.eventsTbl.Rows()); got != tc.rows {
 				t.Fatalf("%d rows visible under the %s, want %d", got, tc.name, tc.rows)
 			}
-			if got := len(m.eventMatches); got != tc.marked {
+			if got := len(m.eventsTbl.Matches()); got != tc.marked {
 				t.Fatalf("%d rows marked under the %s, want %d; it did not take effect", got, tc.name, tc.marked)
 			}
 			for id, w := range want {

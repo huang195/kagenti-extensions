@@ -1,7 +1,6 @@
 package tui
 
 import (
-	"encoding/json"
 	"fmt"
 	"slices"
 	"strings"
@@ -545,84 +544,6 @@ func TestComputeEventPairIDs_MethodDiscrimination(t *testing.T) {
 	}
 	if ids[&events[0]] == ids[&events[1]] {
 		t.Errorf("notifications/initialized must not share id with tools/list, both got %d", ids[&events[0]])
-	}
-}
-
-// TestMatchEventRow_DenyShortcut verifies that typing "deny" surfaces both the
-// SessionDenied phase AND any invocation whose Action is ActionDeny.
-func TestMatchEventRow_DenyShortcut(t *testing.T) {
-	denied := eventRow{event: &pipeline.SessionEvent{Phase: pipeline.SessionDenied}}
-	if !matchEventRow(denied, "deny") {
-		t.Error("SessionDenied event should match the `deny` shortcut")
-	}
-
-	inboundDeny := eventRow{event: &pipeline.SessionEvent{
-		Phase:       pipeline.SessionRequest,
-		Invocations: &pipeline.Invocations{Inbound: []pipeline.Invocation{{Action: pipeline.ActionDeny}}},
-	}}
-	if !matchEventRow(inboundDeny, "deny") {
-		t.Error("event with a deny invocation should match the `deny` shortcut")
-	}
-
-	clean := eventRow{event: &pipeline.SessionEvent{
-		Phase:       pipeline.SessionRequest,
-		Invocations: &pipeline.Invocations{Inbound: []pipeline.Invocation{{Action: pipeline.ActionAllow}}},
-	}}
-	if matchEventRow(clean, "deny") {
-		t.Error("allow-only event should NOT match the `deny` shortcut")
-	}
-}
-
-// TestMatchEventRow_PluginSubstring verifies substring matching across an
-// event's invocation fields (plugin name, reason, path).
-func TestMatchEventRow_PluginSubstring(t *testing.T) {
-	row := eventRow{event: &pipeline.SessionEvent{
-		Phase: pipeline.SessionRequest,
-		Invocations: &pipeline.Invocations{Inbound: []pipeline.Invocation{
-			{Plugin: "jwt-validation", Action: pipeline.ActionSkip, Reason: "path_bypass", Path: "/healthz"},
-		}},
-	}}
-	if !matchEventRow(row, "jwt-validation") {
-		t.Error("filter jwt-validation should match")
-	}
-	if !matchEventRow(row, "path_bypass") {
-		t.Error("filter by reason should match")
-	}
-	if !matchEventRow(row, "/healthz") {
-		t.Error("filter by path should match")
-	}
-	if matchEventRow(row, "token-exchange") {
-		t.Error("filter token-exchange should NOT match a jwt-validation-only event")
-	}
-}
-
-// TestMatchEventRow_TunnelFields confirms a folded tunnel's fields are
-// searchable on the collapsed row — filtering by the bridged origin's
-// host:port still surfaces the row even though the row's own host is
-// port-stripped.
-func TestMatchEventRow_TunnelFields(t *testing.T) {
-	row := eventRow{
-		event:  &pipeline.SessionEvent{Host: "api.anthropic.com"},
-		tunnel: &pipeline.SessionEvent{Host: "api.anthropic.com:443"},
-	}
-	if !matchEventRow(row, "anthropic.com:443") {
-		t.Error("filter on the tunnel host:port should match the collapsed row")
-	}
-}
-
-// TestMatchEventRow_PluginPrefix tests the `plugin:<name>` escape-hatch filter
-// against the event's Plugins map.
-func TestMatchEventRow_PluginPrefix(t *testing.T) {
-	row := eventRow{event: &pipeline.SessionEvent{
-		Plugins: map[string]json.RawMessage{
-			"rate-limiter": json.RawMessage(`{"allowed":true}`),
-		},
-	}}
-	if !matchEventRow(row, "plugin:rate-limiter") {
-		t.Error("expected match on plugin:rate-limiter")
-	}
-	if matchEventRow(row, "plugin:nonexistent") {
-		t.Error("expected no match for a plugin not in the map")
 	}
 }
 

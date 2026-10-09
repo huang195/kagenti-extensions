@@ -447,18 +447,16 @@ func (m *model) handleKey(msg tea.KeyMsg) tea.Cmd {
 		return tea.Quit
 
 	case "/":
-		// Only where there is something to search. On every other pane this used to open a
-		// filter box that narrowed nothing.
-		if searchable(m.pane) {
-			m.openSearch()
-		}
+		// Only where there is something to search: openSearch does nothing on a pane with no
+		// search surface.
+		m.openSearch(m.pane)
 		return nil
 
 	case "n", "N":
 		// The search's next and previous match. Elsewhere the keys fall through to the pane's
 		// component, which binds neither.
-		if searchable(m.pane) {
-			m.searchStep(msg.String() == "n")
+		if m.surface(m.pane) != nil {
+			m.searchStep(m.pane, msg.String() == "n")
 			return nil
 		}
 
@@ -1134,7 +1132,7 @@ func (m *model) helpView() string {
 		// [A] agents is absent for width: the line is already 98 columns, and with one agent —
 		// the common case — the breakdown is a single row. The [?] overlay names it. esc names
 		// the picker instead when this list was reached through it.
-		search := m.searchHints()
+		search := m.searchHints(m.pane)
 		if m.sessionsViaAgents {
 			return "[↑↓] nav  [↵] drill  [u] usage  [$] spend  " + search + "  [esc] agents  [p] pause  [P] pipeline  [?] keys  [q] quit"
 		}
@@ -1154,7 +1152,7 @@ func (m *model) helpView() string {
 		// end, and the escapable/discoverable keys ahead of them, with the
 		// specialised ones first to be lost.
 		base := "[↑↓] nav  [b/f] page  [↵] detail  [c] columns  [u] usage  " +
-			skipHint + "  [p] pause  " + m.searchHints() + "  [esc] back"
+			skipHint + "  [p] pause  " + m.searchHints(m.pane) + "  [esc] back"
 
 		// Notices go BEFORE the essential hints, not after.
 		//

@@ -602,21 +602,16 @@ type model struct {
 	sortCol      eventColumnID
 	sortDesc     bool
 	selectedSess string
-	// search is each pane's committed `/` query — only paneSessions and paneEvents have one —
-	// and searching is whether the prompt is open, on searchPane. Never saved, and cleared by
+	// search is each target's committed `/` query, keyed by pane or targetHelp, and searching
+	// is whether the prompt is open, on searchPane. Never saved, and cleared by
 	// backToPodsPane. See search.go.
 	search     map[paneID]string
 	searching  bool
 	searchPane paneID
-	// searchOrigin is where the cursor was when `/` was pressed: the row typing searches from,
-	// and the row Esc puts the cursor back on.
+	// searchOrigin is where the target was when `/` was pressed: the place typing searches
+	// from, and the place Esc puts it back.
 	searchOrigin searchSpot
-	// sessionMatches and eventMatches are the rows of the sessions and events tables the
-	// pane's search matches, ascending. Each is published by its table's rebuild together with
-	// the rows, so it is index-aligned with sessionRowIDs and visibleRows.
-	sessionMatches []int
-	eventMatches   []int
-	paused         bool
+	paused       bool
 	// hideInactive toggles whether passthrough / skip-only messages are
 	// hidden from the events table. False (default) shows every message —
 	// the operator asked to see all network traffic, processed or not.

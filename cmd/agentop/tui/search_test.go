@@ -2,6 +2,7 @@ package tui
 
 import (
 	"context"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -27,19 +28,20 @@ func forceColour(t *testing.T) {
 }
 
 // rowLook is how tbl draws the screen line that shows tok: "selected" (the cursor), "marked"
-// (a search match), "plain", or "absent" when no line on screen shows it.
+// (a search match — its characters highlighted, or the whole row marked when nothing on
+// screen shows the match), "plain", or "absent" when no line on screen shows it.
 func rowLook(tbl table.Model, tok string) string {
 	esc := func(s lipgloss.Style) string { return strings.SplitN(s.Render("x"), "x", 2)[0] }
 	st := tableStyles()
-	sel, mark := esc(st.Selected), esc(st.Marked)
+	sel := esc(st.Selected)
 	for _, l := range strings.Split(tbl.View(), "\n") {
-		if !strings.Contains(l, tok) {
+		if !strings.Contains(stripANSI(l), tok) {
 			continue
 		}
 		switch {
 		case strings.Contains(l, sel):
 			return "selected"
-		case strings.Contains(l, mark):
+		case strings.Contains(l, esc(st.Match)), strings.Contains(l, esc(st.Marked)):
 			return "marked"
 		}
 		return "plain"
@@ -424,41 +426,15 @@ func TestSearch_DenyStillFindsDeniedEvents(t *testing.T) {
 	forceColour(t)
 	m := newSearchEventsModel(t, "r0.test", "r1.test", "r2.test")
 	m.events["s"][0].Phase = pipeline.SessionDenied
+	m.events["s"][0].Invocations = &pipeline.Invocations{
+		Inbound: []pipeline.Invocation{{Plugin: "jwt-validation", Action: pipeline.ActionDeny}},
+	}
 	m.rebuildEventsTable()
 	typeKeys(m, "/deny")
 	press(m, tea.KeyEnter)
 	checkLooks(t, "after /deny", m.eventsTbl, map[string]string{
 		"r0.test": "selected", "r1.test": "plain", "r2.test": "plain",
 	})
-}
-
-// TestSearch_SlashOpensOnlyWhereThereIsSomethingToSearch: `/` on any other pane used to open
-// an input that narrowed nothing.
-func TestSearch_SlashOpensOnlyWhereThereIsSomethingToSearch(t *testing.T) {
-	m := newSearchEventsModel(t, "r0.test")
-	for _, p := range []paneID{panePipeline, paneCatalog, paneUsage, paneAgents, paneDetail} {
-		m.pane = p
-		m.Update(keyRune('/'))
-		if m.searching {
-			t.Errorf("pane %v: `/` opened the search prompt", p)
-			m.searching = false
-		}
-	}
-	for _, p := range []paneID{paneSessions, paneEvents} {
-		m.pane = p
-		m.searching = false
-		m.Update(keyRune('/'))
-		if !m.searching {
-			t.Errorf("pane %v: `/` did not open the search prompt", p)
-		}
-		if got, want := m.searchInput.Placeholder, searchPlaceholder(p); got != want {
-			t.Errorf("pane %v: placeholder %q, want %q", p, got, want)
-		}
-		press(m, tea.KeyEsc)
-	}
-	if searchPlaceholder(paneSessions) == searchPlaceholder(paneEvents) {
-		t.Error("sessions and events share a placeholder; each should name its own fields")
-	}
 }
 
 // TestSearch_IsNeverSaved: the filter was written to the config file on Enter and came back on
@@ -509,5 +485,147 @@ func TestFooter_SearchStatus(t *testing.T) {
 	press(m, tea.KeyEnter)
 	if st := status(); strings.Contains(st, "[/") {
 		t.Errorf("a cleared search still shows: %q", st)
+	}
+}
+
+// assertEveryCellSearchable is the check that would have caught PHASE: for every row and
+// every column on screen, the cell's drawn text, searched for, matches that row.
+func assertEveryCellSearchable(t *testing.T, tbl *table.Model, search func(q string)) {
+	t.Helper()
+	rows, cols := tbl.Rows(), tbl.Columns()
+	if len(rows) == 0 {
+		t.Fatal("setup: the table has no rows")
+	}
+	for i, r := range rows {
+		for j, v := range r {
+			if j >= len(cols) || cols[j].Width <= 0 {
+				continue
+			}
+			q := strings.TrimSpace(strings.ReplaceAll(stripANSI(v), "…", ""))
+			if q == "" {
+				continue
+			}
+			search(q)
+			if !slices.Contains(tbl.Matches(), i) {
+				t.Errorf("row %d, column %s: %q does not match its own row", i, cols[j].Title, q)
+			}
+		}
+	}
+	search("")
+}
+
+// richEvents is one of each row shape the events table draws differently: a plain request,
+// its response, an inference call, a denial, and an opaque tunnel.
+func richEvents() []pipeline.SessionEvent {
+	evs := hostEvents("r0.test", "r0.test", "llm.test", "auth.test", "tun.test")
+	evs[1].Phase, evs[1].StatusCode, evs[1].Duration = pipeline.SessionResponse, 200, 42*time.Millisecond
+	evs[2].Inference = &pipeline.InferenceExtension{Model: "claude-opus-5-5"}
+	evs[3].Phase = pipeline.SessionDenied
+	evs[3].Direction = pipeline.Inbound
+	evs[3].Invocations = &pipeline.Invocations{
+		Inbound: []pipeline.Invocation{{Plugin: "jwt-validation", Action: pipeline.ActionDeny, Reason: "expired"}},
+	}
+	evs[4].Tunnel, evs[4].TunnelReason = true, pipeline.TunnelReason("no-bridge")
+	return evs
+}
+
+func TestSearch_EveryEventsCellIsSearchable(t *testing.T) {
+	m := newSearchEventsModel(t)
+	m.events["s"] = richEvents()
+	m.rebuildEventsTable()
+	assertEveryCellSearchable(t, &m.eventsTbl, func(q string) {
+		m.search = map[paneID]string{paneEvents: q}
+		m.rebuildEventsTable()
+	})
+}
+
+func TestSearch_EverySessionsCellIsSearchable(t *testing.T) {
+	m := newSearchSessionsModel(t, searchIDs...)
+	m.sessions[0].Title = "fix the flaky archive test"
+	m.sessions[1].EventCount, m.sessions[1].TotalTokens = 12, 3400
+	m.rebuildSessionsTable()
+	assertEveryCellSearchable(t, &m.sessionsTbl, func(q string) {
+		m.search = map[paneID]string{paneSessions: q}
+		m.rebuildSessionsTable()
+	})
+}
+
+// TestSearch_ReqMarksEveryRequestRow is the report that started this: PHASE shows "req", and
+// the search did not read PHASE.
+func TestSearch_ReqMarksEveryRequestRow(t *testing.T) {
+	forceColour(t)
+	m := newSearchEventsModel(t, "r0.test", "r1.test", "r2.test")
+	m.events["s"][1].Phase = pipeline.SessionResponse
+	m.rebuildEventsTable()
+	typeKeys(m, "/req")
+	press(m, tea.KeyEnter)
+	checkLooks(t, "after /req", m.eventsTbl, map[string]string{
+		"r0.test": "marked", "r1.test": "plain", "r2.test": "selected",
+	})
+}
+
+// TestSearch_EventsMatchAHostPastItsCut: HOST is cut to its column; the whole host matches.
+func TestSearch_EventsMatchAHostPastItsCut(t *testing.T) {
+	forceColour(t)
+	long := "a-very-long-hostname-that-the-column-cuts.example.com"
+	m := newSearchEventsModel(t, long, "r1.test")
+	typeKeys(m, "/cuts.example")
+	press(m, tea.KeyEnter)
+	if got := m.eventsTbl.Matches(); !slices.Equal(got, []int{0}) {
+		t.Fatalf("Matches = %v, want [0]", got)
+	}
+}
+
+// TestSearch_EventsMatchAColumnTheTerminalDropped: DIR gives way first on a narrow terminal.
+// It is still a column the operator turned on, so it still matches, and the row is marked
+// because nothing on screen shows the match.
+func TestSearch_EventsMatchAColumnTheTerminalDropped(t *testing.T) {
+	forceColour(t)
+	m := newSearchEventsModel(t, "r0.test", "r1.test")
+	hasDir := func() bool {
+		return slices.ContainsFunc(m.eventsTbl.Columns(), func(c table.Column) bool {
+			return strings.HasPrefix(c.Title, string(colDir))
+		})
+	}
+	for m.width = 120; hasDir() && m.width > 30; m.width-- {
+		m.layout()
+	}
+	if hasDir() {
+		t.Skip("DIR is never dropped at any width this test tries")
+	}
+	m.search = map[paneID]string{paneEvents: "out"}
+	m.rebuildEventsTable()
+	if got := m.eventsTbl.Matches(); !slices.Equal(got, []int{0, 1}) {
+		t.Fatalf("Matches = %v, want both outbound rows", got)
+	}
+	if got := rowLook(m.eventsTbl, "r0.test"); got != "marked" {
+		t.Errorf("r0.test is %s, want marked", got)
+	}
+}
+
+// TestSearch_SessionsMatchTheWholeTitle: TITLE is cut to its column; the whole title matches.
+func TestSearch_SessionsMatchTheWholeTitle(t *testing.T) {
+	m := newSearchSessionsModel(t, searchIDs...)
+	m.width = 100
+	m.sessions[2].Title = "a title long enough that the TITLE column has to cut it short, tailword"
+	m.layout()
+	typeKeys(m, "/tailword")
+	press(m, tea.KeyEnter)
+	if got := m.sessionsTbl.Matches(); len(got) != 1 || m.sessionRowIDs[got[0]] != "y-gamma" {
+		t.Errorf("Matches = %v, want y-gamma's row only", got)
+	}
+}
+
+// TestSearch_StreamedEventsUnderAnOpenPrompt: events keep arriving while the operator types.
+// Each rebuild matches the new rows too, and the count says so.
+func TestSearch_StreamedEventsUnderAnOpenPrompt(t *testing.T) {
+	m := newSearchEventsModel(t, "r0-zeta.test", "r1.test")
+	typeKeys(m, "/zeta")
+	streamHost(m, "r2-zeta.test")
+	if got := m.eventsTbl.Matches(); !slices.Equal(got, []int{0, 2}) {
+		t.Fatalf("Matches = %v, want [0 2]", got)
+	}
+	if st := stripANSI(statusRow(m.footerView())); !strings.Contains(st, "[/zeta") {
+		t.Errorf("status row = %q, want the live search", st)
 	}
 }

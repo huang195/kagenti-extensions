@@ -270,69 +270,74 @@ func (m *model) rebuildSessionsTable() {
 	contextW := sessionsColumnWidth(want, contextColumnTitle)
 	rows := make([]table.Row, 0, len(m.sessions))
 	ids := make([]string, 0, len(m.sessions))
-	var hits []bool
+	var full, bucketFull []table.SearchRow
 	var bucketRows []table.Row
 	var bucketIDs []string
-	var bucketHits []bool
-	emit := func(id string, row table.Row, hit bool) {
+	emit := func(id string, b rowBuilder) {
 		if _, _, ok := pendingBucket(id); ok {
-			bucketRows = append(bucketRows, row)
+			bucketRows = append(bucketRows, b.row)
 			bucketIDs = append(bucketIDs, id)
-			bucketHits = append(bucketHits, hit)
+			bucketFull = append(bucketFull, b.searchRow())
 			return
 		}
-		rows = append(rows, row)
-		// APPENDED IN LOCKSTEP, one line apart, so the two cannot drift: the row carries what
-		// a reader sees and this carries what the code acts on. The search's hit too, for the
-		// row it is marked on.
+		rows = append(rows, b.row)
+		// APPENDED IN LOCKSTEP, one line apart, so the three cannot drift: the row carries
+		// what a reader sees, this what the code acts on, and the search row what the row
+		// says in full.
 		ids = append(ids, id)
-		hits = append(hits, hit)
+		full = append(full, b.searchRow())
 	}
 	q := m.searchQuery(paneSessions)
 	for _, s := range m.sessions {
 		if !m.sessionListed(s, scope) {
 			continue
 		}
-		row := table.Row{
-			sessionIDCell(s.ID, idW),
-		}
+		b := newRowBuilder(q != "")
+		b.cut(sessionIDCell(s.ID, idW), func() string { return sessionIDCell(s.ID, noLimit) })
+		// s.Title straight off the summary, where sessionLabel reaches the same value by id
+		// through m.servedTitle. Two routes, equal only because they read the same slice —
+		// probed across many inputs without finding a divergence. Do not "unify" one into the
+		// other: this loop has the summary in hand and should not pay a lookup, and the header
+		// path has only an id and cannot avoid one.
+		title := func() string { return m.sessionTitleCell(s.ID, s.Title, noLimit) }
 		if showTitle {
-			// s.Title straight off the summary, where sessionLabel reaches the same value by
-			// id through m.servedTitle. Two routes, equal only because they read the same
-			// slice — probed across many inputs without finding a divergence. Do not "unify"
-			// one into the other: this loop has the summary in hand and should not pay a
-			// lookup, and the header path has only an id and cannot avoid one.
-			row = append(row, m.sessionTitleCell(s.ID, s.Title, titleW))
+			b.cut(m.sessionTitleCell(s.ID, s.Title, titleW), title)
+		} else {
+			// TITLE is the column a narrow terminal gives up; it is still searched.
+			b.dropped(title)
 		}
 		if agentW > 0 {
-			row = append(row, sessionAgentCell(s, agentW))
+			b.cut(sessionAgentCell(s, agentW), func() string { return sessionAgentCell(s, noLimit) })
 		}
 		// Read-only: where the session's inference went. No key here changes it — that would
 		// move a running conversation, which the router exists not to do.
 		if serverW > 0 {
-			row = append(row, sessionServerCell(router, s.InferenceHost, serverW))
+			b.cut(sessionServerCell(router, s.InferenceHost, serverW),
+				func() string { return sessionServerCell(router, s.InferenceHost, noLimit) })
 		}
-		row = append(row,
-			relTime(now, s.UpdatedAt),
-			// The server's count, and only ever the server's: it is the complete one.
-			// agentop's own cache holds what it snapshotted plus what it has streamed
-			// since attaching, which for a session older than the connection is a
-			// smaller number — and when handleStreamEvent also wrote this field, the
-			// cell flipped between the two on live traffic. The cached-only rows below
-			// use len(cached) because the server does not list those at all.
-			padLeft(fmt.Sprintf("%d", s.EventCount), eventsW),
-			padLeft(sessionTokens(s.TotalTokens, m.events[s.ID]), tokensW),
-		)
+		b.cell(relTime(now, s.UpdatedAt))
+		// The server's count, and only ever the server's: it is the complete one. agentop's
+		// own cache holds what it snapshotted plus what it has streamed since attaching, which
+		// for a session older than the connection is a smaller number — and when
+		// handleStreamEvent also wrote this field, the cell flipped between the two on live
+		// traffic. The cached-only rows below use len(cached) because the server does not list
+		// those at all.
+		b.cell(padLeft(fmt.Sprintf("%d", s.EventCount), eventsW))
+		b.cell(padLeft(sessionTokens(s.TotalTokens, m.events[s.ID]), tokensW))
+		cost := func() string { return sessionMoneyCellIn(s.CostMicros, s.Saturated, noLimit, s.Currencies) }
+		saved := func() string { return sessionMoneyCellIn(s.AvoidedMicros, s.Saturated, noLimit, s.Currencies) }
 		if showMoney {
-			row = append(row,
-				padLeft(sessionMoneyCellIn(s.CostMicros, s.Saturated, costW, s.Currencies), costW),
-				padLeft(sessionMoneyCellIn(s.AvoidedMicros, s.Saturated, savedW, s.Currencies), savedW))
+			b.cut(padLeft(sessionMoneyCellIn(s.CostMicros, s.Saturated, costW, s.Currencies), costW), cost)
+			b.cut(padLeft(sessionMoneyCellIn(s.AvoidedMicros, s.Saturated, savedW, s.Currencies), savedW), saved)
+		} else {
+			b.dropped(cost)
+			b.dropped(saved)
 		}
 		// The server's published figure is merged with agentop's own — see sessionContextFor for
 		// why neither source dominates. It is what lets a row idle since before agentop attached
 		// draw a gauge on the first poll, with nothing opened.
-		row = append(row, padLeft(contextGauge(m.sessionContextFor(s.ID, s.PromptContext), contextW), contextW))
-		emit(s.ID, row, m.sessionMatchesSearch(q, s.ID, s.Title, s.Agent))
+		b.cell(padLeft(contextGauge(m.sessionContextFor(s.ID, s.PromptContext), contextW), contextW))
+		emit(s.ID, b)
 	}
 	// Sessions whose events agentop still holds but the server no longer lists.
 	// Retaining the events (#870) is only half a fix if there is no row to
@@ -349,54 +354,55 @@ func (m *model) rebuildSessionsTable() {
 			continue
 		}
 		cached := m.events[id]
-		row := table.Row{
-			sessionIDCell(id, idW),
-		}
+		b := newRowBuilder(q != "")
+		b.cut(sessionIDCell(id, idW), func() string { return sessionIDCell(id, noLimit) })
+		// These rows exist precisely because the server no longer lists the session, so there
+		// is no summary to carry a served title. Harvested metadata outlives the listing, so
+		// the cell can still fill from that. Named constant rather than a bare "" so the
+		// absence reads as a fact about this row, not a forgotten argument.
+		title := func() string { return m.sessionTitleCell(id, noServedTitle, noLimit) }
 		if showTitle {
-			// These rows exist precisely because the server no longer lists the session, so
-			// there is no summary to carry a served title. Harvested metadata outlives the
-			// listing, so the cell can still fill from that. Named constant rather than a bare
-			// "" so the absence reads as a fact about this row, not a forgotten argument.
-			row = append(row, m.sessionTitleCell(id, noServedTitle, titleW))
+			b.cut(m.sessionTitleCell(id, noServedTitle, titleW), title)
+		} else {
+			b.dropped(title)
 		}
 		if agentW > 0 {
-			row = append(row, sessionAgentCell(session.SessionSummary{ID: id}, agentW))
+			agent := session.SessionSummary{ID: id}
+			b.cut(sessionAgentCell(agent, agentW), func() string { return sessionAgentCell(agent, noLimit) })
 		}
 		// No summary, so no inference host to name a server from.
 		if serverW > 0 {
-			row = append(row, emptyCell)
+			b.cell(emptyCell)
 		}
-		row = append(row,
-			// "cached" sits in UPDATED now, where an em dash used to, because ACTIVE is gone
-			// and that marker is the only thing on the row saying why it has no server
-			// figures. It answers this column's question as well as anything can: the server
-			// has forgotten the session, so there is no update time to report, and what a
-			// reader needs to know is that these events are local.
-			cachedMarker,
-			padLeft(fmt.Sprintf("%d", len(cached)), eventsW),
-			padLeft(sessionTokens(0, cached), tokensW),
-		)
+		// "cached" sits in UPDATED now, where an em dash used to, because ACTIVE is gone and
+		// that marker is the only thing on the row saying why it has no server figures. It
+		// answers this column's question as well as anything can: the server has forgotten the
+		// session, so there is no update time to report, and what a reader needs to know is
+		// that these events are local.
+		b.cell(cachedMarker)
+		b.cell(padLeft(fmt.Sprintf("%d", len(cached)), eventsW))
+		b.cell(padLeft(sessionTokens(0, cached), tokensW))
 		if showMoney {
 			// No figures for a session the server no longer lists. agentop holds these
 			// events and never held their costs: the money is summed server-side from the
 			// session store, and this row exists precisely because that store has
 			// forgotten the session. An em dash says "not known here", where $0.00 would
 			// say the session was free.
-			row = append(row, emptyCell, emptyCell)
+			b.cell(emptyCell)
+			b.cell(emptyCell)
 		}
 		// These rows DO have a context, and it is the one case where agentop's cache is the only
 		// possible source: the server has forgotten the session, so nothing else could answer.
 		// It does not list these rows at all, so there is no summary and no published figure —
 		// hence the nil, which is the merge's identity.
-		row = append(row, padLeft(contextGauge(m.sessionContextFor(id, nil), contextW), contextW))
-		emit(id, row, m.sessionMatchesSearch(q, id, noServedTitle, ""))
+		b.cell(padLeft(contextGauge(m.sessionContextFor(id, nil), contextW), contextW))
+		emit(id, b)
 	}
-	rows, ids, hits = append(rows, bucketRows...), append(ids, bucketIDs...), append(hits, bucketHits...)
-	var matches []int
-	for i, hit := range hits {
-		if hit {
-			matches = append(matches, i)
-		}
+	rows, ids = append(rows, bucketRows...), append(ids, bucketIDs...)
+	if q == "" {
+		full = nil
+	} else {
+		full = append(full, bucketFull...)
 	}
 	// ONLY WHEN THE HEADER ACTUALLY CHANGES, which is a resize and nothing else. SetRows(nil)
 	// resets the viewport's offset, and this function runs on every poll — clearing
@@ -411,10 +417,9 @@ func (m *model) rebuildSessionsTable() {
 		m.sessionsTbl.SetColumns(want)
 	}
 	m.sessionsTbl.SetRows(rows)
-	m.sessionsTbl.SetSearch(q, nil)
+	m.sessionsTbl.SetSearch(q, full)
 	// Published with the rows they describe, never separately.
 	m.sessionRowIDs = ids
-	m.sessionMatches = matches
 
 	// Restore cursor position if possible. Through setCursorVisible: a restored row
 	// past the first screenful would otherwise land one line below the rendered
@@ -461,18 +466,6 @@ func (m *model) sessionListed(s session.SessionSummary, scope string) bool {
 		return inOtherAgents(s)
 	}
 	return s.Agent == scope
-}
-
-// sessionMatchesSearch reports whether q is a case-insensitive substring of the full session id,
-// the agent, or the title the TITLE cell shows (untruncated). Title goes last, being the only one
-// that costs a lookup. An empty q matches nothing: no search marks no rows.
-func (m *model) sessionMatchesSearch(q, id, served, agent string) bool {
-	if q == "" {
-		return false
-	}
-	q = strings.ToLower(q)
-	has := func(s string) bool { return strings.Contains(strings.ToLower(s), q) }
-	return has(id) || has(agent) || has(m.sessionTitleFor(id, served))
 }
 
 // sessionsListTwoAgents reports whether the listed sessions name two or more agents, which is when

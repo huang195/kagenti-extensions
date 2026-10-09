@@ -107,37 +107,47 @@ func TestSelectedSessionID_DistinguishesIDsThatRenderTheSame(t *testing.T) {
 	}
 }
 
-// One id per row, always, including with a filter and cached-only rows in play.
+// One id per row, always, including with a search and cached-only rows in play — and the
+// search's matches name the rows whose ids it matches.
 //
 // The two are built in the same loop precisely so they cannot drift, and a drift is not a
 // cosmetic bug: it silently shifts every id by one, so the picker acts on a session the
-// operator did not select.
+// operator did not select, or marks one the search did not match.
 func TestSessionRowIDs_MatchTheRowsOneForOne(t *testing.T) {
 	cases := 0
 	for _, width := range []int{60, 72, 100, 200} {
-		for _, filter := range []string{"", "ecb", "zzz"} {
+		for _, search := range []string{"", "ecb", "cached-only", "zzz"} {
 			m := uuidPicker(t, width, uuidOpened, uuidOther)
 			// A cached-only session: held by agentop, absent from the server's list.
 			m.events["cached-only-session-1234"] = []pipeline.SessionEvent{
 				{Phase: pipeline.SessionRequest},
 			}
-			m.filter = filter
+			m.search = map[paneID]string{paneSessions: search}
 			m.rebuildSessionsTable()
 
 			rows := m.sessionsTbl.Rows()
 			if len(m.sessionRowIDs) != len(rows) {
-				t.Errorf("width %d filter %q: %d ids for %d rows",
-					width, filter, len(m.sessionRowIDs), len(rows))
+				t.Errorf("width %d search %q: %d ids for %d rows",
+					width, search, len(m.sessionRowIDs), len(rows))
+			}
+			marked := map[int]bool{}
+			for _, i := range m.sessionMatches {
+				marked[i] = true
 			}
 			for i, id := range m.sessionRowIDs {
 				if id == "" {
-					t.Errorf("width %d filter %q: row %d has an empty id", width, filter, i)
+					t.Errorf("width %d search %q: row %d has an empty id", width, search, i)
 				}
 				// The id and its row agree: the rendered cell is a prefix of the id it stands for.
 				cell := strings.TrimSuffix(rows[i][0], "…")
 				if !strings.HasPrefix(id, cell) {
-					t.Errorf("width %d filter %q: row %d renders %q for id %q — the slices drifted",
-						width, filter, i, rows[i][0], id)
+					t.Errorf("width %d search %q: row %d renders %q for id %q — the slices drifted",
+						width, search, i, rows[i][0], id)
+				}
+				// No titles or agents in this fixture, so the id is all a search can match.
+				if want := search != "" && strings.Contains(id, search); marked[i] != want {
+					t.Errorf("width %d search %q: row %d (%q) marked=%v, want %v",
+						width, search, i, id, marked[i], want)
 				}
 			}
 			cases++

@@ -495,10 +495,9 @@ func tableColumns(cols []eventColumn, sortCol eventColumnID, desc bool) []table.
 // cannot widen it — the same reason every declared width leaves room for one (see
 // sortGlyphAsc).
 //
-// ctxs should be every row of the session, not only those the filter keeps. Measured over
-// the visible rows, a filter typed one letter at a time would resize the columns on every
-// keystroke, and hiding the one row with a saving would narrow TOKENS until the filter was
-// cleared.
+// ctxs should be every row of the session, not only those hideInactive keeps. Measured over
+// the visible rows, hiding the one row with a saving would narrow TOKENS until the rows were
+// shown again.
 func measureColumns(cols []eventColumn, ctxs []cellContext) (widths map[eventColumnID]int,
 	cells map[eventColumnID][]string) {
 	widths = make(map[eventColumnID]int)

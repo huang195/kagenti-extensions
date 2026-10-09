@@ -173,10 +173,10 @@ func TestMeasureColumns_NeverWiderThanTheCap(t *testing.T) {
 	}
 }
 
-// Measured over the whole session, so neither a filter nor the inactive toggle resizes
-// the columns. Typing a filter one letter at a time would otherwise reflow the table on
-// every keystroke, and hiding the one row with a saving would narrow TOKENS under it.
-func TestMeasureColumns_IgnoreTheFilter(t *testing.T) {
+// Measured over the whole session, so neither a search nor the inactive toggle resizes
+// the columns. Hiding the one row with a saving would otherwise narrow TOKENS under it. A
+// search hides nothing, so it is here to keep it that way: marking rows must not reflow them.
+func TestMeasureColumns_IgnoreTheSearchAndTheInactiveToggle(t *testing.T) {
 	now := time.Now()
 	m := sizingModel(t, 200,
 		sizingExchange(t, "r1", "wide.example", now, 1_048_576, estimatedSaving),
@@ -187,20 +187,25 @@ func TestMeasureColumns_IgnoreTheFilter(t *testing.T) {
 	}
 
 	for _, tc := range []struct {
-		name  string
-		apply func(*model)
-		rows  int
+		name   string
+		apply  func(*model)
+		rows   int
+		marked int
 	}{
-		{"filter", func(m *model) { m.filter = "narrow.example" }, 2},
+		// Every row stays, and the narrow exchange's two rows are marked.
+		{"search", func(m *model) { m.search = map[paneID]string{paneEvents: "narrow.example"} }, 4, 2},
 		// No plugin acted on these fixture rows, so hiding inactive rows hides all of them.
-		{"hide inactive", func(m *model) { m.hideInactive = true }, 0},
+		{"hide inactive", func(m *model) { m.hideInactive = true }, 0, 0},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			m.filter, m.hideInactive = "", false
+			m.search, m.hideInactive = nil, false
 			tc.apply(m)
 			m.rebuildEventsTable()
 			if got := len(m.eventsTbl.Rows()); got != tc.rows {
-				t.Fatalf("%d rows visible, want %d; the %s did not take effect", got, tc.rows, tc.name)
+				t.Fatalf("%d rows visible under the %s, want %d", got, tc.name, tc.rows)
+			}
+			if got := len(m.eventMatches); got != tc.marked {
+				t.Fatalf("%d rows marked under the %s, want %d; it did not take effect", got, tc.name, tc.marked)
 			}
 			for id, w := range want {
 				if got := renderedWidth(t, m, id); got != w {

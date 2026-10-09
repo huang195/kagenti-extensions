@@ -32,9 +32,9 @@ func TestEndToEnd_SettingsSurviveARestart(t *testing.T) {
 		t.Errorf("first run warned: %q", warn.String())
 	}
 
-	// --- the user turns COST off and commits a filter, as the key handlers do.
+	// --- the user turns COST off and sorts by it, as the key handlers do.
 	tui.Settings.Events.Columns = []tui.ColumnSetting{{Name: "COST", Visible: false}}
-	tui.Settings.Filter = "github-tool"
+	tui.Settings.Events.SortColumn = "COST"
 	if err := saveUserConfig(path, tui.Settings); err != nil {
 		t.Fatal(err)
 	}
@@ -52,8 +52,8 @@ func TestEndToEnd_SettingsSurviveARestart(t *testing.T) {
 	if warn.Len() != 0 {
 		t.Errorf("reload warned: %q", warn.String())
 	}
-	if tui.Settings.Filter != "github-tool" {
-		t.Errorf("filter = %q after restart, want it remembered", tui.Settings.Filter)
+	if tui.Settings.Events.SortColumn != "COST" {
+		t.Errorf("sort column = %q after restart, want it remembered", tui.Settings.Events.SortColumn)
 	}
 	if len(tui.Settings.Events.Columns) != 1 || tui.Settings.Events.Columns[0].Name != "COST" {
 		t.Errorf("columns = %+v after restart", tui.Settings.Events.Columns)

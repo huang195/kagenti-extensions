@@ -89,7 +89,7 @@ func TestLoadUserConfig_MalformedWarnsAndFallsBack(t *testing.T) {
 	}{
 		{name: "unclosed flow sequence", body: "events: [broken\n"},
 		{name: "top-level list", body: "- not\n- a mapping\n"},
-		{name: "wrong type for a known key", body: "filter:\n  nested: map\n"},
+		{name: "wrong type for a known key", body: "usage:\n  metric:\n    nested: map\n"},
 		{name: "a directory where a file belongs", dir: true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -127,15 +127,15 @@ func TestLoadUserConfig_PartialParseIsDiscarded(t *testing.T) {
 	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
 		t.Fatal(err)
 	}
-	// filter parses; events does not.
-	body := "filter: kept-if-partial\nevents:\n  columns: not-a-list\n"
+	// usage parses; events does not.
+	body := "usage:\n  metric: kept-if-partial\nevents:\n  columns: not-a-list\n"
 	if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
 		t.Fatal(err)
 	}
 
 	var warn bytes.Buffer
-	if got := loadUserConfig(path, &warn); got.Filter != "" {
-		t.Errorf("filter = %q; a failed parse must discard everything", got.Filter)
+	if got := loadUserConfig(path, &warn); got.Usage.Metric != "" {
+		t.Errorf("metric = %q; a failed parse must discard everything", got.Usage.Metric)
 	}
 	if warn.Len() == 0 {
 		t.Error("no warning for a partially-parseable file")
@@ -147,13 +147,16 @@ func TestLoadUserConfig_PartialParseIsDiscarded(t *testing.T) {
 // warning-and-discard for an older binary — which is exactly what
 // yaml.Decoder.KnownFields(true) would do, so this test guards against that
 // refactor.
+//
+// It is backward compatibility too: `filter:` is a key this agentop no longer knows,
+// written by one from before `/` became a search (#1339).
 func TestLoadUserConfig_UnknownKeysLoadQuietly(t *testing.T) {
 	home := prefsHome(t)
 	path := filepath.Join(home, ".cortex", "agentop-config.yaml")
 	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
 		t.Fatal(err)
 	}
-	body := "filter: github\ntheme: dark\nevents:\n  sort_order: cost\n  columns:\n    - name: COST\n      visible: false\n"
+	body := "filter: github\ntheme: dark\nusage:\n  metric: cost\nevents:\n  sort_order: cost\n  columns:\n    - name: COST\n      visible: false\n"
 	if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
 		t.Fatal(err)
 	}
@@ -164,11 +167,39 @@ func TestLoadUserConfig_UnknownKeysLoadQuietly(t *testing.T) {
 	if warn.Len() != 0 {
 		t.Errorf("unknown keys warned: %q", warn.String())
 	}
-	if got.Filter != "github" {
-		t.Errorf("filter = %q, want the known key applied alongside unknown ones", got.Filter)
+	if got.Usage.Metric != "cost" {
+		t.Errorf("metric = %q, want the known key applied alongside unknown ones", got.Usage.Metric)
 	}
 	if len(got.Events.Columns) != 1 || got.Events.Columns[0].Name != "COST" {
 		t.Errorf("columns = %+v, want the COST deviation", got.Events.Columns)
+	}
+}
+
+// TestSaveUserConfig_DropsTheOldFilterKey: the `filter:` an older agentop saved is not
+// carried forward. The next save writes only what this agentop knows, so the key is gone
+// rather than kept around for a feature that no longer reads it (#1339).
+func TestSaveUserConfig_DropsTheOldFilterKey(t *testing.T) {
+	home := prefsHome(t)
+	path := filepath.Join(home, ".cortex", "agentop-config.yaml")
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, []byte("filter: github\nusage:\n  metric: cost\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	var warn bytes.Buffer
+	if err := saveUserConfig(path, loadUserConfig(path, &warn)); err != nil {
+		t.Fatal(err)
+	}
+	b, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(b), "filter:") || strings.Contains(string(b), "github") {
+		t.Errorf("the old filter survived a save:\n%s", b)
+	}
+	if !strings.Contains(string(b), "metric: cost") {
+		t.Errorf("the save lost a known setting along with the old filter:\n%s", b)
 	}
 }
 
@@ -177,8 +208,8 @@ func TestSaveUserConfig_RoundTrips(t *testing.T) {
 	home := prefsHome(t)
 	path := filepath.Join(home, ".cortex", "agentop-config.yaml")
 	want := tui.UserSettings{
-		Events: tui.EventSettings{Columns: []tui.ColumnSetting{{Name: "COST", Visible: false}}},
-		Filter: "github",
+		Events: tui.EventSettings{Columns: []tui.ColumnSetting{{Name: "COST", Visible: false}}, SortColumn: "COST"},
+		Usage:  tui.UsageSettings{Metric: "cost"},
 	}
 
 	if err := saveUserConfig(path, want); err != nil {
@@ -201,7 +232,7 @@ func TestSaveUserConfig_RoundTrips(t *testing.T) {
 func TestSaveUserConfig_IsHandEditable(t *testing.T) {
 	home := prefsHome(t)
 	path := filepath.Join(home, ".cortex", "agentop-config.yaml")
-	if err := saveUserConfig(path, tui.UserSettings{Filter: "x"}); err != nil {
+	if err := saveUserConfig(path, tui.UserSettings{Usage: tui.UsageSettings{Metric: "x"}}); err != nil {
 		t.Fatal(err)
 	}
 	body, err := os.ReadFile(path)
@@ -223,7 +254,7 @@ func TestSaveUserConfig_CreatesCortexDirAt0700AndFileAt0600(t *testing.T) {
 	home := prefsHome(t)
 	path := filepath.Join(home, ".cortex", "agentop-config.yaml")
 
-	if err := saveUserConfig(path, tui.UserSettings{Filter: "x"}); err != nil {
+	if err := saveUserConfig(path, tui.UserSettings{Usage: tui.UsageSettings{Metric: "x"}}); err != nil {
 		t.Fatal(err)
 	}
 
@@ -248,7 +279,7 @@ func TestSaveUserConfig_CreatesCortexDirAt0700AndFileAt0600(t *testing.T) {
 func TestSaveUserConfig_LeavesNoTempFile(t *testing.T) {
 	home := prefsHome(t)
 	path := filepath.Join(home, ".cortex", "agentop-config.yaml")
-	if err := saveUserConfig(path, tui.UserSettings{Filter: "x"}); err != nil {
+	if err := saveUserConfig(path, tui.UserSettings{Usage: tui.UsageSettings{Metric: "x"}}); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := os.Stat(path + ".tmp"); !os.IsNotExist(err) {
@@ -261,15 +292,15 @@ func TestSaveUserConfig_LeavesNoTempFile(t *testing.T) {
 func TestSaveUserConfig_OverwritesAnExistingFile(t *testing.T) {
 	home := prefsHome(t)
 	path := filepath.Join(home, ".cortex", "agentop-config.yaml")
-	if err := saveUserConfig(path, tui.UserSettings{Filter: "first"}); err != nil {
+	if err := saveUserConfig(path, tui.UserSettings{Usage: tui.UsageSettings{Metric: "first"}}); err != nil {
 		t.Fatal(err)
 	}
-	if err := saveUserConfig(path, tui.UserSettings{Filter: "second"}); err != nil {
+	if err := saveUserConfig(path, tui.UserSettings{Usage: tui.UsageSettings{Metric: "second"}}); err != nil {
 		t.Fatalf("second save failed: %v", err)
 	}
 	var warn bytes.Buffer
-	if got := loadUserConfig(path, &warn).Filter; got != "second" {
-		t.Errorf("filter = %q, want the later save to win", got)
+	if got := loadUserConfig(path, &warn).Usage.Metric; got != "second" {
+		t.Errorf("metric = %q, want the later save to win", got)
 	}
 }
 
@@ -300,7 +331,7 @@ func TestSaveUserConfig_DoesNotWriteThroughAPlantedTempfile(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if err := saveUserConfig(path, tui.UserSettings{Filter: "x"}); err != nil {
+	if err := saveUserConfig(path, tui.UserSettings{Usage: tui.UsageSettings{Metric: "x"}}); err != nil {
 		t.Fatalf("save failed: %v", err)
 	}
 
@@ -313,8 +344,8 @@ func TestSaveUserConfig_DoesNotWriteThroughAPlantedTempfile(t *testing.T) {
 	}
 	// And the real config still landed.
 	var warn bytes.Buffer
-	if got := loadUserConfig(path, &warn).Filter; got != "x" {
-		t.Errorf("filter = %q, want the save to have succeeded regardless", got)
+	if got := loadUserConfig(path, &warn).Usage.Metric; got != "x" {
+		t.Errorf("metric = %q, want the save to have succeeded regardless", got)
 	}
 }
 
@@ -327,7 +358,7 @@ func TestSaveUserConfig_DoesNotWriteThroughAPlantedTempfile(t *testing.T) {
 func TestSaveUserConfig_SurvivesTempfileDebris(t *testing.T) {
 	home := prefsHome(t)
 	path := filepath.Join(home, ".cortex", "agentop-config.yaml")
-	if err := saveUserConfig(path, tui.UserSettings{Filter: "before-crash"}); err != nil {
+	if err := saveUserConfig(path, tui.UserSettings{Usage: tui.UsageSettings{Metric: "before-crash"}}); err != nil {
 		t.Fatal(err)
 	}
 	// Debris at the old fixed name, and at a CreateTemp-shaped one.
@@ -338,14 +369,14 @@ func TestSaveUserConfig_SurvivesTempfileDebris(t *testing.T) {
 	}
 
 	for i := 0; i < 5; i++ {
-		if err := saveUserConfig(path, tui.UserSettings{Filter: "after-crash"}); err != nil {
+		if err := saveUserConfig(path, tui.UserSettings{Usage: tui.UsageSettings{Metric: "after-crash"}}); err != nil {
 			t.Fatalf("save %d failed on leftover debris: %v", i+1, err)
 		}
 	}
 
 	var warn bytes.Buffer
-	if got := loadUserConfig(path, &warn).Filter; got != "after-crash" {
-		t.Errorf("filter = %q; saves after a crash never took effect", got)
+	if got := loadUserConfig(path, &warn).Usage.Metric; got != "after-crash" {
+		t.Errorf("metric = %q; saves after a crash never took effect", got)
 	}
 }
 
@@ -353,7 +384,7 @@ func TestSaveUserConfig_SurvivesTempfileDebris(t *testing.T) {
 // every assertion. Columns is the only slice, so a length-plus-elements walk is
 // enough and gives a better failure message than DeepEqual on nil-vs-empty.
 func reflectDeepEqualSettings(a, b tui.UserSettings) bool {
-	if a.Filter != b.Filter || len(a.Events.Columns) != len(b.Events.Columns) {
+	if a.Usage != b.Usage || a.Events.SortColumn != b.Events.SortColumn || len(a.Events.Columns) != len(b.Events.Columns) {
 		return false
 	}
 	for i := range a.Events.Columns {
@@ -396,7 +427,7 @@ func TestSaveUserConfig_ReportsACreateFailure(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = os.Chmod(dir, 0o700) })
 
-	if err := saveUserConfig(filepath.Join(dir, "agentop-config.yaml"), tui.UserSettings{Filter: "x"}); err == nil {
+	if err := saveUserConfig(filepath.Join(dir, "agentop-config.yaml"), tui.UserSettings{Usage: tui.UsageSettings{Metric: "x"}}); err == nil {
 		t.Error("saveUserConfig reported success on an unwritable directory")
 	}
 }
@@ -409,7 +440,7 @@ func TestSaveUserConfig_ReportsACreateFailure(t *testing.T) {
 func TestSaveUserConfig_AWriteFailureDoesNotClobberTheGoodFile(t *testing.T) {
 	home := prefsHome(t)
 	path := filepath.Join(home, ".cortex", "agentop-config.yaml")
-	if err := saveUserConfig(path, tui.UserSettings{Filter: "good"}); err != nil {
+	if err := saveUserConfig(path, tui.UserSettings{Usage: tui.UsageSettings{Metric: "good"}}); err != nil {
 		t.Fatal(err)
 	}
 
@@ -417,7 +448,7 @@ func TestSaveUserConfig_AWriteFailureDoesNotClobberTheGoodFile(t *testing.T) {
 	t.Cleanup(func() { writeAll = prev })
 	writeAll = func(io.Writer, []byte) (int, error) { return 0, errors.New("no space left on device") }
 
-	err := saveUserConfig(path, tui.UserSettings{Filter: "truncated"})
+	err := saveUserConfig(path, tui.UserSettings{Usage: tui.UsageSettings{Metric: "truncated"}})
 	if err == nil {
 		t.Error("a failed write reported success; a truncated file would be renamed into place")
 	} else if !strings.Contains(err.Error(), "no space left") {
@@ -427,8 +458,8 @@ func TestSaveUserConfig_AWriteFailureDoesNotClobberTheGoodFile(t *testing.T) {
 	// The good file must still be there and still good.
 	writeAll = prev
 	var warn bytes.Buffer
-	if got := loadUserConfig(path, &warn).Filter; got != "good" {
-		t.Errorf("filter = %q; the previous config was clobbered by a failed save", got)
+	if got := loadUserConfig(path, &warn).Usage.Metric; got != "good" {
+		t.Errorf("metric = %q; the previous config was clobbered by a failed save", got)
 	}
 	if warn.Len() != 0 {
 		t.Errorf("config no longer parses after a failed save: %q", warn.String())

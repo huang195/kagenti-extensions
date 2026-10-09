@@ -25,7 +25,7 @@ func catalogPlugins(c *apiclient.PluginCatalog) []apiclient.PluginCatalogEntry {
 
 // handleKey processes every key press. Modal overlays claim it first, in
 // order: the key-help overlay, then the picker panes, then an in-flight
-// pipeline edit, then the filter input. Only if none of those own the
+// pipeline edit, then the search prompt. Only if none of those own the
 // keyboard is the key dispatched based on the active pane.
 func (m *model) handleKey(msg tea.KeyMsg) tea.Cmd {
 	// A sticky flash (yank) stays up until the operator does something. Any key
@@ -78,10 +78,10 @@ func (m *model) handleKey(msg tea.KeyMsg) tea.Cmd {
 	// `?` opens the overlay from any pane, with two exceptions. While a
 	// pipeline edit is in flight that overlay is already modal and owns
 	// y/N/r/Esc, so help would swallow the apply confirmation. While the
-	// filter input is focused `?` is a character the user is typing — a
+	// search prompt is open `?` is a character the user is typing — a
 	// session ID or host can contain one — and stealing it would make
-	// those values unfilterable.
-	if msg.String() == "?" && m.editState.phase == editPhaseDone && !m.filtering {
+	// those values unsearchable.
+	if msg.String() == "?" && m.editState.phase == editPhaseDone && !m.searching {
 		m.helpVisible = true
 		m.syncHelpViewport(true)
 		return nil
@@ -89,7 +89,7 @@ func (m *model) handleKey(msg tea.KeyMsg) tea.Cmd {
 
 	// The Usage pane owns the keyboard while it is up, except for esc/q which
 	// the shared handling above already routed.
-	if m.pane == paneUsage && !m.filtering {
+	if m.pane == paneUsage && !m.searching {
 		switch msg.String() {
 		case "m":
 			// Metric. `t` (for "tokens") named one of the four values rather than
@@ -143,7 +143,7 @@ func (m *model) handleKey(msg tea.KeyMsg) tea.Cmd {
 
 	// `u` opens the Usage pane. Scope depends on where it was pressed: from the
 	// events timeline it charts the session being read, from the session picker
-	// it charts everything. Suppressed while filtering, where `u` is a character
+	// it charts everything. Suppressed while searching, where `u` is a character
 	// the user is typing — the same reasoning as the `?` overlay above.
 	//
 	// Gated on !m.colPicker as well: this handler sits above the picker block, so
@@ -153,7 +153,7 @@ func (m *model) handleKey(msg tea.KeyMsg) tea.Cmd {
 	// events timeline the picker was opened from. (`?` above is deliberately NOT
 	// gated: it layers help over the picker without changing panes, and closing it
 	// restores the picker.)
-	if msg.String() == "u" && !m.filtering && !m.colPicker && m.editState.phase == editPhaseDone {
+	if msg.String() == "u" && !m.searching && !m.colPicker && m.editState.phase == editPhaseDone {
 		switch m.pane {
 		case paneEvents, paneDetail:
 			if m.selectedSess != "" {
@@ -165,7 +165,7 @@ func (m *model) handleKey(msg tea.KeyMsg) tea.Cmd {
 	}
 
 	// The spend drawer's four keys, handled where `u` is and gated the same way: not
-	// while filtering (they are characters the user is typing), not under the column
+	// while searching (they are characters the user is typing), not under the column
 	// picker, not mid-edit.
 	//
 	// GLOBAL, unlike every pane binding below, because the strip is global — it draws on
@@ -183,7 +183,7 @@ func (m *model) handleKey(msg tea.KeyMsg) tea.Cmd {
 	// `w` IS TAKEN ON paneUsage, whose handler runs above this one and returns — so the drawer
 	// does not open on that pane at all (see spendDrawerHost) and its hint line never advertises
 	// a key that belongs to something else.
-	if !m.filtering && !m.colPicker && m.editState.phase == editPhaseDone {
+	if !m.searching && !m.colPicker && m.editState.phase == editPhaseDone {
 		switch msg.String() {
 		case "$":
 			return m.toggleSpendDrawer()
@@ -241,7 +241,7 @@ func (m *model) handleKey(msg tea.KeyMsg) tea.Cmd {
 	// left this block swallowing enter/j/k over an inert sessions table. Gating on
 	// the pane covers that and any future transition, where clearing the flag in one
 	// handler would only fix today's path.
-	if m.colPicker && m.pane == paneEvents && !m.filtering {
+	if m.colPicker && m.pane == paneEvents && !m.searching {
 		switch msg.String() {
 		case "q", "ctrl+c":
 			// Quit stays live. A modal that traps the user until they find its exit
@@ -346,9 +346,9 @@ func (m *model) handleKey(msg tea.KeyMsg) tea.Cmd {
 	}
 
 	// `c` opens the column picker from the events timeline. Suppressed while
-	// filtering, where `c` is a character being typed — the same reasoning as `?`
+	// searching, where `c` is a character being typed — the same reasoning as `?`
 	// and `u`.
-	if msg.String() == "c" && m.pane == paneEvents && !m.filtering &&
+	if msg.String() == "c" && m.pane == paneEvents && !m.searching &&
 		m.editState.phase == editPhaseDone {
 		m.colPicker = true
 		return nil
@@ -436,43 +436,9 @@ func (m *model) handleKey(msg tea.KeyMsg) tea.Cmd {
 		return m.handleEditKey(msg)
 	}
 
-	// Filter-mode: input box consumes most keys. Esc cancels (restores the filter as
-	// it was at `/`), Enter commits and is the only key that persists.
-	if m.filtering {
-		switch msg.String() {
-		case "esc":
-			// Cancel, so it restores what was in effect when `/` was pressed and writes
-			// nothing. It used to clear the filter instead — which, once filters began
-			// persisting, meant one mis-keyed Esc permanently discarded a committed
-			// filter, while the README and this file both called the key "cancel".
-			//
-			// Clearing has not been lost: empty the box and press Enter. That keeps Enter
-			// as the only key that writes, which is the property worth having.
-			m.filtering = false
-			m.filter = m.filterBeforeEdit
-			m.filterInput.SetValue(m.filterBeforeEdit)
-			m.layout() // gives the body back the filter's line — see layout()
-			m.refreshActivePane()
-			return nil
-		case "enter":
-			m.filter = m.filterInput.Value()
-			m.filtering = false
-			m.layout() // gives the body back the filter's line — see layout()
-			// Commit, not keystroke: the fallthrough below re-reads the input on every
-			// character typed, and saving there would write once per keypress.
-			//
-			// The only key that persists a filter. An empty box committed here is how a
-			// filter is cleared and the clearing made durable, now that Esc cancels.
-			Settings.Filter = m.filter
-			m.persistSettings()
-			m.refreshActivePane()
-			return nil
-		}
-		var cmd tea.Cmd
-		m.filterInput, cmd = m.filterInput.Update(msg)
-		m.filter = m.filterInput.Value()
-		m.refreshActivePane()
-		return cmd
+	// The search prompt consumes every key while it is open — see searchKey.
+	if m.searching {
+		return m.searchKey(msg)
 	}
 
 	switch msg.String() {
@@ -481,18 +447,20 @@ func (m *model) handleKey(msg tea.KeyMsg) tea.Cmd {
 		return tea.Quit
 
 	case "/":
-		m.filtering = true
-		// The filter input takes a body line, so the height budget changes with this
-		// flag — see layout(). Recomputed here rather than waiting for a WindowSizeMsg
-		// that may never come.
-		m.layout()
-		// Snapshot for Esc. Taken here rather than derived on the way out, because by
-		// then the input has already been edited and the original is gone.
-		m.filterBeforeEdit = m.filter
-		// One input serves every pane, so the hint is chosen per pane at open.
-		m.filterInput.Placeholder = filterPlaceholder(m.pane)
-		m.filterInput.Focus()
+		// Only where there is something to search. On every other pane this used to open a
+		// filter box that narrowed nothing.
+		if searchable(m.pane) {
+			m.openSearch()
+		}
 		return nil
+
+	case "n", "N":
+		// The search's next and previous match. Elsewhere the keys fall through to the pane's
+		// component, which binds neither.
+		if searchable(m.pane) {
+			m.searchStep(msg.String() == "n")
+			return nil
+		}
 
 	case "p":
 		m.paused = !m.paused
@@ -684,6 +652,9 @@ func (m *model) handleKey(msg tea.KeyMsg) tea.Cmd {
 				// Clear only on an actual session change, so
 				// re-entering the same session keeps the pin.
 				m.selectedEventKey = eventKey{}
+				// And the events search, for the same reason: it was typed for that
+				// session's events, and re-entering it keeps it.
+				delete(m.search, paneEvents)
 			}
 			m.selectedSess = id
 			m.pane = paneEvents
@@ -848,14 +819,14 @@ func (m *model) handleKey(msg tea.KeyMsg) tea.Cmd {
 		//
 		// DO NOT MOVE THIS UP BESIDE `u` ON THE STRENGTH OF THAT SYMMETRY. `u`, `$`,
 		// `c` and `?` sit ABOVE the modal blocks and each carries explicit
-		// `!m.filtering && !m.colPicker && m.editState.phase == editPhaseDone` guards
+		// `!m.searching && !m.colPicker && m.editState.phase == editPhaseDone` guards
 		// to compensate. `P` and `C` carry none, and do not need to, because they sit
-		// BELOW all three: the column picker ends in `default: return nil`, the filter
-		// block returns unconditionally after feeding the input, and an in-flight edit
+		// BELOW all three: the column picker ends in `default: return nil`, the search
+		// prompt returns unconditionally after feeding the input, and an in-flight edit
 		// returns via handleEditKey. The safety here is POSITIONAL. Hoisting either
 		// key above those blocks without adopting the guards would make `P` change
 		// panes under a modal popup and swallow a `P` someone was typing into the
-		// filter — silently, since nothing in the type system notices.
+		// search — silently, since nothing in the type system notices.
 		if m.client == nil {
 			return nil
 		}
@@ -986,29 +957,6 @@ func (m *model) handleKey(msg tea.KeyMsg) tea.Cmd {
 		return cmd
 	}
 	return nil
-}
-
-// filterPlaceholder names what `/` matches on pane p (#867).
-func filterPlaceholder(p paneID) string {
-	switch p {
-	case paneSessions:
-		return "filter on SESSION, TITLE, or AGENT…"
-	case paneEvents:
-		return "PLUGIN, METHOD, etc., filter…"
-	}
-	return "filter…"
-}
-
-// refreshActivePane rebuilds the current pane's component after a filter change.
-func (m *model) refreshActivePane() {
-	switch m.pane {
-	case paneSessions:
-		m.rebuildSessionsTable()
-	case paneEvents:
-		m.rebuildEventsTable()
-	case panePipeline:
-		m.rebuildPipelineTable()
-	}
 }
 
 // goTop and goBottom place the cursor through setCursorVisible, which carries the
@@ -1145,8 +1093,8 @@ func (m *model) setStickyFlash(s string) {
 // helpView renders the keybinding hint line for the current pane. Short
 // enough to fit on a single row at 80 cols.
 func (m *model) helpView() string {
-	if m.filtering {
-		return "type to filter · [enter] commit · [esc] cancel"
+	if m.searching {
+		return "type to search · [enter] done · [esc] cancel"
 	}
 	switch m.pane {
 	case paneNamespaces:
@@ -1186,13 +1134,14 @@ func (m *model) helpView() string {
 		// [A] agents is absent for width: the line is already 98 columns, and with one agent —
 		// the common case — the breakdown is a single row. The [?] overlay names it. esc names
 		// the picker instead when this list was reached through it.
+		search := m.searchHints()
 		if m.sessionsViaAgents {
-			return "[↑↓] nav  [↵] drill  [u] usage  [$] spend  [/] filter  [esc] agents  [p] pause  [P] pipeline  [?] keys  [q] quit"
+			return "[↑↓] nav  [↵] drill  [u] usage  [$] spend  " + search + "  [esc] agents  [p] pause  [P] pipeline  [?] keys  [q] quit"
 		}
 		if m.parentCtx != nil {
-			return "[↑↓] nav  [↵] drill  [u] usage  [$] spend  [/] filter  [esc] pods  [p] pause  [P] pipeline  [?] keys  [q] quit"
+			return "[↑↓] nav  [↵] drill  [u] usage  [$] spend  " + search + "  [esc] pods  [p] pause  [P] pipeline  [?] keys  [q] quit"
 		}
-		return "[↑↓] nav  [↵] drill  [u] usage  [$] spend  [/] filter  [p] pause  [P] pipeline  [?] keys  [q] quit"
+		return "[↑↓] nav  [↵] drill  [u] usage  [$] spend  " + search + "  [p] pause  [P] pipeline  [?] keys  [q] quit"
 	case paneEvents:
 		skipHint := "[s] hide passthru/skip"
 		if m.hideInactive {
@@ -1205,7 +1154,7 @@ func (m *model) helpView() string {
 		// end, and the escapable/discoverable keys ahead of them, with the
 		// specialised ones first to be lost.
 		base := "[↑↓] nav  [b/f] page  [↵] detail  [c] columns  [u] usage  " +
-			skipHint + "  [p] pause  [/] filter  [esc] back"
+			skipHint + "  [p] pause  " + m.searchHints() + "  [esc] back"
 
 		// Notices go BEFORE the essential hints, not after.
 		//
@@ -1371,12 +1320,12 @@ func (m *model) layout() {
 	if m.spendDrawerReservesRows() {
 		bodyH -= spendDrawerLinesFor(m.width)
 	}
-	// And one more while the filter is open: View() prepends filterInput above the body, so
-	// the line exists on screen whether or not the budget admits it. Unreserved, the view came
-	// out one line taller than the terminal at every size, the terminal scrolled, and the
-	// bottom row went missing for as long as the operator was typing a filter — the same
-	// symptom as a mis-sized table, from a line nobody counted.
-	if m.filtering {
+	// And one more while the search prompt is open: View() prepends searchInput above the body,
+	// so the line exists on screen whether or not the budget admits it. Unreserved, the view
+	// came out one line taller than the terminal at every size, the terminal scrolled, and the
+	// bottom row went missing for as long as the operator was typing — the same symptom as a
+	// mis-sized table, from a line nobody counted.
+	if m.searching {
 		bodyH--
 	}
 	if bodyH < 4 {
@@ -1441,7 +1390,7 @@ func (m *model) layout() {
 	// re-render would land after it either way.
 	m.detailVp.SetYOffset(m.detailVp.YOffset)
 
-	m.filterInput.Width = m.width - 4
+	m.searchInput.Width = m.width - 4
 
 	// Re-wrap the detail viewport to the new width so long JSON values continue to fit
 	// after a terminal resize. Not a scroll reset: the reader stays where they were, as

@@ -9,8 +9,9 @@ import (
 )
 
 // `/` on the sessions pane matches SESSION, TITLE (harvested or served) and AGENT,
-// case-insensitively, on listed and cached-only rows alike (#867).
-func TestSessionsFilter_MatchesSessionTitleAndAgent(t *testing.T) {
+// case-insensitively, on listed and cached-only rows alike (#867) — and lists every row
+// whatever it matches (#1339).
+func TestSessionsSearch_MatchesSessionTitleAndAgent(t *testing.T) {
 	newModel := func() *model {
 		m := newTitleModel(t, map[string]SessionMetadata{
 			"aaa-111":    {Title: "Refactor the parser"},
@@ -23,11 +24,12 @@ func TestSessionsFilter_MatchesSessionTitleAndAgent(t *testing.T) {
 		m.events["cached-333"] = []pipeline.SessionEvent{{Host: "api.example.com"}}
 		return m
 	}
+	all := []string{"aaa-111", "bbb-222", "cached-333"}
 	cases := []struct {
-		filter string
+		search string
 		want   []string
 	}{
-		{"", []string{"aaa-111", "bbb-222", "cached-333"}},
+		{"", []string{}},
 		{"bbb", []string{"bbb-222"}},
 		{"PARSER", []string{"aaa-111"}},
 		{"served", []string{"bbb-222"}},
@@ -38,29 +40,17 @@ func TestSessionsFilter_MatchesSessionTitleAndAgent(t *testing.T) {
 	}
 	for _, tc := range cases {
 		m := newModel()
-		m.filter = tc.filter
+		m.search = map[paneID]string{paneSessions: tc.search}
 		m.rebuildSessionsTable()
-		if !slices.Equal(m.sessionRowIDs, tc.want) {
-			t.Errorf("filter %q listed %v, want %v", tc.filter, m.sessionRowIDs, tc.want)
+		if !slices.Equal(m.sessionRowIDs, all) {
+			t.Errorf("search %q listed %v, want every session %v", tc.search, m.sessionRowIDs, all)
 		}
-	}
-}
-
-// The shared filter input names what it matches on the pane it opened on.
-func TestFilterPlaceholder_PerPane(t *testing.T) {
-	m := newTestEventsModel(t)
-	m.filterInput = newTestFilterInput()
-	resetSettingsForTest(t)
-
-	for _, p := range []paneID{paneSessions, paneEvents, panePipeline} {
-		m.pane = p
-		m.filtering = false
-		m.handleKey(keyRune('/'))
-		if got, want := m.filterInput.Placeholder, filterPlaceholder(p); got != want {
-			t.Errorf("pane %v: placeholder %q, want %q", p, got, want)
+		got := []string{}
+		for _, i := range m.sessionMatches {
+			got = append(got, m.sessionRowIDs[i])
 		}
-	}
-	if filterPlaceholder(paneSessions) == filterPlaceholder(paneEvents) {
-		t.Error("sessions and events share a placeholder; each should name its own fields")
+		if !slices.Equal(got, tc.want) {
+			t.Errorf("search %q matched %v, want %v", tc.search, got, tc.want)
+		}
 	}
 }

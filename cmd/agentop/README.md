@@ -911,7 +911,7 @@ agentop is for, and the other three are surfaces you visit and leave.
    default                      1h ago                 8           —           —           —        —
 
   ● connected  2.1 events/sec   feedback: https://github.com/rossoctl/cortex/issues/new/choose
-  [↑↓] nav  [↵] drill  [u] usage  [$] spend  [/] filter  [p] pause  [P] pipeline  [?] keys  [q] quit
+  [↑↓] nav  [↵] drill  [u] usage  [$] spend  [/] search  [p] pause  [P] pipeline  [?] keys  [q] quit
   ```
 
   The two money columns are dropped entirely on a terminal too narrow to show a
@@ -1132,8 +1132,8 @@ agentop is for, and the other three are surfaces you visit and leave.
    3     14:23:09.01   out   req      modify    token-exchange      tools/call                                                                       github-tool-mcp
    3     14:23:09.10   out   resp     —         —                   tools/call          503      96ms                                                github-tool-mcp
 
-  ● connected   2.1 events/sec   [sort: DURATION▼]   [filter: anthropic]
-  [↑↓] nav  [b/f] page  [↵] detail  [c] columns  [u] usage  [s] hide passthru/skip  [p] pause  [/] filter  [esc] back  ·  → 4 more columns ([c] to choose)  [?] keys  [q] quit
+  ● connected   2.1 events/sec   [/anthropic 2 matches]   [sort: DURATION▼]
+  [↑↓] nav  [b/f] page  [↵] detail  [c] columns  [u] usage  [s] hide passthru/skip  [p] pause  [/] search  [n/N] next/prev  [esc] back  ·  → 4 more columns ([c] to choose)  [?] keys  [q] quit
   ```
 
   `—` in ACTION and PLUGIN means no plugin acted on that message; a `tunnel`
@@ -1332,8 +1332,8 @@ Layered on top of all of them:
   (`q` closes the overlay rather than quitting agentop). This is the
   discoverable home for keys the single-line footer has no room for,
   `P` among them. Two exceptions: while a pipeline edit is in flight
-  that overlay is already modal and owns `y`/`N`, and while the filter
-  input is focused `?` is a character you're typing (session IDs and
+  that overlay is already modal and owns `y`/`N`, and while the search
+  prompt is open `?` is a character you're typing (session IDs and
   hosts can contain one). In both cases `?` is inert until the keyboard
   is released.
 
@@ -1356,7 +1356,7 @@ Layered on top of all of them:
 
 | Key | Context | Action |
 |---|---|---|
-| `?` | any (not while filtering or mid-edit) | open the key-help overlay (`?`/`Esc`/`q` closes) |
+| `?` | any (not while searching or mid-edit) | open the key-help overlay (`?`/`Esc`/`q` closes) |
 | `↑ ↓` / `k j`, `b`/`f`, `u`/`d`, `g`/`G` | key help | scroll the overlay |
 | `↑ ↓` / `k j` | picker, list | navigate rows |
 | `Enter` | namespaces | open the namespace |
@@ -1367,7 +1367,8 @@ Layered on top of all of them:
 | `Enter` / `→` / `l` | sessions, events | drill into selection |
 | `Esc` / `←` / `h` | detail, events | back out |
 | `Esc` | sessions | back to the agents picker when the list was reached by picking an agent there; otherwise (picker mode) tear down port-forward and back to pods. Sessions and the agents picker above it are the only panes that tear down — every key-opened surface returns to its caller instead |
-| `/` | sessions, events | filter (substring match; Enter commits and saves, Esc cancels the edit and saves nothing; clear the box and press Enter to remove a saved filter) |
+| `/` | sessions, events | search, as in a text editor: every row stays, the matching rows are highlighted, and the cursor jumps to the first match at or after where you pressed `/`, wrapping past the end, as you type. Case-insensitive substring of SESSION, TITLE or AGENT on sessions; on events, of the host, method, plugin fields, identity, A2A text, MCP errors and completion text, plus `deny` (denied events) and `plugin:<name>`. `Enter` keeps the cursor on the match; `Esc` puts the cursor and the previous search back; `Enter` on an empty box clears the search. Each pane keeps its own search, the events pane's only while you stay with one session, and none is saved |
+| `n` / `N` | sessions, events | next / previous match of the search, wrapping at both ends |
 | `X` | sessions | clear all history: every session this Cortex holds, in memory and on disk. Asks first, with the count and the size on disk; `y` erases, `n`/`esc` keeps. The cost ledger is kept. Refused — with the proxy's reason — anywhere but a loopback-only laptop install. Not in the footer, like `A`: a destructive key should not be advertised on the always-visible line |
 | `s` | events | toggle skip-row visibility (default: hidden; the events footer shows the hidden count) |
 | `c` | events | open the column picker (`↑↓`/`jk` move, `space`/`x` toggle, `s` sort, `r` reset, `Esc`/`Enter`/`c` close); the selection and sort are saved on close |
@@ -1522,20 +1523,14 @@ it has seen, so an agent that has not run yet is routed with `agentop server use
 
 ## Settings
 
-agentop remembers the events-table column selection, the sort order, and the active
-filter in `~/.cortex/agentop-config.yaml`. Columns and the sort are saved when the
-column picker closes with `Esc`/`Enter`/`c` (`q` quits without saving); the filter is
-saved when you commit it with `Enter`. There is no explicit save step.
+agentop remembers the events-table column selection, the sort order, and the usage
+pane's view in `~/.cortex/agentop-config.yaml`. Columns and the sort are saved when the
+column picker closes with `Esc`/`Enter`/`c` (`q` quits without saving). There is no
+explicit save step.
 
-A restored filter is shown in the footer as `[filter: …]` while it is in effect but
-not being edited — otherwise a shortened list would have no explanation on screen.
-Pressing `/` puts the cursor in the restored value so you extend it rather than
-replace it, and `Esc` abandons the edit and puts the previous filter back without
-writing anything. `Enter` is the only key that saves a filter, so clearing one means
-emptying the box and pressing `Enter`. In picker mode the restored filter applies to
-the first session view you open and is then dropped when you go back to the pod list:
-a filter surviving a pod switch reads as data loss, so the active one is cleared while
-the saved one stays on disk for the next start.
+A `/` search is not saved: it lasts until you clear it or leave the connection. Older
+agentops filtered with `/` and saved the filter as `filter:`; this one ignores that key
+and drops it the next time it saves.
 
 `--prefs PATH` reads and writes somewhere else. This is *not* the Cortex proxy
 config — that is `~/.cortex/config.yaml`, and `--config` on `agentop service` and
@@ -1553,7 +1548,6 @@ events:
   # Omit sortColumn (or name a column this build does not have) for arrival order.
   sortColumn: DURATION
   sortDesc: true
-filter: github-tool
 ```
 
 ### Schema
@@ -1564,7 +1558,6 @@ filter: github-tool
 | `events.columns[].visible` | bool | required | show that column — an entry without it reads as `false` |
 | `events.sortColumn` | string | unset | sort by this column; unset means arrival order. `#` is not sortable, being arrival order already |
 | `events.sortDesc` | bool | `false` | sort descending; ignored unless `sortColumn` names a sortable column |
-| `filter` | string | empty | the active filter |
 | `usage.metric` | string | `tokens` | usage-pane metric: `tokens`, `requests`, `errors`, `latency` or `cost` |
 | `usage.window` | string | `10m0s` | usage-pane window: `10m0s`, `1h0m0s` or `6h0m0s` |
 | `usage.group` | string | `none` | usage-pane breakdown. `[b]` cycles `none`, `status`, `method`, `plugin`, `host`; a hand-edited file may also use `model`, `endpoint`, `session` or `agent` |
@@ -1622,7 +1615,7 @@ and it persists with your other view settings. An arrow key that happens to reac
 row 0 does not change it — scrolling up to read is navigation, not a preference.
 
 Only the *opening* chooses an end. Every later rebuild — the two-second poll, a
-filter, a column toggle — leaves the cursor where you put it, and the timeline
+search, a column toggle — leaves the cursor where you put it, and the timeline
 follows new events only while you are on the newest row. Under a column sort the
 preference does not apply at all: there "an end" is the largest or smallest value
 rather than the oldest or newest event, so the cursor stays pinned to the event you
@@ -1632,14 +1625,14 @@ were reading instead.
 
 The events table renders no message body, so it does not ask for one. Each fetch
 sends `?view=summary`, which drops the conversation payloads and keeps everything
-the table shows **or its filter searches** — measured at ~163x smaller, and the
+the table shows **or its search matches** — measured at ~163x smaller, and the
 difference between a session that opens in milliseconds and one that takes seconds.
 
-The filter is the part worth spelling out, because it is easy to assume otherwise:
+The search is the part worth spelling out, because it is easy to assume otherwise:
 `/some text` still matches completion and A2A message text, and `plugin:<name>`
 still works, because those fields are searched and so are kept. Dropping them would
 have been ~299x instead of ~163x — both about a megabyte for a 1000-event session,
-so the filter is worth far more than the difference.
+so the search is worth far more than the difference.
 
 The consequence is worth knowing: the first `↵` on a row fetches that one event in
 full from `/v1/sessions/{id}/events/{seq}`. The detail pane renders the summary

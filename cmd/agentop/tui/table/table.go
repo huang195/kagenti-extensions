@@ -2,8 +2,8 @@
 //
 // A copy of github.com/charmbracelet/bubbles v1.0.0 table/table.go (MIT; see LICENSE in
 // this directory), kept because its scrolling cannot be fixed from outside the package.
-// Everything but the scrolling is the upstream code unchanged, so the API is the same and
-// a caller switches by import path alone.
+// Everything but the scrolling and marked rows is the upstream code unchanged, so the
+// upstream API still works and a caller switches by import path alone.
 //
 // WHAT CHANGED: the screen. Upstream renders a window of up to twice the height around the
 // cursor — start = cursor − height — and shows `height` lines of it from a viewport offset
@@ -18,6 +18,10 @@
 // would leave the cursor off screen, and then moves it only as far as it takes to bring the
 // cursor back. Every way of moving the cursor goes through UpdateViewport, so every one
 // keeps the cursor on screen and scrolls only when the cursor crosses an edge.
+//
+// WHAT WAS ADDED: marked rows (SetMarked, Styles.Marked), which agentop's search draws its
+// matches with. Cells are plain text, so a row-wide style applied after truncation is the
+// only highlight that cannot be cut into a lone "…".
 package table
 
 import (
@@ -42,6 +46,10 @@ type Model struct {
 	cursor int
 	focus  bool
 	styles Styles
+
+	// marked is the row indices drawn in Styles.Marked — a search's matches. Indices, not
+	// rows: the caller rebuilds the rows on every refresh and re-marks them with them.
+	marked map[int]bool
 
 	// The viewport renders exactly the rows on screen and never scrolls: its offset stays
 	// 0, and start is the scroll position. Rows [start, end) are what the screen shows.
@@ -130,6 +138,8 @@ type Styles struct {
 	Header   lipgloss.Style
 	Cell     lipgloss.Style
 	Selected lipgloss.Style
+	// Marked draws the rows SetMarked names. Not upstream: see the package doc.
+	Marked lipgloss.Style
 }
 
 // DefaultStyles returns a set of default style definitions for this table.
@@ -341,6 +351,20 @@ func (m *Model) SetRows(r []Row) {
 	m.UpdateViewport()
 }
 
+// SetMarked draws the given rows in Styles.Marked, replacing any earlier marks; nil clears
+// them. The cursor's row is drawn in Selected whether it is marked or not. Indices outside
+// the rows are ignored. Not upstream: see the package doc.
+func (m *Model) SetMarked(rows []int) {
+	m.marked = nil
+	for _, r := range rows {
+		if m.marked == nil {
+			m.marked = make(map[int]bool, len(rows))
+		}
+		m.marked[r] = true
+	}
+	m.UpdateViewport()
+}
+
 // SetColumns sets a new columns state.
 func (m *Model) SetColumns(c []Column) {
 	m.cols = c
@@ -448,6 +472,9 @@ func (m *Model) renderRow(r int) string {
 
 	if r == m.cursor {
 		return m.styles.Selected.Render(row)
+	}
+	if m.marked[r] {
+		return m.styles.Marked.Render(row)
 	}
 
 	return row

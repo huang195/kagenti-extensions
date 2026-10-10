@@ -350,6 +350,13 @@ const (
 	// Distinct from client-rejected-ca either way: THIS client may well trust the CA
 	// and is being tunnelled because an earlier one had trouble.
 	TunnelSkipCached TunnelReason = "skip-cached"
+	// TunnelProgramRefused — the program that opened this connection rejected the
+	// bridge's leaf on an earlier connection, so no interception was attempted.
+	// Recorded against the client's program (tlsbridge.Program), not the host, so
+	// another program talking to the same host is still bridged. The window starts at
+	// 30s and doubles; after three rejections in a row the program is not retried until
+	// Cortex restarts.
+	TunnelProgramRefused TunnelReason = "program-refused"
 	// TunnelBridgeDisabled — no TLS bridge is configured.
 	TunnelBridgeDisabled TunnelReason = "bridge-disabled"
 	// TunnelPassthroughPort, TunnelPassthroughNonTLS and TunnelPassthroughHost mirror

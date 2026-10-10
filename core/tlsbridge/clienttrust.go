@@ -59,6 +59,23 @@ func (c *ClientTrust) OSTrustOnly(exe string) bool {
 	return !trusted
 }
 
+// TrustReporter is a Trust that can say what it last found out about the OS, for the
+// unread report. ClientTrust is one.
+type TrustReporter interface {
+	OSTrustState() (trusted bool, checkedAt time.Time, checked bool)
+}
+
+// OSTrustState implements TrustReporter: whether the OS trusts the bridge CA and when
+// that was evaluated, refreshing an answer older than its window. checked is false off
+// darwin, where nothing is asked.
+func (c *ClientTrust) OSTrustState() (trusted bool, checkedAt time.Time, checked bool) {
+	if c == nil || c.goos != "darwin" {
+		return false, time.Time{}, false
+	}
+	trusted, checkedAt = c.osTrusted()
+	return trusted, checkedAt, true
+}
+
 // goExecutablesMax bounds the Go-executable cache. A laptop sends far fewer distinct
 // programs through the proxy than this; past it, an evicted path costs one more read.
 const goExecutablesMax = 512

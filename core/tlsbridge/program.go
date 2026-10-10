@@ -1,6 +1,9 @@
 package tlsbridge
 
-import "strconv"
+import (
+	"strconv"
+	"strings"
+)
 
 // Program names the client program behind a bridged connection, for the per-program
 // skip set (NewProgramSkipSet). Exe is the client process's executable, absolute and
@@ -37,4 +40,25 @@ func (p Program) Key() string { return p.Exe + "\x00" + p.Agent }
 // it names a session, and no new instance would be read until Cortex restarted.
 func (p Program) ProcessKey() string {
 	return p.Key() + "\x00" + strconv.FormatInt(int64(p.PID), 10) + "@" + strconv.FormatInt(p.Start, 10)
+}
+
+// ProgramFromKey is the inverse of Key and ProcessKey, for the unread report, which has
+// only the program memory's keys to name its entries by. Two fields give a program and
+// leave PID and Start zero; three give a process, read back from "<pid>@<start>".
+func ProgramFromKey(k string) Program {
+	f := strings.SplitN(k, "\x00", 3)
+	p := Program{Exe: f[0]}
+	if len(f) > 1 {
+		p.Agent = f[1]
+	}
+	if len(f) == 3 {
+		pid, start, _ := strings.Cut(f[2], "@")
+		if n, err := strconv.ParseInt(pid, 10, 32); err == nil {
+			p.PID = int32(n)
+		}
+		if n, err := strconv.ParseInt(start, 10, 64); err == nil {
+			p.Start = n
+		}
+	}
+	return p
 }

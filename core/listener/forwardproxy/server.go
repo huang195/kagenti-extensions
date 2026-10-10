@@ -787,10 +787,16 @@ func (s *Server) bridgeVerdict(r *http.Request, tl *tunnelLog, host string, firs
 	}
 	// Either key: the program's, which every process running it shares, and this
 	// process's own, where bridgeMemory keeps a refusal from a process older than the CA.
-	if s.TLSBridge.Programs.Contains(prog.Key()) || s.TLSBridge.Programs.Contains(prog.ProcessKey()) {
-		return pipeline.TunnelProgramRefused, false
+	// The connection is noted under the key that matched, so the unread report counts it
+	// on the entry that passed it through.
+	for _, key := range [...]string{prog.Key(), prog.ProcessKey()} {
+		if s.TLSBridge.Programs.Contains(key) {
+			s.TLSBridge.Unread.Note(key, string(pipeline.TunnelProgramRefused), host)
+			return pipeline.TunnelProgramRefused, false
+		}
 	}
 	if t := s.TLSBridge.Trust; t != nil && t.OSTrustOnly(prog.Exe) {
+		s.TLSBridge.Unread.Note(prog.Key(), string(pipeline.TunnelOSTrustOnly), host)
 		return pipeline.TunnelOSTrustOnly, false
 	}
 	tl.program = &prog
@@ -880,6 +886,13 @@ func (s *Server) bridgeServe(client net.Conn, authority, host string, tl *tunnel
 			memory.Fail(key)
 		} else {
 			memory.FailTransient(key)
+		}
+		if memory == s.TLSBridge.Programs {
+			// The failed connection was not read either, and it names the host the
+			// program refused, which the report would otherwise lack until its next try.
+			// Under the key just failed, so the note joins that entry. A host's entry is
+			// the report's hosts list, which needs no note.
+			s.TLSBridge.Unread.Note(key, string(pipeline.TunnelProgramRefused), host)
 		}
 		// UNCONDITIONAL, and it names the client. Success elsewhere must not silence
 		// this: it used to sit behind bridgedRequests == 0, which treats CA trust as a

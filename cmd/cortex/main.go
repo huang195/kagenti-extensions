@@ -40,6 +40,7 @@ import (
 	"github.com/rossoctl/cortex/core/cost/pricing"
 	"github.com/rossoctl/cortex/core/cost/usage"
 	"github.com/rossoctl/cortex/core/memstore"
+	"github.com/rossoctl/cortex/core/observe"
 	"github.com/rossoctl/cortex/core/peerproc"
 	"github.com/rossoctl/cortex/core/pipeline"
 	"github.com/rossoctl/cortex/core/plugins"
@@ -891,6 +892,7 @@ func main() {
 			Skip:     tlsbridge.NewSkipSet(),
 			Programs: tlsbridge.NewProgramSkipSet(),
 			Trust:    tlsbridge.NewClientTrust(minter),
+			Unread:   tlsbridge.NewUnreadLog(),
 			Upstream: up,
 			CAPEM:    src.CACertPEM(),
 			CAFile:   caTrustPath(cfg.TLSBridge.CADir),
@@ -1002,8 +1004,12 @@ func main() {
 		sources = append(sources, plugins.CollectStats(outboundH.Load())...)
 		return auth.MergeStats(sources...)
 	}
+	var statOpts []observe.Option
+	if bridge != nil {
+		statOpts = append(statOpts, observe.WithTLSBridgeUnread(bridge.UnreadHandler()))
+	}
 	statSrv := bootstrap.ServeStatServer(rld.ConfigProvider(), statsProvider, rld.Handler(), pricingRegistry.Handler(),
-		listeners.take("stats"))
+		listeners.take("stats"), statOpts...)
 
 	// Warm the plugin catalog at boot so any factory that violates the
 	// constructor contract surfaces here rather than on the first

@@ -626,3 +626,34 @@ func TestSkipSet_StoppedEntriesAreEvictedLast(t *testing.T) {
 		t.Error("the new entry was not recorded")
 	}
 }
+
+func TestSkipSet_EntriesListsWhatContainsReports(t *testing.T) {
+	s := NewProgramSkipSet()
+	// Tiny windows to stop one entry across them and let another expire, then long
+	// ones so the live entry stays live for the rest of the test.
+	s.base, s.ttl = time.Millisecond, 2*time.Millisecond
+	refuseAcrossWindows(s, "stopped", programStopAfter)
+	s.Fail("expired")
+	s.base, s.ttl = time.Hour, time.Hour
+	s.Fail("live")
+	time.Sleep(5 * time.Millisecond)
+
+	got := map[string]SkipEntry{}
+	for _, e := range s.Entries() {
+		got[e.Key] = e
+	}
+	if e, ok := got["stopped"]; !ok || !e.Stopped || !e.Until.IsZero() || e.Failures != programStopAfter {
+		t.Errorf("stopped = %+v, %v; want Stopped, no Until, %d failures", e, ok, programStopAfter)
+	}
+	if e, ok := got["live"]; !ok || e.Stopped || e.Until.IsZero() || e.Failures != 1 {
+		t.Errorf("live = %+v, %v; want a window and 1 failure", e, ok)
+	}
+	if _, ok := got["expired"]; ok {
+		t.Error("an expired entry was listed; Contains no longer reports it")
+	}
+	for k := range got {
+		if !s.Contains(k) {
+			t.Errorf("Entries listed %q, which Contains does not report", k)
+		}
+	}
+}

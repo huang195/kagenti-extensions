@@ -463,3 +463,91 @@ func TestBridgeProgram_RefusedBeforeWinsOverOSTrust(t *testing.T) {
 		t.Error("the row says os-trust-only for a program that refused")
 	}
 }
+
+// tlsbridge reports with its own copies of these strings, since it does not import
+// pipeline; the two must not drift.
+func TestUnreadReasonsMatchTunnelReasons(t *testing.T) {
+	if tlsbridge.UnreadProgramRefused != string(pipeline.TunnelProgramRefused) ||
+		tlsbridge.UnreadOSTrustOnly != string(pipeline.TunnelOSTrustOnly) {
+		t.Fatal("tlsbridge's unread reasons differ from the tunnel reasons the rows carry")
+	}
+}
+
+// End to end: what the bridge passed through, and why, reaches the report, every
+// connection counted on the entry that passed it through — the program's for a process
+// started after the CA, and the process's own for one started before it, which the
+// report names.
+func TestBridgeProgram_TheReportListsWhatIsNotRead(t *testing.T) {
+	stalePython, freshCurl := fproc(600, 1, exePython), freshProc(400, 1, exeCurl)
+	procs := newFakeProcs(freshProc(300, 1, exeHelm), stalePython, freshCurl)
+	store := session.New(0, 0, 0)
+	defer store.Close()
+	sc := newBridgeScene(t, store, procs)
+	sc.engine.Unread = tlsbridge.NewUnreadLog()
+	sc.engine.Trust = fakeTrust{exeHelm: true}
+	refusers := map[int32]string{
+		600: tlsbridge.Program{Exe: exePython, PID: 600, Start: stalePython.Start.UnixNano()}.ProcessKey(),
+		400: tlsbridge.Program{Exe: exeCurl}.Key(),
+	}
+
+	if _, err := sc.handshake(t, procs, 300, sc.refusing); err != nil {
+		t.Fatalf("helm: %v", err)
+	}
+	for pid, key := range refusers {
+		if _, err := sc.handshake(t, procs, pid, sc.refusing); err == nil {
+			t.Fatalf("pid %d completed a handshake on a leaf it does not trust", pid)
+		}
+		eventually(t, func() bool { return sc.engine.Programs.Contains(key) }, "the refusal to be recorded")
+		if bridged, err := sc.handshake(t, procs, pid, sc.refusing); err != nil || bridged {
+			t.Fatalf("pid %d's next connection was not passed through (bridged=%v, err=%v)", pid, bridged, err)
+		}
+	}
+	var report tlsbridge.UnreadReport
+	defer func() {
+		if t.Failed() {
+			t.Logf("report: %+v", report.Programs)
+		}
+	}()
+	eventually(t, func() bool {
+		report = sc.engine.UnreadReport()
+		var helm, python, curl bool
+		for _, p := range report.Programs {
+			switch p.Program {
+			case exeHelm:
+				helm = p.Reason == tlsbridge.UnreadOSTrustOnly && p.LastHost != "" && p.PID == 0
+			case exePython:
+				python = p.Reason == tlsbridge.UnreadProgramRefused && p.PID == 600 && p.Connections == 2
+			case exeCurl:
+				curl = p.Reason == tlsbridge.UnreadProgramRefused && p.PID == 0 && p.Connections == 2
+			}
+		}
+		return helm && python && curl
+	}, "helm (os-trust-only), the stale python3 process and curl (program-refused, both connections each) in the report")
+}
+
+// A process older than the CA that refused has its own entry, and its program can have
+// one too, from a process that started after the CA and refused as well. That process's
+// next connection is counted once, on the program's entry, which is the one checked first.
+func TestBridgeProgram_AConnectionIsCountedOnItsProgramsEntryFirst(t *testing.T) {
+	stale := fproc(100, 1, exeClaude)
+	procs := newFakeProcs(stale)
+	store := session.New(0, 0, 0)
+	defer store.Close()
+	sc := newBridgeScene(t, store, procs)
+	sc.engine.Unread = tlsbridge.NewUnreadLog()
+	prog := tlsbridge.Program{Exe: exeClaude, PID: stale.PID, Start: stale.Start.UnixNano()}
+	sc.engine.Programs.Fail(prog.Key())
+	sc.engine.Programs.Fail(prog.ProcessKey())
+
+	if bridged, err := sc.handshake(t, procs, 100, sc.refusing); err != nil || bridged {
+		t.Fatalf("the process was not passed through (bridged=%v, err=%v)", bridged, err)
+	}
+	byPID := map[int32]tlsbridge.UnreadProgram{}
+	for _, p := range sc.engine.UnreadReport().Programs {
+		byPID[p.PID] = p
+	}
+	if byPID[0].Connections != 1 || byPID[stale.PID].Connections != 0 {
+		t.Errorf("program entry = %+v, process entry = %+v; want the connection on the program's alone",
+			byPID[0], byPID[stale.PID])
+	}
+}

@@ -172,3 +172,22 @@ func TestOSTrustCheck_ARealVerifierDoesNotTrustAFreshCA(t *testing.T) {
 		t.Fatal("the platform trusts a CA generated a moment ago")
 	}
 }
+
+// The unread report says "not checked" off darwin, and must never ask the OS there;
+// on darwin it reports the check's own answer and time.
+func TestClientTrust_OSTrustState(t *testing.T) {
+	at := time.Unix(1700000000, 0)
+	asked := 0
+	check := func() (bool, time.Time) { asked++; return true, at }
+	if _, _, checked := (&ClientTrust{goos: "linux", osTrusted: check}).OSTrustState(); checked || asked != 0 {
+		t.Errorf("off darwin: checked = %v after %d evaluations, want unchecked and none", checked, asked)
+	}
+	trusted, got, checked := (&ClientTrust{goos: "darwin", osTrusted: check}).OSTrustState()
+	if !checked || !trusted || !got.Equal(at) {
+		t.Errorf("on darwin = (%v, %v, %v), want (true, %v, true)", trusted, got, checked, at)
+	}
+	var none *ClientTrust
+	if _, _, checked := none.OSTrustState(); checked {
+		t.Error("a nil ClientTrust reported a check")
+	}
+}

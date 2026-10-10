@@ -428,3 +428,31 @@ func (s *SkipSet) Contains(host string) bool {
 	// Expired entries read as absent; Fail reclaims them. A stopped one never expires.
 	return ok && (e.stopped || time.Now().Before(e.expiry))
 }
+
+// SkipEntry is one key a SkipSet is currently passing through, for reporting.
+type SkipEntry struct {
+	Key string
+	// Failures is the consecutive failed handshakes behind the entry. Only rejections
+	// escalate, but a transient failure seeds an entry at one.
+	Failures int
+	// Until is when the window ends; zero for a stopped entry, which has no end.
+	Until   time.Time
+	Stopped bool
+}
+
+// Entries lists the keys Contains reports right now, in no particular order.
+func (s *SkipSet) Entries() []SkipEntry {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	now := time.Now()
+	out := make([]SkipEntry, 0, len(s.m))
+	for k, e := range s.m {
+		switch {
+		case e.stopped:
+			out = append(out, SkipEntry{Key: k, Failures: e.failures, Stopped: true})
+		case now.Before(e.expiry):
+			out = append(out, SkipEntry{Key: k, Failures: e.failures, Until: e.expiry})
+		}
+	}
+	return out
+}

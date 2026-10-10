@@ -36,3 +36,19 @@ func TestProgramProcessKey_NamesOneProcessAndNeverAProgram(t *testing.T) {
 		t.Error("two processes under one pid, started at different times, share a process key")
 	}
 }
+
+// The unread report names each program-memory entry by parsing its key back, so both
+// key forms must survive the trip: a program's gives no process, and a process's gives
+// the very process. The agent path holds an "@", which the process half also uses.
+func TestProgramFromKey_ReadsBothKeyForms(t *testing.T) {
+	p := Program{Exe: "/usr/bin/python3", Agent: "/Users/x/.nvm/node@20/bin/node", PID: 4242, Start: 1700000000123456789}
+	if got, want := ProgramFromKey(p.Key()), (Program{Exe: p.Exe, Agent: p.Agent}); got != want {
+		t.Errorf("ProgramFromKey(Key) = %+v, want %+v", got, want)
+	}
+	if got := ProgramFromKey(p.ProcessKey()); got != p {
+		t.Errorf("ProgramFromKey(ProcessKey) = %+v, want %+v", got, p)
+	}
+	if got, want := ProgramFromKey(Program{Exe: "/bin/sh"}.Key()), (Program{Exe: "/bin/sh"}); got != want {
+		t.Errorf("ProgramFromKey of a program under no agent = %+v, want %+v", got, want)
+	}
+}

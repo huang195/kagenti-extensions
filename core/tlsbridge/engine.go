@@ -18,7 +18,10 @@ type Engine struct {
 	// Trust predicts programs that could only refuse a leaf, so they are passed through
 	// without being shown one (ClientTrust: a Go program on macOS, while macOS does not
 	// trust the CA). Nil predicts nothing.
-	Trust    Trust
+	Trust Trust
+	// Unread remembers, per program, the connections passed through because of the
+	// program, for UnreadReport. Nil records nothing.
+	Unread   *UnreadLog
 	Upstream *http.Client
 	CAPEM    []byte
 

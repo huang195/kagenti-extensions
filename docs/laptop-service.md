@@ -630,7 +630,7 @@ curl -s http://127.0.0.1:47602/tls-bridge/unread
 
 `programs` has one entry per program Cortex is not reading: `program` and `agent` (the
 executables), `reason`, `connections` (how many of the program's connections Cortex has
-passed through unread since it started), `failures` and `stopped` (on `program-refused`),
+passed through unread since Cortex started), `failures` and `stopped` (on `program-refused`),
 and `lastHost`. `pid` appears on an entry kept for one process that started before Cortex's
 CA. `hosts` is the host memory behind `skip-cached`: the hosts passed through for clients
 whose program cannot be named. On macOS, `osTrustsCA` is whether macOS trusted Cortex's CA

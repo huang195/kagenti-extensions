@@ -54,7 +54,9 @@ func checkUnread(env *setupEnv, ui *checklist.UI) {
 	if !ok {
 		return
 	}
-	if len(rep.Programs) == 0 {
+	// The host memory is unread traffic too, from clients whose program Cortex could not
+	// name, so an empty program list alone is not everything read.
+	if len(rep.Programs) == 0 && len(rep.Hosts) == 0 {
 		ui.Done("unread", "Cortex reads every program that reaches it", 0)
 		return
 	}
@@ -62,6 +64,9 @@ func checkUnread(env *setupEnv, ui *checklist.UI) {
 	for _, p := range rep.Programs {
 		ui.Note("unread", unreadLine(env, p))
 		goPrograms = goPrograms || p.Reason == tlsbridge.UnreadOSTrustOnly
+	}
+	if len(rep.Hosts) > 0 {
+		ui.Note("unread", unreadHostsLine(rep.Hosts))
 	}
 	if goPrograms && env.goos == "darwin" {
 		// What trusting the CA buys is said under the fix rather than promised by it: Go
@@ -84,20 +89,41 @@ func unreadLine(env *setupEnv, p tlsbridge.UnreadProgram) string {
 		s += " under " + env.tilde(p.Agent)
 	}
 	s += ": " + p.Reason
-	if p.Stopped {
-		s += ", not retried until Cortex restarts"
-	}
 	var aside []string
 	if p.PID != 0 {
 		// Only a process older than the CA is remembered by its PID: it cannot have
-		// loaded the CA, so the program itself is not at fault.
+		// loaded the CA, so the program itself is not at fault. Restarting that process
+		// reads it again even once its entry has stopped, so a stop is not mentioned.
 		aside = append(aside, fmt.Sprintf("pid %d, started before Cortex's CA — restarting it is enough", p.PID))
+	} else if p.Stopped {
+		s += ", not retried until Cortex restarts"
 	}
 	if p.LastHost != "" {
 		aside = append(aside, "last "+p.LastHost)
 	}
 	if len(aside) > 0 {
 		s += " (" + strings.Join(aside, "; ") + ")"
+	}
+	return s
+}
+
+// unreadHostsShown is how many hosts unreadHostsLine names before it only counts.
+const unreadHostsShown = 3
+
+// unreadHostsLine is the host memory as one line: how many hosts are passed through for
+// clients Cortex could not name, and the first few of them.
+func unreadHostsLine(hosts []tlsbridge.UnreadHost) string {
+	s := fmt.Sprintf("%d hosts", len(hosts))
+	if len(hosts) == 1 {
+		s = "1 host"
+	}
+	names := make([]string, 0, unreadHostsShown)
+	for _, h := range hosts[:min(len(hosts), unreadHostsShown)] {
+		names = append(names, h.Host)
+	}
+	s += " passed through for clients Cortex could not name: " + strings.Join(names, ", ")
+	if more := len(hosts) - len(names); more > 0 {
+		s += fmt.Sprintf(" and %d more", more)
 	}
 	return s
 }

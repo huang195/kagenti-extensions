@@ -102,6 +102,46 @@ func TestCheckUnread_SaysRestartingAProcessOlderThanTheCAIsEnough(t *testing.T) 
 	}
 }
 
+// A stopped entry for one process is still that process's alone: restarting it is
+// enough, so the line must not also say it waits for Cortex to restart.
+func TestCheckUnread_AStoppedProcessEntryNamesOnlyTheProcessRestart(t *testing.T) {
+	plainOutput(t)
+	env := unreadEnv(t, "linux", `{"programs":[`+
+		`{"program":"/usr/bin/python3","pid":600,"reason":"program-refused","failures":3,"stopped":true,"connections":3}],"hosts":[]}`)
+	var b bytes.Buffer
+	checkUnread(env, checklist.New(&b, false))
+	out := b.String()
+	if !strings.Contains(out, "python3: program-refused (pid 600, started before Cortex's CA — restarting it is enough)") ||
+		strings.Contains(out, "until Cortex restarts") {
+		t.Errorf("want only the process restart named:\n%s", out)
+	}
+}
+
+// The host memory holds clients Cortex could not name, so an empty program list is not
+// everything read: doctor says how many hosts are passed through, and never fails on it.
+func TestCheckUnread_CountsHostsPassedThroughForUnnamedClients(t *testing.T) {
+	plainOutput(t)
+	for _, c := range []struct {
+		hosts, want string
+	}{
+		{`{"host":"api.example.com","failures":1,"until":"2026-10-09T14:42:00-04:00"}`,
+			"1 host passed through for clients Cortex could not name: api.example.com"},
+		{`{"host":"a.example","failures":1,"until":"2026-10-09T14:42:00-04:00"},` +
+			`{"host":"b.example","failures":1,"until":"2026-10-09T14:42:00-04:00"},` +
+			`{"host":"c.example","failures":2,"until":"2026-10-09T14:42:00-04:00"},` +
+			`{"host":"d.example","failures":1,"until":"2026-10-09T14:42:00-04:00"}`,
+			"4 hosts passed through for clients Cortex could not name: a.example, b.example, c.example and 1 more"},
+	} {
+		env := unreadEnv(t, "darwin", `{"osTrustsCA":true,"programs":[],"hosts":[`+c.hosts+`]}`)
+		var b bytes.Buffer
+		checkUnread(env, checklist.New(&b, false))
+		out := b.String()
+		if !strings.Contains(out, c.want) || strings.Contains(out, "reads every program") || strings.Contains(out, "✗") {
+			t.Errorf("want %q, and no ✓ or ✗ line:\n%s", c.want, out)
+		}
+	}
+}
+
 // Off macOS there is no keychain to point at; the list stays, the advice goes.
 func TestCheckUnread_GivesNoKeychainAdviceOffMacOS(t *testing.T) {
 	plainOutput(t)

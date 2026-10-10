@@ -118,8 +118,10 @@ func TestUnreadReport_OmitsOSTrustWhereNothingChecks(t *testing.T) {
 	if err := json.Unmarshal(b, &m); err != nil {
 		t.Fatal(err)
 	}
-	if _, ok := m["osTrustsCA"]; ok {
-		t.Errorf("report = %s; osTrustsCA must be absent when nothing checked", b)
+	for _, k := range []string{"osTrustsCA", "osTrustCheckedAt"} {
+		if _, ok := m[k]; ok {
+			t.Errorf("report = %s; %s must be absent when nothing checked", b, k)
+		}
 	}
 	if string(m["programs"]) != "[]" || string(m["hosts"]) != "[]" {
 		t.Errorf("report = %s; empty lists must encode as [], not null", b)
@@ -158,5 +160,52 @@ func TestUnreadLog_IsBounded(t *testing.T) {
 	}
 	if _, ok := u.m[last]; !ok {
 		t.Error("the program noted last was forgotten")
+	}
+}
+
+// A process's own entry is cleared only by that process completing a handshake, which it
+// cannot do once it has exited — and restarting a stale agent is exactly what the
+// rejection advises. So the report lists the entry only while the process runs, and nil
+// ProcessAlive assumes it does. A program-wide entry names no process and is never asked
+// about.
+func TestUnreadReport_ListsAProcessEntryOnlyWhileTheProcessRuns(t *testing.T) {
+	stale := Program{Exe: "/bin/claude", PID: 4242, Start: 1700000000123456789}
+	e := &Engine{Skip: NewSkipSet(), Programs: NewProgramSkipSet(), Unread: NewUnreadLog()}
+	e.Programs.base, e.Programs.ttl = time.Millisecond, 2*time.Millisecond
+	refuseAcrossWindows(e.Programs, stale.ProcessKey(), programStopAfter)
+	e.Programs.base, e.Programs.ttl = time.Hour, time.Hour
+	e.Programs.Fail(Program{Exe: "/usr/bin/python3"}.Key())
+
+	listed := func() (process, program bool) {
+		for _, p := range e.UnreadReport().Programs {
+			switch {
+			case p.Program == stale.Exe && p.PID == stale.PID && p.Stopped:
+				process = true
+			case p.Program == "/usr/bin/python3" && p.PID == 0:
+				program = true
+			}
+		}
+		return process, program
+	}
+	if process, program := listed(); !process || !program {
+		t.Fatalf("nil ProcessAlive: process listed = %v, program listed = %v; want both", process, program)
+	}
+
+	var askedPID int32
+	var askedStart int64
+	e.ProcessAlive = func(pid int32, start int64) bool { askedPID, askedStart = pid, start; return true }
+	if process, _ := listed(); !process {
+		t.Error("a stopped process entry was omitted while its process runs")
+	}
+	if askedPID != stale.PID || askedStart != stale.Start {
+		t.Errorf("ProcessAlive asked about %d@%d, want %d@%d", askedPID, askedStart, stale.PID, stale.Start)
+	}
+
+	e.ProcessAlive = func(int32, int64) bool { return false }
+	if process, program := listed(); process || !program {
+		t.Errorf("process exited: process listed = %v, program listed = %v; want only the program", process, program)
+	}
+	if !e.Programs.Contains(stale.ProcessKey()) {
+		t.Error("the report removed the entry from the program memory; it must only read it")
 	}
 }

@@ -546,8 +546,12 @@ func TestBridgeProgram_AConnectionIsCountedOnItsProgramsEntryFirst(t *testing.T)
 	for _, p := range sc.engine.UnreadReport().Programs {
 		byPID[p.PID] = p
 	}
-	if byPID[0].Connections != 1 || byPID[stale.PID].Connections != 0 {
-		t.Errorf("program entry = %+v, process entry = %+v; want the connection on the program's alone",
-			byPID[0], byPID[stale.PID])
+	progEntry, progListed := byPID[0]
+	procEntry, procListed := byPID[stale.PID]
+	if !progListed || !procListed {
+		t.Fatalf("program entry listed = %v, process entry listed = %v; want both", progListed, procListed)
+	}
+	if progEntry.Connections != 1 || procEntry.Connections != 0 {
+		t.Errorf("program entry = %+v, process entry = %+v; want the connection on the program's alone", progEntry, procEntry)
 	}
 }

@@ -21,9 +21,16 @@ type Engine struct {
 	Trust Trust
 	// Unread remembers, per program, the connections passed through because of the
 	// program, for UnreadReport. Nil records nothing.
-	Unread   *UnreadLog
-	Upstream *http.Client
-	CAPEM    []byte
+	Unread *UnreadLog
+	// ProcessAlive reports whether process pid, started at start (Unix nanoseconds, as
+	// Program.Start has it), is still running, for UnreadReport. A process's own entry
+	// (Program.ProcessKey) is cleared only by that process completing a handshake, which
+	// it cannot do once it has exited, so without this the report would list it until
+	// Cortex restarts — after the user restarted the process as the rejection advises.
+	// Nil assumes every process is alive.
+	ProcessAlive func(pid int32, start int64) bool
+	Upstream     *http.Client
+	CAPEM        []byte
 
 	// CAFile is the on-disk trust anchor clients must load. Diagnostics only:
 	// the bridge itself works from CAPEM. It exists so a listener that notices

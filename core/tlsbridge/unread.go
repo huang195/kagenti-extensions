@@ -137,6 +137,12 @@ func (e *Engine) UnreadReport() UnreadReport {
 	if e.Programs != nil {
 		for _, en := range e.Programs.Entries() {
 			p := ProgramFromKey(en.Key)
+			// An exited process's entry can match no connection again, so it is not
+			// listed. The report leaves the program memory alone: the entry stays until
+			// evicted, which costs nothing, since a new process never shares its key.
+			if p.PID != 0 && e.ProcessAlive != nil && !e.ProcessAlive(p.PID, p.Start) {
+				continue
+			}
 			up := UnreadProgram{Program: p.Exe, Agent: p.Agent, PID: p.PID, Reason: UnreadProgramRefused,
 				Failures: en.Failures, Stopped: en.Stopped}
 			if !en.Stopped {
@@ -189,7 +195,9 @@ func fillUnread(up *UnreadProgram, n unreadEntry) {
 	up.LastSeen = &seen
 }
 
-// UnreadHandler serves UnreadReport as JSON. GET only: the report changes nothing.
+// UnreadHandler serves UnreadReport as JSON. GET only: serving it decides and records
+// nothing. The one thing it can change is the OS-trust answer, which it refreshes when
+// that has outlived its window, as the next Go program's connection would have.
 func (e *Engine) UnreadHandler() http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodGet {

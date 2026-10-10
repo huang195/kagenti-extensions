@@ -980,6 +980,17 @@ func main() {
 				slog.Warn("process attribution off: this host's process lookup is unavailable", "error", perr)
 			} else {
 				fpSrv.Processes = procs
+				if bridge != nil {
+					// The unread report lists a process's own entry only while that process
+					// runs. A pid alone could be reused, so the start time must match too;
+					// both come from this resolver, whose start times compare with each other.
+					// Nothing locks the field, so it is set before any listener that reaches the
+					// bridge serves: the forward proxy below, and the stats server, its reader.
+					bridge.ProcessAlive = func(pid int32, start int64) bool {
+						ps, err := procs.Ancestry(pid, 1)
+						return err == nil && len(ps) > 0 && ps[0].Start.UnixNano() == start
+					}
+				}
 				slog.Info("process attribution on: header-less requests are filed by the process that sent them")
 			}
 		}

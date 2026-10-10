@@ -1,5 +1,7 @@
 package tlsbridge
 
+import "strconv"
+
 // Program names the client program behind a bridged connection, for the per-program
 // skip set (NewProgramSkipSet). Exe is the client process's executable, absolute and
 // symlink-resolved. Agent is the executable of the nearest process in its ancestry
@@ -13,7 +15,26 @@ package tlsbridge
 type Program struct {
 	Exe   string
 	Agent string
+	// PID and Start name the client process itself, Start in Unix nanoseconds as
+	// session.Proc has it, for ProcessKey. Key ignores them. Zero when unknown.
+	PID   int32
+	Start int64
 }
 
-// Key is p as a SkipSet key. NUL separates the halves because no path contains one.
+// Key is p as a SkipSet key: the program, whichever process runs it. NUL separates the
+// halves because no path contains one, so a Key holds exactly one NUL.
 func (p Program) Key() string { return p.Exe + "\x00" + p.Agent }
+
+// ProcessKey is p's process as a SkipSet key: Key, then a second NUL and
+// "<pid>@<start>", both decimal. It holds exactly two NULs, so it never equals any Key,
+// and splitting a key on NUL tells the two apart: two fields name a program, three a
+// process.
+//
+// It is for a process that started before the bridge CA. CA files are read once at
+// startup, so such a process cannot have been told about the CA, and its refusal is
+// evidence about that process, not the program. Recorded under Key, a stale Claude
+// Code's refusals would stop the key every freshly started Claude Code also has until
+// it names a session, and no new instance would be read until Cortex restarted.
+func (p Program) ProcessKey() string {
+	return p.Key() + "\x00" + strconv.FormatInt(int64(p.PID), 10) + "@" + strconv.FormatInt(p.Start, 10)
+}

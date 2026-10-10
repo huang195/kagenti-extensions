@@ -277,7 +277,9 @@ const programStopAfter = 3
 // rejects the leaf programStopAfter times in a row is passed through until Cortex
 // restarts, instead of being retried every time a window ends. Nothing bridges a
 // stopped key, so no success comes to clear it. A new key is the other way back: an
-// upgrade moves the executable's path.
+// upgrade moves the executable's path, and a process that started before the bridge
+// CA is recorded under a key of its own (Program.ProcessKey), so restarting that
+// process is enough.
 func NewProgramSkipSet() *SkipSet {
 	s := NewSkipSet()
 	s.stopAfter = programStopAfter

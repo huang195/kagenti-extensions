@@ -11,8 +11,9 @@ type Engine struct {
 	Term     *Terminator
 	Skip     *SkipSet
 	// Programs is the skip set keyed by client program (Program.Key), which the forward
-	// proxy records against instead of Skip whenever it can name the client's program.
-	// Nil leaves every connection to Skip, as before programs could be named.
+	// proxy records against instead of Skip whenever it can name the client's program —
+	// or by the client process (Program.ProcessKey), when that process started before
+	// the CA. Nil leaves every connection to Skip, as before programs could be named.
 	Programs *SkipSet
 	Upstream *http.Client
 	CAPEM    []byte

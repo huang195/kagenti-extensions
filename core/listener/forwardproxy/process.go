@@ -109,7 +109,7 @@ func (s *Server) bridgeProgram(r *http.Request) (tlsbridge.Program, bool) {
 	if len(cp.chain) == 0 || cp.chain[0].Exe == "" {
 		return tlsbridge.Program{}, false
 	}
-	p := tlsbridge.Program{Exe: cp.chain[0].Exe}
+	p := tlsbridge.Program{Exe: cp.chain[0].Exe, PID: cp.chain[0].PID, Start: cp.chain[0].Start}
 	for _, proc := range cp.chain {
 		if s.Sessions.IsAgentProcess(proc) {
 			p.Agent = proc.Exe

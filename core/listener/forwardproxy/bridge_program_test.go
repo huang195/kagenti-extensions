@@ -5,12 +5,15 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"encoding/pem"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"slices"
 	"strings"
 	"testing"
+	"time"
 
+	"github.com/rossoctl/cortex/core/peerproc"
 	"github.com/rossoctl/cortex/core/pipeline"
 	"github.com/rossoctl/cortex/core/session"
 	"github.com/rossoctl/cortex/core/tlsbridge"
@@ -28,10 +31,28 @@ const (
 	exePython = "/usr/bin/python3"
 )
 
+// freshProc is fproc for a process started after the bridge CA, which a test about an
+// ordinary program needs. fproc's processes start in 1970, so to the bridge every one of
+// them predates its CA and is remembered on its own (Program.ProcessKey) rather than as
+// its program. An hour from now postdates any CA a test mints, however far that CA's
+// NotBefore is backdated.
+func freshProc(pid, ppid int32, exe string) peerproc.Proc {
+	p := fproc(pid, ppid, exe)
+	p.Start = time.Now().Add(time.Hour)
+	return p
+}
+
+// staleStart is a process start before every CA a test mints, as Program.Start has it.
+var staleStart = time.Unix(1, 0).UnixNano()
+
+// freshStart is a process start after every CA a test mints, as Program.Start has it.
+func freshStart() int64 { return time.Now().Add(time.Hour).UnixNano() }
+
 // bridgeScene is a forward proxy with process attribution and a TLS bridge in front of
 // a TLS origin, served the way cortex serves it.
 type bridgeScene struct {
 	proxyURL, backendURL, target string
+	server                       *Server
 	engine                       *tlsbridge.Engine
 	bridgeCA                     *x509.Certificate
 	// trusting holds the bridge CA and the origin's certificate: a client the bridge can
@@ -70,7 +91,10 @@ func newBridgeScene(t *testing.T, store *session.Store, procs *fakeProcs) *bridg
 	sc.trusting.AddCert(origin.Certificate())
 	sc.refusing = x509.NewCertPool()
 	sc.refusing.AddCert(origin.Certificate())
-	sc.proxyURL, sc.backendURL, _ = newProcessProxy(t, store, procs, func(s *Server) { s.TLSBridge = sc.engine })
+	sc.proxyURL, sc.backendURL, _ = newProcessProxy(t, store, procs, func(s *Server) {
+		s.TLSBridge = sc.engine
+		sc.server = s
+	})
 	return sc
 }
 
@@ -110,7 +134,7 @@ func tunnelReasons(store *session.Store, id string) []pipeline.TunnelReason {
 // connection, and a different program talking to the same host is still read. Before,
 // one refusal hid the host from every program until a window passed.
 func TestBridgeProgram_ARefusingProgramIsPassedThroughAndOthersStillBridged(t *testing.T) {
-	procs := newFakeProcs(fproc(300, 1, exeHelm), fproc(400, 1, exeCurl))
+	procs := newFakeProcs(freshProc(300, 1, exeHelm), freshProc(400, 1, exeCurl))
 	store := session.New(0, 0, 0)
 	defer store.Close()
 	sc := newBridgeScene(t, store, procs)
@@ -147,7 +171,7 @@ func TestBridgeProgram_ARefusingProgramIsPassedThroughAndOthersStillBridged(t *t
 // Review focus 3. The same interpreter run by an agent and run on its own can disagree
 // about the CA, so one refusing must not pass the other through.
 func TestBridgeProgram_SameExecutableUnderAnAgentIsTrackedApart(t *testing.T) {
-	procs := newFakeProcs(fproc(100, 1, exeClaude), fproc(500, 100, exePython), fproc(600, 1, exePython))
+	procs := newFakeProcs(freshProc(100, 1, exeClaude), freshProc(500, 100, exePython), freshProc(600, 1, exePython))
 	store := session.New(0, 0, 0)
 	defer store.Close()
 	sc := newBridgeScene(t, store, procs)
@@ -168,7 +192,7 @@ func TestBridgeProgram_SameExecutableUnderAnAgentIsTrackedApart(t *testing.T) {
 // recorded against the host, and the host memory decides its next connection. A named
 // program ignores the host memory, and its success clears the host's entry.
 func TestBridgeProgram_AnUnnamedClientKeepsTheHostMemory(t *testing.T) {
-	procs := newFakeProcs(fproc(400, 1, exeCurl)) // pid 999 is in no table, so its executable is unknown
+	procs := newFakeProcs(freshProc(400, 1, exeCurl)) // pid 999 is in no table, so its executable is unknown
 	store := session.New(0, 0, 0)
 	defer store.Close()
 	sc := newBridgeScene(t, store, procs)
@@ -187,11 +211,59 @@ func TestBridgeProgram_AnUnnamedClientKeepsTheHostMemory(t *testing.T) {
 	eventually(t, func() bool { return !sc.engine.Skip.Contains(host) }, "curl's success to clear the host's entry")
 }
 
+// The usual refusal is a process that started before the CA existed — a first install,
+// a recreated ~/.cortex, a CA renewal — and such a process cannot have loaded the CA, so
+// its refusals are remembered against that process alone. Against its program they
+// would stop the key a freshly started instance also has until it names a session, and
+// no new instance would be read until Cortex restarted: the "restart the client" advice
+// the rejection prints would stop working.
+func TestBridgeProgram_AStaleProcessDoesNotStopItsProgram(t *testing.T) {
+	stale, fresh := fproc(100, 1, exeClaude), freshProc(200, 1, exeClaude)
+	procs := newFakeProcs(stale, fresh)
+	store := session.New(0, 0, 0)
+	defer store.Close()
+	sc := newBridgeScene(t, store, procs)
+	staleProg := tlsbridge.Program{Exe: exeClaude, PID: stale.PID, Start: stale.Start.UnixNano()}
+	claude := tlsbridge.Program{Exe: exeClaude}.Key()
+
+	if _, err := sc.handshake(t, procs, 100, sc.refusing); err == nil {
+		t.Fatal("the stale process completed a handshake on a leaf it does not trust")
+	}
+	eventually(t, func() bool { return sc.engine.Programs.Contains(staleProg.ProcessKey()) },
+		"the stale process's refusal to be recorded against that process")
+	// Its second and third refusals. A CONNECT cannot reach the forge again while the
+	// process's own window is open, and windows are 30s and up, so these go to
+	// bridgeServe, which forges unconditionally and records through the same rule. They
+	// land in that open window and so count once (tlsbridge's tests pin the stop itself);
+	// what matters here is that however many there are, none reaches the program's key.
+	for range 2 {
+		tl := discardTunnel()
+		tl.program = &staleProg
+		sc.server.bridgeServe(rejectingClient(t), sc.target, hostOnly(sc.target), tl)
+	}
+	if sc.engine.Programs.Contains(claude) {
+		t.Fatal("the stale process's refusals were recorded against its program, which a fresh claude shares")
+	}
+
+	if bridged, err := sc.handshake(t, procs, 200, sc.trusting); err != nil || !bridged {
+		t.Fatalf("a freshly started claude was not bridged after a stale one refused (bridged=%v, err=%v)", bridged, err)
+	}
+	if bridged, err := sc.handshake(t, procs, 100, sc.refusing); err != nil || bridged {
+		t.Fatalf("the stale process's next connection was not passed through (bridged=%v, err=%v)", bridged, err)
+	}
+	eventually(t, func() bool {
+		return slices.Contains(tunnelReasons(store, session.DefaultSessionID), pipeline.TunnelProgramRefused)
+	}, "the stale process's next connection to be recorded as program-refused")
+}
+
+// A process that started after the CA could have loaded it, so its refusal is evidence
+// about the program and is recorded under Key, where it decides every process running
+// that program.
 func TestBridgeServe_RecordsANamedProgramsRefusalAgainstTheProgram(t *testing.T) {
 	s, _, authority := bridgeForRejectTest(t)
 	s.TLSBridge.Programs = tlsbridge.NewProgramSkipSet()
 	host := hostOnly(authority)
-	prog := tlsbridge.Program{Exe: exeHelm}
+	prog := tlsbridge.Program{Exe: exeHelm, PID: 300, Start: freshStart()}
 	tl := discardTunnel()
 	tl.program = &prog
 
@@ -199,8 +271,92 @@ func TestBridgeServe_RecordsANamedProgramsRefusalAgainstTheProgram(t *testing.T)
 	if !s.TLSBridge.Programs.Contains(prog.Key()) {
 		t.Error("the refusal was not recorded against the program")
 	}
+	if s.TLSBridge.Programs.Contains(prog.ProcessKey()) {
+		t.Error("a process started after the CA had its refusal recorded against the process alone")
+	}
 	if s.TLSBridge.Skip.Contains(host) {
 		t.Error("the refusal was recorded against the host as well")
+	}
+}
+
+func TestBridgeServe_RecordsAStaleProcesssRefusalAgainstTheProcess(t *testing.T) {
+	s, _, authority := bridgeForRejectTest(t)
+	s.TLSBridge.Programs = tlsbridge.NewProgramSkipSet()
+	host := hostOnly(authority)
+	prog := tlsbridge.Program{Exe: exeClaude, PID: 100, Start: staleStart}
+	tl := discardTunnel()
+	tl.program = &prog
+
+	s.bridgeServe(rejectingClient(t), authority, host, tl)
+	if !s.TLSBridge.Programs.Contains(prog.ProcessKey()) {
+		t.Error("a process older than the CA did not have its refusal recorded against the process")
+	}
+	if s.TLSBridge.Programs.Contains(prog.Key()) {
+		t.Error("a process older than the CA had its refusal recorded against its program")
+	}
+	if s.TLSBridge.Skip.Contains(host) {
+		t.Error("the refusal was recorded against the host as well")
+	}
+}
+
+// Only a process known to predate the CA is told apart. An unknown start, or a CA whose
+// NotBefore cannot be read, is no evidence either way, so the refusal is the program's,
+// as it was before processes were told apart.
+func TestBridgeServe_WithoutEvidenceOfStalenessRecordsAgainstTheProgram(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		start int64
+		noCA  bool
+	}{
+		{name: "unknown start", start: 0},
+		{name: "unknown CA NotBefore", start: staleStart, noCA: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s, _, authority := bridgeForRejectTest(t)
+			s.TLSBridge.Programs = tlsbridge.NewProgramSkipSet()
+			if tc.noCA {
+				s.TLSBridge.CAPEM = nil // CAPEM is read only for diagnostics and this rule; the terminator mints from its source
+			}
+			prog := tlsbridge.Program{Exe: exeHelm, PID: 300, Start: tc.start}
+			tl := discardTunnel()
+			tl.program = &prog
+
+			s.bridgeServe(rejectingClient(t), authority, hostOnly(authority), tl)
+			if !s.TLSBridge.Programs.Contains(prog.Key()) {
+				t.Error("the refusal was not recorded against the program")
+			}
+			if s.TLSBridge.Programs.Contains(prog.ProcessKey()) {
+				t.Error("the refusal was recorded against the process with no evidence it predates the CA")
+			}
+		})
+	}
+}
+
+// The rejection line names the agent a program runs under: python3 under an agent and
+// python3 alone are remembered apart, and without it their lines read the same.
+func TestBridgeServe_RejectionLogNamesTheAgent(t *testing.T) {
+	var logbuf bytes.Buffer
+	prev := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(&logbuf, &slog.HandlerOptions{Level: slog.LevelWarn})))
+	t.Cleanup(func() { slog.SetDefault(prev) })
+
+	s, _, authority := bridgeForRejectTest(t)
+	s.TLSBridge.Programs = tlsbridge.NewProgramSkipSet()
+	for _, prog := range []tlsbridge.Program{{Exe: exePython, Agent: exeClaude}, {Exe: exePython}} {
+		logbuf.Reset()
+		tl := discardTunnel()
+		tl.program = &prog
+		s.bridgeServe(rejectingClient(t), authority, hostOnly(authority), tl)
+		got := logbuf.String()
+		if !strings.Contains(got, "program="+exePython) {
+			t.Fatalf("the rejection line does not name the program:\n%s", got)
+		}
+		if named := strings.Contains(got, "agent="); named != (prog.Agent != "") {
+			t.Errorf("agent %q: line names an agent = %v:\n%s", prog.Agent, named, got)
+		}
+		if prog.Agent != "" && !strings.Contains(got, "agent="+exeClaude) {
+			t.Errorf("the rejection line does not name the agent %s:\n%s", exeClaude, got)
+		}
 	}
 }
 
@@ -217,8 +373,8 @@ func TestBridgeServe_UnnamedTunnelRecordsAgainstTheHost(t *testing.T) {
 	}
 }
 
-// Review focus 2: an Engine without program memory (cortex-envoy, cortex-cpex) records
-// against the host even when a program was named, and does not panic.
+// Review focus 2: an Engine built without Programs, as any outside consumer of core may
+// build one, records against the host even when a program was named, and does not panic.
 func TestBridgeServe_ProgramWithoutProgramMemoryFallsBackToTheHost(t *testing.T) {
 	s, _, authority := bridgeForRejectTest(t) // no Programs
 	host := hostOnly(authority)
@@ -231,17 +387,21 @@ func TestBridgeServe_ProgramWithoutProgramMemoryFallsBackToTheHost(t *testing.T)
 	}
 }
 
+// A completed handshake clears both of the connection's keys: its program's, and its
+// process's own, where a refusal from before the CA would have been kept.
 func TestBridgeServe_ASuccessClearsTheProgramsEntry(t *testing.T) {
 	s, _, authority := bridgeForRejectTest(t)
 	s.TLSBridge.Programs = tlsbridge.NewProgramSkipSet()
 	host := hostOnly(authority)
-	prog := tlsbridge.Program{Exe: exeCurl}
+	prog := tlsbridge.Program{Exe: exeCurl, PID: 400, Start: freshStart()}
 	s.TLSBridge.Programs.Fail(prog.Key())
+	s.TLSBridge.Programs.Fail(prog.ProcessKey())
 	tl := discardTunnel()
 	tl.program = &prog
 
 	// bridgeServe blocks serving the decrypted connection, so run it and wait.
 	go s.bridgeServe(trustingClient(t, s.TLSBridge.CAPEM), authority, host, tl)
-	eventually(t, func() bool { return !s.TLSBridge.Programs.Contains(prog.Key()) },
-		"a completed handshake to clear the program's entry")
+	eventually(t, func() bool {
+		return !s.TLSBridge.Programs.Contains(prog.Key()) && !s.TLSBridge.Programs.Contains(prog.ProcessKey())
+	}, "a completed handshake to clear the program's entry and the process's")
 }

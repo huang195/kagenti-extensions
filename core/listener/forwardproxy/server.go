@@ -158,9 +158,9 @@ type Server struct {
 	bridgeAttempts  atomic.Uint64
 	bridgedRequests atomic.Uint64
 
-	// caNotBefore is parsed on first use and never changes for the process.
+	// caNotBeforeAt is parsed on first use and never changes for the process.
 	caNotBeforeOnce sync.Once
-	caNotBeforeStr  string
+	caNotBeforeAt   time.Time
 	// caFingerprint is likewise derived once; the CA is fixed for the process.
 	caFingerprintOnce sync.Once
 	caFingerprintStr  string
@@ -785,7 +785,9 @@ func (s *Server) bridgeVerdict(r *http.Request, tl *tunnelLog, host string, firs
 	if v != tlsbridge.Terminate {
 		return passthroughReason(why), false
 	}
-	if s.TLSBridge.Programs.Contains(prog.Key()) {
+	// Either key: the program's, which every process running it shares, and this
+	// process's own, where bridgeMemory keeps a refusal from a process older than the CA.
+	if s.TLSBridge.Programs.Contains(prog.Key()) || s.TLSBridge.Programs.Contains(prog.ProcessKey()) {
 		return pipeline.TunnelProgramRefused, false
 	}
 	tl.program = &prog
@@ -796,11 +798,20 @@ func (s *Server) bridgeVerdict(r *http.Request, tl *tunnelLog, host string, firs
 // the bridge rules named the client's program, and the host's otherwise — which is
 // what the transparent listener, a client whose program could not be named, and an
 // Engine without Programs all get.
+//
+// A process that started before the bridge CA gets an entry of its own instead
+// (Program.ProcessKey). It cannot have loaded that CA, so its refusal says nothing
+// about the program, and under the program's key a stale agent would stop every new
+// instance of it, which shares that key until it names a session. An unknown start or
+// NotBefore is no evidence the process is stale, and it records against the program.
 func (s *Server) bridgeMemory(tl *tunnelLog, host string) (*tlsbridge.SkipSet, string) {
-	if tl != nil && tl.program != nil && s.TLSBridge.Programs != nil {
-		return s.TLSBridge.Programs, tl.program.Key()
+	if tl == nil || tl.program == nil || s.TLSBridge.Programs == nil {
+		return s.TLSBridge.Skip, host
 	}
-	return s.TLSBridge.Skip, host
+	if nb := s.caNotBeforeTime(); tl.program.Start != 0 && !nb.IsZero() && time.Unix(0, tl.program.Start).Before(nb) {
+		return s.TLSBridge.Programs, tl.program.ProcessKey()
+	}
+	return s.TLSBridge.Programs, tl.program.Key()
 }
 
 // bridgeServe attempts to terminate the client's TLS and serve the decrypted
@@ -886,6 +897,11 @@ func (s *Server) bridgeServe(client net.Conn, authority, host string, tl *tunnel
 		}
 		if tl != nil && tl.program != nil {
 			args = append(args, "program", tl.program.Exe)
+			// python3 under an agent and python3 alone are remembered apart, and would
+			// otherwise log the same line.
+			if tl.program.Agent != "" {
+				args = append(args, "agent", tl.program.Agent)
+			}
 		}
 		// The restart advice goes ONLY on a real rejection. An EOF or a cipher
 		// mismatch would send someone restarting agents over something that was never
@@ -924,11 +940,12 @@ func (s *Server) bridgeServe(client net.Conn, authority, host string, tl *tunnel
 	// any skip left by a different client that does not — which is what stops one stale
 	// agent suppressing this host for everyone until a window elapses.
 	s.TLSBridge.Skip.Succeed(host)
-	// A named program's own entry is cleared too. The host's is cleared either way: a
-	// completed handshake proves this host's leaf works, and a client whose program
-	// cannot be named gets the benefit.
+	// A named program's own entries are cleared too, its process's along with its
+	// program's. The host's is cleared either way: a completed handshake proves this
+	// host's leaf works, and a client whose program cannot be named gets the benefit.
 	if tl != nil && tl.program != nil && s.TLSBridge.Programs != nil {
 		s.TLSBridge.Programs.Succeed(tl.program.Key())
+		s.TLSBridge.Programs.Succeed(tl.program.ProcessKey())
 	}
 	// Bridged: defer the open, with no reason, which is what tells agentop to fold this
 	// row into the decrypted inner request whose own action is the interesting one.
@@ -2157,13 +2174,13 @@ func clientPort(c net.Conn) string {
 	return "<port>"
 }
 
-// caNotBefore is the bridge CA's NotBefore, which is the line dividing clients
+// caNotBeforeTime is the bridge CA's NotBefore, which is the line dividing clients
 // that can trust it from clients that cannot: CA files are read once at process
-// start, so anything older than this is holding a different CA (or none).
-// Parsed once — the value is fixed for the process.
-func (s *Server) caNotBefore() string {
+// start, so anything older than this is holding a different CA (or none). Zero when
+// there is no CA or it cannot be parsed. Parsed once — the value is fixed for the
+// process.
+func (s *Server) caNotBeforeTime() time.Time {
 	s.caNotBeforeOnce.Do(func() {
-		s.caNotBeforeStr = "unknown"
 		if s.TLSBridge == nil || len(s.TLSBridge.CAPEM) == 0 {
 			return
 		}
@@ -2175,9 +2192,20 @@ func (s *Server) caNotBefore() string {
 		if err != nil {
 			return
 		}
-		s.caNotBeforeStr = crt.NotBefore.Local().Format(time.RFC3339)
+		s.caNotBeforeAt = crt.NotBefore
 	})
-	return s.caNotBeforeStr
+	return s.caNotBeforeAt
+}
+
+// caNotBefore is caNotBeforeTime as the rejection line prints it, "unknown" when it is
+// zero. Rendered from the one parse, so the cutoff the log advises restarting clients
+// against is the one bridgeMemory tells stale processes apart by.
+func (s *Server) caNotBefore() string {
+	nb := s.caNotBeforeTime()
+	if nb.IsZero() {
+		return "unknown"
+	}
+	return nb.Local().Format(time.RFC3339)
 }
 
 // caFingerprint is the bridge CA's SHA-256, in the encoding

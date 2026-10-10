@@ -59,7 +59,9 @@ func TestCheckUnread_ListsEachProgramAndSaysHowToHaveGoProgramsRead(t *testing.T
 // The advice is one line, because a second one in Advise's reason would lose the
 // indent. It says a Go agent goes unpriced as well as unread, as nothing else in doctor
 // would, and it promises only what trusting the CA does: Go programs are read on the
-// hosts Cortex intercepts, which go's and gh's own hosts are not.
+// hosts Cortex intercepts, which go's and gh's own hosts are not. Nor is every Go program
+// read then: one that relays another system's traffic (gvproxy, listed on any Mac
+// running podman) or trusts its own CA list refuses Cortex's certificate instead.
 func TestCheckUnread_AdviceSaysAGoAgentIsNotPricedAndPromisesOnlyInterceptedHosts(t *testing.T) {
 	plainOutput(t)
 	env := unreadEnv(t, "darwin", helmUnread)
@@ -79,6 +81,11 @@ func TestCheckUnread_AdviceSaysAGoAgentIsNotPricedAndPromisesOnlyInterceptedHost
 	}
 	if !strings.Contains(out, "Go programs' traffic to the hosts it intercepts") {
 		t.Errorf("the advice does not say trusting the CA reads only intercepted hosts:\n%s", out)
+	}
+	for _, want := range []string{"gvproxy", "own CA list", "fail up to three times per Cortex run"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("the advice does not warn that some Go programs then fail (lacks %q):\n%s", want, out)
+		}
 	}
 }
 
@@ -136,7 +143,7 @@ func TestCheckUnread_CountsHostsPassedThroughForUnnamedClients(t *testing.T) {
 		var b bytes.Buffer
 		checkUnread(env, checklist.New(&b, false))
 		out := b.String()
-		if !strings.Contains(out, c.want) || strings.Contains(out, "reads every program") || strings.Contains(out, "✗") {
+		if !strings.Contains(out, c.want) || strings.Contains(out, "✓") || strings.Contains(out, "✗") {
 			t.Errorf("want %q, and no ✓ or ✗ line:\n%s", c.want, out)
 		}
 	}
@@ -153,13 +160,16 @@ func TestCheckUnread_GivesNoKeychainAdviceOffMacOS(t *testing.T) {
 	}
 }
 
-func TestCheckUnread_SaysSoWhenEverythingIsRead(t *testing.T) {
+// With both lists empty the ✓ claims only what the report shows: nothing is passed
+// through for distrusting the CA. Hosts on the passthrough list reach Cortex too and
+// are unread by design, so "every program is read" would be false.
+func TestCheckUnread_SaysSoWhenNothingIsPassedThroughForTheCA(t *testing.T) {
 	plainOutput(t)
 	env := unreadEnv(t, "darwin", `{"osTrustsCA":true,"programs":[],"hosts":[]}`)
 	var b bytes.Buffer
 	checkUnread(env, checklist.New(&b, false))
-	if !strings.Contains(b.String(), "reads every program") {
-		t.Errorf("got:\n%s", b.String())
+	if want := markLine("✓", "unread") + "no program is passed through for distrusting Cortex's CA\n"; b.String() != want {
+		t.Errorf("got\n%q\nwant\n%q", b.String(), want)
 	}
 }
 

@@ -682,6 +682,14 @@ security delete-certificate -c authbridge-tls-bridge-ca \
   ~/Library/Keychains/login.keychain-db
 ```
 
+Trusting the CA does not have every Go program read. One that relays another system's
+traffic — `gvproxy`, which carries the podman VM's, whose clients trust their own CAs — or
+that trusts a CA list of its own without Cortex's CA in it (`helm --ca-file` naming another
+CA, say) is shown Cortex's certificate once macOS trusts it, and refuses it. That
+connection fails, and Cortex passes the program through as `program-refused` for a window
+before trying it again: it fails up to three times per Cortex run, after which Cortex stops
+trying it until Cortex restarts.
+
 `git`, `curl` and Python are **not** affected on macOS — they read their bundles
 through OpenSSL/LibreSSL, which honours the variables on every platform. On Linux
 `SSL_CERT_FILE` works normally, so a Go program there is read like any other.

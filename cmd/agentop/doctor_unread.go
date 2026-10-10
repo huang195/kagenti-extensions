@@ -57,7 +57,7 @@ func checkUnread(env *setupEnv, ui *checklist.UI) {
 	// The host memory is unread traffic too, from clients whose program Cortex could not
 	// name, so an empty program list alone is not everything read.
 	if len(rep.Programs) == 0 && len(rep.Hosts) == 0 {
-		ui.Done("unread", "Cortex reads every program that reaches it", 0)
+		ui.Done("unread", "no program is passed through for distrusting Cortex's CA", 0)
 		return
 	}
 	goPrograms := false
@@ -71,11 +71,17 @@ func checkUnread(env *setupEnv, ui *checklist.UI) {
 	if goPrograms && env.goos == "darwin" {
 		// What trusting the CA buys is said under the fix rather than promised by it: Go
 		// programs are then read on the hosts Cortex intercepts, and go's and gh's own
-		// hosts are not among them, so neither tool is read for its usual traffic.
+		// hosts are not among them, so neither tool is read for its usual traffic. And
+		// not every Go program trusts what macOS trusts: gvproxy relays the podman VM's
+		// clients, which trust their own CAs, and a program given its own CA list trusts
+		// that. Once the prediction stops passing them through they refuse, and the
+		// program memory passes them through again only after its refusals.
 		keychain := filepath.Join(env.home, "Library", "Keychains", "login.keychain-db")
 		ui.Advise("Go tools", "work through Cortex but are not read (a Go agent's model calls are not priced either): macOS does not trust its CA",
 			"security add-trusted-cert -k "+env.tilde(keychain)+" -p ssl "+env.tilde(filepath.Join(cfg.TLSBridge.CADir, "ca.crt")))
 		ui.Faint("    once macOS trusts the CA, Cortex reads Go programs' traffic to the hosts it intercepts, within a minute") // at the fix's indent
+		ui.Faint("    programs that relay another system's traffic (gvproxy, for the podman VM) or bring their own CA list are then shown " +
+			"Cortex's certificate, and fail up to three times per Cortex run before Cortex passes them through again")
 	}
 }
 

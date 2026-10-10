@@ -141,9 +141,10 @@ var managedKeys = []string{
 var bundleKeys = []string{envSSLCert, envGitCA, envRequestsCA, envCurlCA}
 
 // darwinGoNote is printed on macOS, where SSL_CERT_FILE is inert: Go resolves
-// roots through Security.framework and reads no CA file. The proxy therefore passes
-// Go tools through unread rather than breaking them, and the note says so, with the
-// one way to have them read.
+// roots through Security.framework and reads no CA file. Unless macOS trusts the
+// bridge CA, the proxy therefore passes Go tools through unread rather than breaking
+// them, and the note says so, with the one way to have them read. It is printed
+// without checking that trust, so it states the condition rather than the outcome.
 //
 // Said at enable time rather than left to documentation because what it describes —
 // a Go tool's HTTPS left unread, with nothing failing to say so — is the same "no
@@ -155,8 +156,9 @@ var bundleKeys = []string{envSSLCert, envGitCA, envRequestsCA, envCurlCA}
 // output. Short for the same reason; docs/laptop-service.md ("Go tools on macOS
 // are passed through unread") carries the why.
 func darwinGoNote(caPath string) string {
-	return "Note: on macOS, Go tools (go, gh, helm) trust only the keychain, so Cortex passes\n" +
-		"  their HTTPS through unread rather than breaking them. To have Cortex read them too:\n" +
+	return "Note: on macOS, Go tools (go, gh, helm) trust only the keychain, so unless\n" +
+		"  macOS trusts Cortex's CA, Cortex passes their HTTPS through unread rather\n" +
+		"  than breaking them. To have Cortex read them:\n" +
 		"    security add-trusted-cert -k ~/Library/Keychains/login.keychain-db -p ssl \\\n" +
 		"      " + caPath + "\n" +
 		"  (undo: security delete-certificate -c authbridge-tls-bridge-ca \\\n" +

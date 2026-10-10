@@ -645,12 +645,12 @@ for `linux || freebsd || …` and excludes darwin; on darwin verification is han
 Security.framework, which consults the keychain alone. No environment variable can change
 that.
 
-So on a Mac, Cortex does not show a Go program its certificate. It recognises a Go program
-from the executable's build information, asks macOS — reading, never writing — whether it
-trusts Cortex's CA, and when it does not, passes the program's HTTPS through unread. The
-row says `os-trust-only`. The program works exactly as it does without Cortex, from its
-first connection; Cortex records the host and the bytes, as for any tunnel, but not the
-content.
+So on a Mac, Cortex shows a Go program its certificate only when macOS trusts Cortex's
+CA. It recognises a Go program from the executable's build information, asks macOS —
+reading, never writing — whether it trusts Cortex's CA, and when it does not, passes the
+program's HTTPS through unread. The row says `os-trust-only`. The program works exactly
+as it does without Cortex, from its first connection; Cortex records the host and the
+bytes, as for any tunnel, but not the content.
 
 To have Cortex read those programs too, trust the CA in your login keychain:
 

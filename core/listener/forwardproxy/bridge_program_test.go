@@ -120,6 +120,10 @@ func TestBridgeProgram_ARefusingProgramIsPassedThroughAndOthersStillBridged(t *t
 		t.Fatal("first connection: helm completed a handshake on a leaf it does not trust")
 	}
 	eventually(t, func() bool { return sc.engine.Programs.Contains(helm) }, "helm's refusal to be recorded against helm")
+	eventually(t, func() bool {
+		reasons := tunnelReasons(store, session.DefaultSessionID)
+		return len(reasons) > 0 && reasons[0] == pipeline.TunnelClientRejectedCA
+	}, "the first connection's tunnel row to say client-rejected-ca")
 	if sc.engine.Skip.Contains(hostOnly(sc.target)) {
 		t.Error("helm's refusal was recorded against the host too, which hides the host from every program")
 	}

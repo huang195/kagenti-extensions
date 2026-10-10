@@ -15,6 +15,10 @@ type Engine struct {
 	// or by the client process (Program.ProcessKey), when that process started before
 	// the CA. Nil leaves every connection to Skip, as before programs could be named.
 	Programs *SkipSet
+	// Trust predicts programs that could only refuse a leaf, so they are passed through
+	// without being shown one (ClientTrust: a Go program on macOS, while macOS does not
+	// trust the CA). Nil predicts nothing.
+	Trust    Trust
 	Upstream *http.Client
 	CAPEM    []byte
 

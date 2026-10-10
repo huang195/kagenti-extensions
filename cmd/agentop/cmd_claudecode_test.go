@@ -798,13 +798,14 @@ func TestClaudeCodeDisable_RestoresPriorCAValues(t *testing.T) {
 }
 
 // TestDarwinGoNoteNamesTheKeychainRemedy: SSL_CERT_FILE is inert on macOS, so the
-// note is the only place a user learns that the Go tools need the keychain. If it
-// stops naming the command, the gap goes back to being silent.
+// note is the only place a user learns that Cortex passes the Go tools through unread,
+// and that the keychain is how to have them read. If it stops saying either, the gap
+// goes back to being silent.
 func TestDarwinGoNoteNamesTheKeychainRemedy(t *testing.T) {
 	note := darwinGoNote("/Users/x/.cortex/ca/ca.crt")
 	for _, want := range []string{
 		"security add-trusted-cert", "login.keychain-db",
-		"/Users/x/.cortex/ca/ca.crt", "inert",
+		"/Users/x/.cortex/ca/ca.crt", "unread",
 	} {
 		if !strings.Contains(note, want) {
 			t.Errorf("note is missing %q:\n%s", want, note)

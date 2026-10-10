@@ -42,7 +42,10 @@ type Decision struct {
 // cannot be pointed at a CA file by environment on macOS (no SSL_CERT_FILE
 // support in root_darwin.go). `gh` in particular has no CA option at all
 // (cli/cli#1735, open since 2020), so intercepting api.github.com breaks it with
-// no configuration available to fix it.
+// no configuration available to fix it. On macOS a Go program is now also passed
+// through by program wherever it connects (ClientTrust), so this list no longer
+// carries that case there. It stays for every other client and platform, and its own
+// reasoning — no plugin reads this traffic — holds regardless.
 //
 // The list is grounded in observed failures — every host here appeared in a real
 // proxy log as `reason=handshake-fail` — plus the sibling registries that fail
@@ -389,7 +392,10 @@ func (s *SkipSet) fail(host string, escalate bool) {
 		}
 	}
 	// A stopped entry stays stopped, and a rejection that reaches stopAfter stops it. A
-	// transient failure never does: it is not evidence about trust.
+	// transient failure never does: it is not evidence about trust. Nor does it add to
+	// the count or lengthen the window, but as a key's first failure it starts the count
+	// at one, like any first failure, so on the program set a hang-up followed by two
+	// spaced rejections stops the program.
 	stopped := ok && e.stopped
 	if escalate && s.stopAfter > 0 && n >= s.stopAfter {
 		stopped = true

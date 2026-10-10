@@ -790,6 +790,9 @@ func (s *Server) bridgeVerdict(r *http.Request, tl *tunnelLog, host string, firs
 	if s.TLSBridge.Programs.Contains(prog.Key()) || s.TLSBridge.Programs.Contains(prog.ProcessKey()) {
 		return pipeline.TunnelProgramRefused, false
 	}
+	if t := s.TLSBridge.Trust; t != nil && t.OSTrustOnly(prog.Exe) {
+		return pipeline.TunnelOSTrustOnly, false
+	}
 	tl.program = &prog
 	return "", true
 }

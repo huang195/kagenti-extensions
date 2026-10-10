@@ -405,3 +405,61 @@ func TestBridgeServe_ASuccessClearsTheProgramsEntry(t *testing.T) {
 		return !s.TLSBridge.Programs.Contains(prog.Key()) && !s.TLSBridge.Programs.Contains(prog.ProcessKey())
 	}, "a completed handshake to clear the program's entry and the process's")
 }
+
+// fakeTrust predicts a refusal for the executables it names.
+type fakeTrust map[string]bool
+
+func (f fakeTrust) OSTrustOnly(exe string) bool { return f[exe] }
+
+// Goal 1. A program the bridge knows would refuse — a Go program on macOS while macOS
+// does not trust the CA — is passed through on its FIRST connection, and nothing is
+// recorded against it or the host, because it was never shown a leaf.
+func TestBridgeProgram_APredictedRefusalWorksFromTheFirstConnection(t *testing.T) {
+	procs := newFakeProcs(freshProc(300, 1, exeHelm), freshProc(400, 1, exeCurl))
+	store := session.New(0, 0, 0)
+	defer store.Close()
+	sc := newBridgeScene(t, store, procs)
+	sc.engine.Trust = fakeTrust{exeHelm: true}
+
+	bridged, err := sc.handshake(t, procs, 300, sc.refusing)
+	if err != nil {
+		t.Fatalf("helm's first connection failed: %v", err)
+	}
+	if bridged {
+		t.Fatal("helm was shown the bridge's leaf")
+	}
+	eventually(t, func() bool {
+		return slices.Contains(tunnelReasons(store, session.DefaultSessionID), pipeline.TunnelOSTrustOnly)
+	}, "an os-trust-only tunnel row")
+	if sc.engine.Programs.Contains(tlsbridge.Program{Exe: exeHelm}.Key()) {
+		t.Error("a refusal was recorded for a program that was never shown a leaf")
+	}
+	if sc.engine.Skip.Contains(hostOnly(sc.target)) {
+		t.Error("the host was skipped although nothing refused")
+	}
+	if bridged, err := sc.handshake(t, procs, 400, sc.trusting); err != nil || !bridged {
+		t.Fatalf("curl was not bridged (bridged=%v, err=%v)", bridged, err)
+	}
+}
+
+// Review focus 4. A program that refused while macOS still trusted the CA keeps its own
+// reason when the prediction also applies: both pass it through, and the row says what
+// actually happened to it.
+func TestBridgeProgram_RefusedBeforeWinsOverOSTrust(t *testing.T) {
+	procs := newFakeProcs(freshProc(300, 1, exeHelm))
+	store := session.New(0, 0, 0)
+	defer store.Close()
+	sc := newBridgeScene(t, store, procs)
+	sc.engine.Programs.Fail(tlsbridge.Program{Exe: exeHelm}.Key())
+	sc.engine.Trust = fakeTrust{exeHelm: true}
+
+	if bridged, err := sc.handshake(t, procs, 300, sc.refusing); err != nil || bridged {
+		t.Fatalf("helm was not passed through (bridged=%v, err=%v)", bridged, err)
+	}
+	eventually(t, func() bool {
+		return slices.Contains(tunnelReasons(store, session.DefaultSessionID), pipeline.TunnelProgramRefused)
+	}, "a program-refused tunnel row")
+	if slices.Contains(tunnelReasons(store, session.DefaultSessionID), pipeline.TunnelOSTrustOnly) {
+		t.Error("the row says os-trust-only for a program that refused")
+	}
+}

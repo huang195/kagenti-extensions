@@ -890,6 +890,7 @@ func main() {
 			Term:     tlsbridge.NewTerminator(minter),
 			Skip:     tlsbridge.NewSkipSet(),
 			Programs: tlsbridge.NewProgramSkipSet(),
+			Trust:    tlsbridge.NewClientTrust(minter),
 			Upstream: up,
 			CAPEM:    src.CACertPEM(),
 			CAFile:   caTrustPath(cfg.TLSBridge.CADir),

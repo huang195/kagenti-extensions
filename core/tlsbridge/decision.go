@@ -255,7 +255,8 @@ type skipEntry struct {
 	expiry   time.Time
 	failures int
 	// stopped marks an entry that has stopped expiring: its key is passed through until
-	// a success clears it or the process restarts. Only a set with stopAfter set has any.
+	// Cortex restarts. Nothing bridges a stopped key, so in practice no success comes to
+	// clear it. Only a set with stopAfter set has any.
 	stopped bool
 }
 
@@ -266,15 +267,17 @@ func NewSkipSet() *SkipSet {
 // programStopAfter is how many rejections in a row stop a program being retried.
 // Three, each after a window in which the program could have been fixed, is enough to
 // say it will not change during this run; retrying forever is what made one refusing
-// client fail again every ten minutes (#912).
+// client fail again every ten minutes (#912). A rejection that lands while a window is
+// still open does not count toward it (see fail).
 const programStopAfter = 3
 
 // NewProgramSkipSet is the skip set the forward proxy keys by client program
-// (Program.Key) rather than host. It has NewSkipSet's windows, and one difference: a
-// program that rejects the leaf programStopAfter times in a row is passed through
-// until a success clears it or the process restarts, instead of being retried every
-// time a window ends. A program upgrade moves its executable's path, and so its key,
-// which is the other way back.
+// (Program.Key) rather than host. It has NewSkipSet's windows, and two differences: a
+// rejection counts only once the window before it has ended, and a program that
+// rejects the leaf programStopAfter times in a row is passed through until Cortex
+// restarts, instead of being retried every time a window ends. Nothing bridges a
+// stopped key, so no success comes to clear it. A new key is the other way back: an
+// upgrade moves the executable's path.
 func NewProgramSkipSet() *SkipSet {
 	s := NewSkipSet()
 	s.stopAfter = programStopAfter
@@ -328,8 +331,10 @@ func (s *SkipSet) fail(host string, escalate bool) {
 	defer s.mu.Unlock()
 	now := time.Now()
 	if len(s.m) >= s.max {
-		// Purge expired entries; if still full, drop the earliest-expiring one.
-		// Fail is cold (only fires when a minted leaf is rejected), so an O(n)
+		// Purge expired entries, and if the set is still full drop the one evictsBefore
+		// puts first: the soonest to expire among those that will. A stopped entry never
+		// expires, so the purge keeps it, and it is dropped only when every entry left is
+		// stopped. Fail is cold (only fires when a minted leaf is rejected), so an O(n)
 		// sweep here is cheap.
 		var oldestK string
 		var oldest skipEntry
@@ -346,21 +351,32 @@ func (s *SkipSet) fail(host string, escalate bool) {
 			delete(s.m, oldestK)
 		}
 	}
-	// An expired entry keeps its count. Both callers check Contains before forging, so
-	// a skipped host can't reject anything and every rejection after the first lands on
-	// an expired entry. Restarting there kept a pinned host at the base forever. A
-	// window elapsing is no evidence the problem is gone; a completed handshake is, and
-	// Succeed clears the count when one happens.
+	e, ok := s.m[host]
+	// On the program set, a rejection that lands while the window is still open does not
+	// count. Both callers check Contains before forging, so it comes from a connection
+	// that passed that check before the first rejection was recorded: the rest of one
+	// burst, not another chance the program had to be fixed. Counting it would stop a
+	// program in under a second. It is held like a transient failure instead. The host
+	// set never stops, so it keeps escalating on a burst as it always has.
+	if ok && escalate && s.stopAfter > 0 && now.Before(e.expiry) {
+		escalate = false
+	}
+	// An expired entry keeps its count. A skipped key can't reject anything, so every
+	// rejection after the first that is not part of a burst lands on an expired entry,
+	// and on the program set those are the only ones counted. Restarting the count there
+	// kept a pinned host at the base forever. A window elapsing is no evidence the
+	// problem is gone; a completed handshake is, and Succeed clears the count when one
+	// happens.
 	n := 1
 	expiry := now.Add(s.backoffFor(1))
-	if e, ok := s.m[host]; ok {
+	if ok {
 		if escalate {
 			n = e.failures + 1
 			expiry = now.Add(s.backoffFor(n))
 		} else {
-			// Hold the count where it is: a transient failure must not lengthen the
-			// window, but it must not shorten one a real rejection already earned
-			// either.
+			// Hold the count where it is: a transient failure, or the rest of a burst,
+			// must not lengthen the window, but it must not shorten one a counted
+			// rejection already earned either.
 			n = e.failures
 			if n < 1 {
 				n = 1
@@ -372,10 +388,7 @@ func (s *SkipSet) fail(host string, escalate bool) {
 	}
 	// A stopped entry stays stopped, and a rejection that reaches stopAfter stops it. A
 	// transient failure never does: it is not evidence about trust.
-	stopped := false
-	if e, ok := s.m[host]; ok && e.stopped {
-		stopped = true
-	}
+	stopped := ok && e.stopped
 	if escalate && s.stopAfter > 0 && n >= s.stopAfter {
 		stopped = true
 	}

@@ -473,6 +473,19 @@ func TestDefaultPassthrough_ClaudeCodeUpdater(t *testing.T) {
 	}
 }
 
+// refuseAcrossWindows records n rejections of key, each after the window the one before
+// it earned has ended: a program refusing again when it is next tried, which is the only
+// rejection the program set counts. s's windows must be a few milliseconds for this to
+// be quick.
+func refuseAcrossWindows(s *SkipSet, key string, n int) {
+	for i := 0; i < n; i++ {
+		if i > 0 {
+			time.Sleep(s.ttl + 5*time.Millisecond)
+		}
+		s.Fail(key)
+	}
+}
+
 // TestProgramSkipSet_StopsAfterThreeRejections: a program that keeps refusing the
 // leaf is evidence it will not change during this run, so the third consecutive
 // rejection stops the retries. The window would otherwise re-arm forever (#912).
@@ -480,8 +493,7 @@ func TestProgramSkipSet_StopsAfterThreeRejections(t *testing.T) {
 	s := NewProgramSkipSet()
 	s.base, s.ttl = time.Millisecond, 4*time.Millisecond
 
-	s.Fail("p")
-	s.Fail("p")
+	refuseAcrossWindows(s, "p", 2)
 	time.Sleep(10 * time.Millisecond) // past any window two rejections earn
 	if s.Contains("p") {
 		t.Fatal("two rejections stopped the retries; three are required")
@@ -493,14 +505,49 @@ func TestProgramSkipSet_StopsAfterThreeRejections(t *testing.T) {
 	}
 }
 
+// TestProgramSkipSet_ABurstCountsOnce: the program set counts a rejection only after a
+// wait. Connections that all passed Contains before the first rejection was recorded
+// land on its still-open window. That is one burst, not three chances the program had
+// to be fixed, so it must not stop the program in under a second.
+func TestProgramSkipSet_ABurstCountsOnce(t *testing.T) {
+	s := NewProgramSkipSet()
+	for i := 0; i < programStopAfter; i++ {
+		s.Fail("p")
+	}
+	s.mu.RLock()
+	e := s.m["p"]
+	s.mu.RUnlock()
+	if e.stopped {
+		t.Fatal("one burst of rejections stopped the program")
+	}
+	if e.failures != 1 {
+		t.Errorf("failures = %d after one burst of %d rejections, want 1", e.failures, programStopAfter)
+	}
+	if got := window(t, s, "p"); got > s.base {
+		t.Errorf("the burst lengthened the window to %v, more than one base (%v)", got, s.base)
+	}
+
+	// Nor does a burst undo a longer window an earlier, counted rejection earned.
+	s.Fail("q")
+	expireWindow(t, s, "q")
+	s.Fail("q") // counted: a 2x window
+	earned := window(t, s, "q")
+	s.Fail("q") // the rest of that connection's burst
+	if got := window(t, s, "q"); got < earned-time.Second {
+		t.Errorf("a burst cut the earned window from %v to %v", earned, got)
+	}
+}
+
 // A transient failure is not evidence about trust, so it must not walk a program
-// toward being passed through for the rest of the run.
+// toward being passed through for the rest of the run. Each one lands after the window
+// ends, where a rejection would count.
 func TestProgramSkipSet_TransientFailuresDoNotCountTowardStopping(t *testing.T) {
 	s := NewProgramSkipSet()
 	s.base, s.ttl = time.Millisecond, 4*time.Millisecond
 
 	s.Fail("p")
 	for i := 0; i < 5; i++ {
+		time.Sleep(10 * time.Millisecond)
 		s.FailTransient("p")
 	}
 	time.Sleep(10 * time.Millisecond)
@@ -511,9 +558,9 @@ func TestProgramSkipSet_TransientFailuresDoNotCountTowardStopping(t *testing.T) 
 
 func TestProgramSkipSet_SucceedClearsAStop(t *testing.T) {
 	s := NewProgramSkipSet()
-	for i := 0; i < programStopAfter; i++ {
-		s.Fail("p")
-	}
+	s.base, s.ttl = time.Millisecond, 4*time.Millisecond
+	refuseAcrossWindows(s, "p", programStopAfter)
+	time.Sleep(10 * time.Millisecond) // past the ceiling: only a stop still holds it
 	if !s.Contains("p") {
 		t.Fatal("precondition: the program is not stopped")
 	}
@@ -547,9 +594,7 @@ func TestSkipSet_StoppedEntriesAreEvictedLast(t *testing.T) {
 	// the default windows its three rejections outlast live's one, and ordering by
 	// expiry alone would pass.
 	s.base, s.ttl = time.Millisecond, time.Millisecond
-	for i := 0; i < programStopAfter; i++ {
-		s.Fail("stopped")
-	}
+	refuseAcrossWindows(s, "stopped", programStopAfter)
 	time.Sleep(5 * time.Millisecond)
 	s.base, s.ttl = skipBackoffBase, skipTTL
 	s.Fail("live")

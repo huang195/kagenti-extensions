@@ -87,8 +87,9 @@ func TestBlocks_CollapsedByDefaultWithHeaderAtTheAnchor(t *testing.T) {
 	}
 }
 
-// Enter on a header opens the block: member rows appear in time order, indented
-// via the DIR gutter, and the header's glyph turns over. Enter again closes it.
+// Enter on a header opens the block: member rows appear together under the
+// header (see TestBlocks_ExpandedMembersStayTogether), marked via the DIR
+// gutter, and the header's glyph turns over. Enter again closes it.
 func TestBlocks_EnterToggles(t *testing.T) {
 	m := newBlockModel(t, blockEvents())
 
@@ -124,6 +125,46 @@ func TestBlocks_EnterToggles(t *testing.T) {
 	m.toggleSubagentBlock()
 	if got := len(m.eventsTbl.Rows()); got != 4 {
 		t.Fatalf("re-collapsed: rendered rows = %d, want 4", got)
+	}
+}
+
+// An expanded block's rows render TOGETHER, directly under the header — pulled
+// out of the chronological interleaving with the main conversation. Live traffic
+// interleaves (a subagent's exchange spans several main-conversation turns), and
+// rendering members at their own timestamps scattered the block across the pane,
+// which read as "expanding did nothing" — the header said 56 rows and the rows
+// below it were the main conversation's.
+func TestBlocks_ExpandedMembersStayTogether(t *testing.T) {
+	events := []pipeline.SessionEvent{
+		{Direction: pipeline.Outbound, Phase: pipeline.SessionRequest, Host: "ete", RequestID: "a1", Subagent: "a1"},
+		// The main conversation's row, chronologically INSIDE a1's exchange.
+		{Direction: pipeline.Outbound, Phase: pipeline.SessionRequest, Host: "ete", RequestID: "m1"},
+		{Direction: pipeline.Outbound, Phase: pipeline.SessionResponse, Host: "ete", RequestID: "a1", Subagent: "a1"},
+		{Direction: pipeline.Outbound, Phase: pipeline.SessionRequest, Host: "ete", RequestID: "m2"},
+	}
+	m := newBlockModel(t, events)
+
+	// Collapsed: header anchored at a1's first row, then the main rows.
+	if got := len(m.eventsTbl.Rows()); got != 3 {
+		t.Fatalf("collapsed rows = %d, want 3 (header + m1 + m2)", got)
+	}
+
+	m.eventsTbl.SetCursor(0)
+	if !m.toggleSubagentBlock() {
+		t.Fatal("Enter on the header row did not toggle")
+	}
+
+	// Expanded: header, a1's whole exchange, THEN the main rows — a1's response
+	// must not sit at its chronological slot below m1.
+	want := []string{"a1", "a1", "m1", "m2"}
+	if got := len(m.eventsTbl.Rows()); got != 5 {
+		t.Fatalf("expanded rows = %d, want 5 (header + a1's pair + m1 + m2)", got)
+	}
+	for i, id := range want {
+		// Row 0 is the header, whose visibleRows entry holds no event.
+		if rid := m.visibleRows[i+1].event.RequestID; rid != id {
+			t.Errorf("expanded row %d = %s, want %s", i+1, rid, id)
+		}
 	}
 }
 

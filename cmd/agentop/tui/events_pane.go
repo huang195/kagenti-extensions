@@ -210,58 +210,12 @@ func (m *model) rebuildEventsTable() {
 	if q != "" {
 		droppedCols = droppedColumns(selectedColumns(m.eventColumns), cols)
 	}
-	for j, cc := range ctxs {
-		// hideInactive (the `s` toggle) is off by default — every message is
-		// shown, including passthrough/skip-only ones, per "I should see all
-		// network messages". Turning it on focuses the timeline on plugin
-		// activity (deny/modify/observe/allow). It hides whole exchanges: a row whose
-		// partner is shown is shown too, or a routed request refused for its model —
-		// no plugin acts on the 403 — would look as if it never got an answer.
-		// The predicate is rowInactiveHidden, shared with collectSubagentBlocks
-		// so the two filter the same rows.
-		if m.rowInactiveHidden(ctxs, partner, j) {
-			m.hiddenInactive++
-			continue
-		}
-
-		// Subagent blocks: a row naming an agent joins that agent's block, whose
-		// header sits at the block's first surviving row. Collapsed (the default,
-		// and always while no search is live) the row is not rendered at all — the
-		// header's rollup is what a collapsed block says. m.visibleRows keeps an
-		// empty eventRow for the header so it stays parallel to the rendered rows;
-		// headerRows is what says a rendered row is a header.
-		if b := m.subagentBlocks[cc.row.event.Subagent]; b != nil {
-			if !b.anchored {
-				b.anchored = true
-				text := b.headerText(m.subagentLabel(b.id), m.blockOpen(b.id, q != ""))
-				rows = append(rows, table.Row{text})
-				m.visibleRows = append(m.visibleRows, eventRow{})
-				if m.headerRows == nil {
-					m.headerRows = make(map[int]*subagentBlock)
-				}
-				m.headerRows[len(rows)-1] = b
-				if q != "" {
-					full = append(full, table.SearchRow{Cells: []string{text}})
-				}
-			}
-			if !m.blockOpen(b.id, q != "") {
-				continue
-			}
-		}
-
-		// Cells come from the selected columns, in their order — see
-		// events_columns.go. Previously this was a positional table.Row literal
-		// parallel to a []table.Column slice, so inserting a column meant editing
-		// both in step and a mismatch shifted every later cell under the wrong
-		// heading.
-		//
-		// PHASE carries no bracket glyphs. They were box-drawing corners (┌/│/└)
-		// meant to visually connect a request to its response, and they could only
-		// ever be correct for exchanges that NEST. Concurrent requests cross
-		// instead: A starts, B starts, A ends, B ends — for which a tree has no
-		// notation, so both rows claimed to contain each other and the output was
-		// actively misleading. The # column pairs exchanges exactly (by the
-		// proxy-stamped RequestID), which is what the glyphs approximated.
+	// renderEventRow appends one event's cells to every parallel structure the
+	// pane keeps — the table's rows, visibleRows, and the search rows — so the
+	// two places a row can render from (its own loop turn, or its block's
+	// expansion below) cannot drift apart.
+	renderEventRow := func(j int) {
+		cc := ctxs[j]
 		row := make(table.Row, 0, len(cols))
 		for _, c := range cols {
 			// A measured column's cell was evaluated for this row by measureColumns,
@@ -281,6 +235,61 @@ func (m *model) rebuildEventsTable() {
 		if q != "" {
 			full = append(full, eventSearchRow(cols, droppedCols, cc))
 		}
+	}
+	for j, cc := range ctxs {
+		// hideInactive (the `s` toggle) is off by default — every message is
+		// shown, including passthrough/skip-only ones, per "I should see all
+		// network messages". Turning it on focuses the timeline on plugin
+		// activity (deny/modify/observe/allow). It hides whole exchanges: a row whose
+		// partner is shown is shown too, or a routed request refused for its model —
+		// no plugin acts on the 403 — would look as if it never got an answer.
+		// The predicate is rowInactiveHidden, shared with collectSubagentBlocks
+		// so the two filter the same rows.
+		if m.rowInactiveHidden(ctxs, partner, j) {
+			m.hiddenInactive++
+			continue
+		}
+
+		// Subagent blocks: a row naming an agent joins that agent's block, whose
+		// header sits at the block's first surviving row. Collapsed (the default,
+		// and always while no search is live) the row is not rendered at all — the
+		// header's rollup is what a collapsed block says. Expanded, the block's
+		// rows render TOGETHER, directly under the header, pulled out of the
+		// chronological interleaving with the main conversation — at their own
+		// timestamps they scatter across the pane (a subagent's exchange spans
+		// several main-conversation turns), and the rows under the header are the
+		// main conversation's, which reads as the expansion doing nothing. The
+		// timestamp and # columns still carry where each row sat. m.visibleRows
+		// keeps an empty eventRow for the header so it stays parallel to the
+		// rendered rows; headerRows is what says a rendered row is a header.
+		if b := m.subagentBlocks[cc.row.event.Subagent]; b != nil {
+			if !b.anchored {
+				b.anchored = true
+				text := b.headerText(m.subagentLabel(b.id), m.blockOpen(b.id, q != ""))
+				rows = append(rows, table.Row{text})
+				m.visibleRows = append(m.visibleRows, eventRow{})
+				if m.headerRows == nil {
+					m.headerRows = make(map[int]*subagentBlock)
+				}
+				m.headerRows[len(rows)-1] = b
+				if q != "" {
+					full = append(full, table.SearchRow{Cells: []string{text}})
+				}
+				if m.blockOpen(b.id, q != "") {
+					// b.rows holds exactly the member rows that survived the
+					// inactive filter, in arrival order — the same population the
+					// loop below renders — so nothing is double-counted or skipped.
+					for _, mj := range b.rows {
+						renderEventRow(mj)
+					}
+				}
+			}
+			// The member's cells went out with its block's header — or nowhere,
+			// while the block is collapsed. Either way not here.
+			continue
+		}
+
+		renderEventRow(j)
 		// Keyed from the SAME cellContext that just rendered the row, so the value
 		// sorted on and the value displayed cannot come apart. cc.width stays zero
 		// here — render takes its own copy — and no sortKey reads it.
@@ -291,6 +300,10 @@ func (m *model) rebuildEventsTable() {
 		// the same thing in `partner` as it does here. The sort never reads it as a
 		// position in `keys` — only compares two of them — so the filter's gaps are
 		// harmless.
+		//
+		// Member rows take the block branch above and never reach this — safe
+		// because blocks exist only while no sort is active (see the collection
+		// above), so a row the sort needs cannot be skipped by a block.
 		if sortCol != nil {
 			keys = append(keys, rowKey{val: sortCol.sortKey(cc), exchange: j})
 		}

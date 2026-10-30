@@ -2,6 +2,7 @@ package tui
 
 import (
 	"encoding/json"
+	"slices"
 	"strings"
 	"testing"
 
@@ -165,6 +166,72 @@ func TestBlocks_ExpandedMembersStayTogether(t *testing.T) {
 		if rid := m.visibleRows[i+1].event.RequestID; rid != id {
 			t.Errorf("expanded row %d = %s, want %s", i+1, rid, id)
 		}
+	}
+}
+
+// Two subagents running concurrently, each interleaved with the other and with
+// the main conversation — and a1's traffic resuming long after a2 finished its
+// first exchange. Each block still renders as ONE contiguous segment under its
+// own single header: membership is by subagent id over the whole session, not
+// by time-contiguity, so interleaving cannot split a block into segments or
+// emit a second header for the same agent.
+func TestBlocks_ConcurrentSubagentsEachStayOneSegment(t *testing.T) {
+	req := func(id, sub string) pipeline.SessionEvent {
+		return pipeline.SessionEvent{Direction: pipeline.Outbound, Phase: pipeline.SessionRequest, Host: "ete", RequestID: id, Subagent: sub}
+	}
+	resp := func(id, sub string) pipeline.SessionEvent {
+		return pipeline.SessionEvent{Direction: pipeline.Outbound, Phase: pipeline.SessionResponse, Host: "ete", RequestID: id, Subagent: sub}
+	}
+	events := []pipeline.SessionEvent{
+		req("a1.1", "a1"),
+		req("m1", ""),
+		req("a2.1", "a2"), // a2 starts while a1's first exchange is in flight
+		resp("a1.1", "a1"),
+		resp("a2.1", "a2"),
+		req("m2", ""),
+		resp("m2", ""),
+		req("a2.2", "a2"), // a2 continues after main turns
+		resp("a2.2", "a2"),
+		req("m3", ""),
+		resp("m3", ""),
+		req("a1.2", "a1"), // a1's traffic resumes long after it started
+		resp("a1.2", "a1"),
+		req("m4", ""),
+	}
+	m := newBlockModel(t, events)
+	m.subagentOpen = map[string]bool{"a1": true, "a2": true}
+	m.rebuildEventsTable()
+
+	// Each subagent's rows render in arrival order within its segment.
+	order := map[string][]string{}
+	for _, vr := range m.visibleRows {
+		if vr.event != nil && vr.event.Subagent != "" {
+			order[vr.event.Subagent] = append(order[vr.event.Subagent], vr.event.RequestID)
+		}
+	}
+	if got := order["a1"]; !slices.Equal(got, []string{"a1.1", "a1.1", "a1.2", "a1.2"}) {
+		t.Errorf("a1's segment = %v, want its whole exchange run in order", got)
+	}
+	if got := order["a2"]; !slices.Equal(got, []string{"a2.1", "a2.1", "a2.2", "a2.2"}) {
+		t.Errorf("a2's segment = %v, want its whole exchange run in order", got)
+	}
+	// A subagent's rendered rows must form ONE contiguous run: their positions
+	// span exactly their count. A block split into segments — or a second
+	// header for the same agent — would leave gaps in that span.
+	for _, sub := range []string{"a1", "a2"} {
+		var pos []int
+		for i, vr := range m.visibleRows {
+			if vr.event != nil && vr.event.Subagent == sub {
+				pos = append(pos, i)
+			}
+		}
+		if len(pos) == 0 || pos[len(pos)-1]-pos[0]+1 != len(pos) {
+			t.Errorf("%s's rows at %v, not one contiguous run", sub, pos)
+		}
+	}
+	// Exactly two headers rendered.
+	if headers := len(m.headerRows); headers != 2 {
+		t.Errorf("headers = %d, want 2 (one per subagent, however interleaved)", headers)
 	}
 }
 

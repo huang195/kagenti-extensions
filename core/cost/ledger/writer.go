@@ -236,6 +236,10 @@ func New(dir string, opts ...Option) (*Writer, error) {
 		return nil, err
 	}
 	w.store = s
+	// The cache's "is this day still being written" must answer at the writer's
+	// instant, not the machine's: a pinned test clock filing rows into a past day
+	// would otherwise have that day cached as immutable while the writer appends.
+	s.now = w.now
 	if perr := s.prune(now); perr != nil {
 		// Not fatal, and not returned. A ledger that cannot delete an old file is
 		// still a ledger that can record today's spend, and refusing to start the
@@ -511,12 +515,21 @@ func (w *Writer) Record(_ string, e *pipeline.SessionEvent) {
 	if c := pricing.UnitOf(w.rates, e.Host, model); c != "" {
 		r.Currency = rowLabel(c)
 	}
-	if e.StatusCode >= 400 || e.Phase == pipeline.SessionDenied {
+	// BOTH RULES ARE THE RING'S, called rather than restated (#1566). This writer and
+	// the aggregator answer the same traffic on different surfaces — today/7d/month
+	// here, the duration windows there — and a restated rule drifts: the ledger's copy
+	// of the error rule predated the destination_private exemption, so a guard refusal
+	// read as an error on today but not on 1h, and its copy of the priceable rule
+	// required a non-zero token count, so a truncated stream hid a coverage gap here
+	// that the ring reported there.
+	if usage.CountsAsError(e) {
 		r.Errors = 1
 	}
-	// Priceable: carried a model and a non-zero token count. The denominator for
-	// coverage — Requests is the wrong one, since only inference can be priced.
-	if r.Model != "" && r.Tokens > 0 {
+	// Priceable: the parser recognised a model, so a rate could have been named — the
+	// denominator for coverage, since Requests is the wrong one (only inference can be
+	// priced). usage.Priceable, not `r.Model != "" && r.Tokens > 0`: a successful
+	// response with a model and no usage is a coverage gap and must be counted as one.
+	if usage.Priceable(e) {
 		r.PriceableRequests = 1
 	}
 	// The figure core/cost/settle settled. Record, not Decode: an unpriced record
@@ -926,11 +939,9 @@ func (w *Writer) logDrops() {
 // writer, not about anybody's read: it happened once, no later read can rediscover it, and
 // every reader of this ledger is equally short because of it.
 //
-// No non-test caller today, and it stays exported anyway: it is the completeness signal the
-// package doc and Window's contract both cite, and the /v1/usage response has a Degraded
-// field already carrying the two READ-side counts beside it (see Caveats). This is the
-// write-side one that belongs there next, which is a sessionapi change rather than a reason
-// to withdraw the number.
+// The non-test caller is sessionapi's /v1/usage response (the Degraded field beside
+// the two READ-side counts from Caveats): the completeness signal the package doc and
+// Window's contract both cite, surfaced where an operator reads it.
 func (w *Writer) Dropped() int64 { return w.dropped.Load() }
 
 // run is the ONLY goroutine that touches the filesystem after construction.

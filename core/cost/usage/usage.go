@@ -813,7 +813,10 @@ func (a *Aggregator) costOf(e *pipeline.SessionEvent, ce event.Event, haveRec bo
 		// denial after the parser ran, reports a model with zero usage. Naming it
 		// would advertise a missing rate for a model that may well have one, and
 		// adding that entry would never make the row disappear.
-		if e.StatusCode >= 400 || e.Phase == pipeline.SessionDenied {
+		//
+		// Priceable is this rule stated once, so the ledger's today/7d/month windows
+		// answer with the same denominator the duration windows do (#1566).
+		if !Priceable(e) {
 			return eventCost{}
 		}
 		// A SUCCEEDED one is a coverage gap and must be counted as one. Returning a
@@ -1280,12 +1283,40 @@ func (a *Aggregator) evictColdestLocked() {
 // configured it to, on traffic that was never going to be allowed through — a
 // nonzero "error rate" made of refusals is the policy working, not the proxy
 // failing. The Finisher sees it as an allow for the same reason.
-func countsAsError(e *pipeline.SessionEvent) bool {
+//
+// Exported because the cost LEDGER counts the same traffic for its today/7d/month
+// windows and must apply the same rule (#1566): a refusal the ring excludes read as
+// an error on today but not on the 1h window, and two surfaces an operator reads
+// side by side disagreed about whether the proxy was failing.
+func CountsAsError(e *pipeline.SessionEvent) bool {
 	if e.Error != nil && (e.Error.Kind == pipeline.ErrorKindUpgradeDeclined ||
 		e.Error.Kind == pipeline.ErrorKindDestinationPrivate) {
 		return false
 	}
 	return e.Error != nil || e.StatusCode >= 400 || e.Phase == pipeline.SessionDenied
+}
+
+// Priceable reports whether e is inference traffic the coverage ratio's denominator
+// counts: the parser recognised a model on it, so a rate could have been named for it.
+// This is the ring's rule, exported so the ledger answers today/7d/month with the same
+// denominator the ring gives the duration windows (#1566): the ledger used to require
+// a non-zero token count as well, so a truncated OpenAI-dialect stream — 200, a model,
+// and no usage block, because every counter lives on the final chunk — was priceable
+// on 1h and invisible on today, and nine priced requests plus one of those read
+// "9/9 priced" over a gap the other surface reported as 9/10.
+//
+// A FAILED response with a model and no usage is not priceable: a 5xx or a denial
+// after the parser ran is not a pricing gap, and naming it would advertise a missing
+// rate for a model that may well have one. See eventCost for the full reasoning; this
+// function is that rule stated once.
+func Priceable(e *pipeline.SessionEvent) bool {
+	if e.Inference == nil || e.Inference.Model == "" {
+		return false
+	}
+	if pricing.UsageFromInference(e.Inference) != (pricing.Usage{}) {
+		return true
+	}
+	return e.StatusCode < 400 && e.Phase != pipeline.SessionDenied
 }
 
 // foldInto accumulates one event into one ring.
@@ -1368,7 +1399,7 @@ func (a *Aggregator) foldInto(ring []bucket, t time.Time, sessionID string, e *p
 	if ec.incompleteReason != "" {
 		addLabel(&b.byIncomplete, ringLabel(ec.incompleteReason), Counts{Requests: 1})
 	}
-	if countsAsError(e) {
+	if CountsAsError(e) {
 		one.Errors = 1
 	}
 	b.Counts.Add(one)

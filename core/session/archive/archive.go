@@ -46,6 +46,15 @@ const (
 	// wrap time arithmetic must not turn into a cutoff in the future.
 	MaxRetentionDays = 3650
 	defaultMaxBytes  = 2 << 30
+	// defaultMaxSegBytes rotates one session's segment once it holds this many bytes
+	// (#1566). Segments used to close only on idle, the open-writer cap or
+	// delete/clear/rename — never on size — and planPrune skips open segments in both
+	// its age and maxBytes loops, so a session busy past the idle window kept one
+	// segment growing without limit and maxBytes was a bound the busiest session was
+	// exempt from. A cap of maxBytes/defaultMaxOpen bounds a session's disk footprint
+	// about the same way maxOpen bounds the heap. Rotation runs on the tick after the
+	// cap is crossed, because a segment's byte count is only real once flushed.
+	defaultMaxSegBytes = defaultMaxBytes / 16
 )
 
 // Option configures an Archive.
@@ -60,6 +69,11 @@ func WithRetentionDays(days int) Option { return func(a *Archive) { a.retainDays
 
 // WithMaxBytes sets the archive's size bound. Zero or negative is the default, 2 GiB.
 func WithMaxBytes(n int64) Option { return func(a *Archive) { a.maxBytes = n } }
+
+// WithMaxSegmentBytes rotates a session's segment once it holds this many bytes, so
+// retention can prune a busy session's history instead of watching one open segment
+// grow past the archive's size bound. Zero or negative is the default, 128 MiB.
+func WithMaxSegmentBytes(n int64) Option { return func(a *Archive) { a.maxSegBytes = n } }
 
 // WithQueueDepth sets the request path's queue depth, for tests.
 func WithQueueDepth(n int) Option { return func(a *Archive) { a.depth = n } }
@@ -98,10 +112,13 @@ type Archive struct {
 	now        func() time.Time
 	retainDays int
 	maxBytes   int64
-	depth      int
-	idleClose  time.Duration
-	maxOpen    int
-	tickEvery  time.Duration
+	// maxSegBytes rotates a session's segment once it holds this many bytes. Writer
+	// goroutine only, like everything that touches segment writers.
+	maxSegBytes int64
+	depth       int
+	idleClose   time.Duration
+	maxOpen     int
+	tickEvery   time.Duration
 
 	// Test seams: gate holds the writer before each op; segHook sees each new segment writer.
 	gate    chan struct{}
@@ -221,6 +238,9 @@ func Open(root string, opts ...Option) (*Archive, error) {
 	}
 	if a.maxBytes <= 0 {
 		a.maxBytes = defaultMaxBytes
+	}
+	if a.maxSegBytes <= 0 {
+		a.maxSegBytes = defaultMaxSegBytes
 	}
 	if a.depth <= reserve {
 		a.depth = reserve + 1
@@ -730,6 +750,19 @@ func (a *Archive) tick() {
 		}
 		if err := s.w.flush(); err != nil {
 			a.writeFailed(s, err)
+			continue
+		}
+		// Rotation at the cap (#1566). planPrune skips open segments in both its age and
+		// maxBytes loops, so a session that stays busy past the idle window would otherwise
+		// keep one segment growing without limit, and maxBytes would be a bound the busiest
+		// session was exempt from. Closing here moves the segment into the closed list,
+		// where retention can delete it; the session's next write opens a fresh one.
+		//
+		// AFTER the flush, because Bytes counts what the zstd encoder has handed the file:
+		// an unflushed writer reports zero no matter how much is buffered in it, so a
+		// write-time check could not see the cap cross. The cost is one tick of overshoot.
+		if s.w.info().Bytes >= a.maxSegBytes {
+			a.closeWriter(s)
 			continue
 		}
 		if now.Sub(s.lastWrite) >= a.idleClose {

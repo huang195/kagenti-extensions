@@ -10,6 +10,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/rossoctl/cortex/core/cost/usage"
@@ -110,7 +111,32 @@ type store struct {
 	// do it — a row near midnight is filed under a date no query for that local day ever
 	// visits: written, retained for 30 days, and invisible to every read.
 	loc *time.Location
+	// now is the writer's clock, so the day cache's "is this day still being written"
+	// answers at the same instant the writer files rows by. Set by the Writer after
+	// newStore; time.Now for any other constructor.
+	now func() time.Time
+	// days caches decoded PAST day files, keyed by the day (#1566). Query re-decoded
+	// every day file in the window on every call: agentop polls today each minute and
+	// 7d/month each five, so on the 31st the month span decoded 31 files per poll, and
+	// past days almost never change. The current day is never cached — its file is
+	// still being appended to. Entries are validated against the file's size and mtime
+	// before use, so a changed past day is re-read, not served stale. Guarded by mu.
+	mu   sync.Mutex
+	days map[time.Time]dayCacheEntry
 }
+
+// dayCacheEntry is one decoded past day, with the file facts that validate it.
+type dayCacheEntry struct {
+	rows    []Row
+	issues  dayIssues
+	size    int64
+	modTime time.Time
+}
+
+// dayCacheMax bounds the cache. A month window holds 31 entries; 128 covers a
+// retention of four months, and the eviction below drops the oldest day rather than
+// erroring or blocking.
+const dayCacheMax = 128
 
 // newStore prepares dir, creating it if needed. A nil loc means time.Local.
 func newStore(dir string, retainDays int, loc *time.Location) (*store, error) {
@@ -143,7 +169,7 @@ func newStore(dir string, retainDays int, loc *time.Location) (*store, error) {
 	if err := os.MkdirAll(dir, dirMode); err != nil {
 		return nil, fmt.Errorf("costledger: cannot create %s: %w", dir, err)
 	}
-	return &store{dir: dir, retainDays: retainDays, loc: loc}, nil
+	return &store{dir: dir, retainDays: retainDays, loc: loc, now: time.Now, days: map[time.Time]dayCacheEntry{}}, nil
 }
 
 // dayOf is the package dayOf resolved in the STORE's zone. The one place the day an
@@ -476,8 +502,65 @@ func appendBytes(f io.Writer, b []byte) (int, error) {
 // write path, not a larger buffer here.
 const maxLineBytes = 1 << 20
 
-// readDay decodes one day file. A missing file is not an error: an idle day writes
-// none, which is the normal case on a laptop.
+// readDay answers one day's rows, from the cache when the day is past and the file is
+// unchanged (#1566). The cache exists because the read side polls: agentop re-queries
+// the same windows every minute to five minutes, and a past day file changes only when
+// a second writer appends to it, which moves size and mtime. TODAY is never cached —
+// the writer is still appending to its file — and neither is any error: a day that
+// could not be read is re-attempted on the next query rather than remembered as empty.
+//
+// Stat, not Open, validates an entry: the file's size and mtime are enough to know the
+// bytes are the ones already decoded, and a file an operator has made unreadable still
+// answers from the cache — which is the point, the decode was already paid for.
+func (s *store) readDay(day time.Time) ([]Row, dayIssues, error) {
+	if !day.Before(s.dayOf(s.now())) {
+		return s.readDayFile(day)
+	}
+	fi, err := os.Stat(s.path(day))
+	if os.IsNotExist(err) {
+		// Pruned or never written. Dropped rather than kept: an entry for a deleted
+		// file would serve rows retention has decided to forget.
+		s.mu.Lock()
+		delete(s.days, day)
+		s.mu.Unlock()
+		return nil, dayIssues{}, nil
+	}
+	if err != nil {
+		// Stat itself failed — permissions on the directory, a broken mount. Fall
+		// through to the read, which reports the failure through its own error path
+		// rather than guessing here.
+		return s.readDayFile(day)
+	}
+	s.mu.Lock()
+	ent, ok := s.days[day]
+	s.mu.Unlock()
+	if ok && ent.size == fi.Size() && ent.modTime.Equal(fi.ModTime()) {
+		return ent.rows, ent.issues, nil
+	}
+	rows, issues, rerr := s.readDayFile(day)
+	if rerr != nil {
+		return rows, issues, rerr
+	}
+	s.mu.Lock()
+	if len(s.days) >= dayCacheMax {
+		// Oldest day out, not newest-in-first-out: the newest past days are the ones
+		// the rolling windows keep asking for, and a cache that evicted them would
+		// re-decode exactly the files it exists to avoid.
+		var oldest time.Time
+		for d := range s.days {
+			if oldest.IsZero() || d.Before(oldest) {
+				oldest = d
+			}
+		}
+		delete(s.days, oldest)
+	}
+	s.days[day] = dayCacheEntry{rows: rows, issues: issues, size: fi.Size(), modTime: fi.ModTime()}
+	s.mu.Unlock()
+	return rows, issues, nil
+}
+
+// readDayFile decodes one day file, uncached — the whole file, line by line. A missing
+// file is not an error: an idle day writes none, which is the normal case on a laptop.
 //
 // SKIPS an undecodable line and keeps going, rather than stopping at it. A scanner rather
 // than one json.Decoder over the whole file, because a Decoder cannot resync: it tolerates a
@@ -490,7 +573,7 @@ const maxLineBytes = 1 << 20
 // level, and not into a local, which reaches no caller, no exported counter and no API
 // response. The count is what lets an operator tell "my ledger is fine" from "my ledger is
 // losing lines", so it has to leave this function. See dayIssues and Caveats.SkippedLines.
-func (s *store) readDay(day time.Time) ([]Row, dayIssues, error) {
+func (s *store) readDayFile(day time.Time) ([]Row, dayIssues, error) {
 	f, err := os.Open(s.path(day))
 	if os.IsNotExist(err) {
 		return nil, dayIssues{}, nil

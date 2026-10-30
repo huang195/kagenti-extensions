@@ -187,6 +187,33 @@ func (m *model) rebuildEventsTable() {
 	} else {
 		m.subagentBlocks = nil
 	}
+	// Member rows number their exchanges WITHIN their block, from 1 (#1047): the
+	// block is read as the subagent's own transcript, so its first exchange is 1
+	// — the session-wide number the main rows keep would start a block at 94 and
+	// say nothing about how much the subagent itself did. The session-wide ids
+	// still decide what an exchange IS (a request and its response share one
+	// number there, and therefore here); only the counting restarts per block.
+	// Assigned into ctxs here, after the blocks exist and before any cell
+	// renders — the # column is not a measured one, so measureColumns above never
+	// read it.
+	var blockIDs map[*pipeline.SessionEvent]int
+	for _, b := range m.subagentBlocks {
+		if blockIDs == nil {
+			blockIDs = make(map[*pipeline.SessionEvent]int)
+		}
+		seen := make(map[int]bool, len(b.rows))
+		for _, j := range b.rows {
+			e := ctxs[j].row.event
+			if !seen[ids[e]] {
+				seen[ids[e]] = true
+			}
+			blockIDs[e] = len(seen)
+		}
+		b.msgs = len(seen)
+	}
+	for i := range ctxs {
+		ctxs[i].blockIDs = blockIDs
+	}
 	// keys is the sort value for each row that survived the filters, parallel to
 	// rows and m.visibleRows. Collected inside the loop because the sortKey funcs
 	// take the same cellContext the cells do — including the chronological index the

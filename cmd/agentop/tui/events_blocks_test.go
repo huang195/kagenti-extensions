@@ -81,9 +81,10 @@ func TestBlocks_CollapsedByDefaultWithHeaderAtTheAnchor(t *testing.T) {
 	if b := m.headerRows[3]; b == nil || b.id != "a2" {
 		t.Errorf("header at 3 = %v, want a2", m.headerRows[3])
 	}
-	// The header carries the rollup: a1's response holds 900 tokens at $0.10.
+	// The header carries the rollup: a1 holds one exchange (2 rows) whose
+	// response carries 900 tokens at $0.10.
 	h := m.eventsTbl.Rows()[1][0]
-	if !strings.Contains(h, "▸─") || !strings.Contains(h, "2 rows") || !strings.Contains(h, "900 tok") || !strings.Contains(h, "$0.10") {
+	if !strings.Contains(h, "▸─") || !strings.Contains(h, "1 msg") || !strings.Contains(h, "900 tok") || !strings.Contains(h, "$0.10") {
 		t.Errorf("a1 header = %q", h)
 	}
 }
@@ -232,6 +233,51 @@ func TestBlocks_ConcurrentSubagentsEachStayOneSegment(t *testing.T) {
 	// Exactly two headers rendered.
 	if headers := len(m.headerRows); headers != 2 {
 		t.Errorf("headers = %d, want 2 (one per subagent, however interleaved)", headers)
+	}
+}
+
+// Member rows number their exchanges from 1 WITHIN the block — the block reads
+// as the subagent's own transcript — while main rows keep the session-wide
+// numbers. A request and its response still share one number, and the block's
+// count agrees with the last number shown inside it.
+func TestBlocks_MembersNumberFromOneInsideTheBlock(t *testing.T) {
+	req := func(id, sub string) pipeline.SessionEvent {
+		return pipeline.SessionEvent{Direction: pipeline.Outbound, Phase: pipeline.SessionRequest, Host: "ete", RequestID: id, Subagent: sub}
+	}
+	resp := func(id, sub string) pipeline.SessionEvent {
+		return pipeline.SessionEvent{Direction: pipeline.Outbound, Phase: pipeline.SessionResponse, Host: "ete", RequestID: id, Subagent: sub}
+	}
+	events := []pipeline.SessionEvent{
+		req("m1", ""), resp("m1", ""), // session exchange 1
+		req("a1.1", "a1"), resp("a1.1", "a1"), // session 2 — block-local 1
+		req("m2", ""), resp("m2", ""), // session 3
+		req("a1.2", "a1"), resp("a1.2", "a1"), // session 4 — block-local 2
+	}
+	m := newBlockModel(t, events)
+	m.eventsTbl.SetCursor(2) // a1's header: m1's pair, then the header
+	if !m.toggleSubagentBlock() {
+		t.Fatal("Enter on the header row did not toggle")
+	}
+
+	// Rendered: m1 req, m1 resp, header, a1's two exchanges, m2's pair. The
+	// first cell of each EVENT row is the # column; the header row is one cell
+	// of its own, standing in for the position.
+	want := []string{"1", "1", "HEADER", "1", "1", "2", "2", "3", "3"}
+	rows := m.eventsTbl.Rows()
+	if len(rows) != len(want) {
+		t.Fatalf("expanded rows = %d, want %d", len(rows), len(want))
+	}
+	for i, n := range want {
+		if n == "HEADER" {
+			continue // checked below, with the rollup
+		}
+		if got := rows[i][0]; got != n {
+			t.Errorf("row %d # = %q, want %q", i, got, n)
+		}
+	}
+	// The header's rollup counts exchanges, in the same unit the rows show.
+	if h := rows[2][0]; !strings.Contains(h, "2 msgs") {
+		t.Errorf("header = %q, want the exchange count (2 msgs)", h)
 	}
 }
 
@@ -420,8 +466,8 @@ func TestBlocks_RollupFollowsTheInactiveFilter(t *testing.T) {
 			t.Errorf("header for a2 at row %d", i)
 		}
 	}
-	// a1's header counts the rows expanding it would show: the kept exchange, 2.
-	if h := m.eventsTbl.Rows()[1][0]; !strings.Contains(h, "2 rows") {
+	// a1's header counts what expanding it would show: the kept exchange, 1 msg.
+	if h := m.eventsTbl.Rows()[1][0]; !strings.Contains(h, "1 msg") {
 		t.Errorf("a1 header = %q, want the kept exchange counted", h)
 	}
 }

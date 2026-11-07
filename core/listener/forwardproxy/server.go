@@ -784,6 +784,11 @@ func (s *Server) serveOutbound(w http.ResponseWriter, r *http.Request, tl *tunne
 		// to), so the exchange rides this client as HTTP/1.1.
 		client = s.TLSBridge.Upstream
 	}
+	if !skipped && !forwardUpgrade {
+		if c, ok := spikeHairpin(r, chain); ok {
+			client = c
+		}
+	}
 	resp, err := client.Do(r)
 	// A Resender reads refused answers, and a 101 is not one — it is the upgrade
 	// succeeding. Peeking at its (empty) body and sending the GET again would tear

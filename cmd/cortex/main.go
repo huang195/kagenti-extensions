@@ -1069,6 +1069,13 @@ func main() {
 			fatalf("listener.skip_hosts: %v", serr)
 		}
 		fpSrv.SkipHosts = skipHosts
+		// SPIKE (#1491 W1): the hairpin's egress listener.
+		if addr := os.Getenv("CORTEX_SPIKE_EGRESS"); addr != "" {
+			go func() {
+				slog.Info("spike: egress listener", "addr", addr)
+				fatalf("spike egress: %v", http.ListenAndServe(addr, forwardproxy.SpikeEgressHandler(os.Getenv("CORTEX_SPIKE_HAIRPIN_TOKEN"))))
+			}()
+		}
 		// Egress allow list (#1483): deny-by-default destinations for the
 		// forward proxy — off-list CONNECT targets and absolute-form hosts
 		// are refused with 403 destination_denied before any resolve or
